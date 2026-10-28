@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 use connector_config::is_onion_endpoint;
+use connector_proxied_client::ProxiedClient;
 use connector_runtime::NO_SOCKS_PROXY;
 use url::Url;
 
@@ -36,18 +37,12 @@ const OCTET_STREAM: &str = "application/octet-stream";
 pub struct ReqwestPeerClient {
     /// Every endpoint that is not an onion endpoint.
     direct: reqwest::Client,
-    /// Onion endpoints -- or the reason this node has no way to dial one.
-    ///
-    /// `Err` on a node that configured no proxy, which is the default and
-    /// is not an error condition until an onion endpoint is actually
-    /// dialed; and `Err` too if `reqwest` refused the configured URL,
-    /// which [`Config::load`] has already checked the scheme of. Both fail
+    /// Onion endpoints. `None` on a node that configured no proxy, which is
+    /// the default and is not an error condition until an onion endpoint is
+    /// actually dialed. A proxy whose host does not resolve fails the dial
     /// the same way -- as an ordinary dial failure carrying the reason --
-    /// because both mean the same thing to the packet: this endpoint
-    /// cannot be reached from this node.
-    ///
-    /// [`Config::load`]: connector_config::Config::load
-    onion: Result<reqwest::Client, String>,
+    /// and is built again at the next one.
+    onion: Option<ProxiedClient>,
 }
 
 impl ReqwestPeerClient {
@@ -62,7 +57,7 @@ impl ReqwestPeerClient {
     pub fn new(client: reqwest::Client) -> Self {
         ReqwestPeerClient {
             direct: client,
-            onion: Err(NO_SOCKS_PROXY.to_string()),
+            onion: None,
         }
     }
 
@@ -74,11 +69,12 @@ impl ReqwestPeerClient {
     /// preference: it is what makes the *proxy* resolve the name, and no
     /// resolver on this machine can resolve a `.onion` one.
     ///
-    /// Infallible on purpose. The only way the proxied client fails to
-    /// build is a `reqwest` refusal of a URL config has already validated
-    /// the scheme of, and the honest answer to that is the same one a
-    /// missing proxy gets: onion dials fail, naming the reason, while
-    /// every clearnet peering on this node keeps working.
+    /// Infallible on purpose. The proxied client fails to build when the
+    /// proxy's host does not resolve (its daemon is not up yet), and the
+    /// honest answer to that is the same one a missing proxy gets: onion
+    /// dials fail, naming the reason, while every clearnet peering on this
+    /// node keeps working. [`ProxiedClient`] builds it again at the next
+    /// onion dial, and again when a request finds the proxy unreachable.
     ///
     /// Takes no direct client, unlike [`ReqwestPeerClient::new`], so it does
     /// not compose with a caller that tuned one. Nothing needs that today --
@@ -90,12 +86,9 @@ impl ReqwestPeerClient {
     /// [`Config::load`]: connector_config::Config::load
     #[must_use]
     pub fn through_socks_proxy(proxy: &Url) -> Self {
-        let onion = reqwest::Proxy::all(proxy.as_str())
-            .and_then(|socks| reqwest::Client::builder().proxy(socks).build())
-            .map_err(|error| format!("socks_proxy '{proxy}' could not be used: {error}"));
         ReqwestPeerClient {
             direct: reqwest::Client::new(),
-            onion,
+            onion: Some(ProxiedClient::new(proxy, |builder| builder)),
         }
     }
 
@@ -105,11 +98,14 @@ impl ReqwestPeerClient {
     /// that decides a dial and the suffix that decides a carriage
     /// (`PeerCarriage::for_endpoint`) are one implementation, so a node
     /// cannot load a peering it will not dial.
-    fn client_for(&self, endpoint: &Url) -> Result<&reqwest::Client, String> {
+    fn client_for(&self, endpoint: &Url) -> Result<reqwest::Client, String> {
         if is_onion_endpoint(endpoint) {
-            self.onion.as_ref().map_err(Clone::clone)
+            match &self.onion {
+                Some(proxied) => proxied.client(),
+                None => Err(NO_SOCKS_PROXY.to_string()),
+            }
         } else {
-            Ok(&self.direct)
+            Ok(self.direct.clone())
         }
     }
 }
@@ -143,10 +139,12 @@ impl PeerHttpClient for ReqwestPeerClient {
             outbound = outbound.header(name, value);
         }
 
-        let response = outbound
-            .send()
-            .await
-            .map_err(|error| failure(error.to_string()))?;
+        let response = outbound.send().await.map_err(|error| {
+            if let (Some(proxied), true) = (&self.onion, is_onion_endpoint(endpoint)) {
+                proxied.observe(&error);
+            }
+            failure(error.to_string())
+        })?;
         let status = response.status().as_u16();
         let mut headers = Headers::new();
         for (name, value) in response.headers() {

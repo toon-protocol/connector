@@ -21,12 +21,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use ethers::providers::{JsonRpcClient, JsonRpcError, Provider, ProviderError, RpcError};
+use ethers::contract::ContractError;
+use ethers::providers::{
+    JsonRpcClient, JsonRpcError, Middleware, Provider, ProviderError, RpcError,
+};
 use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 use serde::Serialize;
 
-use crate::{is_refusal, refusal_backoff, RpcTransport};
+use crate::{is_refusal, refusal_backoff, AsRefused, Refused, RpcTransport};
 
 /// A JSON-RPC client over one settlement table's [`RpcTransport`].
 #[derive(Debug)]
@@ -74,6 +77,9 @@ pub enum EvmRpcError {
         #[source]
         source: reqwest::Error,
     },
+    /// The circuit's proxy could not be used, so nothing was sent.
+    #[error("{endpoint} was not dialled: {reason}")]
+    ProxyUnusable { endpoint: String, reason: String },
     /// The endpoint kept refusing (403 or 429) after every retry.
     #[error("{endpoint} refused the request with HTTP {status}, {attempts} times in a row")]
     Refused {
@@ -106,6 +112,52 @@ impl RpcError for EvmRpcError {
     fn as_serde_error(&self) -> Option<&serde_json::Error> {
         match self {
             EvmRpcError::Unreadable { reason, .. } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+impl AsRefused for EvmRpcError {
+    fn refusal(&self) -> Option<Refused> {
+        match self {
+            EvmRpcError::Refused {
+                endpoint, status, ..
+            } => Some(Refused {
+                endpoint: endpoint.clone(),
+                status: *status,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl AsRefused for ProviderError {
+    fn refusal(&self) -> Option<Refused> {
+        // `ProviderError` boxes the client's error as a bare `RpcError`, so
+        // the refusal is found by asking whether that box is the one this
+        // client returns.
+        match self {
+            ProviderError::JsonRpcClientError(source) => {
+                let source: &(dyn std::error::Error + 'static) = source.as_ref();
+                source.downcast_ref::<EvmRpcError>()?.refusal()
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<M> AsRefused for ContractError<M>
+where
+    M: Middleware,
+    M::Error: 'static,
+{
+    fn refusal(&self) -> Option<Refused> {
+        match self {
+            ContractError::ProviderError { e } => e.refusal(),
+            ContractError::MiddlewareError { e } => {
+                let e: &(dyn std::error::Error + 'static) = e;
+                e.downcast_ref::<ProviderError>()?.refusal()
+            }
             _ => None,
         }
     }
@@ -153,18 +205,26 @@ impl JsonRpcClient for EvmRpc {
 
         let mut retry = 0;
         let (status, bytes) = loop {
-            let response = self
+            let http = self
                 .transport
                 .http()
+                .map_err(|reason| EvmRpcError::ProxyUnusable {
+                    endpoint: endpoint(),
+                    reason,
+                })?;
+            let response = http
                 .post(self.transport.url().clone())
                 .json(&body)
                 .send()
                 .await
-                .map_err(|source| EvmRpcError::Transport {
-                    endpoint: endpoint(),
-                    // reqwest prints the full URL, and a keyed endpoint's
-                    // path is its API key; `endpoint` already names where.
-                    source: source.without_url(),
+                .map_err(|source| {
+                    self.transport.observe(&source);
+                    EvmRpcError::Transport {
+                        endpoint: endpoint(),
+                        // reqwest prints the full URL, and a keyed endpoint's
+                        // path is its API key; `endpoint` already names where.
+                        source: source.without_url(),
+                    }
                 })?;
             let status = response.status();
             if is_refusal(status) {

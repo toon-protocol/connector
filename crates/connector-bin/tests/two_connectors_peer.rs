@@ -76,8 +76,8 @@ use connector_signer::PublicKeyBytes;
 
 mod support;
 use support::{
-    identity_from_key_seed, sample_prepare, sealed_prepare_data, spawn_connector, spawn_stub_app,
-    write_config, write_raw_key_file, ConnectorProcess,
+    identity_from_key_seed, sample_prepare, sealed_prepare_data, sealed_prepare_data_with_headers,
+    spawn_connector, spawn_stub_app, write_config, write_raw_key_file, ConnectorProcess,
 };
 
 /// This test binary's own base port for [`Anvil::spawn`], distinct from
@@ -537,6 +537,38 @@ fn spawn_payee(
     tempfile::NamedTempFile,
     tempfile::NamedTempFile,
 ) {
+    spawn_payee_priced(fixture, state_dir, stub_app_addr, 0)
+}
+
+/// [`spawn_payee`] with the terminated route priced at `price`.
+fn spawn_payee_priced(
+    fixture: &PeerFixture,
+    state_dir: &std::path::Path,
+    stub_app_addr: &str,
+    price: u64,
+) -> (
+    ConnectorProcess,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+) {
+    spawn_payee_route(fixture, state_dir, stub_app_addr, price, false)
+}
+
+/// [`spawn_payee`] with the terminated route priced at `price`, and a
+/// payment route (ADR 0083) when `payment` is set.
+fn spawn_payee_route(
+    fixture: &PeerFixture,
+    state_dir: &std::path::Path,
+    stub_app_addr: &str,
+    price: u64,
+    payment: bool,
+) -> (
+    ConnectorProcess,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+) {
     let key_file = write_raw_key_file(PAYEE_SIGNER_SEED);
     let settlement_key = settlement_key_file(PAYEE_SETTLEMENT_KEY);
     let config = write_config(&format!(
@@ -551,7 +583,8 @@ key_file = "{key_file}"
 [[routes]]
 prefix = "{APP_PREFIX}"
 handler_url = "http://{stub_app_addr}"
-price = 0
+price = {price}
+payment = {payment}
 
 # The peering this node accepts. No `endpoint`: the payer dials us.
 [[peers]]
@@ -1201,6 +1234,128 @@ async fn a_client_may_not_declare_more_than_the_forwarded_route_charges() {
     );
 }
 
+/// **A packet whose forwarded amount is below the terminating route's price
+/// is not paid for twice** (#1462). The payee greets the forward with its
+/// terms; a retry changes the voucher and not the packet, so it could only
+/// end `F03` after a second admitted voucher. The payer signs none: the
+/// payee's journal holds the one voucher the forward rode.
+#[tokio::test]
+async fn a_forward_below_the_terminating_price_is_not_retried_over_btp() {
+    let Some(fixture) = PeerFixture::spawn().await else {
+        return;
+    };
+    let payee_state = tempfile::tempdir().expect("temp payee state dir");
+    let stub_app = spawn_stub_app();
+    let price = FORWARDED + 5;
+    let (payee, _payee_config, _payee_key, _payee_settlement) =
+        spawn_payee_priced(&fixture, payee_state.path(), &stub_app.addr, price);
+    let payee_client_edge = format!("http://{}/ilp", payee.client_edge_addr);
+    let (payer, _payer_config, _payer_key, _payer_settlement) = spawn_payer(
+        &fixture,
+        Carriage::Btp,
+        &payee_endpoint(Carriage::Btp, &payee),
+        &payee_client_edge,
+    );
+
+    let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
+    let (data, _shared) = sealed_prepare_data(b"too cheap", &payee_identity);
+    let prepare = Prepare {
+        amount: CLIENT_PRICE,
+        ..sample_prepare(APP_PREFIX, data)
+    };
+    let (status, answer, _ack) = post_peer_request(
+        &reqwest::Client::new(),
+        &payer.client_edge_addr,
+        Some(&fixture.client_claim(1)),
+        &prepare,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let reject = Reject::decode(&answer).expect("a packet below the price is refused");
+    assert!(
+        reject.message.contains(&price.to_string())
+            && reject.message.contains(&FORWARDED.to_string()),
+        "the reject must name the quoted price {price} and the amount {FORWARDED}: {}",
+        reject.message
+    );
+    assert_eq!(
+        journaled(payee_state.path(), &fixture.payer_channel),
+        vec![FORWARDED],
+        "the payee must hold one voucher, not a second for the price. Journal was:\n{}",
+        client_edge_journal(payee_state.path())
+    );
+}
+
+/// **A refusal at a priced termination states its charge, and the hop that
+/// carried the packet adds its fee** (the glossary's Cost): a sender reading
+/// a refused packet off the payer learns `PEER_FEE` plus the payee's price,
+/// not the fee alone. The payee's price is one unit more than the payer
+/// forwards, so its gate refuses `F06` on the real peering.
+#[tokio::test]
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_termination_charge_over_btp() {
+    a_refusal_across_a_peering_states_the_fee_plus_the_charge(Carriage::Btp).await;
+}
+
+#[tokio::test]
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_termination_charge_over_http() {
+    a_refusal_across_a_peering_states_the_fee_plus_the_charge(Carriage::Http).await;
+}
+
+async fn a_refusal_across_a_peering_states_the_fee_plus_the_charge(carriage: Carriage) {
+    let Some(fixture) = PeerFixture::spawn().await else {
+        return;
+    };
+    let payee_state = tempfile::tempdir().expect("temp payee state dir");
+    let stub_app = spawn_stub_app();
+    let charge = FORWARDED + 1;
+    let (payee, _payee_config, _payee_key, _payee_settlement) =
+        spawn_payee_priced(&fixture, payee_state.path(), &stub_app.addr, charge);
+    let payee_client_edge = format!("http://{}/ilp", payee.client_edge_addr);
+    let (payer, _payer_config, _payer_key, _payer_settlement) = spawn_payer(
+        &fixture,
+        carriage,
+        &payee_endpoint(carriage, &payee),
+        &payee_client_edge,
+    );
+
+    let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
+    let (data, _shared_secret) = sealed_prepare_data(b"underpaid", &payee_identity);
+    let prepare = Prepare {
+        amount: CLIENT_PRICE,
+        ..sample_prepare(APP_PREFIX, data)
+    };
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/ilp", payer.client_edge_addr))
+        .header(
+            "ilp-payment-channel-claim",
+            BASE64.encode(fixture.client_claim(1)),
+        )
+        .body(prepare.encode())
+        .send()
+        .await
+        .expect("POST /ilp");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let accumulated_cost = response
+        .headers()
+        .get("toon-accumulated-cost")
+        .expect("every REJECT this edge answers carries its running cost")
+        .to_str()
+        .expect("the accumulated-cost header is ASCII")
+        .to_string();
+    let body = response.bytes().await.expect("response body").to_vec();
+    let reject = Reject::decode(&body).expect("an underpaid packet is refused, not fulfilled");
+    // `F06` from the payee's price gate or `F03` from the arrival's own
+    // amount check, whichever the carriage reaches first: both state the
+    // charge.
+    assert!(
+        ["F03", "F06"].contains(&reject.code.as_str()),
+        "{} {}",
+        reject.code.as_str(),
+        reject.message
+    );
+    assert_eq!(accumulated_cost, (PEER_FEE + charge).to_string());
+}
+
 // ---------------------------------------------------------------------------
 // A peer voucher is acknowledged, and re-acknowledged, over both carriages.
 // ---------------------------------------------------------------------------
@@ -1284,4 +1439,193 @@ async fn a_peer_voucher_is_acknowledged(carriage: Carriage) {
         below.contains(r#""rejected""#) && below.contains("amount_not_advancing"),
         "a voucher below the watermark is refused as not advancing: {below}"
     );
+}
+
+/// An app that records the headers of every request it receives, so a test
+/// reads what a real app was told rather than what the connector meant to
+/// say. In-process: `stub-app` is payment-oblivious and echoes nothing.
+/// Each request's headers, in arrival order.
+type Received = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+struct RecordingApp {
+    addr: String,
+    received: Received,
+}
+
+fn spawn_recording_app() -> RecordingApp {
+    use axum::http::HeaderMap;
+    let received = Received::default();
+    let seen = Arc::clone(&received);
+    let router = axum::Router::new().route(
+        "/",
+        axum::routing::post(move |headers: HeaderMap| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().expect("recording lock").push(
+                    headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.as_str().to_string(),
+                                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                            )
+                        })
+                        .collect(),
+                );
+                "received"
+            }
+        }),
+    );
+    let server =
+        axum::Server::bind(&"127.0.0.1:0".parse().expect("addr")).serve(router.into_make_service());
+    let addr = server.local_addr().to_string();
+    tokio::spawn(server);
+    RecordingApp { addr, received }
+}
+
+impl RecordingApp {
+    fn calls(&self) -> usize {
+        self.received.lock().expect("recording lock").len()
+    }
+
+    /// Every value of header `name` the `call`th request carried.
+    fn header(&self, call: usize, name: &str) -> Vec<String> {
+        self.received.lock().expect("recording lock")[call]
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+}
+
+/// Present `claim` riding `prepare` to the payee over `carriage`, returning
+/// the answering packet's bytes.
+async fn answer_of(
+    carriage: Carriage,
+    client: &reqwest::Client,
+    addr: &str,
+    claim: &str,
+    prepare: &Prepare,
+) -> Vec<u8> {
+    match carriage {
+        Carriage::Btp => send_peer_message(addr, Some(claim), prepare).await.0,
+        Carriage::Http => {
+            post_peer_request(client, addr, Some(claim), prepare)
+                .await
+                .1
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives_over_btp() {
+    a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(Carriage::Btp).await;
+}
+
+#[tokio::test]
+async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives_over_http() {
+    a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(Carriage::Http).await;
+}
+
+/// **ADR 0083, on two real peers' wire**: at a `payment = true` route a peer
+/// arrival's voucher must advance the channel by the packet's own `amount`,
+/// at default `forwarded_claim_enforcement`. A voucher covering only the
+/// charge buys nothing above it (`F03`, the app never called); one covering
+/// the amount reaches the app with `X-TOON-Amount` that amount, and
+/// `X-TOON-Payer` / `X-TOON-Chain` naming the inbound peering channel, over
+/// whatever the caller forged under those names.
+async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Carriage) {
+    const CHARGE: u64 = 50;
+    let Some(fixture) = PeerFixture::spawn().await else {
+        return;
+    };
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let app = spawn_recording_app();
+    let (payee, _config, _key, _settlement_key) =
+        spawn_payee_route(&fixture, state_dir.path(), &app.addr, CHARGE, true);
+    let payee_identity = identity_from_key_seed(PAYEE_SIGNER_SEED);
+    let client = reqwest::Client::new();
+    let forged = vec![
+        ("X-TOON-Amount".to_string(), "999999".to_string()),
+        ("x-toon-payer".to_string(), "evm:forged".to_string()),
+        ("X-Toon-Chain".to_string(), "forged".to_string()),
+    ];
+    let prepare_of = |amount: u64, body: &[u8]| {
+        let (data, _shared) =
+            sealed_prepare_data_with_headers(body, forged.clone(), &payee_identity);
+        Prepare {
+            amount,
+            ..sample_prepare(APP_PREFIX, data)
+        }
+    };
+    let refused = |answer: &[u8]| {
+        Reject::decode(answer).unwrap_or_else(|_| panic!("expected a REJECT, got {answer:?}"))
+    };
+
+    // (1) The amount, covered: admitted, and stated.
+    let answer = answer_of(
+        carriage,
+        &client,
+        &payee.client_edge_addr,
+        &fixture.payer_voucher(400),
+        &prepare_of(400, b"covered"),
+    )
+    .await;
+    connector_domain::Fulfill::decode(&answer).unwrap_or_else(|_| {
+        let reject = refused(&answer);
+        panic!(
+            "a covered amount was refused: {} {}",
+            reject.code.as_str(),
+            reject.message
+        )
+    });
+    assert_eq!(app.calls(), 1);
+    assert_eq!(app.header(0, "x-toon-amount"), vec!["400"]);
+    assert_eq!(
+        app.header(0, "x-toon-payer"),
+        vec![format!("evm:{}", fixture.payer_channel)]
+    );
+    assert_eq!(app.header(0, "x-toon-chain"), vec!["evm"]);
+
+    // (2) The voucher advances by 400 and the packet declares 700: covers the
+    // charge, not the amount. Refused F03; the wrap is never opened.
+    let answer = answer_of(
+        carriage,
+        &client,
+        &payee.client_edge_addr,
+        &fixture.payer_voucher(800),
+        &prepare_of(700, b"underfunded"),
+    )
+    .await;
+    assert_eq!(refused(&answer).code.as_str(), "F03");
+    assert_eq!(
+        app.calls(),
+        1,
+        "the app must not be called for an uncovered amount"
+    );
+
+    // (3) Covered, but under the charge: ADR 0029's refusal still holds.
+    let answer = answer_of(
+        carriage,
+        &client,
+        &payee.client_edge_addr,
+        &fixture.payer_voucher(1_000),
+        &prepare_of(CHARGE - 1, b"under the charge"),
+    )
+    .await;
+    assert_eq!(refused(&answer).code.as_str(), "F03");
+    assert_eq!(app.calls(), 1);
+
+    // (4) Any amount at or above the charge, covered, is stated as sent.
+    let answer = answer_of(
+        carriage,
+        &client,
+        &payee.client_edge_addr,
+        &fixture.payer_voucher(1_200),
+        &prepare_of(200, b"covered again"),
+    )
+    .await;
+    assert!(connector_domain::Fulfill::decode(&answer).is_ok());
+    assert_eq!(app.calls(), 2);
+    assert_eq!(app.header(1, "x-toon-amount"), vec!["200"]);
 }

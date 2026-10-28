@@ -632,6 +632,25 @@ impl Config {
             });
         }
 
+        // A spending or deposit limit counts in a journal under `state_dir`
+        // (ADR 0078 decision 8); a node with nowhere to keep it would hand
+        // every key a fresh day on each restart.
+        if state_dir.is_none() {
+            for controller in operator.as_ref().map_or(&[][..], |o| o.controller_keys()) {
+                let limit = if controller.spending_limit().is_some() {
+                    "spending limit"
+                } else if controller.deposit_limit().is_some() {
+                    "deposit limit"
+                } else {
+                    continue;
+                };
+                return Err(ConfigError::LimitWithoutStateDir {
+                    entry: controller.name().to_string(),
+                    limit,
+                });
+            }
+        }
+
         // A node that can accept a claim must be able to remember having
         // accepted it (issue #605). Refused here, at load, rather than at
         // the first claim: a node whose watermarks live only in memory
@@ -1032,7 +1051,7 @@ mod tests {
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
     use crate::settlement::SettlementChain;
-    use connector_domain::{AssetId, Price};
+    use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -1236,6 +1255,112 @@ price = 1000
         // The flat spelling is untouched and still means what it meant.
         assert_eq!(config.routes()[1].price(), Price::flat(1000));
         assert!(config.routes()[1].price().is_flat());
+    }
+
+    /// ADR 0081: `max_bytes` is optional, and a route that writes none has
+    /// no limit at all. The forwarded branch is `route.rs`'s
+    /// `resolve_routes` tests' to cover, since a forwarded route needs a
+    /// whole peering to load here.
+    #[test]
+    fn loads_a_routes_payload_limit() {
+        let config = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+max_bytes = 65536
+
+[[routes]]
+prefix = "g.example.quotes"
+handler_url = "http://localhost:5001"
+price = 1000
+"#,
+                key_path.display()
+            )
+        })
+        .expect("load");
+
+        assert_eq!(config.routes()[0].max_bytes(), PayloadLimit::new(65_536));
+        assert_eq!(config.routes()[1].max_bytes(), None);
+    }
+
+    /// ADR 0081: a zero limit refuses every payload. ADR 0082: a limit above
+    /// 64 MiB would raise the node's request limit further than a route may
+    /// -- both are refused by name rather than loaded.
+    #[test]
+    fn refuses_a_payload_limit_of_zero_or_above_64_mib() {
+        for (value, expected) in [("0", "max_bytes = 0"), ("67108865", "67108864")] {
+            let error = with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+max_bytes = {value}
+"#,
+                    key_path.display()
+                )
+            })
+            .expect_err("refused");
+            assert!(
+                error.to_string().contains(expected)
+                    && error.to_string().contains("g.example.upload"),
+                "max_bytes = {value}: got {error}"
+            );
+        }
+    }
+
+    /// ADR 0082: a route may declare `max_bytes` up to 64 MiB, beside a
+    /// route that declares a small one.
+    #[test]
+    fn loads_a_payload_limit_up_to_64_mib() {
+        let load = |max_bytes: &str| {
+            with_key_file(|key_path| {
+                format!(
+                    r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[[routes]]
+prefix = "g.example.upload"
+handler_url = "http://localhost:5000"
+price = 1000
+{max_bytes}
+
+[[routes]]
+prefix = "g.example.quotes"
+handler_url = "http://localhost:5001"
+price = 1000
+max_bytes = 4096
+"#,
+                    key_path.display()
+                )
+            })
+            .expect("load")
+        };
+
+        assert_eq!(load("").routes()[0].max_bytes(), None);
+        let raised = load("max_bytes = 67108864");
+        assert_eq!(
+            raised.routes()[0].max_bytes(),
+            PayloadLimit::new(64 * 1024 * 1024)
+        );
+        assert_eq!(raised.routes()[1].max_bytes(), PayloadLimit::new(4096));
     }
 
     /// A price table exists only to carry a slope, so omitting `per_kib` is
@@ -3084,6 +3209,84 @@ key_file = "{key_file}"
         );
     }
 
+    /// A spending limit's day total is journaled under `state_dir` (ADR
+    /// 0078 decision 8), so a node stating one with no `state_dir` is refused.
+    #[test]
+    fn rejects_a_spending_limit_with_no_state_dir() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut controllers = tempfile::NamedTempFile::new().expect("temp controllers file");
+        std::io::Write::write_all(
+            &mut controllers,
+            format!(
+                "[agent]\nkey = \"{key}\"\nscope = [\"packets\"]\n\
+                 spending_limit = {{ per_write = 1, per_day = 5 }}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write controllers");
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{}"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                "f".repeat(64),
+                controllers.path().display(),
+            )
+        });
+
+        expect_error(
+            result,
+            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "spending limit"),
+        );
+    }
+
+    #[test]
+    fn rejects_a_deposit_limit_with_no_state_dir() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut controllers = tempfile::NamedTempFile::new().expect("temp controllers file");
+        std::io::Write::write_all(
+            &mut controllers,
+            format!(
+                "[agent]\nkey = \"{key}\"\nscope = [\"channels-fund\"]\n\
+                 deposit_limit = {{ per_write = 1, per_day = 5 }}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write controllers");
+        let result = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{}"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                "f".repeat(64),
+                controllers.path().display(),
+            )
+        });
+
+        expect_error(
+            result,
+            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "deposit limit"),
+        );
+    }
+
     /// A peer claim's watermark is no less a replay defence than a client
     /// claim's (issue #605).
     #[test]
@@ -3454,6 +3657,34 @@ write_keys = ["{key}"]
         let operator = config.operator().expect("operator config");
         assert_eq!(operator.bearer_token(), "secret-token");
         assert_eq!(operator.write_keys().len(), 1);
+        assert_eq!(operator.packet_history(), 0);
+    }
+
+    /// Issue #1477: `packet_history` is an optional key under
+    /// `deny_unknown_fields`, read through `Config::load` as written.
+    #[test]
+    fn an_operator_section_with_a_packet_history_loads() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let config = with_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "secret-token"
+write_keys = ["{key}"]
+packet_history = 500
+"#,
+                key_path.display()
+            )
+        })
+        .expect("load");
+
+        let operator = config.operator().expect("operator config");
+        assert_eq!(operator.packet_history(), 500);
     }
 
     /// Issue #1003, end to end through `Config::load`: the shape the store

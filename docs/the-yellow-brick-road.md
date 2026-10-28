@@ -220,7 +220,7 @@ _Follow the road. Start small. Let the bricks earn the next step._
 - [RFC 0018](rfcs/README.md), _Connector Risk Mitigations_ — _"smaller payments carry
   proportionally less risk … in ILPv4, this is the default."_
 - [RFC 0027](rfcs/README.md), _ILPv4_ — designed for _"large volumes of low-value packets."_
-- The README's [Peering](../README.md#peering) chapter, where the operator's version of this
+- The [Peering](guide/peering.md) guide, where the operator's version of this
   lives, and [`CONTEXT.md`](../CONTEXT.md)'s **Path** entry.
 
 </details>

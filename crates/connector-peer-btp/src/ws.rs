@@ -68,12 +68,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use connector_btp::{decode_frame, BtpSessionHandle, OutboundRequests};
 use connector_config::is_onion_endpoint;
+use connector_domain::BTP_MESSAGE_LIMIT;
 use connector_runtime::NO_SOCKS_PROXY;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_socks::tcp::Socks5Stream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use url::Url;
@@ -146,6 +148,18 @@ impl TungsteniteDialer {
         self
     }
 
+    /// The websocket configuration every dialed session reads under (ADR
+    /// 0082): [`BTP_MESSAGE_LIMIT`] for a message and for a frame -- the
+    /// figure the accept side reads at too -- and tungstenite's defaults for
+    /// the rest.
+    fn websocket_config() -> WebSocketConfig {
+        WebSocketConfig {
+            max_message_size: Some(BTP_MESSAGE_LIMIT),
+            max_frame_size: Some(BTP_MESSAGE_LIMIT),
+            ..WebSocketConfig::default()
+        }
+    }
+
     /// A SOCKS5 stream to `endpoint`, established through this node's
     /// proxy, or the reason there is none.
     ///
@@ -206,9 +220,9 @@ impl TungsteniteDialer {
         //
         // It ends when the read loop does. The two halves of a split socket
         // fail independently -- a peer that restarts closes the connection,
-        // which the *read* half sees at once and the write half learns only
-        // on its next write -- so a writer still waiting on its channel is a
-        // live send half over a dead socket. That is what made a payee's
+        // which the *read* half sees as soon as the kernel reports it and
+        // the write half learns only on its next write -- so a writer still
+        // waiting on its channel is a live send half over a dead socket. That is what made a payee's
         // restart cost a packet (issue #1240): the dial side kept handing
         // out a handle whose reply channel was still open, wrote the next
         // PREPARE into it, and then waited out the answer timeout for a
@@ -216,6 +230,12 @@ impl TungsteniteDialer {
         // when the read loop ends drops the receiver instead, which closes
         // the channel, which is what `BtpSessionHandle::is_gone` reads --
         // so the next packet finds a dead session and redials.
+        //
+        // A request already written into the session is a different case:
+        // nothing is left to answer it, and the table the cached handle
+        // keeps alive would hold it to the answer timeout. The read loop
+        // closing the table answers it at the close
+        // (`OriginateError::ClosedBeforeAnswer`), and it is never resent.
         let (replies, mut reply_rx) = mpsc::channel::<Vec<u8>>(REPLY_QUEUE_DEPTH);
         let writer = tokio::spawn(async move {
             while let Some(bytes) = reply_rx.recv().await {
@@ -234,6 +254,7 @@ impl TungsteniteDialer {
             Some(state) => {
                 let mut session =
                     PeerSession::with_outbound(Arc::clone(state), replies, Arc::clone(&outbound));
+                let outbound_for_close = Arc::clone(&outbound);
                 tokio::spawn(async move {
                     while let Some(Ok(Message::Binary(bytes))) = stream.next().await {
                         if session.handle_frame(&bytes).await.is_err() {
@@ -242,6 +263,7 @@ impl TungsteniteDialer {
                     }
                     // However this loop ended, the socket is finished.
                     writer.abort();
+                    outbound_for_close.close();
                 });
             }
             // Ask-only: answers correlate, everything else is dropped --
@@ -257,6 +279,7 @@ impl TungsteniteDialer {
                         }
                     }
                     writer.abort();
+                    outbound.close();
                 });
             }
         }
@@ -296,7 +319,7 @@ impl PeerDialer for TungsteniteDialer {
             let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
                 endpoint.as_str(),
                 stream,
-                None,
+                Some(Self::websocket_config()),
                 None,
             )
             .await
@@ -304,9 +327,13 @@ impl PeerDialer for TungsteniteDialer {
             return Ok(self.start_session(socket));
         }
 
-        let (socket, _) = tokio_tungstenite::connect_async(endpoint.as_str())
-            .await
-            .map_err(|error| failed(error.to_string()))?;
+        let (socket, _) = tokio_tungstenite::connect_async_with_config(
+            endpoint.as_str(),
+            Some(Self::websocket_config()),
+            false,
+        )
+        .await
+        .map_err(|error| failed(error.to_string()))?;
         Ok(self.start_session(socket))
     }
 }

@@ -133,7 +133,7 @@ rate = { numerator = 4000, denominator = 1 }
 # the flat fee (decision 8), applied against the sender: 4000/1 at 1/100 deals
 # at 3960/1. So one packet's arithmetic, end to end, is:
 #
-#     1100 arrive          (1200 sent, A keeps its flat 100)
+#     1100 arrive          (1100 sent; A charges its operator's own packet no fee)
 #     x 3960/1             (the 4000 mid, less this node's 1% spread)
 #     = 4356000            floor, always the connector's way (decision 4)
 #     - 6000               this node's flat fee on the `b-c` peering

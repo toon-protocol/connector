@@ -10,7 +10,7 @@
 //!
 //!   * its own PUBLIC ILP-over-HTTP and BTP endpoints -- the container sees
 //!     `0.0.0.0:4000` and a private docker network, never
-//!     `https://proxy.ario.devnet.toonprotocol.dev/ilp`;
+//!     `https://toonprotocol.dev/ilp`;
 //!   * which ILP addresses it answers to.
 //!
 //! Everything else a node says about itself is **derived**: the prices come
@@ -41,9 +41,10 @@
 //! advertises it elsewhere (ND-08).
 
 use serde::Deserialize;
+use url::{Host, Url};
 
 use crate::error::ConfigError;
-use crate::peer::{PeerCarriage, PeerExposure};
+use crate::peer::{is_onion_endpoint, PeerCarriage, PeerExposure};
 use crate::route::is_valid_ilp_address;
 
 /// The `[node]` section exactly as written. `deny_unknown_fields` for the
@@ -140,6 +141,46 @@ impl NodeConfig {
     /// no BTP peer listener and chose not to publish one.
     pub fn btp_endpoint(&self) -> Option<&str> {
         self.btp_endpoint.as_deref()
+    }
+
+    /// The published endpoints a payer outside this host cannot be expected to
+    /// reach, as `(field, value)` pairs -- see [`is_host_local_endpoint`]. A
+    /// warning's input, never a refusal: these values are legitimate in tests,
+    /// in `local/` topologies and in a same-host trial.
+    pub fn host_local_endpoints(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("http_endpoint", self.http_endpoint()),
+            ("btp_endpoint", self.btp_endpoint()),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| Some((field, value?)))
+        .filter(|(_, value)| {
+            Url::parse(value)
+                .map(|url| is_host_local_endpoint(&url))
+                .unwrap_or(false)
+        })
+        .collect()
+    }
+}
+
+/// Whether `url` names a host that only a payer on this machine (or this
+/// docker network) can dial: loopback (`127.0.0.0/8`, `::1`, `localhost`,
+/// `*.localhost`), an unspecified address (`0.0.0.0`, `::`), or a single-label
+/// name with no dot, which is usually a container name. Onion endpoints are
+/// never host-local; that rule is [`is_onion_endpoint`], not a second copy.
+#[must_use]
+fn is_host_local_endpoint(url: &Url) -> bool {
+    if is_onion_endpoint(url) {
+        return false;
+    }
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost") || !name.contains('.')
+        }
+        None => false,
     }
 }
 
@@ -563,5 +604,56 @@ mod tests {
             resolve_node(Some(written), PeerExposure::Both),
             Err(ConfigError::AnnounceKeyRemoved { field }) if field == "relay_url"
         ));
+    }
+
+    #[test]
+    fn host_local_endpoints_are_classified() {
+        let local = |u: &str| is_host_local_endpoint(&Url::parse(u).unwrap());
+        for flagged in [
+            "http://127.0.0.1:3000/ilp",
+            "http://127.5.5.5/ilp",
+            "http://[::1]:3000/ilp",
+            "http://localhost/ilp",
+            "http://foo.localhost/ilp",
+            "http://0.0.0.0:3000/ilp",
+            "http://[::]:3000/ilp",
+            "ws://connector:3001/btp",
+            "http://node-a:3000/ilp",
+        ] {
+            assert!(local(flagged), "{flagged} should be flagged");
+        }
+        for fine in [
+            "https://your-node.example/ilp",
+            "https://proxy.ario.devnet.toonprotocol.dev/ilp",
+            "http://203.0.113.7/ilp",
+            "http://abcdefgh.onion/ilp",
+            "ws://abcdefgh.anyone:3001/btp",
+        ] {
+            assert!(!local(fine), "{fine} should not be flagged");
+        }
+    }
+
+    #[test]
+    fn host_local_endpoints_names_each_flagged_field() {
+        let mut written = raw();
+        written.http_endpoint = Some("http://127.0.0.1:3000/ilp".into());
+        written.btp_endpoint = Some("ws://connector:3001/btp".into());
+        let node = resolve_node(Some(written), PeerExposure::Both)
+            .expect("loads")
+            .expect("present");
+        assert_eq!(
+            node.host_local_endpoints(),
+            vec![
+                ("http_endpoint", "http://127.0.0.1:3000/ilp"),
+                ("btp_endpoint", "ws://connector:3001/btp"),
+            ]
+        );
+
+        let mut public = raw();
+        public.http_endpoint = Some("https://your-node.example/ilp".into());
+        let node = resolve_node(Some(public), PeerExposure::Both)
+            .expect("loads")
+            .expect("present");
+        assert!(node.host_local_endpoints().is_empty());
     }
 }

@@ -91,6 +91,32 @@ pub enum WriteAuthError {
     /// [`crate::write_auth::WriteAuth`] -- but it is part of this type so
     /// both layers report failure the same way.
     Replayed,
+    /// The signature verifies, and the key is a controller's restricted key
+    /// whose scope does not include this write (ADR 0078). Like `Replayed`,
+    /// raised a layer up, in [`crate::write_auth::WriteAuth`]; unlike every
+    /// other variant it is a `403`, not a `401`: the caller is known.
+    OutOfScope(connector_config::WriteScope),
+    /// The signature verifies, and the key is a controller's restricted key
+    /// past its expiry (ADR 0078). A `403`, like `OutOfScope`.
+    KeyExpired,
+    /// The signature verifies, the write is in scope, and the key's spending
+    /// limit refuses the packet (ADR 0078). A `403`. A deposit limit's refusal
+    /// comes later, from the channel write that finds the deposit.
+    LimitRefused(crate::day_totals::CountRefusal),
+}
+
+impl WriteAuthError {
+    /// The reason a verified key was refused (`"scope"`, `"expiry"`, `"spending-limit"` or `"deposit-limit"`), or
+    /// `None` for a signature that did not verify. It labels the refused-write
+    /// metric and decides `403` over `401`.
+    pub fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            WriteAuthError::OutOfScope(_) => Some("scope"),
+            WriteAuthError::KeyExpired => Some("expiry"),
+            WriteAuthError::LimitRefused(refusal) => Some(refusal.kind().reason()),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for WriteAuthError {
@@ -122,6 +148,12 @@ impl std::fmt::Display for WriteAuthError {
             }
             WriteAuthError::SignatureInvalid => write!(f, "signature does not verify"),
             WriteAuthError::Replayed => write!(f, "signature has already been used"),
+            WriteAuthError::OutOfScope(write) => write!(
+                f,
+                "scope: this key's scope does not include '{write}' (ADR 0078)"
+            ),
+            WriteAuthError::KeyExpired => write!(f, "expiry: this key has expired (ADR 0078)"),
+            WriteAuthError::LimitRefused(refusal) => write!(f, "{refusal}"),
         }
     }
 }

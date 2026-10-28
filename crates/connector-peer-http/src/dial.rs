@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use connector_btp::{CLAIM_HEADER, PEER_CHALLENGE_HEADER};
 use connector_config::{PeerCarriage, PeerConfig};
 use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
-use connector_runtime::{ClaimAckOutcome, Covering, PeerForward, PeerTransport};
+use connector_runtime::{AnswerWait, ClaimAckOutcome, Covering, PeerForward, PeerTransport};
 use url::Url;
 
 use crate::headers::{self, Headers, PeerRequest, PeerResponse};
@@ -275,17 +275,25 @@ impl HttpPeerTransport {
         Headers::new()
     }
 
+    /// POST `request`, waiting at most `wait`. `Err(true)` is a wait that
+    /// ended at the packet's outgoing expiry (PF-26), `Err(false)` any other
+    /// failure to be answered, the answer timeout included.
     async fn post(
         &self,
         state: &RelationState,
         request: PeerRequest,
-        timeout: Duration,
-    ) -> Option<PeerResponse> {
+        wait: AnswerWait,
+    ) -> Result<PeerResponse, bool> {
+        let timeout = wait.span;
         let answered =
             tokio::time::timeout(timeout, self.client.post(&state.relation.endpoint, request))
                 .await;
         match answered {
-            Ok(Ok(response)) if response.answers_the_packet() => Some(response),
+            Ok(Ok(response))
+                if response.answers_the_packet() || response.quoted_terms().is_some() =>
+            {
+                Ok(response)
+            }
             // §6.2: `4xx`/`5xx` are reserved for a malformed request or a
             // connector fault -- there is no ILP answer, so there is nothing
             // to read, and in particular no ack to read off it.
@@ -296,7 +304,7 @@ impl HttpPeerTransport {
                     status = response.status,
                     "peer answered with no ILP body; {NAT_NOTE}"
                 );
-                None
+                Err(false)
             }
             // `HttpDialError` carries the endpoint it attempted but not the
             // peer id -- the client that mints one holds a URL and nothing
@@ -310,7 +318,7 @@ impl HttpPeerTransport {
                     %error,
                     "peer request failed; {NAT_NOTE}"
                 );
-                None
+                Err(false)
             }
             // §6.3 on expiry: the voucher is **not acknowledged**. The
             // peering is not torn down; the next forward asks the next hop's
@@ -320,9 +328,10 @@ impl HttpPeerTransport {
                     peer_id = %state.relation.peer_id,
                     endpoint = %state.relation.endpoint,
                     timeout_ms = timeout.as_millis(),
+                    ran_out_at_expiry = wait.ends_at_expiry,
                     "peer did not answer in time; {NAT_NOTE}"
                 );
-                None
+                Err(wait.ends_at_expiry)
             }
         }
     }
@@ -345,6 +354,7 @@ fn peer_not_dialable(peer_id: &str) -> PacketResponse {
         ),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     })
 }
 
@@ -366,6 +376,7 @@ fn dial_failed(peer_id: &str, endpoint: &Url) -> PacketResponse {
         message: format!("peer '{peer_id}' unreachable at {endpoint}"),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     })
 }
 
@@ -381,14 +392,19 @@ fn decode_answer(response: &PeerResponse) -> Option<PacketResponse> {
     Some(PacketResponse::Reject(reject))
 }
 
-#[async_trait]
-impl PeerTransport for HttpPeerTransport {
-    async fn forward(
+impl HttpPeerTransport {
+    /// [`PeerTransport::forward`], with every wait also ended at `budget`
+    /// when one is given -- the packet's outgoing expiry (PF-26). Waiting for
+    /// the relation's voucher-in-flight turn is bounded by it too, since that
+    /// is a wait on the forward path like any other.
+    async fn forward_bounded(
         &self,
         peer_id: &str,
         prepare: Prepare,
         covering: Option<Covering>,
+        budget: Option<Duration>,
     ) -> PeerForward {
+        let started = tokio::time::Instant::now();
         // A voucher or a challenge arrives rendered and rides its own header
         // verbatim (§1.4, §4).
         let rendered = match covering {
@@ -424,19 +440,32 @@ impl PeerTransport for HttpPeerTransport {
         // Requests carrying none are unconstrained, so the lock is taken
         // only when one rides.
         let _guard = if voucher {
-            Some(state.voucher_in_flight.lock().await)
+            match budget {
+                None => Some(state.voucher_in_flight.lock().await),
+                Some(budget) => {
+                    match tokio::time::timeout(budget, state.voucher_in_flight.lock()).await {
+                        Ok(guard) => Some(guard),
+                        Err(_) => return PeerForward::ran_out_at_expiry(peer_id),
+                    }
+                }
+            }
         } else {
             None
         };
+        // What the turn cost comes off the packet's budget; the answer
+        // timeout starts afresh, as it always did.
+        let budget = budget.map(|budget| budget.saturating_sub(started.elapsed()));
+        let wait = AnswerWait::new(state.relation.peer_answer_timeout, budget);
 
-        let Some(response) = self
-            .post(state, request, state.relation.peer_answer_timeout)
-            .await
-        else {
-            return PeerForward {
-                response: dial_failed(peer_id, &state.relation.endpoint),
-                ..PeerForward::unreachable(peer_id)
-            };
+        let response = match self.post(state, request, wait).await {
+            Ok(response) => response,
+            Err(true) => return PeerForward::ran_out_at_expiry(peer_id),
+            Err(false) => {
+                return PeerForward {
+                    response: dial_failed(peer_id, &state.relation.endpoint),
+                    ..PeerForward::unreachable(peer_id)
+                };
+            }
         };
 
         // §6.1/§6.2: the ack answers the voucher, independently of whatever
@@ -449,18 +478,69 @@ impl PeerTransport for HttpPeerTransport {
             ClaimAckOutcome::NotSent
         };
 
+        // A `402` with readable terms is the far node's client edge greeting
+        // a claimless packet (#1481). It carries no ILP body, so the reject
+        // is this carriage's reading of it, built as the BTP greeting is: an
+        // `F06` stating the charge quoted for this packet, with the terms
+        // reported beside it for the connector's one retry-or-decline rule.
+        // The ack is never read off it: no voucher was admitted.
+        if let Some(terms) = response.quoted_terms() {
+            tracing::info!(
+                peer_id,
+                price = terms.price().unwrap_or_default(),
+                resource = %terms.resource.url,
+                required_transport = terms.required_transport().unwrap_or_default(),
+                "peer answered a forwarded PREPARE with a 402 and x402 terms"
+            );
+            let reject = Reject {
+                code: RejectCode::f06_unexpected_payment(),
+                triggered_by: String::new(),
+                message: "No payment channel claim attached".to_string(),
+                data: Vec::new(),
+                accumulated_cost: terms.price().unwrap_or_default(),
+                reason: None,
+            };
+            return PeerForward::quoted(
+                PacketResponse::Reject(reject),
+                ClaimAckOutcome::NotSent,
+                terms,
+            );
+        }
+
         match decode_answer(&response) {
-            // No terms are ever reported on this carriage: reading the HTTP
-            // 402's own `payment-required` body is issue #874's BTP-side
-            // change and has no twin here yet, so a peer that greets this
-            // connector over HTTP is reported as an ordinary refusal --
-            // absence of terms, never an unreadable greeting silently
-            // downgraded (see `PeerForward::payment_required`).
+            // An ordinary answer quotes no terms on this carriage: the peer
+            // price gate's `200` is not read for a `Payment-Required` header
+            // (it would turn greeted retries on for bound peers). Absence of
+            // terms, never an unreadable greeting silently downgraded (see
+            // `PeerForward::payment_required`).
             Some(answer) => PeerForward::answered(answer, ack),
             None => {
                 tracing::warn!(peer_id, "peer answer carried no decodable ILP packet");
                 PeerForward::undecodable(peer_id, ack)
             }
         }
+    }
+}
+
+#[async_trait]
+impl PeerTransport for HttpPeerTransport {
+    async fn forward(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+    ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, None).await
+    }
+
+    async fn forward_within(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+        budget: Duration,
+    ) -> PeerForward {
+        self.forward_bounded(peer_id, prepare, covering, Some(budget))
+            .await
     }
 }

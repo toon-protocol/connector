@@ -25,7 +25,11 @@
 //! - **A longer path emits nothing.** A peer-role arrival, a forwarded
 //!   packet, an unclaimed request -- none of them admitted a client claim
 //!   here, so none of them carry a payer, and the header is absent rather
-//!   than guessed. ADR 0017's "on any path longer than one hop the header
+//!   than guessed. The one exception is a peer arrival at a **payment
+//!   route** (ADR 0083), whose voucher this connector accepted and whose
+//!   advance it checked against the packet's own `amount`: it states that
+//!   `amount`, and names the last hop's peering channel -- never the
+//!   person who paid. ADR 0017's "on any path longer than one hop the header
 //!   names the wrong party" is therefore not merely avoided by convention;
 //!   there is no code path that can produce it.
 //! - **A free route emits nothing.** Attribution describes a payment; a
@@ -70,7 +74,9 @@ pub(crate) struct PaymentAttribution<'a> {
     pub channel_key: &'a str,
     /// What this connector charged for this packet -- the route's schedule
     /// at this packet's own payload length -- which is exactly what that
-    /// claim had to cover (ADR 0020, ADR 0028, ADR 0065).
+    /// claim had to cover (ADR 0020, ADR 0028, ADR 0065). At a payment
+    /// route reached from a peer, the packet's own `amount`, which the
+    /// voucher's advance had to cover instead (ADR 0083).
     pub charge: u64,
 }
 

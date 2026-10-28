@@ -215,7 +215,10 @@ Raising it is an operator decision, or a controller's: post the same `id` again 
 removes one.
 
 **A route through the peering is a second, separate write** — `POST /routes/peers { prefix, peer_id,
-price }` — because a peering and a route are different decisions and one may exist without the other.
+price, request? }` — because a peering and a route are different decisions and one may exist without
+the other. The optional `request` is a JSON object, opaque to the node
+([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md)): any
+other JSON type is a `400`, and a re-post without it clears it.
 Onboarding is those two calls, with `POST /channels` still available for an operator who wants to open
 a channel on their own terms first; this write then _finds_ it.
 
@@ -245,13 +248,14 @@ outside it in fact.
 
 ### 2.1 What changes without a restart, and what does not
 
-| change                                          | how                                                               |
-| ----------------------------------------------- | ----------------------------------------------------------------- |
-| a route's price, a peering's fee, a handler URL | **edit the file and restart** — reload is a restart               |
-| a leased route                                  | pushed by a **controller**, expires unless renewed, never durable |
-| a runtime peer or peer route                    | written through the operator surface, **durable** across restarts |
-| a channel: open, fund, withdraw, land           | the operator surface, against a settlement backend (§2.2)         |
-| originating a packet outward                    | the operator surface                                              |
+| change                                          | how                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------- |
+| a route's price, a peering's fee, a handler URL | **edit the file and restart** — reload is a restart                       |
+| a leased route                                  | pushed by a **controller**, expires unless renewed, never durable         |
+| a runtime peer or peer route                    | written through the operator surface, **durable** across restarts         |
+| a channel: open, fund, withdraw, land           | the operator surface, against a settlement backend (§2.2)                 |
+| originating a packet outward                    | the operator surface                                                      |
+| a controller's write key: grant, change, revoke | **edit `controller_keys_file`** — read again on every signed request (§4) |
 
 **A runtime row can never take a key the configuration file owns.** A colliding write is refused
 outright, and on the next boot a runtime row whose key the file has since claimed is **deleted**, not
@@ -288,7 +292,9 @@ performs none of them.
   `claim`, Solana `settle`, or `settle_and_seal` on a channel its payer is closing. The watchers and
   sweeps land vouchers on their own; this is the lever for planned maintenance. The voucher landed is
   the one the client edge accepted and journaled, never one the caller supplies, and landing it twice
-  is a `409`.
+  is a `409`. The answer is the channel's row, as `GET /channels` shows it, plus `transaction`: the one
+  transaction that landed the voucher — on EVM `0x` and 64 lowercase hex, on Solana the base58
+  signature. `GET /channels` rows carry no `transaction`.
 
 **An open is journaled before it spends, and that is what makes it safe to retry**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 8). The
@@ -324,7 +330,8 @@ opens and funds its own x402 channel through `POST /peers`.
 
 ### 2.3 What an operator can see
 
-Reads are gated by a bearer token and nothing else: peers, routes (config, leased and runtime, each
+Reads are gated by a bearer token — or, in this implementation, a write key's signature in its place
+(§4) — and nothing else: peers, routes (config, leased and runtime, each
 labelled by source), channels, claims, node identity, the write audit log, and metrics.
 
 `GET /channels` lists every x402 channel, inbound and outbound, each with its `direction`,
@@ -337,6 +344,9 @@ comes from the outbound channels' own book (`book: "outbound"`). A row's `nonce`
 voucher, which has none; a `toon-channel` row an older journal still holds reports the nonce the
 journal recorded on the peer book and `0` on the client book, whose replay keeps only amounts since
 issue #1384.
+
+`GET /write-keys` lists every write key: its key id, whether it is restricted, its scope and its
+expiry.
 
 The audit log is the one worth knowing about: **every accepted write is retained as its own
 signature**, not as a log line asserting that something happened.
@@ -388,8 +398,8 @@ response to anything arriving over the network.
 
 **Non-normative.** How _this_ connector spells §3.
 
-**Reads** — bearer token: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
-`/claims` · `/rates` · `/identity` · `/audit-log` · `/metrics`
+**Reads** — bearer token, or a write key's signature in its place: `GET /peers` · `/routes` · `/routes/leased` · `/routes/peers` · `/channels` ·
+`/claims` · `/rates` · `/identity` · `/audit-log` · `/write-keys` · `/metrics`
 
 **Writes** — RFC 9421 HTTP Message Signature from a key on an operator allowlist, with RFC 9530
 Content-Digest binding the signature to the body: `POST /packets` · `POST|DELETE /peers` ·
@@ -400,9 +410,56 @@ Content-Digest binding the signature to the body: `POST /packets` · `POST|DELET
 through exactly the lines above from the operator's browser
 ([ADR 0066](../adr/0066-the-operator-dashboard-is-a-page-the-surface-serves-and-signs-in-the-browser.md)).
 
+A key on `write_keys` may make every write. A **controller's** key, declared in `[operator]
+controller_keys_file` ([ADR 0078](../adr/0078-a-controllers-write-key-carries-a-scope-and-two-limits.md)),
+carries a **scope** — a list of the named writes `packets`, `peers`, `routes-peers`, `routes-leased`,
+`channels-open`, `channels-fund`, `channels-withdraw` and `channels-land` (a `DELETE` belongs to the
+name of its `POST`) — and an optional expiry. A verified signature from such a key outside its scope or
+after its expiry is answered `403` naming the reason (`scope`, `expiry`, `spending-limit` or `deposit-limit`), before anything is signed,
+journaled or sent; it is not retained in the audit log, and counts on `toon_writes_refused_total`. `401`
+remains the answer to a signature that is missing, bad, replayed or unlisted.
+
+The **contents** of `controller_keys_file` are read again on every signed request
+([ADR 0079](../adr/0079-a-controllers-key-is-revoked-by-an-edit-and-may-sign-a-read.md)): an entry
+removed is an unlisted key at that key's next request, with no restart, and OP-02's "individually
+revocable" is met for a controller by an edit alone. A file that cannot be read or no longer parses
+yields no restricted keys until it is repaired. `write_keys`, `write_keys_file` and the setting naming
+the controllers' file are read once at boot.
+
+A read that presents no `Authorization` header MAY carry the signature a write carries, over an empty
+body, from any key that may sign a write; a scope does not narrow reads. Such a read is not spent, not
+retained in the audit log, and good until its own `expires`. This is write authority conferring read
+authority, which OP-03 does not forbid; a bearer token still confers no write.
+
+A key whose scope includes `packets` carries a **spending limit**, `per_write` and `per_day`, both
+required. A `POST /packets` from it is refused `403` when the packet's amount is above `per_write`, or
+would take the key's total for the current UTC day above `per_day`. A packet counts at its full `Prepare`
+amount once accepted — fulfilled, rejected with any code, or never answered — and nothing is given
+back. The figure is bare: the amount is added as a number with no asset and no conversion, so on a node
+holding tokens of different decimals it adds unlike units. The count is journaled under `state_dir`,
+by key, before the packet is handed on; a packet whose count cannot be journaled is refused; a restart,
+or removing and re-adding the entry, does not reset the day. A key on `write_keys` is never counted,
+and only packets a write key originates count. `GET /write-keys` shows each restricted key's limit and
+`counted_today`.
+
+A key whose scope includes `peers`, `channels-open` or `channels-fund` carries a **deposit limit**,
+`per_write` and `per_day`, both required, counted apart from the spending limit. A deposit is refused
+`403` when it is above `per_write`, or would take the key's deposit total for the current UTC day above
+`per_day`; nothing is journaled as a channel, signed or sent. `POST /peers` and `POST /channels` count
+their `deposit` when the write opens a channel — a repeat that finds or resumes a channel counts
+nothing — and `POST /channels/:id/fund` counts its `amount` every time, since it is an increment. A
+deposit counts when its channel write is journaled, before the transaction is sent; a deposit whose
+transaction fails, and a withdrawal, give nothing back. The count is journaled in the same file and
+under the same rules as the spending limit's, and `GET /write-keys` shows the deposit limit and its
+`counted_today` beside it.
+
 Two mechanisms sit behind the write half that [ADR 0008](../adr/0008-operator-surface-splits-read-from-write.md)'s
 Decision does not name — **replay rejection**, and the **audit log** the retained signatures are
 exposed through. Both are live and both are load-bearing for OP-05 and OP-02.
+
+A REJECT answered by `POST /packets` carries the `TOON-Accumulated-Cost` response header — a decimal
+`u64`, present on every REJECT and zero included, as on the client edge and the peer HTTP edge —
+because the cost never rides the OER encoding (ADR 0011). A FULFILL carries no such header.
 
 `GET /metrics` is Prometheus text exposition format; every other read is JSON.
 

@@ -1,7 +1,14 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
-**`schema_version` 8** (issue #1429, ADR 0074 decision 3 amended 2026-09-30): an EVM voucher's
+**`schema_version` 9** (issue #1532): a new top-level `client_edge` section. Its `f03_rejects` holds
+four cases, one per client-edge **reject reason** — `underpayment`, `undercollateralized`,
+`amount_over_charge`, `probe_terminates_here` — each pinning the code (`F03`), the cost, the reason,
+the exact `toon-accumulated-cost` / `toon-reject-reason` HTTP header pair and the exact BTP
+protocolData entries. The English message is not pinned. A replayer asserts that a client-edge
+`F03` raised for one of those four situations carries exactly that pair and that any other code
+carries no `toon-reject-reason`. Before
+that, **`schema_version` 8** (issue #1429, ADR 0074 decision 3 amended 2026-09-30): an EVM voucher's
 `maxClaimableAmount` widens from `u64` to `u128`, and every `max_claimable_amount` field becomes a
 decimal string rather than a JSON number — invariant 7's own paragraph has the detail. Before that,
 **`schema_version` 7** (issue #1384, [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)

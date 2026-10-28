@@ -146,4 +146,21 @@ pub enum JournalEntry {
         channel_id: String,
         cumulative_amount: u128,
     },
+    /// This node's signed watermark on its outbound channel `channel_id` is
+    /// now `cumulative_amount`, which may be LOWER than a voucher it signed
+    /// before: the receiver reported, after a forward ended in a reject,
+    /// that it holds no voucher that high, so the packet the voucher paid
+    /// for was never carried and is not owed (ADR 0075, issue #1446).
+    /// Written only by `connector_runtime::OutboundChannels::set_watermark`,
+    /// into its own journal file, and only after a later voucher has been
+    /// found not to have been signed since.
+    ///
+    /// Unlike `OutboundVoucherSigned`, whose replay folds by max, a replay
+    /// of this entry SETS the watermark, as `InboundClaimRolledBack` does
+    /// for the inbound side: it exists to move a watermark down, which a
+    /// max-fold would silently undo.
+    OutboundWatermarkSet {
+        channel_id: String,
+        cumulative_amount: u128,
+    },
 }

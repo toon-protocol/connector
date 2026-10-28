@@ -405,7 +405,8 @@ mod tests {
         let landed = client
             .land(second.presentation.channel(), second.voucher.clone())
             .await
-            .expect("the client lands its latest payout");
+            .expect("the client lands its latest payout")
+            .state;
         assert_eq!(landed.landed, 500);
     }
 

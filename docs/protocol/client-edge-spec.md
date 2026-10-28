@@ -92,15 +92,18 @@ application/octet-stream`. An ILP-level outcome — fulfilled or rejected — is
 
   | Status | Meaning                                                                         |
   | ------ | ------------------------------------------------------------------------------- |
-  | `400`  | Malformed request: not a PREPARE, undecodable OER, oversized body.              |
+  | `400`  | Malformed request: not a PREPARE, or undecodable OER.                           |
   | `401`  | An `ILP-Peer-Id` was presented but authentication failed. Answered before       |
   |        | the route is looked up, so it never arrives as a `402` instead. See §1.2.       |
   | `402`  | Unpaid request to a route this connector terminates and prices: x402 v2         |
   |        | payment-required terms, JSON body (not OER). See §1.4.                          |
   | `403`  | A probe (`POST /ilp/probe`) from a sender not authorized to probe: no           |
   |        | payment channel this connector recognizes, or over its rate limit. See §1.6.    |
-  | `413`  | Request body too large. There is no config field for this: the limit is         |
-  |        | axum's own `DefaultBodyLimit` (2 MiB), which this router does not override.     |
+  | `413`  | Request body over the node's request limit (ADR 0082): 2 MiB, or the largest    |
+  |        | route `max_bytes` plus 64 KiB of framing, whichever is larger. It is derived    |
+  |        | from the routes, not set by a key of its own, and `POST /ilp/probe` reads at    |
+  |        | the same figure. A route's `max_bytes` is checked after this, on the decoded    |
+  |        | PREPARE: a packet within this limit but over it is a `200` + `F00` (§1.3).      |
   | `500`  | Reserved by this spec for transport failure only; an unexpected                 |
   |        | internal error during routing is surfaced as a `200` + `T00` REJECT, not a 500. |
 
@@ -131,6 +134,15 @@ A request identifies its sender in one of two ways:
   required to pay for a terminated route.
 
 ### 1.3 Payment claim
+
+**A packet over its route's payload limit is never paid for.** A route MAY declare `max_bytes`
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)); a
+PREPARE whose `data` — the sealed wrap, the length a price is charged on — is longer is answered
+`200` with an `F00` REJECT reading `'<destination>' accepts at most <max_bytes> payload bytes; this
+packet carries <len>`, with `accumulated_cost` `0`. It is checked after the route's transport policy
+and **before** the §1.4 greeting and every step below, on both carriages, so a claim header on such
+a request is never read, its claim never reaches the journal and its watermark does not move. A
+packet exactly `max_bytes` long is charged and delivered as it would be without a limit.
 
 A request pays with a claim header. **Every claim is an x402 `batch-settlement` voucher**
 ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md),
@@ -258,7 +270,8 @@ the terminating app:
    than a cached floor: on EVM the figure can fall, so there is no lower bound to cache. The refusal
    is its own reason, distinguishable from an underpayment: this voucher _does_ cover the route's
    price, and it consumes nothing — no watermark advances and nothing is recorded — so the remedy
-   is to top the channel up and resubmit the same voucher.
+   is to top the channel up and resubmit the same voucher. It is `F03` with cost `0` and the reject
+   reason `undercollateralized` (§1.6, "The reject reason").
 
    **A payout nets against nothing** ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
    decision 7, issue #1381). A payout rides a connector→client channel of its own (§1.9 step 7), so
@@ -456,7 +469,10 @@ Two rules attach to the forwarded case and to nothing else. A client-edge PREPAR
 forwarded destination is refused `F03_INVALID_AMOUNT` when its declared `amount` exceeds that
 `price` — this connector never puts more value on the peer semantics than it collected, and the
 refusal is decided before the claim is ingested so a packet that will not be carried never spends
-a watermark. And a _peer-role_ PREPARE is never answered with this greeting at all
+a watermark. It carries the cost `price` and the reject reason `amount_over_charge` (§1.6). The same holds of a PREPARE to a destination nothing will carry — no configured route,
+no runtime peer route, no active lease, no bound client session: it is rejected `F02` without its
+claim being ingested, on both carriages ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md),
+issue #1446). And a _peer-role_ PREPARE is never answered with this greeting at all
 (`peer-carriage-spec.md` §3.1): everything in this section is the client-facing direction.
 
 This is **answering, not announcing** ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md)):
@@ -523,6 +539,7 @@ deleted with that claim scheme.
 **`extensions.toon`** carries what that entry also carried that is not a payment option, unchanged
 in name and meaning: `info` holds `ilpAddress`, `amount`, `endpoint` (`/ilp`), `price` and
 `sessionLeaseTtlMs` on every greeting, plus `pricePerKib` where the addressed route prices by size,
+plus `maxBytes` where it declares a payload limit (§1.3),
 plus whichever of `ilpAddresses`/`btpEndpoint`/`requiredTransport` applies (below), and nothing
 else; `schema` is a JSON Schema describing `info`, as x402 v2 asks of an extension, and is
 informational. It is on **every** greeting, including one with no `accepts[]` entry, so the amount
@@ -650,6 +667,13 @@ carries a slope the two answer different questions and must not be conflated:
 
 `toon.pricePerKib` is **absent**, not `"0"`, on a flat route.
 
+**`toon.maxBytes`** is the addressed route's payload limit
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)): a JSON
+number of bytes, the longest sealed payload the route accepts. A client checks its own packet against
+it before paying; a packet over it is refused `F00` whatever it carries (§1.3). It is **absent** on a
+route with no limit, so such a route's greeting is byte-identical to what it was before the field
+existed. `GET /ilp/routes/price` answers `maxBytes` the same way.
+
 **Transport policy** (issue #701, `toon-meta#262` decision 11): which transport(s) a terminated
 route accepts is per-connector config, not a protocol constant — `both` by default, so no deployed
 route changes behavior until an operator opts in, or restricted to `http` or `btp` alone. A request
@@ -736,6 +760,30 @@ channel through which a price was ever disclosed was that reject's human-readabl
 client learned a price by underpaying first, which is precisely what cost discovery exists to
 prevent.
 
+**The reject reason.** The client edge answers four different situations with `F03`, and the
+sender's next move differs between them. A reject this connector raises itself for one of them
+carries a **reject reason** (`CONTEXT.md` "Reject reason") beside its code and cost, in the same
+place as `TOON-Accumulated-Cost`: the `Toon-Reject-Reason` response header on `POST /ilp`,
+`POST /ilp/probe` and the operator's `POST /packets`, and a protocolData entry named
+`toon-reject-reason` (ASCII UTF-8 text) on a BTP reject response (§1.9). It is never put in the
+REJECT's `data` and never sent as a claim-ack (the claim-ack is the peer carriage's, and a
+connector sends none on a client interaction). The set is closed:
+
+| reason                  | situation                                                             | cost       | sender's next move                                   |
+| ----------------------- | --------------------------------------------------------------------- | ---------- | ---------------------------------------------------- |
+| `underpayment`          | the voucher did not advance by the route's charge (§1.3 step 5)       | the charge | sign a voucher that pays it                          |
+| `undercollateralized`   | the cumulative amount is above what the channel can pay (§1.3 step 5) | `0`        | top the channel up, then resend **the same** voucher |
+| `amount_over_charge`    | a forwarded PREPARE declares an `amount` above the forwarding charge  | the charge | send `amount` = the charge                           |
+| `probe_terminates_here` | a probe to a route this connector terminates (below)                  | the charge | pay that charge; a probe is never delivered          |
+
+All four are `F03`; the code, the cost and the English `message` are unchanged by the reason, and
+the `message` stays non-normative. A reason is attached **only to a reject this connector raised
+itself**: a reject relayed back from a peer reaches the client with its cost and no reason, a
+connector never invents one, and every other code (`F01`, `T00`, `T05`, `F02`, `F06`, …) carries
+none. An absent reason means "not raised here", never "unknown". A client that receives an absent
+or unrecognized reason acts on the code and the cost alone. Adding a value to the set is a spec
+change. The vectors pin each case (`client_edge.f03_rejects`).
+
 **The probe ingress: `POST /ilp/probe`.** Same request body and same response framing as `POST
 /ilp` (§1.1); what differs is the gate in front of it, and that nothing is charged. Because probing
 traverses the network for free, a probe is accepted only from a sender identified by a payment
@@ -760,7 +808,7 @@ A probe is never **delivered** to a route this connector terminates. Free traver
 what ADR 0011 grants a probe; it does not also buy the work behind a priced route, which is what
 delivering would hand over. A destination that terminates here is answered `F03` with that route's
 price as `TOON-Accumulated-Cost` — the same figure a real request would be charged, and the whole
-path cost, since no hop was traversed to reach it. A destination beyond this connector is routed
+path cost, since no hop was traversed to reach it — and the reject reason `probe_terminates_here`. A destination beyond this connector is routed
 by the ordinary routing table, exactly as ADR 0011 requires: a probe is not a distinct packet type
 and fee accumulation is not a special mode for it.
 
@@ -952,6 +1000,10 @@ retired with the field, [ADR 0057](../adr/0057-minimum-delivery-is-retired-a-cla
 - **Method/path:** `GET /ilp/btp`, websocket upgrade. The `btp` subprotocol is selected when
   offered; an upgrade offering no subprotocol is accepted identically.
 - **Frames:** binary websocket messages, one BTP frame per message. Text frames are ignored.
+- **Message limit:** one message, and one websocket frame, may be up to 64 MiB plus 64 KiB — the
+  largest request limit any node can have (ADR 0082), never a library default. It is fixed rather
+  than the node's own request limit because responses ride the same socket. A larger message ends
+  the session, with every request in flight on it.
 
 **BTP frame layout** (all integers big-endian; this is the `@toon-protocol/client`
 `btp/protocol.ts` dialect, which is the deployed client wire, extended additively with RFC-23's
@@ -1039,7 +1091,9 @@ silently dropped exactly as it was before TRANSFER existed.
    artifact). The claim runs the SAME §1.3 pipeline and the PREPARE is then routed identically to
    `POST /ilp`; the outcome returns as a RESPONSE whose `ilpPacket` is the FULFILL or REJECT. On
    a REJECT, `accumulated_cost` (§1.6) rides as a protocolData entry named `toon-accumulated-cost`
-   (decimal-uint64 UTF-8 text) beside the OER body — the BTP analogue of the HTTP header. The
+   (decimal-uint64 UTF-8 text) beside the OER body — the BTP analogue of the HTTP header — and, on
+   an `F03` this connector raised, a `toon-reject-reason` entry beside it (§1.6, "The reject
+   reason"). The
    privacy-wrapped carriage (§1.3's `-Wrapped` header) has no BTP protocolData equivalent yet;
    a wrapped claim is an HTTP-only feature today.
 3. **Wrong transport** (issue #701, `toon-meta#262` decision 11): a PREPARE addressed to a route
@@ -1059,7 +1113,9 @@ silently dropped exactly as it was before TRANSFER existed.
    RESPONSE carrying an `F06` (Unexpected Payment) REJECT, message
    `No payment channel claim attached`, with the x402 v2 terms JSON — byte-identical to §1.4's
    body — as a protocolData entry named `payment-required` (again mirroring the HTTP header of
-   the same name). A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
+   the same name). The REJECT's accumulated cost (`toon-accumulated-cost`) is the route's charge for
+   that packet — the price schedule at the packet's own payload length, the figure the terms quote
+   (issue #1481); a `greeting` on an unpriced destination states `0`. A claimless PREPARE to an unpriced route passes through unchanged, as on HTTP —
    unless, per §1.4's issue #807 update, the PREPARE itself declares `greeting`, in which case this
    same `F06` greeting fires regardless of destination or price.
 5. **Standalone claim**: a MESSAGE with an empty `ilpPacket` and a `payment-channel-claim` entry

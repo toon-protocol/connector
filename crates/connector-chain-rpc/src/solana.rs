@@ -4,11 +4,17 @@
 //! The SDK's `HttpSender` already takes a caller's `reqwest::Client`, so the
 //! bounds and the circuit ride in on the transport's client unchanged. What
 //! it lacks is half of the refusal rule: it retries a 429 (five times, 500ms
-//! apart) and returns a 403 as a final error. [`RefusalRetrying`] wraps it
-//! and retries both with the crate's backoff, so a 403 from an exit relay's
-//! shared address is never read as an answer. The SDK's own 429 retries
-//! still run first, inside each of these attempts; that only makes a
-//! persistent 429 cost more time before it is reported, never less.
+//! apart, honouring a `Retry-After` under 120s) and returns a 403 as a final
+//! error. [`RefusalRetrying`] wraps it and retries a 403 with the crate's
+//! backoff, so a 403 from an exit relay's shared address is never read as an
+//! answer. A 429 it does **not** retry: the SDK's five retries already are
+//! that chain's 429 backoff, and a second layer would multiply them (six
+//! requests per attempt, five attempts). A persistent 429 therefore costs 6
+//! requests and a persistent 403 costs 5.
+//!
+//! A refusal that outlasts its retries is returned as an `Io` error carrying
+//! a [`Refused`], which names the endpoint (never the URL) and the status;
+//! [`AsRefused`] reads it back off the `ClientError`.
 
 use async_trait::async_trait;
 use solana_rpc_client::http_sender::HttpSender;
@@ -20,7 +26,7 @@ use solana_rpc_client_api::client_error::{
 };
 use solana_rpc_client_api::request::{RpcError, RpcRequest};
 
-use crate::{is_refusal, refusal_backoff, RpcTransport};
+use crate::{is_refusal, refusal_backoff, AsRefused, Refused, RpcTransport};
 
 /// An `RpcClient` over `transport`, configured by `config` (in practice
 /// `RpcClientConfig::with_commitment(CommitmentConfig::confirmed())`).
@@ -39,17 +45,45 @@ pub fn answered(error: &ClientError) -> bool {
     )
 }
 
-/// The SDK's `HttpSender` over the transport's client, retrying a refusal
-/// (403 or 429) with backoff.
+/// The node's "minimum context slot has not been reached" answer (-32016).
+///
+/// `get_account_with_config` rewraps a failed call as a `Custom` error whose
+/// text carries the node's (`AccountNotFound: pubkey=..: RPC response error
+/// -32016: ..`), so the code is looked for there as well as in a typed
+/// response error. Both are what the pinned `solana-rpc-client` 2.1.0 gives.
+pub fn is_min_context_slot_not_reached(error: &ClientError) -> bool {
+    const CODE: i64 =
+        solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
+    match error.kind() {
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => *code == CODE,
+        _ => error
+            .to_string()
+            .contains(&format!("RPC response error {CODE}")),
+    }
+}
+
+/// The SDK's `HttpSender` over the transport's client, retrying a 403 with
+/// backoff. The SDK retries a 429 itself, so one reaching here is final.
 pub struct RefusalRetrying {
-    inner: HttpSender,
+    transport: RpcTransport,
 }
 
 impl RefusalRetrying {
     pub fn new(transport: &RpcTransport) -> RefusalRetrying {
         RefusalRetrying {
-            inner: HttpSender::new_with_client(transport.url().as_str(), transport.http().clone()),
+            transport: transport.clone(),
         }
+    }
+
+    /// A sender over the transport's *current* client: a circuit's is
+    /// rebuilt when its proxy cannot be reached, so it is taken afresh for
+    /// each attempt rather than held.
+    fn sender(&self) -> Result<HttpSender, String> {
+        let client = self.transport.http()?;
+        Ok(HttpSender::new_with_client(
+            self.transport.url().as_str(),
+            client,
+        ))
     }
 }
 
@@ -62,13 +96,21 @@ impl RpcSender for RefusalRetrying {
     ) -> ClientResult<serde_json::Value> {
         let mut retry = 0;
         loop {
-            let error = match self.inner.send(request, params.clone()).await {
+            let error = match self
+                .sender()
+                .map_err(|reason| ClientError::from(ErrorKind::Custom(reason)))?
+                .send(request, params.clone())
+                .await
+            {
                 Ok(value) => return Ok(value),
                 // reqwest prints the full URL, and a keyed endpoint's path is
                 // its API key, so it is dropped from every error this
                 // sender returns.
                 Err(error) => match error.kind {
-                    ErrorKind::Reqwest(source) => ClientError::from(source.without_url()),
+                    ErrorKind::Reqwest(source) => {
+                        self.transport.observe(&source);
+                        ClientError::from(source.without_url())
+                    }
                     kind => ClientError::from(kind),
                 },
             };
@@ -76,24 +118,47 @@ impl RpcSender for RefusalRetrying {
                 ErrorKind::Reqwest(source) => source.status().filter(|status| is_refusal(*status)),
                 _ => None,
             };
+            let Some(status) = refused else {
+                return Err(error);
+            };
+            // A 429 has had the SDK's retries already.
             // `HttpSender` drops the response, headers and all, before it
             // returns a status error, so `Retry-After` is not visible here
             // and the computed backoff is used.
-            match refused.and_then(|_| refusal_backoff(retry, &Default::default())) {
+            let wait = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                None
+            } else {
+                refusal_backoff(retry, &Default::default())
+            };
+            match wait {
                 Some(wait) => {
                     retry += 1;
                     tokio::time::sleep(wait).await;
                 }
-                None => return Err(error),
+                None => {
+                    return Err(ClientError::from(std::io::Error::other(Refused {
+                        endpoint: self.transport.endpoint(),
+                        status: status.as_u16(),
+                    })))
+                }
             }
         }
     }
 
     fn get_transport_stats(&self) -> RpcTransportStats {
-        self.inner.get_transport_stats()
+        RpcTransportStats::default()
     }
 
     fn url(&self) -> String {
-        self.inner.url()
+        self.transport.url().to_string()
+    }
+}
+
+impl AsRefused for ClientError {
+    fn refusal(&self) -> Option<Refused> {
+        match self.kind() {
+            ErrorKind::Io(source) => source.get_ref()?.downcast_ref::<Refused>().cloned(),
+            _ => None,
+        }
     }
 }

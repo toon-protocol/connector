@@ -22,11 +22,13 @@ test-support = ["tokio/net", "tokio/io-util"]
 # pulls in (ADR 0070), so the lockfile gains nothing. 0.11 because both
 # chain SDKs build their clients on 0.11 and a client handed across that
 # seam has to be the same type.
+connector-proxied-client = { path = "../connector-proxied-client" }
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+tracing = "0.1"
 url = "2"
 async-trait = "0.1"
 ethers = { version = "2", default-features = false, features = ["rustls"], optional = true }
@@ -41,4 +43,5 @@ connector-chain-rpc = { path = ".", features = ["evm", "solana", "test-support"]
 connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
 ethers = { version = "2", default-features = false, features = ["rustls"] }
 solana-sdk = "=2.1.0"
+tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }

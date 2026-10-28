@@ -154,6 +154,58 @@ pub enum ConfigError {
     },
 
     #[error(
+        "the [operator] controller_keys_file {path} is not a valid controller-key file: \
+         {message}. One TOML table per restricted key (ADR 0078); unknown fields are refused"
+    )]
+    ControllerKeysFileInvalid { path: PathBuf, message: String },
+
+    #[error("controller key '{entry}' in {path} is refused: {reason}")]
+    ControllerKeyInvalid {
+        path: PathBuf,
+        entry: String,
+        reason: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} is also on [operator] write_keys / write_keys_file, \
+         where a key may make every write: a key is restricted or it is not, so keep it in \
+         exactly one place (ADR 0078)"
+    )]
+    ControllerKeyAlsoWriteKey { path: PathBuf, entry: String },
+
+    #[error(
+        "controller key '{entry}' in {path} repeats the key of entry '{first}': one key, one \
+         entry (ADR 0078)"
+    )]
+    ControllerKeyDuplicated {
+        path: PathBuf,
+        entry: String,
+        first: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} has '{write}' in its scope but states no {limit}: \
+         a scope that commits value must state its limit (ADR 0078 decision 6). A key that \
+         needs no limit belongs on write_keys"
+    )]
+    ControllerLimitRequired {
+        path: PathBuf,
+        entry: String,
+        write: crate::WriteScope,
+        limit: &'static str,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} states a {limit} with only one of 'per_write' and \
+         'per_day': a limit has both figures (ADR 0078 decision 2)"
+    )]
+    ControllerLimitIncomplete {
+        path: PathBuf,
+        entry: String,
+        limit: &'static str,
+    },
+
+    #[error(
         "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but neither is set"
     )]
     RouteMissingTarget { prefix: String },
@@ -162,6 +214,12 @@ pub enum ConfigError {
         "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but both are set"
     )]
     RouteTargetAmbiguous { prefix: String },
+
+    #[error(
+        "route '{prefix}' sets 'payment = true' with a 'peer_id': a payment route ends at an \
+         app, so it needs a 'handler_url' (ADR 0083) -- a forward is never the end of a payment"
+    )]
+    PaymentRouteForwards { prefix: String },
 
     #[error("route '{prefix}' has an empty 'peer_id'")]
     RoutePeerIdEmpty { prefix: String },
@@ -202,6 +260,28 @@ pub enum ConfigError {
          route accepts both client transports. Remove the 'transport' field"
     )]
     PeerRouteHasTransport { prefix: String, value: String },
+
+    /// ADR 0081: a limit of zero refuses every packet with a payload, which
+    /// is a route nobody can use rather than a limit.
+    #[error(
+        "route '{prefix}' sets max_bytes = 0, which refuses every packet with a payload \
+         (ADR 0081). Omit 'max_bytes' for no limit, or set the largest sealed payload, in \
+         bytes, this route accepts"
+    )]
+    RouteMaxBytesZero { prefix: String },
+
+    /// ADR 0082: a route's `max_bytes` raises the node's request limit to
+    /// carry it, and no further than 64 MiB.
+    #[error(
+        "route '{prefix}' sets max_bytes = {value}, above the {limit}-byte limit a route may \
+         declare (ADR 0082: a route raises the node's request limit to carry its largest \
+         packet, up to this bound). Set it to {limit} or less, or omit it"
+    )]
+    RouteMaxBytesAboveLimit {
+        prefix: String,
+        value: u64,
+        limit: u64,
+    },
 
     #[error(
         "route '{prefix}' sets transport = '{value}', which this connector does not recognize \
@@ -890,6 +970,15 @@ pub enum ConfigError {
          this node can write, and mount it so it outlives the container"
     )]
     SettlementWithoutStateDir,
+
+    /// A spending or deposit limit is counted in a journal under `state_dir` (ADR 0078
+    /// decision 8); without one the count would not survive a restart.
+    #[error(
+        "controller key '{entry}' states a {limit} but 'state_dir' is not set: the day's \
+         count is journaled under state_dir, and a count held only in memory would reset the \
+         day at every restart. Set a top-level state_dir to a directory this node can write"
+    )]
+    LimitWithoutStateDir { entry: String, limit: &'static str },
 
     #[error("state_dir '{path}' exists but is not a directory")]
     StateDirNotADirectory { path: PathBuf },

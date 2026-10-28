@@ -172,6 +172,13 @@ pub struct RoutePrice {
     /// before this issue.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request: Option<serde_json::Value>,
+    /// The largest sealed payload, in bytes, this route accepts (ADR 0081,
+    /// issue #1530) -- the `[[routes]] max_bytes` a packet over is refused
+    /// `F00` under, before it is paid for. A JSON number, as on the greeting.
+    /// Absent on a route with no limit, so a node that sets none publishes
+    /// exactly the document it published before ADR 0081.
+    #[serde(rename = "maxBytes", skip_serializing_if = "Option::is_none", default)]
+    pub max_bytes: Option<u64>,
     /// The client transport **this** route requires (ND-05a, TOON_Network
     /// issue #111) -- `"http"` or `"btp"`, the two spellings
     /// `TransportPolicy::name` already gives the greeting's
@@ -197,6 +204,13 @@ pub struct RoutePrice {
         default
     )]
     pub required_transport: Option<String>,
+    /// `Some(true)` on a payment route (ADR 0083, issue #1543): the payer
+    /// chooses the amount, at or above the price, and all of it is the
+    /// operator's. Absent -- never `false` -- on every other route, so a node
+    /// with no payment route publishes exactly the document it published
+    /// before ADR 0083.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub payment: Option<bool>,
 }
 
 /// The document itself, as it goes on the wire.
@@ -447,6 +461,8 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
+                payment: None,
                 required_transport: None,
             }],
             Some("btp".to_string()),
@@ -465,6 +481,31 @@ mod tests {
         }
     }
 
+    /// ADR 0083: `"payment": true` on a payment route, and no `payment` key at
+    /// all anywhere else -- so a node with none publishes the document it
+    /// always did.
+    #[test]
+    fn a_payment_route_is_marked_and_no_other_route_carries_the_key() {
+        let route = |prefix: &str, payment| RoutePrice {
+            prefix: prefix.to_string(),
+            price: "0".to_string(),
+            price_per_kib: None,
+            request: None,
+            max_bytes: None,
+            payment,
+            required_transport: None,
+        };
+        let document = NodeSelfDescription::describe(
+            &facts(),
+            None,
+            vec![route("g.toon.tip", Some(true)), route("g.toon.app", None)],
+            None,
+        );
+        let json = serde_json::to_value(&document).expect("serializes");
+        assert_eq!(json["routes"][0]["payment"], serde_json::json!(true));
+        assert!(json["routes"][1].get("payment").is_none());
+    }
+
     /// A price is a decimal string, not a JSON number: a `u64` price is not
     /// safely representable in one.
     #[test]
@@ -477,6 +518,8 @@ mod tests {
                 price: u64::MAX.to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
+                payment: None,
                 required_transport: None,
             }],
             None,
@@ -503,6 +546,8 @@ mod tests {
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: Some(serde_json::json!({"protocol": "nip90", "kinds": [5096, 5098]})),
+                    max_bytes: None,
+                    payment: None,
                     required_transport: None,
                 },
                 RoutePrice {
@@ -510,6 +555,8 @@ mod tests {
                     price: "1000".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
+                    payment: None,
                     required_transport: None,
                 },
             ],
@@ -542,6 +589,8 @@ mod tests {
                     price: "1".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
+                    payment: None,
                     required_transport: published_required_transport("btp"),
                 },
                 RoutePrice {
@@ -549,6 +598,8 @@ mod tests {
                     price: "0".to_string(),
                     price_per_kib: None,
                     request: None,
+                    max_bytes: None,
+                    payment: None,
                     required_transport: published_required_transport("both"),
                 },
             ],
@@ -613,6 +664,8 @@ mod tests {
                 price: "1000".to_string(),
                 price_per_kib: None,
                 request: None,
+                max_bytes: None,
+                payment: None,
                 required_transport: None,
             }],
             Some("btp".to_string()),

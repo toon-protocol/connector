@@ -4,7 +4,7 @@
 //! most specific prefix across both kinds without caring which one it is.
 
 use chrono::{DateTime, Utc};
-use connector_domain::Price;
+use connector_domain::{PayloadLimit, Price};
 
 /// A route whose traffic this connector forwards to a peer's connector for
 /// the next hop, rather than terminating it at an app of its own.
@@ -26,6 +26,7 @@ pub struct PeerRoute {
     peer_id: String,
     price: Price,
     request: Option<serde_json::Value>,
+    max_bytes: Option<PayloadLimit>,
 }
 
 impl PeerRoute {
@@ -61,17 +62,29 @@ impl PeerRoute {
             peer_id: peer_id.into(),
             price,
             request: None,
+            max_bytes: None,
         }
     }
 
     /// Attach what a client should send to use this route (issue #1210) --
     /// `connector-cli` calls this with the config-file row's own
     /// `connector_config::PeerRouteConfig::request` when it builds this
-    /// route from `[[routes]]`. A route built any other way -- a lease, or
-    /// a test that does not care -- keeps `None`, the value every
-    /// constructor above already gives it.
+    /// route from `[[routes]]`, and the runtime peer/route table with the
+    /// `request` a `POST /routes/peers` carried (issue #1479). A route built
+    /// any other way -- a lease, or a test that does not care -- keeps
+    /// `None`, the value every constructor above already gives it.
     pub fn with_request(mut self, request: Option<serde_json::Value>) -> PeerRoute {
         self.request = request;
+        self
+    }
+
+    /// Attach the largest sealed payload this route accepts (ADR 0081) --
+    /// `connector-cli` calls this with the config-file row's own
+    /// `connector_config::PeerRouteConfig::max_bytes`. A route built any
+    /// other way -- a lease, a runtime `POST /routes/peers` route, or a test
+    /// that does not care -- keeps `None`.
+    pub fn with_max_bytes(mut self, max_bytes: Option<PayloadLimit>) -> PeerRoute {
+        self.max_bytes = max_bytes;
         self
     }
 
@@ -96,10 +109,17 @@ impl PeerRoute {
     }
 
     /// What a client should send to use this route (issue #1210). `None`
-    /// on a route built with no [`PeerRoute::with_request`] call -- every
-    /// route before this issue, and every leased route today.
+    /// on a route built with no [`PeerRoute::with_request`] call, or with
+    /// `None` -- every leased route, and any peer route declared without one.
     pub fn request(&self) -> Option<&serde_json::Value> {
         self.request.as_ref()
+    }
+
+    /// The largest sealed payload a packet to this prefix may carry (ADR
+    /// 0081). `None` on a route built with no [`PeerRoute::with_max_bytes`]
+    /// call.
+    pub fn max_bytes(&self) -> Option<PayloadLimit> {
+        self.max_bytes
     }
 }
 

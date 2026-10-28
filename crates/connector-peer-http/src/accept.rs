@@ -222,6 +222,7 @@ impl PeerHttpState {
                     message: "no peer route for this interaction".to_string(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 })),
                 ClaimAckOutcome::NotSent,
             );
@@ -268,7 +269,11 @@ impl PeerHttpState {
         // amount on it is denominated in.
         let response = self
             .connector
-            .handle_peer_prepare(Some(&peer_id), prepare)
+            .handle_peer_prepare_over(
+                Some(&peer_id),
+                prepare,
+                price_gate::accepted_channel(ack, voucher.as_ref()).as_deref(),
+            )
             .await;
         self.finish(&role, packet_response(response), ack)
     }

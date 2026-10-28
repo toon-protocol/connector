@@ -28,6 +28,10 @@
 //!    channel rather than opening a second, and says which branch it took.
 //! 6. **Trust-on-first-use.** Whatever the URL serves is who the peering is
 //!    with.
+//! 7. **`connector probe` reads what a peered path costs** (ADR 0011, #1468)
+//!    off the real refusals of real nodes: a priced termination's charge, a
+//!    fee-charging hop's partial sum, and a delivery once the amount covers
+//!    both.
 
 mod support;
 
@@ -75,13 +79,24 @@ const APP_PRICE: u64 = 1_000;
 /// 0061). Non-zero on purpose: it is what makes "advanced by exactly the
 /// forwarded amount" a measurement of the fee rather than of the request.
 const PEER_FEE: u64 = 50;
-/// What a packet originated at one node carries to leave `APP_PRICE` at the
-/// other after the peering fee (ADR 0010, ADR 0028).
-const AMOUNT: u64 = APP_PRICE + PEER_FEE;
+/// What a client of one node pays for a route to the other: the app's price
+/// plus the peering's fee (ADR 0010, ADR 0028).
+const ROUTE_PRICE: u64 = APP_PRICE + PEER_FEE;
+/// What a packet originated at one node carries. An operator's own packet
+/// pays its node no fee (ADR 0061, #1466), so all of it is forwarded and
+/// this is exactly what reaches the other node.
+const AMOUNT: u64 = APP_PRICE;
 /// The opening deposit each node puts behind its own outbound channel.
 const DEPOSIT: u128 = 10_000;
 /// Each node's settlement account's USDC.
 const FUNDED: u128 = 1_000_000;
+/// Anvil's *third* well-known dev account (`0x3C44…93BC`): the third node
+/// of a path that needs a hop in the middle. [`Anvil::spawn`] genesis-funds
+/// only the first two, so [`Chain::spawn`] gives this one its gas.
+const THIRD_PRIVATE_KEY: &str = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+/// What every started KiB of payload adds to a node's sized route (ADR
+/// 0065).
+const PER_KIB: u64 = 10;
 
 /// A distinct `created` per signed request: the operator surface rejects a
 /// replayed signature (ADR 0008's #1067 amendment).
@@ -198,9 +213,14 @@ impl Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT + offset).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
-        for key in [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY] {
+        for key in [
+            DEPLOYER_PRIVATE_KEY,
+            COUNTERPARTY_PRIVATE_KEY,
+            THIRD_PRIVATE_KEY,
+        ] {
             x402.mint(token, address_of(key), FUNDED).await;
         }
+        x402.fund_gas(address_of(THIRD_PRIVATE_KEY)).await;
         Chain { anvil, x402, token }
     }
 }
@@ -319,6 +339,11 @@ handler_url = "http://{app}/"
 price = {APP_PRICE}
 
 [[routes]]
+prefix = "g.example.{name}.sized"
+handler_url = "http://{app}/sized"
+price = {{ base = {APP_PRICE}, per_kib = {PER_KIB} }}
+
+[[routes]]
 prefix = "g.example.{name}.pinned"
 handler_url = "http://{app}/pinned"
 price = 0
@@ -362,6 +387,9 @@ key_file = "{settlement_key}"
     /// Restart from the same config file and `state_dir`, through the
     /// production boot path, on the same socket.
     async fn restart(&mut self) {
+        // A restart ends the old process first, and with it its hold on
+        // `state_dir` (issue #1318).
+        self.runtime.state_dir_lock.take();
         self.runtime = connector_cli::build(&self.config)
             .await
             .expect("rebuild the node");
@@ -436,7 +464,7 @@ key_file = "{settlement_key}"
             serde_json::json!({
                 "prefix": format!("g.example.{}", other.name),
                 "peer_id": other.name,
-                "price": AMOUNT,
+                "price": ROUTE_PRICE,
             }),
         )
         .await;
@@ -527,6 +555,7 @@ fn spawn_app() -> String {
     let addr = listener.local_addr().expect("app addr");
     let app = Router::new()
         .route("/", post(|| async { "delivered" }))
+        .route("/sized", post(|| async { "delivered" }))
         .route("/pinned", post(|| async { "delivered" }));
     tokio::spawn(async move {
         let _ = axum::Server::from_tcp(listener)
@@ -629,7 +658,7 @@ async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) 
             a.inbound_watermark(&b_to_a).await,
             crossing * APP_PRICE,
             "A's watermark on B's channel advanced by exactly what B forwarded: the packet \
-             carried {AMOUNT}, B kept its {PEER_FEE} fee (ADR 0061), and {APP_PRICE} reached A"
+             carried {AMOUNT}, B charged its own operator's packet no fee (ADR 0061, #1466), and {APP_PRICE} reached A"
         );
     }
     assert_eq!(a.journaled(&b_to_a), vec![APP_PRICE, 2 * APP_PRICE]);
@@ -642,9 +671,9 @@ async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) 
     assert_eq!(b.journaled(&a_to_b), vec![APP_PRICE]);
 
     // ── A zero-value packet carries the challenge, and no voucher ───────
-    // Only a peering with no fee can carry one (a fee leaves nothing to
-    // forward, R01), so B reprices its peering -- a repeat of the write,
-    // which finds its channel and opens nothing.
+    // B reprices its peering to no fee -- a repeat of the write, which finds
+    // its channel and opens nothing. (An originated packet pays no fee, so
+    // this no longer decides whether the packet is refused.)
     let repriced = b.peer_with(&a, 0).await;
     assert_eq!(repriced["channel"]["status"], "found");
     assert_eq!(repriced["channel"]["id"], b_to_a.as_str());
@@ -1146,4 +1175,223 @@ write_keys = ["{write_key_hex}"]
         message.contains("/ilp"),
         "the 502 must name the fix -- POST /peers takes the self-description URL: {message}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Seam 7: `connector probe` across real peerings (ADR 0011, #1468).
+// ─────────────────────────────────────────────────────────────────────────
+
+impl Node {
+    /// This node's operator key as the file `--operator-key` names: the
+    /// ed25519 secret's 32 raw bytes.
+    fn operator_key_file(&self) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("operator key file");
+        file.write_all(self.operator.secret.as_bytes())
+            .expect("write");
+        file
+    }
+
+    /// `connector probe --json` through the real verb, from this node's
+    /// operator surface to `payee`'s `route`, carrying `amount` and `body`:
+    /// the printed object, or the error line it failed with.
+    async fn probe(
+        &self,
+        payee: &Node,
+        route: &str,
+        amount: Option<u64>,
+        body: &[u8],
+    ) -> Result<serde_json::Value, String> {
+        let to = format!("g.example.{}.{route}", payee.name);
+        self.probe_to(&to, payee, amount, body).await
+    }
+
+    /// [`Node::probe`] to any address, sealed to `seal_to`.
+    async fn probe_to(
+        &self,
+        to: &str,
+        seal_to: &Node,
+        amount: Option<u64>,
+        body: &[u8],
+    ) -> Result<serde_json::Value, String> {
+        let key = self.operator_key_file();
+        let mut body_file = tempfile::NamedTempFile::new().expect("body file");
+        body_file.write_all(body).expect("write");
+        let operator = format!("http://{}", self.addr);
+        let seal_to = seal_to.url();
+        let amount = amount.map(|amount| amount.to_string());
+        let mut args = vec![
+            "connector",
+            "probe",
+            "--operator",
+            &operator,
+            "--operator-key",
+            key.path().to_str().expect("utf-8 path"),
+            "--to",
+            to,
+            "--seal-to",
+            &seal_to,
+            "--body",
+            body_file.path().to_str().expect("utf-8 path"),
+            "--json",
+        ];
+        if let Some(amount) = &amount {
+            args.extend(["--amount", amount]);
+        }
+        match connector_cli::run(&args).await {
+            Ok(connector_cli::Command::Finished { summary }) => {
+                Ok(serde_json::from_str(&summary).expect("--json prints one object"))
+            }
+            Ok(_) => panic!("a probe finishes; it does not serve"),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// **A probe reads a path's cost off real refusals, and is delivered once
+/// its amount covers it.** C originates to A through B, which charges
+/// [`PEER_FEE`] on the peering C's packet arrives on; C charges its own
+/// operator's packet nothing (#1466).
+///
+/// * B probing A's priced route directly reads that route's charge; on A's
+///   sized route, a larger payload reads a larger charge (ADR 0065).
+/// * C's amount-0 probe stops at B, which it cannot pay: `R01`, a partial
+///   sum of B's fee -- and no channel moves.
+/// * Carrying that fee gets past B and reads the complete cost: B's fee
+///   plus A's charge.
+/// * Carrying that is delivered, and paid.
+/// * No route, and a peer that stops answering, are failures.
+#[tokio::test]
+async fn a_probe_reads_what_a_peered_path_costs() {
+    if !require_anvil() {
+        return;
+    }
+    let chain = Chain::spawn(60).await;
+    let app = spawn_app();
+    let a = Node::boot(
+        "nodea",
+        COUNTERPARTY_PRIVATE_KEY,
+        0x0a,
+        &chain,
+        Carriage::Http,
+        &app,
+    )
+    .await;
+    let b = Node::boot(
+        "nodeb",
+        DEPLOYER_PRIVATE_KEY,
+        0x0b,
+        &chain,
+        Carriage::Http,
+        &app,
+    )
+    .await;
+    let c = Node::boot(
+        "nodec",
+        THIRD_PRIVATE_KEY,
+        0x0c,
+        &chain,
+        Carriage::Http,
+        &app,
+    )
+    .await;
+    // Payee first, so each payer's first voucher arrives on a bound channel.
+    a.peer_with(&b, PEER_FEE).await;
+    b.peer_with(&a, PEER_FEE).await;
+    b.peer_with(&c, PEER_FEE).await;
+    let c_to_b = channel_of(&c.peer_with(&b, PEER_FEE).await);
+    b.route_to(&a).await;
+    c.write(
+        Method::POST,
+        "/routes/peers",
+        serde_json::json!({
+            "prefix": "g.example.nodea",
+            "peer_id": "nodeb",
+            "price": ROUTE_PRICE + PEER_FEE,
+        }),
+    )
+    .await;
+
+    // ── A direct peer terminating a priced route: its charge ────────────
+    let direct = b.probe(&a, "app", None, b"hello").await.expect("a cost");
+    assert_eq!(direct["outcome"], "complete", "{direct}");
+    assert_eq!(direct["amount"], 0, "--amount defaults to 0: {direct}");
+    assert_eq!(direct["accumulatedCost"], APP_PRICE, "{direct}");
+
+    // ── A route that prices by size: a larger payload, a larger cost ────
+    let small = b.probe(&a, "sized", None, b"small").await.expect("a cost");
+    let large = b
+        .probe(&a, "sized", None, &vec![b'x'; 4 * 1024])
+        .await
+        .expect("a cost");
+    let small_cost = small["accumulatedCost"].as_u64().expect("a cost");
+    let large_cost = large["accumulatedCost"].as_u64().expect("a cost");
+    assert!(small_cost > APP_PRICE, "{small}");
+    assert!(
+        large_cost >= small_cost + 4 * PER_KIB,
+        "four more KiB must cost at least four more steps: {small} {large}"
+    );
+
+    // ── Too small for the fee-charging hop: a partial sum ───────────────
+    let partial = c.probe(&a, "app", None, b"hello").await.expect("a cost");
+    assert_eq!(partial["outcome"], "partial", "{partial}");
+    assert_eq!(partial["code"], "R01", "{partial}");
+    assert_eq!(partial["accumulatedCost"], PEER_FEE, "{partial}");
+    assert!(
+        b.journaled(&c_to_b).is_empty(),
+        "an amount-0 probe carries no voucher"
+    );
+    assert_eq!(
+        chain.x402.channel(&ChannelId(c_to_b.clone())).await,
+        (DEPOSIT, 0),
+        "and moves no channel"
+    );
+
+    // ── Covering the fee and not the charge: the complete cost ──────────
+    let complete = c
+        .probe(&a, "app", Some(PEER_FEE), b"hello")
+        .await
+        .expect("a cost");
+    assert_eq!(complete["outcome"], "complete", "{complete}");
+    assert_eq!(
+        complete["accumulatedCost"],
+        PEER_FEE + APP_PRICE,
+        "{complete}"
+    );
+
+    // ── Covering the path: delivered, and paid ──────────────────────────
+    let delivered = c
+        .probe(&a, "app", Some(PEER_FEE + APP_PRICE), b"hello")
+        .await
+        .expect("delivered");
+    assert_eq!(delivered["outcome"], "delivered", "{delivered}");
+    assert_eq!(delivered["paid"], PEER_FEE + APP_PRICE, "{delivered}");
+    assert_eq!(delivered["body"], "delivered", "{delivered}");
+
+    // ── No route: a failure, with its code ──────────────────────────────
+    let no_route = c
+        .probe_to("g.example.nowhere.app", &a, None, b"hello")
+        .await
+        .expect_err("no route is not a cost");
+    let no_route: serde_json::Value =
+        serde_json::from_str(&no_route).expect("--json renders the failure too");
+    assert_eq!(no_route["outcome"], "failed", "{no_route}");
+    assert_eq!(no_route["code"], "F02", "{no_route}");
+
+    // ── A peer that does not answer: a failure, with its code ───────────
+    // A keeps serving its identity, so the probe can still be sealed to it,
+    // and stops answering everything else -- B's forward included.
+    let full = a.socket.router();
+    let identity_only = Router::new().route_service(
+        "/ilp/identity",
+        tower::service_fn(move |request: Request<Body>| full.clone().oneshot(request)),
+    );
+    a.socket.swap(identity_only);
+    let unanswered = c
+        .probe(&a, "app", Some(PEER_FEE), b"hello")
+        .await
+        .expect_err("a peer that does not answer is not a cost");
+    let failed: serde_json::Value =
+        serde_json::from_str(&unanswered).expect("--json renders the failure too");
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(failed["code"], "T01", "{failed}");
 }

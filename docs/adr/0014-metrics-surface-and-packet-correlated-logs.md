@@ -1,6 +1,6 @@
 # The metrics surface is decided, not accreted, and logs correlate a packet by its condition
 
-**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md) and [0069](0069-the-execution-condition-leaves-the-wire.md). Four of the five metrics stand. `toon_exposure` is kept at its decided name for scrape-config stability and is **permanently zero with no producer**, because the projection it was shaped for is retired. The log-correlation half is retired outright by 0069: the execution condition it correlated by no longer exists, and cross-hop correlation is not replaced.
+**Status:** Accepted, amended by [0033](0033-the-exposure-machinery-is-retired-not-restated.md), [0069](0069-the-execution-condition-leaves-the-wire.md) and [0077](0077-the-node-keeps-a-bounded-packet-history-for-watching.md) (a bounded packet history is a read beside the metrics; no metric or label is added). Four of the five metrics stand. `toon_exposure` is kept at its decided name for scrape-config stability and is **permanently zero with no producer**, because the projection it was shaped for is retired. The log-correlation half is retired outright by 0069: the execution condition it correlated by no longer exists, and cross-hop correlation is not replaced.
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 

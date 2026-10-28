@@ -170,8 +170,9 @@ forwarded_claim_enforcement = "enforce"   # default, if omitted: "observe"
   `local/mixed-chain`'s `a-b` row is the worked example, and the only place in the repository this
   setting does anything: B declares the peering in config — `[[peers]]` with `"enforce"`, and a
   `[[peer_channels]]` row naming A's voucher signer — and A covers each forward with a voucher on its
-  own outbound x402 channel toward B for `amount_after_fee(1200, 100)`, so B enforces on the 1100
-  that arrives. Since ADR 0075 (issue #1380) the covering claim on a forward is always such a
+  own outbound x402 channel toward B for the 1100 it forwards — the rehearsal's packet is A's
+  operator's own, so A charges it no fee (ADR 0061, #1466) — so B enforces on the 1100 that
+  arrives. Since ADR 0075 (issue #1380) the covering claim on a forward is always such a
   voucher, and a `[[pay_channels]]` row names that outbound channel rather than a shared
   `toon-channel`.
 

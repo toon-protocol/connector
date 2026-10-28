@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::controller_keys::{ControllerKey, ControllerKeysFile};
 use crate::error::ConfigError;
 
 /// The `[operator]` section as written in the config file. Its presence
@@ -54,6 +55,14 @@ pub(crate) struct RawOperatorConfig {
     write_keys: Option<Vec<String>>,
     #[serde(default)]
     write_keys_file: Option<PathBuf>,
+    /// The restricted keys of a controller (ADR 0078): a file of its own,
+    /// one table per key. Beside `write_keys`, never instead of it.
+    #[serde(default)]
+    controller_keys_file: Option<PathBuf>,
+    /// How many recent packets to keep in memory for `GET /packets`
+    /// (ADR 0077). Absent or `0` keeps none; not a required key.
+    #[serde(default)]
+    packet_history: Option<usize>,
 }
 
 /// The literal bearer token never reaches a [`fmt::Debug`] rendering, for
@@ -74,6 +83,8 @@ impl fmt::Debug for RawOperatorConfig {
             .field("bearer_token_file", &self.bearer_token_file)
             .field("write_keys", &self.write_keys)
             .field("write_keys_file", &self.write_keys_file)
+            .field("controller_keys_file", &self.controller_keys_file)
+            .field("packet_history", &self.packet_history)
             .finish()
     }
 }
@@ -87,6 +98,9 @@ impl fmt::Debug for RawOperatorConfig {
 pub struct OperatorConfig {
     bearer_token: String,
     write_keys: Vec<[u8; 32]>,
+    controller_keys: Vec<ControllerKey>,
+    controller_keys_file: Option<ControllerKeysFile>,
+    packet_history: usize,
 }
 
 /// Same redaction as [`RawOperatorConfig`]'s, one step further along: a
@@ -100,12 +114,18 @@ impl fmt::Debug for OperatorConfig {
                 "write_keys",
                 &format_args!("{} key(s)", self.write_keys.len()),
             )
+            .field(
+                "controller_keys",
+                &format_args!("{} key(s)", self.controller_keys.len()),
+            )
+            .field("packet_history", &self.packet_history)
             .finish()
     }
 }
 
 impl OperatorConfig {
-    /// The bearer token every read on the operator surface must present.
+    /// The bearer token a read on the operator surface presents, unless it
+    /// is signed by a write key instead (ADR 0079).
     pub fn bearer_token(&self) -> &str {
         &self.bearer_token
     }
@@ -117,6 +137,28 @@ impl OperatorConfig {
     pub fn write_keys(&self) -> &[[u8; 32]] {
         &self.write_keys
     }
+
+    /// The restricted keys of controllers (ADR 0078): each may make only the
+    /// writes its scope names, until its expiry. Disjoint from
+    /// [`write_keys`](Self::write_keys). This is the file as it stood at
+    /// boot; the operator surface reads it again through
+    /// [`controller_keys_file`](Self::controller_keys_file).
+    pub fn controller_keys(&self) -> &[ControllerKey] {
+        &self.controller_keys
+    }
+
+    /// The file the restricted keys are read from, if the config names one.
+    /// Its contents are the one part of the operator surface's
+    /// authentication that changes without a restart (ADR 0079).
+    pub fn controller_keys_file(&self) -> Option<&ControllerKeysFile> {
+        self.controller_keys_file.as_ref()
+    }
+
+    /// How many recent packets the node keeps in memory for the operator to
+    /// watch (ADR 0077); `0` keeps none.
+    pub fn packet_history(&self) -> usize {
+        self.packet_history
+    }
 }
 
 fn parse_write_key(value: &str) -> Result<[u8; 32], ConfigError> {
@@ -125,7 +167,7 @@ fn parse_write_key(value: &str) -> Result<[u8; 32], ConfigError> {
     })
 }
 
-fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -149,7 +191,10 @@ fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
 /// for `[signer] key_file`. The path is resolved the same way those are (by
 /// the OS, against the process's working directory), which is why the
 /// committed fleet configs write absolute container paths.
-fn read_operator_file(setting: &'static str, path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn read_operator_file(
+    setting: &'static str,
+    path: &Path,
+) -> Result<String, ConfigError> {
     if !path.is_file() {
         return Err(ConfigError::OperatorFileNotFound {
             setting,
@@ -298,10 +343,20 @@ pub(crate) fn resolve_operator(
 
     let bearer_token = resolve_bearer_token(raw.bearer_token, raw.bearer_token_file)?;
     let write_keys = resolve_write_keys(raw.write_keys, raw.write_keys_file)?;
+    let controller_keys_file = raw
+        .controller_keys_file
+        .map(|path| ControllerKeysFile::new(path, write_keys.clone()));
+    let controller_keys = match &controller_keys_file {
+        Some(file) => file.parse(&file.read()?)?,
+        None => Vec::new(),
+    };
 
     Ok(Some(OperatorConfig {
         bearer_token,
         write_keys,
+        controller_keys,
+        controller_keys_file,
+        packet_history: raw.packet_history.unwrap_or(0),
     }))
 }
 
@@ -320,7 +375,22 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(write_keys.iter().map(|k| k.to_string()).collect()),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }
+    }
+
+    #[test]
+    fn packet_history_is_off_unless_configured() {
+        let off = resolve_operator(Some(raw("token", &[KEY])))
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(off.packet_history(), 0);
+
+        let mut on = raw("token", &[KEY]);
+        on.packet_history = Some(500);
+        let on = resolve_operator(Some(on)).expect("resolve").expect("some");
+        assert_eq!(on.packet_history(), 500);
     }
 
     /// A temp file holding `contents`, kept alive by the caller -- dropping
@@ -331,6 +401,118 @@ mod tests {
         file.write_all(contents.as_bytes()).expect("write");
         file.flush().expect("flush");
         file
+    }
+
+    fn with_controllers(path: PathBuf) -> RawOperatorConfig {
+        let mut config = raw("token", &[OTHER_KEY]);
+        config.controller_keys_file = Some(path);
+        config
+    }
+
+    #[test]
+    fn a_controller_keys_file_resolves_beside_the_write_keys() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let resolved = resolve_operator(Some(with_controllers(file.path().to_path_buf())))
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(resolved.write_keys().len(), 1);
+        assert_eq!(resolved.controller_keys().len(), 1);
+        assert_eq!(resolved.controller_keys()[0].name(), "agent");
+    }
+
+    #[test]
+    fn no_controller_keys_file_means_no_restricted_keys() {
+        let resolved = resolve_operator(Some(raw("token", &[KEY])))
+            .expect("resolve")
+            .expect("some");
+        assert!(resolved.controller_keys().is_empty());
+        assert!(resolved.controller_keys_file().is_none());
+    }
+
+    #[test]
+    fn the_controller_keys_file_reads_again_under_the_rules_it_booted_under() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let resolved = resolve_operator(Some(with_controllers(file.path().to_path_buf())))
+            .expect("resolve")
+            .expect("some");
+        let live = resolved.controller_keys_file().expect("names a file");
+        let read = |live: &ControllerKeysFile| live.read().and_then(|text| live.parse(&text));
+
+        std::fs::write(file.path(), "").expect("revoke");
+        assert!(read(live).expect("an empty file parses").is_empty());
+
+        // A restricted key that is also on `write_keys` is refused on a
+        // re-read exactly as it is at boot.
+        std::fs::write(
+            file.path(),
+            format!("[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"),
+        )
+        .expect("rewrite");
+        assert!(matches!(
+            read(live),
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
+    }
+
+    #[test]
+    fn a_named_controller_keys_file_that_is_missing_is_refused() {
+        let result = resolve_operator(Some(with_controllers(PathBuf::from(
+            "/nonexistent/controllers.toml",
+        ))));
+        assert!(matches!(
+            result,
+            Err(ConfigError::OperatorFileNotFound {
+                setting: "controller_keys_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_named_controller_keys_file_that_is_unreadable_is_refused() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(&[0xff, 0xfe, 0xfd]).expect("write");
+        file.flush().expect("flush");
+        let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
+        assert!(matches!(
+            result,
+            Err(ConfigError::OperatorFileUnreadable {
+                setting: "controller_keys_file",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_controller_key_that_is_also_on_write_keys_file_is_refused() {
+        let keys = file_holding(&format!("{OTHER_KEY}\n"));
+        let controllers = file_holding(&format!(
+            "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let mut config = with_controllers(controllers.path().to_path_buf());
+        config.write_keys = None;
+        config.write_keys_file = Some(keys.path().to_path_buf());
+        let result = resolve_operator(Some(config));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
+    }
+
+    #[test]
+    fn a_controller_key_that_is_also_a_write_key_is_refused() {
+        let file = file_holding(&format!(
+            "[agent]\nkey = \"{OTHER_KEY}\"\nscope = [\"channels-land\"]\n"
+        ));
+        let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+        ));
     }
 
     #[test]
@@ -414,6 +596,8 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -435,6 +619,8 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -455,6 +641,8 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -489,6 +677,8 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
+            packet_history: None,
         }))
         .expect("resolve")
         .expect("some");
@@ -510,6 +700,8 @@ mod tests {
             bearer_token_file: Some(token.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("ambiguous").to_string();
@@ -526,6 +718,8 @@ mod tests {
             bearer_token_file: None,
             write_keys: Some(vec![OTHER_KEY.to_string()]),
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("ambiguous").to_string();
@@ -542,6 +736,8 @@ mod tests {
             bearer_token_file: Some(PathBuf::from("/nonexistent/operator-bearer-token")),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("missing file").to_string();
@@ -559,6 +755,8 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(PathBuf::from("/nonexistent/operator-write-keys")),
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("missing file").to_string();
@@ -581,6 +779,8 @@ mod tests {
             bearer_token_file: Some(dir.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("not a file").to_string();
@@ -598,6 +798,8 @@ mod tests {
             bearer_token_file: Some(file.path().to_path_buf()),
             write_keys: Some(vec![KEY.to_string()]),
             write_keys_file: None,
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let message = result.expect_err("unreadable").to_string();
@@ -614,6 +816,8 @@ mod tests {
                 bearer_token_file: Some(token.path().to_path_buf()),
                 write_keys: Some(vec![KEY.to_string()]),
                 write_keys_file: None,
+                controller_keys_file: None,
+                packet_history: None,
             }));
 
             let message = result
@@ -635,6 +839,8 @@ mod tests {
                 bearer_token_file: None,
                 write_keys: None,
                 write_keys_file: Some(keys.path().to_path_buf()),
+                controller_keys_file: None,
+                packet_history: None,
             }));
 
             let message = result
@@ -653,6 +859,8 @@ mod tests {
             bearer_token_file: None,
             write_keys: None,
             write_keys_file: Some(keys.path().to_path_buf()),
+            controller_keys_file: None,
+            packet_history: None,
         }));
 
         let error = result.expect_err("malformed entry");

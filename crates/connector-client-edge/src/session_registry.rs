@@ -233,9 +233,9 @@ impl SessionRegistry {
             .send_message(protocol_data, ilp_packet)
             .await
             .map_err(|error| match error {
-                OriginateError::SessionGone | OriginateError::Timeout => {
-                    no_live_session_reject(address)
-                }
+                OriginateError::SessionGone
+                | OriginateError::Timeout
+                | OriginateError::ClosedBeforeAnswer => no_live_session_reject(address),
             })
     }
 
@@ -260,9 +260,9 @@ impl SessionRegistry {
             .send_transfer(amount, protocol_data)
             .await
             .map_err(|error| match error {
-                OriginateError::SessionGone | OriginateError::Timeout => {
-                    no_live_session_reject(address)
-                }
+                OriginateError::SessionGone
+                | OriginateError::Timeout
+                | OriginateError::ClosedBeforeAnswer => no_live_session_reject(address),
             })
     }
 
@@ -292,6 +292,7 @@ fn no_live_session_reject(address: &str) -> Reject {
         message: format!("no live client session for '{address}'"),
         data: Vec::new(),
         accumulated_cost: 0,
+        reason: None,
     }
 }
 

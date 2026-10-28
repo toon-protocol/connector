@@ -116,7 +116,8 @@ over a network.
 
 `mixed-chain` is one node settling with different peers on different chains,
 and the only thing that changes an amount between two hops there is a hop
-subtracting its own flat fee — 1200 sent, 1100 across the boundary, 1050
+subtracting its own flat fee — 1100 sent, 1100 across the boundary (the
+packet is A's operator's own, so A charges it no fee: ADR 0061, #1466), 1050
 delivered. **It is still not a conversion**, and what keeps it unconverted is
 ADR 0071's **absence rule** (decision 2): those three configs declare no
 `[[tokens]]`, so the middle node sits on no boundary. Both of its legs hold
@@ -192,6 +193,10 @@ a path adds up (ADR 0028), and no container can see a fee quietly back at zero.
 | `dealing` A     | 1200     | 100         | 1100 µUSDC, which is B's route price exactly         |
 | `dealing` B     | 1100     | 6000 (9 dp) | 4350000 base units of the 9-decimal mock (see below) |
 
+The A rows are what A does with a **client's** packet. The rehearsal's own packet is
+originated by A's operator (`POST /packets`), which pays A no fee (ADR 0061, #1466),
+so its `AMOUNT` is the A row's _forwards_ figure and A keeps nothing of it.
+
 ### The peer-role proof
 
 On an x402 channel the payee journals a voucher in one book whichever role it
@@ -250,8 +255,8 @@ name.
 ### One packet's arithmetic, and where each number lives
 
 ```
-1200  µUSDC  leave the sender                     local/keys.sh, A's route price
-- 100                A's flat fee                                  a-b's fee (keys.sh)
+1100  µUSDC  leave the sender                     the rehearsal's AMOUNT
+-   0                A's fee, waived on its operator's own packet  (ADR 0061, #1466)
 = 1100  µUSDC  arrive at the boundary             = B's route price (keys.sh), exactly
 × 4000/1             the declared mid             connector-b.toml, [[rates]]
 × 99/100             less B's 1% spread           connector-b.toml, [rate_guards]
@@ -522,7 +527,7 @@ connector send \
   --operator-key local/.keys/two-hop/connector-a/operator-send.key \
   --to        g.local.two-hop.b.app \       # the ILP destination
   --seal-to   http://127.0.0.1:3002/ilp \   # the connector that TERMINATES it (B)
-  --amount    1100 \
+  --amount    1000 \
   --body      payload.json \
   --expect-fulfill
 ```

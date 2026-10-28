@@ -45,12 +45,18 @@ services:
       BASE_SEPOLIA_RPC_URL: ${BASE_SEPOLIA_RPC_URL:-https://sepolia.base.org}
       BASE_SEPOLIA_USDC: ${BASE_SEPOLIA_USDC:-0x0C996d7c934c79a6255254875607Fe69df25C0E1}
       BASE_SEPOLIA_USDC_AMOUNT: ${BASE_SEPOLIA_USDC_AMOUNT:-1000}
-      # Pinned to '0', not an overridable default (§4.6's own table entry: the
-      # code's own default is already '0' — packages/faucet/src/base-sepolia.js
-      # — this box does not carry infra/linode-node/docker-compose.node.yml's
-      # override to '0.001'). USDC only means no native-gas drip of any kind,
-      # on any chain, ever, from this box.
-      BASE_SEPOLIA_ETH_AMOUNT: '0'
+      # §4.6 pinned this to '0': USDC only, no native gas from this box. That
+      # left a devnet payer able to open a channel (gasless, through the
+      # facilitator) but never to LEAVE one, because initiateWithdraw and
+      # finalizeWithdraw are the payer's own transactions and no public Base
+      # Sepolia faucet is on the path a newcomer follows. A first-run test on
+      # 2026-10-13 stranded two devnet deposits exactly this way. A best-effort
+      # drip of a little ETH, only while the key sits above
+      # BASE_SEPOLIA_ETH_RESERVE, closes the loop; the USDC mint is still the
+      # leg's job and still never fails on the ETH leg (base-sepolia.js).
+      # Solana stays SOL-less: treasury SOL is scarce (#945) and the chain's
+      # own airdrop works for devnet.
+      BASE_SEPOLIA_ETH_AMOUNT: ${BASE_SEPOLIA_ETH_AMOUNT:-0.001}
     volumes:
       # Fresh treasury keypair, generated ON THIS BOX (§4.4) by
       # ./generate-solana-treasury.sh — never copied from another box. It is

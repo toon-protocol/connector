@@ -2,17 +2,22 @@
 #
 # ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 # The devnet is ONE host (infra ADR 0001): the Linode labelled `relay`, a
-# 1 GB nanode, running the relay, store, gas-station and workload-gateway
-# nodes, the faucet, and the edge — one Caddy that terminates TLS for every
-# public hostname. Each node deploys by GitOps (connector ADR 0068): a
+# 1 GB nanode, behind the edge — one Caddy that terminates TLS for every
+# public hostname. Since 2026-10-16 it runs ONE connector, the relay's
+# (relay#270, infra#57): `relay-connector-1`, at https://toonprotocol.dev/ilp,
+# terminating every devnet app's prefix itself from the relay repo's
+# committed `deploy/connector.toml`. The store, gas-station, workload-gateway
+# and Echo Merchant stacks run only their app now, which that connector
+# reaches over each app's own edge network; the faucet and the Onboarder were
+# never connectors. Each stack deploys by GitOps (connector ADR 0068): a
 # `toon-auto-apply-<node>.timer` on the host fast-forwards that node's own
-# repository every five minutes, applies its `deploy/` bundle, waits for its
-# connector to go `healthy`, and only then records the commit in
-# `deploy/.applied`. The edge deploys the same way from toon-protocol/infra.
-# The faucet is deployed by hand and has no timer.
+# repository every five minutes, applies its `deploy/` bundle, waits for it
+# to go healthy, and only then records the commit in `deploy/.applied`. The
+# edge and the Onboarder deploy the same way from toon-protocol/infra. The
+# faucet is deployed by hand and has no timer.
 #
 # That apply gate is real, and it is also all there is. It asks about ONE
-# container, ONCE, at deploy time. Nothing it does notices:
+# stack, ONCE, at deploy time. Nothing it does notices:
 #
 #   * a container that went down AFTER the apply — a crash-loop presents as
 #     `Up 3 seconds` on any single look, and the apply has long since exited;
@@ -22,10 +27,12 @@
 #     reports it to a journal nobody reads, while the node sits on the last
 #     commit that did apply. A merge that never reaches the host looks, from
 #     GitHub, exactly like a merge that did;
+#   * the one connector unable to reach an app it routes to — the app's own
+#     apply is green, and its route is a dead end;
 #   * the edge in front of a healthy node answering 502, or with a bad
 #     certificate — loopback reaches the container directly and never sees it;
-#   * the host itself running out of memory or disk. Every node on it now
-#     shares 961 MB and one root filesystem, so one node's leak takes the
+#   * the host itself running out of memory or disk. Every stack on it
+#     shares 961 MB and one root filesystem, so one stack's leak takes the
 #     others down with it (ADR 0001, "Consequences").
 #
 # ── WHAT REACHES A HUMAN ────────────────────────────────────────────────────
@@ -63,10 +70,12 @@
 # This workflow is strictly READ-ONLY on the host. The on-host script runs
 # `docker ps`/`inspect`/`compose port`, `systemctl show`/`is-active`/
 # `list-unit-files`, `journalctl` (read), `git rev-parse`/`log -g`, `cat`,
-# `df`, and `curl` against loopback — and nothing else. It never fetches (it
-# reads what the timer last fetched), never starts, stops or recreates
-# anything, and writes no file, not even to /tmp. There is no `apply` input
-# because there is nothing here to apply; a node applies itself.
+# `sed` (read), `df`, and `curl` GETs against loopback and against the
+# containers' own addresses on the host's docker networks — and nothing else.
+# It never fetches (it reads what the timer last fetched), never starts,
+# stops or recreates anything, and writes no file, not even to /tmp. There
+# is no `apply` input because there is nothing here to apply; a node applies
+# itself.
 #
 # ── WHAT IT PROBES, AND WHY THAT SET ────────────────────────────────────────
 # The watched set is not a hardcoded service list. It is DISCOVERED on the
@@ -81,22 +90,31 @@
 # Every container in that set needs a serving probe in the `case` below. A
 # container with NO PROBE DEFINED is a FAILURE, not a skip: adding a service
 # to a node's bundle without saying how to tell whether it is serving is the
-# omission this file exists to refuse.
+# omission this file exists to refuse. (That is what turned this workflow red
+# on 2026-10-15: infra#56 brought the Echo Merchant's stack onto the host,
+# and relay#268 the relay's `anon` sidecar, and neither had an arm here.)
 #
-# Today that discovers ten containers: `connector` in each of the four node
-# projects, `relay`, `store`, `gas-station`, `gateway`, the edge's `caddy`,
-# and the faucet.
+# Today that discovers eleven containers: the one `connector` and the `relay`
+# and `anon` beside it in the relay's project, `store`, `gas-station`,
+# `gateway`, `echo-merchant` and `blossom` (each the only container in its
+# project), the edge's `caddy`, the Onboarder (the x402 facilitator,
+# `onboarder`), and the faucet.
 #
 # Two probe layers, because each catches what the other cannot:
 #
 #   1. ON THE HOST, per container: state (running, not restarting) sampled
 #      TWICE at least 15s apart, so a crash-loop is caught by a rising
 #      `RestartCount`; Docker's own healthcheck wherever one is defined; and
-#      for each connector a real `GET /ilp/identity` on the loopback port
-#      `docker compose port` reports for it. The Rust connector has NO
-#      `/health` (`/health`, `/healthz`, `/status` and `/` all 404);
-#      `/ilp/identity` 200s only once the process is serving AND has read its
-#      signer key file.
+#      a serving probe per service (see the `case`).
+#      For the ONE connector: it is the only `connector` on the host, in the
+#      relay's project (a connector in any other stack is a FAILURE — the
+#      devnet runs one); a real `GET /ilp/identity` on the loopback port
+#      `docker compose port` reports for it (the Rust connector has NO
+#      `/health`; `/ilp/identity` 200s only once the process is serving AND
+#      has read its signer key file); and, for every `handler_url` in the
+#      relay's committed `connector.toml`, a running container answering that
+#      host name on a docker network the connector is attached to, which
+#      answers HTTP on that port — the connector can reach the app.
 #      Per auto-apply node: the timer is active and fired recently, the last
 #      apply exited `success`, and the node is not stuck behind `main` — see
 #      "THE STALENESS RULE" on the probe job.
@@ -106,57 +124,50 @@
 #      cannot reach its upstream, or serves a certificate that does not cover
 #      the name, looks perfect from loopback. Every hostname has an EXPECTED
 #      answer, not just "not 5xx":
-#        - `proxy.{relay,ario,gas,gateway}.devnet…/ilp/identity` → 200
-#        - `relay-ws.devnet…/` → **426 Upgrade Required**, the honest liveness
-#          signal for a WebSocket-only endpoint (a 200 there would mean
-#          something other than the relay is answering)
-#        - `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`
-#          → 200 (each is the app behind the node, not its connector)
+#        - `toonprotocol.dev/ilp/identity` → 200 (the one connector)
+#        - `relay.toonprotocol.dev/` → **426 Upgrade Required**, the honest
+#          liveness signal for a WebSocket-only endpoint (a 200 there would
+#          mean something other than the relay is answering)
+#        - `dvm.devnet…/health`, `gas.devnet…/health`, `faucet.devnet…/health`,
+#          `onboard.devnet…/health` → 200 (each is an app, not a connector;
+#          the Onboarder is not a node and has no connector)
 #        - `gw.devnet…/` and a fresh random `<label>.gw.devnet…/` → **503**
 #          with `toon-gateway-reason: no_grant`: the gateway answered and
 #          dialled nobody, which is its healthy, empty state.
+#        - `blossom.devnet…/<64 zeros>` → **404** with
+#          `x-reason: blob not found`: the app consulted its holdings for a
+#          blob that never exists. Caddy's own fallback 404 carries no
+#          `x-reason`, so a bare 404 would prove nothing.
+#      The transitional `proxy.{relay,ario,gas,gateway,echo}.devnet…` and
+#      `relay-ws.devnet…` names are NOT probed: they are aliases of the one
+#      connector that infra#58 removes, and nothing here may go red when it
+#      merges.
 #
-# ── WHAT THE PROBES ABOVE CANNOT SEE: A FORWARDED ROUTE ─────────────────────
-# Everything above asks whether a node is up and answering for ITSELF. Nothing
-# above asks whether one node can still reach another, and on 2026-08-28 that
-# cost two multi-hour outages, both of them green on every check in this file
-# for their whole duration:
+# ── WHAT THE PROBES ABOVE CANNOT SEE: WHAT THE CONNECTOR SELLS ──────────────
+# Everything above asks whether a container is up and answering. Nothing above
+# asks whether the connector still SELLS what the committed config says, at
+# the price it says, and whether the relay still tells clients to pay it. Two
+# jobs ask, and they are deliberately NOT the same question:
 #
-#   * **10:26Z, `T01 peer unreachable`** on `g.toon.relay.store` and
-#     `g.toon.relay.gas`, from a connector restart on the relay node. Every
-#     container was `running`, every `GET /ilp/identity` was 200, every public
-#     edge answered. Found at 17:20Z, by a human sending a job by hand.
-#   * **01:27Z, `T00 … would not report the claim state of channel FDi2TCT9…`**
-#     on `g.toon.store.relay`, from an SPL mint cutover. On Solana the channel
-#     PDA is seeded with the mint (`["channel", min(p1,p2), max(p1,p2), mint]`),
-#     so changing the mint on one node moves every channel id it shares — and
-#     the far side is then asked about a channel it has never heard of. Found
-#     at 13:45Z, the same way.
+#   `peering-crosscheck` — FREE, and on every run. It reads nothing but public
+#     documents — the connector's `GET /ilp` self-description (ADR 0050), the
+#     relay's NIP-11 document, and the relay repo's committed
+#     `deploy/connector.toml` — and holds them to each other: every committed
+#     route listed at its committed price, the committed addresses, endpoints
+#     and tokens, and a relay naming the same connector, key, price and tokens.
+#     (Its name predates the one connector: until 2026-10-16 it held several
+#     nodes' documents to each other across their peerings. There are no
+#     peerings in the devnet now.)
 #
-# Co-locating the nodes did not remove this class: a hop between two nodes on
-# the same host is still a real hop — two connectors, two keys, one payment
-# channel (ADR 0001). Two jobs ask about it, and they are deliberately NOT the
-# same question:
+#   `paid-probe` — DISPATCH ONLY, and OFF by default. It originates a real
+#     packet to each committed route from the connector's own operator
+#     surface and reads what comes back, which is the only thing that proves
+#     a packet reaches the app. See its own header for what it costs.
 #
-#   `peering-crosscheck` — FREE, and on every run. It reads nothing but each
-#     node's public `GET /ilp` self-description (ADR 0050) and holds the
-#     documents to each other: does every forwarded prefix land on a node that
-#     actually routes it, at a price the forward covers, over a peering whose
-#     two sides still derive channel ids from the SAME settlement facts. That
-#     last clause is the 01:27Z outage, caught with no credential and no money.
-#     It also catches two things nothing has ever checked — a forward to a
-#     prefix nobody routes, and a forward priced under the far side, both of
-#     which charge a payer and then refuse them.
-#
-#   `paid-probe` — DISPATCH ONLY, and OFF by default, because it SPENDS. It
-#     originates a real packet across a real peering and reads what comes back,
-#     which is the only thing that proves a packet crosses. See its own header
-#     for why it needs no funded CI wallet and what it does cost.
-#
-# The division is the honest one. A cross-check of two documents can prove the
-# two sides AGREE; it cannot prove a packet gets through, and nothing free can.
-# The 10:26Z outage is the proof: every document stayed correct throughout —
-# the peering was simply not up, and only a packet could say so.
+# The division is the honest one. A cross-check of documents can prove they
+# AGREE; it cannot prove a packet gets through, and nothing free can. The
+# 2026-08-28 10:26Z `T01` outage is the proof: every document stayed correct
+# for seven hours.
 
 name: fleet-health
 
@@ -176,7 +187,7 @@ on:
         required: false
         default: '0'
       paid_probe:
-        description: 'Cross a paid forwarded route. `send` SPENDS (~2000 base units, ~$0.002) from the relay node own peer channels.'
+        description: 'Send one packet to each committed route from the one connector own operator surface. No peering is on the path, so `send` debits no channel, but every app receives a real request.'
         type: choice
         required: false
         default: 'off'
@@ -318,34 +329,37 @@ jobs:
           echo "::warning::$IMAGE exited $STATUS against the committed config, but not with INVALID_CONFIG — not a config-schema break, see output above"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Do the three nodes still agree with each other about a FORWARDED route?
+  # Does the one connector still sell what its committed config says?
   #
-  # Free, unauthenticated, and on every run. It reads nothing but each node's
-  # public `GET /ilp` self-description (ADR 0050) — no ssh key, no bearer
-  # token, no Linode token, no packet, no money — and holds the three
-  # documents to each other.
+  # Free, unauthenticated, and on every run. It reads nothing but public
+  # documents — the connector's `GET /ilp` self-description (ADR 0050) at
+  # https://toonprotocol.dev/ilp, the relay's NIP-11 document at
+  # relay.toonprotocol.dev, and `deploy/connector.toml` on the relay repo's
+  # `main` — no ssh key, no bearer token, no Linode token, no packet, no
+  # money — and holds them to each other.
   #
-  # The three are the relay, store and gas-station nodes: the ones that
-  # forward to one another. They share one host now, and that changes
-  # nothing here — a hop between two nodes on the same host is still two
-  # connectors, two keys and one payment channel (infra ADR 0001). The
-  # workload gateway's node forwards nothing, so it has no row to agree on.
+  # Until 2026-10-16 this held several nodes' self-descriptions to each other
+  # across their peerings, which is where its job id comes from. The devnet
+  # runs one connector now, so there is no forwarded leg in the fleet left to
+  # agree on; what can disagree is the connector against the config it was
+  # meant to apply (a missing route, a price the merge did not reach), and
+  # the relay against the connector it tells every client to pay (the
+  # 2026-08-28 01:27Z mint-cutover outage, in its one-connector shape).
   #
   # WHAT IT CANNOT DO, stated here so nobody reads a green tick as more than
-  # it is: it proves the two sides AGREE. It does not prove a packet gets
-  # through. The 2026-08-28 10:26Z `T01` outage is the counter-example — every
-  # document stayed correct for all seven hours; the peering was simply down.
-  # Only `paid-probe` below can say otherwise.
+  # it is: it proves the documents AGREE. It does not prove a packet reaches
+  # an app — the host probe asks whether the connector can reach each app,
+  # and only `paid-probe` below sends one.
   #
   # The assertions and their failure branches live in
   # tools/ci/fleet-peering-crosscheck.py, which is a file rather than a
   # heredoc because it is testable: its FAIL paths are unreachable from a
-  # healthy fleet by construction, so `--self-test` drives every one of them
+  # healthy devnet by construction, so `--self-test` drives every one of them
   # against synthetic documents, and this job runs that FIRST. A monitor whose
   # failure branches have never executed is a green tick over nothing.
   # ─────────────────────────────────────────────────────────────────────────
   peering-crosscheck:
-    name: The fleet agrees with itself about a forwarded route
+    name: The one connector sells what its committed config says
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -359,7 +373,7 @@ jobs:
       - name: The cross-check's own failure branches still fire
         run: python3 tools/ci/fleet-peering-crosscheck.py --self-test
 
-      - name: Hold the three self-descriptions to each other
+      - name: Hold the connector to its committed config and to the relay
         id: crosscheck
         run: |
           set -uo pipefail
@@ -370,9 +384,9 @@ jobs:
 
           FAILS=$(grep -c '^FAIL' /tmp/peering.tsv || true)
           {
-            echo "### peering cross-check — $( [ "$FAILS" -eq 0 ] && echo 'the fleet agrees with itself' || echo "**$FAILS disagreement(s)**" )"
+            echo "### one-connector cross-check — $( [ "$FAILS" -eq 0 ] && echo 'the connector, its committed config and the relay agree' || echo "**$FAILS disagreement(s)**" )"
             echo ""
-            echo "| | between | check | detail |"
+            echo "| | subject | check | detail |"
             echo "|---|---|---|---|"
             while IFS=$'\t' read -r st subject chk det; do
               icon=$( [ "$st" = "OK" ] && echo '✅' || echo '❌' )
@@ -519,6 +533,11 @@ jobs:
           MEMINFO=${FH_MEMINFO:-/proc/meminfo}
           # Compose projects watched although no timer deploys them.
           HAND_DEPLOYED=${FH_HAND_DEPLOYED:-linode-faucet}
+          # The node whose stack runs the devnet's ONE connector (relay#270).
+          # Every other stack runs only its app; a `connector` anywhere else
+          # is a failure.
+          ONE_CONNECTOR_NODE=${FH_ONE_CONNECTOR_NODE:-relay}
+          one_dir=""
           STARTED=$(date +%s)
 
           row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(printf '%s' "$4" | tr '\t\r\n|' '   /')"; }
@@ -546,6 +565,7 @@ jobs:
               continue
             fi
             dir=$(dirname "$exe")
+            [ "$node" != "$ONE_CONNECTOR_NODE" ] || one_dir="$dir"
 
             # The node's containers.
             mine=$(docker ps -a --filter "label=com.docker.compose.project.working_dir=$dir" --format '{{.Names}}' 2>/dev/null)
@@ -616,6 +636,7 @@ jobs:
           # First restart sample, then the serving probes, then a second
           # sample at least SAMPLE_GAP seconds after the first.
           sample1=""
+          one_connector=""
           for n in $names; do
             sample1="$sample1$n $(docker inspect -f '{{.RestartCount}}' "$n" 2>/dev/null || echo -1)
           "
@@ -653,10 +674,17 @@ jobs:
             # omission this file refuses.
             case "$svc" in
               connector|connector-rust)
-                # The client edge is published on loopback at a different port
-                # per node (relay 3000, gateway 4001, gas 4002, store 4003), and
-                # the container port differs too (3000 on the relay, 4000
-                # elsewhere). Read the container port off the container and ask
+                # The devnet runs ONE connector, in the relay's stack
+                # (relay#270). A connector anywhere else is a second one: a
+                # stack that was meant to run only its app, or one that came
+                # back without the one-connector change.
+                wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$n" 2>/dev/null)
+                if [ -z "$one_dir" ] || [ "$wd" != "$one_dir" ]; then
+                  row FAIL "$who" 'one connector' "a connector outside the $ONE_CONNECTOR_NODE stack (${wd:-no working dir}): the devnet runs one connector, the $ONE_CONNECTOR_NODE's, and every other stack runs only its app"
+                  continue
+                fi
+                # The client edge is published on loopback (relay: 3000).
+                # Read the container port off the container and ask
                 # `docker compose port` where it lands — by project name, which
                 # reads the running containers, not the bundle's files, so a
                 # half-rendered bundle cannot blind this probe.
@@ -673,12 +701,48 @@ jobs:
                     row FAIL "$who" 'GET /ilp/identity' "${got:-000} on $addr: up but not serving"
                   fi
                 fi
+                one_connector="$one_connector $n"
                 ;;
-              relay|store|gas-station|gateway|faucet|caddy)
+              relay|anon|store|gas-station|gateway|faucet|caddy|onboarder)
                 # Each of these defines a container HEALTHCHECK, read above,
                 # rather than having its probe restated here. Without one the
                 # probe is blind, and that is a failure, not a pass.
                 [ "$health" != "none" ] || row FAIL "$who" 'docker healthcheck' 'defines no healthcheck, and this arm relies on one: the probe is blind'
+                ;;
+              blossom)
+                # Blossom (toon-protocol/blossom) defines no healthcheck and
+                # its image has no curl or wget, so the probe is from here:
+                # a read-only GET of a blob that never exists (the all-zero
+                # hash) on the free read port, 3000, of its own address. A
+                # healthy app consults its holdings and answers 404 with
+                # `x-reason: blob not found`; a broken holdings store answers
+                # 500. Port 3001 is the paid write port and is not touched.
+                bip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$n" 2>/dev/null | awk '{print $1}')
+                bpath=/$(printf '0%.0s' $(seq 64))
+                # The headers come back on stdout, not in a file: this script
+                # writes nothing on the host. The status is the last line.
+                bhead=$(curl -s -o /dev/null -D - -w '%{http_code}' --max-time 10 "http://${bip:-0.0.0.0}:3000$bpath" 2>/dev/null | tr -d '\r')
+                got=$(printf '%s\n' "$bhead" | tail -1)
+                bwhy=$(printf '%s\n' "$bhead" | awk -F': *' 'tolower($1)=="x-reason" {print $2}' | tail -1)
+                if [ "$got" = "404" ] && [ "$bwhy" = "blob not found" ]; then
+                  row OK "$who" 'GET /<64 zeros>' "404 blob not found on its own address"
+                else
+                  row FAIL "$who" 'GET /<64 zeros>' "${got:-000}${bwhy:+ $bwhy} on ${bip:-no address}:3000: expected 404 blob not found"
+                fi
+                ;;
+              echo-merchant)
+                # The Echo Merchant (infra#56) defines no healthcheck, and
+                # answers any request with a Mirror of it — so a GET of `/` on
+                # its own address is its liveness probe. It publishes no host
+                # port; the address is its own on its project's network.
+                eip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$n" 2>/dev/null | awk '{print $1}')
+                eport=$(docker inspect -f '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$n" 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+                got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${eip:-0.0.0.0}:${eport:-3000}/" 2>/dev/null)
+                if [ "$got" = "200" ]; then
+                  row OK "$who" 'GET /' "200 on its own address"
+                else
+                  row FAIL "$who" 'GET /' "${got:-000} on ${eip:-no address}:${eport:-?}: up but not serving"
+                fi
                 ;;
               swap-node)
                 # Not on the devnet since the one-host cutover; kept so a maker
@@ -695,6 +759,51 @@ jobs:
                 ;;
             esac
           done
+
+          # ── The one connector, and the apps it routes to ──────────────────
+          # Exactly one connector, in the relay's stack. Then every
+          # `handler_url` in that stack's committed `connector.toml` (the
+          # checkout the timer applies) must name a running container on a
+          # docker network the connector is attached to, and that container
+          # must answer HTTP on that port. Any HTTP status is an answer: the
+          # GET is of `/`, not of the handler's path, so a 404 is the app
+          # saying it is there. Nothing is sent to the handler itself.
+          set -- $one_connector
+          if [ -z "$one_dir" ]; then
+            row FAIL '(host)' 'one connector' "no enabled toon-auto-apply-$ONE_CONNECTOR_NODE.timer: cannot tell which stack runs the devnet's one connector"
+          elif [ "$#" -ne 1 ]; then
+            row FAIL '(host)' 'one connector' "$# running connector(s) in the $ONE_CONNECTOR_NODE stack (${one_connector:- none}): the devnet's apps are all routed by exactly one"
+          else
+            row OK '(host)' 'one connector' "$1, in the $ONE_CONNECTOR_NODE stack"
+            conn=$1
+            toml="$one_dir/connector.toml"
+            origins=$(sed -n 's|^[[:space:]]*handler_url[[:space:]]*=[[:space:]]*"\(https\{0,1\}://[^/"]*\).*|\1|p' "$toml" 2>/dev/null | sort -u)
+            [ -n "$origins" ] || row FAIL "$ONE_CONNECTOR_NODE/connector" 'reaches its apps' "no handler_url in $toml: cannot tell which apps it routes to"
+            conn_nets=$(docker inspect -f '{{range $k, $_ := .NetworkSettings.Networks}}{{$k}} {{end}}' "$conn" 2>/dev/null)
+            # <container> <network> <ip> <name,name,...> for every running
+            # container, read once.
+            netmap=$(for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+              [ "$c" != "$conn" ] || continue
+              docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$.Name}} {{$k}} {{$v.IPAddress}} {{range $v.Aliases}}{{.}},{{end}}{{range $v.DNSNames}}{{.}},{{end}}{{println}}{{end}}' "$c" 2>/dev/null
+            done)
+            for origin in $origins; do
+              hp=${origin#*://}; h=${hp%%:*}; p=${hp##*:}
+              [ "$p" != "$hp" ] || p=80
+              hit=$(printf '%s\n' "$netmap" | awk -v h="$h" -v nets=" $conn_nets " '
+                NF >= 4 && index(nets, " " $2 " ") { n = split($4, a, ","); for (i = 1; i <= n; i++) if (a[i] == h) { sub(/^\//, "", $1); print $1, $2, $3; exit } }')
+              if [ -z "$hit" ]; then
+                row FAIL "$ONE_CONNECTOR_NODE/connector -> $h:$p" 'reaches its app' "no running container answers to \`$h\` on any network the connector is on ($conn_nets): every route to $origin is a dead end"
+                continue
+              fi
+              set -- $hit
+              got=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$3:$p/" 2>/dev/null)
+              if [ -n "$got" ] && [ "$got" != "000" ]; then
+                row OK "$ONE_CONNECTOR_NODE/connector -> $h:$p" 'reaches its app' "$1 on $2 answers HTTP $got on GET /"
+              else
+                row FAIL "$ONE_CONNECTOR_NODE/connector -> $h:$p" 'reaches its app' "$1 on $2 is \`$h\` but does not answer on port $p: every route to $origin fails"
+              fi
+            done
+          fi
 
           # ── Host headroom ─────────────────────────────────────────────────
           # Every node shares one nanode; a leak in one starves the others.
@@ -755,7 +864,15 @@ jobs:
           # certificate that does not cover the name (curl verifies it), looks
           # perfect from on the host.
           #
-          # <url> <expected status> [<required toon-gateway-reason>]
+          # The one connector and the relay have their own names now
+          # (infra#57); the app sites stay under devnet.toonprotocol.dev. The
+          # transitional proxy.*.devnet and relay-ws.devnet aliases are not
+          # here on purpose: infra#58 removes them.
+          #
+          # <url> <expected status> [[<header>:]<required reason>]
+          # The reason is read from `toon-gateway-reason` unless the entry
+          # names another header (`x-reason:blob not found`); it runs to the
+          # end of the line, so it may contain spaces.
           # The random label is fresh every run so no cache can answer for
           # the gateway; the CHECK column names it `<random>` so the alert's
           # change signature does not move with it.
@@ -763,13 +880,17 @@ jobs:
           D=devnet.toonprotocol.dev
           while read -r url want reason; do
             [ -n "$url" ] || continue
+            rhdr=toon-gateway-reason
+            case "${reason:-}" in
+              *:*) rhdr=${reason%%:*}; reason=${reason#*:} ;;
+            esac
             shown="${url/$LABEL/<random>}"
             # Up to three tries, so a single dropped connection is not an
             # outage — and a real one still fails all three.
             for try in 1 2 3; do
               got=$(curl -s -o /dev/null -D /tmp/public-headers -w '%{http_code}' --max-time 20 "$url" 2>/dev/null || true)
               got=${got:-000}
-              seen=$(tr -d '\r' < /tmp/public-headers 2>/dev/null | awk -F': *' 'tolower($1)=="toon-gateway-reason" {print $2}' | tail -1)
+              seen=$(tr -d '\r' < /tmp/public-headers 2>/dev/null | awk -F': *' -v h="$rhdr" 'tolower($1)==h {print $2}' | tail -1)
               if [ "$got" = "$want" ] && { [ -z "${reason:-}" ] || [ "$seen" = "$reason" ]; }; then
                 break
               fi
@@ -781,16 +902,15 @@ jobs:
               printf 'FAIL\t(edge)\t%s\texpected %s%s, got %s%s\n' "$shown" "$want" "${reason:+ $reason}" "$got" "${seen:+ $seen}"
             fi
           done > /tmp/public.tsv <<EOF
-          https://proxy.relay.$D/ilp/identity 200
-          https://relay-ws.$D/ 426
-          https://proxy.ario.$D/ilp/identity 200
+          https://toonprotocol.dev/ilp/identity 200
+          https://relay.toonprotocol.dev/ 426
           https://dvm.$D/health 200
-          https://proxy.gas.$D/ilp/identity 200
           https://gas.$D/health 200
-          https://proxy.gateway.$D/ilp/identity 200
           https://gw.$D/ 503 no_grant
           https://$LABEL.gw.$D/ 503 no_grant
           https://faucet.$D/health 200
+          https://onboard.$D/health 200
+          https://blossom.$D/0000000000000000000000000000000000000000000000000000000000000000 404 x-reason:blob not found
           EOF
           cat /tmp/public.tsv
 
@@ -832,29 +952,41 @@ jobs:
         run: rm -f ~/.ssh/devnet ~/.ssh/config
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Does a packet ACTUALLY cross a peering?
+  # Does a packet ACTUALLY reach each app?
   #
-  # DISPATCH ONLY, and `off` by default. This is the only check in this file
-  # that spends, and arming it on the cron is an operator's decision, not a
-  # reviewer's — see "THE COST" below and
+  # DISPATCH ONLY, and `off` by default. It is the only check in this file
+  # that WRITES — `POST /packets` on the one connector's operator surface,
+  # and a real request to every app — and arming that on the cron is an
+  # operator's decision, not a reviewer's. See
   # docs/operators/fleet-release-and-health.md.
   #
-  # ── WHY A PROBE HAS TO BE PAID ──────────────────────────────────────────
-  # A forwarded route is a PAID route. An unpaid request to `g.toon.relay.store`
-  # comes back as x402 payment terms, which the relay answers out of its own
-  # config without consulting the store at all — so it proves nothing about
-  # the peering. The `T01`/`T00`/FULFILL distinction only exists once a packet
-  # has been paid for and forwarded.
+  # ── WHAT IT USED TO DO, AND WHY IT CHANGED ──────────────────────────────
+  # Until 2026-10-16 this crossed a PEERING: the relay's connector forwarded a
+  # paid packet to the store's and the gas-station's connectors, paying out
+  # of its own peer channels (~2000 base units a run), because a T01 or T00
+  # on a forwarded leg was the 2026-08-28 outage and only a paid packet could
+  # show it. The devnet runs one connector now (relay#270): every app's route
+  # ends at it, and there is no peering in the fleet left to cross. Aiming the
+  # old job at what exists would find no forwarded leg and fail on every run.
   #
-  # ── IT NEEDS NO FUNDED CI WALLET ────────────────────────────────────────
-  # The obvious design — a dedicated CI wallet, a channel opened from CI, a
-  # client SDK, a channel-watermark file to reconcile on every run — needs a
-  # funded private key in GitHub secrets, and would be the operator's call.
-  # None of it is necessary, because the connector can originate a packet
-  # through its OWN routing: `POST /packets` (ADR 0008), which `connector send`
-  # forms and signs (ADR 0058 cites it as the precedent). Driven that way the
-  # money comes from the relay's own peer channel — the very channel being
-  # tested — and the packet takes exactly the path a client's would.
+  # What CAN still go dark while every document agrees is the last hop: the
+  # connector's `handler_url` to the app, over the app's edge network. The
+  # host probe asks whether the app answers there; this asks whether a
+  # PACKET gets through — routing, gift-wrap, delivery and the fulfilment
+  # derived from it (ADR 0019) — for every committed route.
+  #
+  # ── IT NEEDS NO FUNDED CI WALLET, AND DEBITS NO CHANNEL ─────────────────
+  # The connector originates the packet through its OWN routing:
+  # `POST /packets` (ADR 0008), which `connector send` forms and signs. The
+  # packet ends at the same connector, so no peering is on its path and no
+  # peer channel is debited; an operator-originated packet pays the node no
+  # fee (ADR 0061, #1466), and the claim-on-arrival rule (ADR 0042) is a peer
+  # PREPARE's, which this is not. What it does cost is a real request to each
+  # app — the probe's target, `/fleet-health-probe`, sits beneath each
+  # handler's path and is no route any app defines, so each is expected to
+  # answer with a 404 or (the Echo Merchant) a Mirror rather than do paid
+  # work. This repo has not yet run `send` against the one connector; run
+  # `dry-run` first, then `send` once, and read the apps' answers.
   #
   # So this job adds NO new secret. It needs:
   #   * `DEVNET_SSH_KEY`, which this workflow already holds; and
@@ -863,46 +995,27 @@ jobs:
   #     it is bind-mounted read-only into a throwaway container and nothing
   #     is copied anywhere.
   #
-  # ── THE COST, STATED PLAINLY ────────────────────────────────────────────
-  # ~1011 base units for the store leg and ~1001 for the gas leg: ~2000 units,
-  # about $0.002, per run, out of the relay's peer channels.
-  #
-  # A REJECT COSTS THE SAME AS A FULFILL. ADR 0042 retires ADR 0004's "value
-  # moves on fulfilment": a peer PREPARE carries its covering claim and the
-  # claim is banked on ARRIVAL, before the packet is handled at all. So
-  # pointing the probe at an envelope the app refuses makes it cheap in the
-  # sense that the app does no work — no Arweave upload, no gas transaction —
-  # and NOT in the sense that the packet is free. Anyone reasoning about
-  # arming this on the 15-minute cron should price it at ~$0.20/day and plan
-  # to `POST /channels/:id/fund` the relay's channels; hourly is ~$0.05/day.
-  #
   # ── WHAT THE ANSWER MEANS ───────────────────────────────────────────────
-  #   FULFILL       the packet crossed the peering AND the far app answered.
-  #                 `connector send` checks the fulfilment against the one its
-  #                 own gift-wrap derives (ADR 0019), so this is proof the
-  #                 packet reached the node holding the shared secret — not
-  #                 merely *a* node willing to answer.
-  #   REJECT F..    the packet CROSSED the peering and the far side answered
-  #                 with a final error — `F99 app declined the delivery with
-  #                 HTTP 4xx` is the expected one, since the probe deliberately
-  #                 sends an envelope the app refuses. The peering is proven.
-  #                 F02 is the exception: it means the far side has no route
-  #                 for the name, which `peering-crosscheck` should have caught
-  #                 first and is a real failure.
-  #   REJECT T01    the peering itself is down. This is 10:26Z. The message
-  #                 names the peer.
-  #   REJECT T00    the claim or channel state is broken between the two — the
-  #                 01:27Z shape. Read `peering-crosscheck`'s settlement rows
-  #                 in the same run: a mint or token-network change on one node
-  #                 moves every channel id it shares.
+  # The packet ends at this connector, so the answer is the connector's own
+  # verdict on the last hop (ADR 0020: an HTTP status is envelope content,
+  # never a packet outcome):
+  #   FULFILL       the app answered — any HTTP status. `connector send`
+  #                 checks the fulfilment against the one its own gift-wrap
+  #                 derives (ADR 0019), so this is proof the packet reached
+  #                 the connector holding the shared secret and its app.
+  #   REJECT T01    the app could not be reached at all: the route is a dead
+  #                 end. Read the host probe's `reaches its app` rows.
+  #   REJECT R00    the app did not answer before the packet expired.
+  #   REJECT F02    the connector routes no such name, which the cross-check
+  #                 should have caught first.
+  #   anything else is a failure, quoted.
   #
   # `dry-run` forms and signs the packet, prints what it would have sent, and
   # sends nothing. It proves the credential, the container, the loopback
-  # address and the leg table without spending — worth running after any
-  # change to this job.
+  # address and the route table — worth running after any change to this job.
   # ─────────────────────────────────────────────────────────────────────────
   paid-probe:
-    name: A packet crosses a peering (${{ inputs.paid_probe }})
+    name: A packet reaches each app through the one connector (${{ inputs.paid_probe }})
     if: always() && github.event_name == 'workflow_dispatch' && inputs.paid_probe != 'off'
     needs: peering-crosscheck
     # `always()`: a disagreeing fleet is exactly when an operator most wants
@@ -928,24 +1041,20 @@ jobs:
           [ -n "${LINODE_CLI_TOKEN:-}" ] || { echo "::error::LINODE_CLI_TOKEN is not set — cannot resolve the host's label to an IP."; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
 
-      # Which legs exist, and what each costs, read off the SAME fleet map the
-      # cross-check uses — never a second table here. A copy is a copy that
-      # goes stale, and a paid probe aimed at a prefix nobody routes any more
-      # would report a real-looking failure about nothing.
-      - name: Read the fleet's forwarded legs
+      # Which routes exist, and what each costs, read off the SAME committed
+      # config the cross-check holds the connector to — never a second table
+      # here. A copy is a copy that goes stale, and a probe aimed at a prefix
+      # nobody routes any more would report a real-looking failure about
+      # nothing.
+      - name: Read the one connector's committed routes
         id: legs
         run: |
           set -euo pipefail
           python3 tools/ci/fleet-peering-crosscheck.py --legs > /tmp/legs.tsv
-          echo "the fleet forwards:"
+          echo "the one connector routes:"
           cat /tmp/legs.tsv
-          # Only the relay's own legs are drivable here: this job SSHes to the
-          # host's relay node, and the relay is the node with a peer-forwarding
-          # table and an operator key on disk. Adding another node means adding it to
-          # this step, not a new source of truth.
-          awk -F'\t' '$1 == "relay"' /tmp/legs.tsv > /tmp/relay-legs.tsv
-          if [ ! -s /tmp/relay-legs.tsv ]; then
-            echo "::error::the relay forwards nothing — there is no paid route to probe."
+          if [ ! -s /tmp/legs.tsv ]; then
+            echo "::error::the one connector lists none of its committed routes — there is nothing to probe."
             exit 1
           fi
 
@@ -985,7 +1094,7 @@ jobs:
           } > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-      - name: Send one packet down each forwarded leg
+      - name: Send one packet to each committed route
         id: probe
         run: |
           set -uo pipefail
@@ -994,8 +1103,8 @@ jobs:
           # The image the relay is ACTUALLY running, not a pin read from this
           # repo: `connector send` has to be the same build as the node it is
           # driving, and ADR 0068 put that pin in the relay's own repository.
-          # Scoped to the relay's compose project: every node on the host runs
-          # a service called `connector`, each on its own pin.
+          # Scoped to the relay's compose project, which holds the devnet's
+          # one connector.
           # The single-quoted `$(...)` and `$…` in this step run on the host or
           # are TSV text; neither is meant to expand here.
           : > /tmp/paid.tsv
@@ -1010,51 +1119,50 @@ jobs:
           FLAG=$( [ "$MODE" = "dry-run" ] && echo "--dry-run" || echo "" )
 
           # shellcheck disable=SC2016
-          while IFS=$'\t' read -r near prefix far far_url amount; do
+          while IFS=$'\t' read -r prefix amount handler; do
             [ -n "$IMAGE" ] || break
             # `--network host`: the relay's client edge and operator surface
-            # share 127.0.0.1:3000 on the host (docker-compose.operator.yml
-            # mounts the surface onto the port the edge already serves).
-            # The key is bind-mounted read only and never copied anywhere.
+            # share 127.0.0.1:3000 on the host. The packet is sealed to the
+            # same connector, on the same loopback port: it is the one that
+            # terminates every route. The key is bind-mounted read only and
+            # never copied anywhere.
             OUT=$(sshhost "docker run --rm --network host \
                     -v /root/relay/deploy/operator-write.key:/k:ro '$IMAGE' \
                     send --operator http://127.0.0.1:3000 --operator-key /k \
-                    --to '$prefix' --seal-to '$far_url' --amount '$amount' \
+                    --to '$prefix' --seal-to http://127.0.0.1:3000/ilp --amount '$amount' \
                     --target /fleet-health-probe --method POST \
                     --expires-in 30 $FLAG" 2>&1)
-            echo "── $near -> $far ($prefix, $amount units) ─────────"
+            echo "── $prefix -> $handler ($amount units) ─────────"
             echo "$OUT"
 
-            LEG="$near -> $far"
+            LEG="connector -> $handler"
             # One line, no tabs: this lands in a TSV field, and a stray tab
             # or newline in a peer's message would silently split the row and
             # render the alert table as nonsense.
             HEAD=$(printf '%s' "$OUT" | head -1 | tr '\t\n' '  ')
             case "$OUT" in
               "DRY RUN"*)
-                printf 'OK\t%s\tdry run `%s`\tformed and signed, nothing sent and nothing paid — the key, the container and the leg table are all good\n' "$LEG" "$prefix" ;;
+                printf 'OK\t%s\tdry run `%s`\tformed and signed, nothing sent — the key, the container and the route table are all good\n' "$LEG" "$prefix" ;;
               "FULFILL WITH THE WRONG FULFILMENT"*)
-                printf 'FAIL\t%s\tpaid probe `%s`\tfulfilled, but NOT by the node this packet was sealed to (ADR 0019). `%s` is not the connector terminating `%s`.\n' "$LEG" "$prefix" "$far_url" "$prefix" ;;
+                printf 'FAIL\t%s\tpacket to `%s`\tfulfilled, but NOT by the connector this packet was sealed to (ADR 0019).\n' "$LEG" "$prefix" ;;
               "FULFILL"*)
-                printf 'OK\t%s\tpaid probe `%s`\tFULFILL — the packet crossed the peering and the terminating app answered\n' "$LEG" "$prefix" ;;
+                printf 'OK\t%s\tpacket to `%s`\tFULFILL — the connector delivered it and the app answered\n' "$LEG" "$prefix" ;;
               "REJECT T01"*)
-                printf 'FAIL\t%s\tpaid probe `%s`\tT01 PEER UNREACHABLE — the peering itself is down; the packet never left this node. %s\n' "$LEG" "$prefix" "$HEAD" ;;
-              "REJECT T00"*)
-                printf 'FAIL\t%s\tpaid probe `%s`\tT00 — the two sides disagree about the channel. Read this run cross-check settlement rows: a mint or token-network change on one node moves every channel id it shares. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+                printf 'FAIL\t%s\tpacket to `%s`\tT01 — the connector could not reach the app at all: this route is a dead end. Read the host probe `reaches its app` rows. %s\n' "$LEG" "$prefix" "$HEAD" ;;
+              "REJECT R00"*)
+                printf 'FAIL\t%s\tpacket to `%s`\tR00 — the app did not answer before the packet expired. %s\n' "$LEG" "$prefix" "$HEAD" ;;
               "REJECT F02"*)
-                printf 'FAIL\t%s\tpaid probe `%s`\tF02 — the packet CROSSED the peering, and the far side routes no such name. The cross-check should have caught this first. %s\n' "$LEG" "$prefix" "$HEAD" ;;
-              "REJECT F"*)
-                printf 'OK\t%s\tpaid probe `%s`\tthe packet CROSSED the peering and the far side answered — %s. The probe sends an envelope the app refuses on purpose; a final error from the far end is the peering proving itself.\n' "$LEG" "$prefix" "$HEAD" ;;
+                printf 'FAIL\t%s\tpacket to `%s`\tF02 — the connector routes no such name. The cross-check should have caught this first. %s\n' "$LEG" "$prefix" "$HEAD" ;;
               *)
-                printf 'FAIL\t%s\tpaid probe `%s`\tunrecognised answer: %s\n' "$LEG" "$prefix" "$(printf '%s' "$OUT" | head -3 | tr '\t\n' '  ')" ;;
+                printf 'FAIL\t%s\tpacket to `%s`\tunrecognised answer: %s\n' "$LEG" "$prefix" "$(printf '%s' "$OUT" | head -3 | tr '\t\n' '  ')" ;;
             esac >> /tmp/paid.tsv
-          done < /tmp/relay-legs.tsv
+          done < /tmp/legs.tsv
 
           FAILS=$(grep -c '^FAIL' /tmp/paid.tsv || true)
           {
-            echo "### paid probe (\`$MODE\`) — $( [ "$FAILS" -eq 0 ] && echo 'every forwarded leg carries a packet' || echo "**$FAILS leg(s) failing**" )"
+            echo "### packet probe (\`$MODE\`) — $( [ "$FAILS" -eq 0 ] && echo 'every committed route delivers a packet' || echo "**$FAILS route(s) failing**" )"
             echo ""
-            echo "| | leg | check | detail |"
+            echo "| | hop | check | detail |"
             echo "|---|---|---|---|"
             while IFS=$'\t' read -r st leg chk det; do
               icon=$( [ "$st" = "OK" ] && echo '✅' || echo '❌' )
@@ -1237,7 +1345,7 @@ jobs:
             echo "The devnet host failed one or more health probes."
             echo ""
             echo "**Run:** $RUN_URL"
-            echo "**Host probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **Peering cross-check:** \`$PEERING\` · **Paid probe:** \`$PAID\`"
+            echo "**Host probes:** \`$PROBE\` · **Config compatibility:** \`$COMPAT\` · **One-connector cross-check:** \`$PEERING\` · **Packet probe:** \`$PAID\`"
             echo "**This failure since:** $SINCE · **consecutive runs:** $RUNS"
             echo ""
             if [ "$RUNS" -gt 1 ]; then
@@ -1248,18 +1356,18 @@ jobs:
               echo ""
             fi
             if [ "$PEERING" != "success" ]; then
-              echo "> ⚠️ **Two nodes no longer agree about a forwarded route.**"
+              echo "> ⚠️ **The one connector no longer sells what its committed config says, or the relay names a different connector.**"
               echo ">"
-              echo "> This is the class nothing used to check, and both 2026-08-28 outages"
-              echo "> were in it. The table below names the disagreement. A settlement-facts"
-              echo "> row means a mint or token-network changed on one node and not the other,"
-              echo "> which moves every channel id the two share — the far side is then asked"
-              echo "> about a channel it has never heard of (\`T00\`). A DANGLING FORWARD means"
-              echo "> a node sells a prefix nobody routes: the payer is charged and refused."
+              echo "> The table below names the disagreement. A MISSING ROUTE or PRICE DIFFERS row"
+              echo "> means \`https://toonprotocol.dev/ilp\` and the relay repo's committed"
+              echo "> \`deploy/connector.toml\` disagree: a merge that did not reach the host (read"
+              echo "> the host probe's \`relay\` rows), or a host edit no merge made. A relay row means"
+              echo "> the relay's NIP-11 document tells clients a connector, key, price or token the"
+              echo "> connector does not have: every client is charged and refused. A SHADOWED"
+              echo "> ROUTE is a runtime route (\`POST /routes/peers\`) carrying a committed prefix."
               echo ">"
-              echo "> A green cross-check is NOT proof a packet crosses. To prove that, run"
-              echo "> this workflow with \`paid_probe: send\` — it spends ~\$0.002 and says"
-              echo "> which hop the packet dies at."
+              echo "> A green cross-check is NOT proof a packet gets through. To prove that, run"
+              echo "> this workflow with \`paid_probe: send\` — it says which app a packet dies at."
               echo ""
             fi
             if [ "$COMPAT" != "success" ]; then
@@ -1286,11 +1394,13 @@ jobs:
             echo ""
             echo "| subject | repository | on the host |"
             echo "|---|---|---|"
-            echo "| \`relay\` | toon-protocol/relay | \`/root/relay\` |"
+            echo "| \`relay\` (the one connector, its config, and the relay) | toon-protocol/relay | \`/root/relay\` |"
             echo "| \`store\` | toon-protocol/store | \`/root/store\` |"
             echo "| \`gas\` | toon-protocol/gas-station | \`/root/gas-station\` |"
             echo "| \`gateway\` | toon-protocol/gateway | \`/root/gateway\` |"
+            echo "| \`echo\` | toon-protocol/echo-merchant | \`/root/echo-merchant\` |"
             echo "| \`edge\` | toon-protocol/infra (\`edge/deploy\`) | \`/root/infra/edge\` |"
+            echo "| \`onboarder\` | toon-protocol/infra (\`onboarder/deploy\`) | \`/root/infra/onboarder\` |"
             echo "| \`linode-faucet\` | toon-protocol/connector (\`infra/linode-faucet\`), **hand-deployed, no timer** | \`/root/faucet-connector\` |"
             echo ""
             echo '```sh'
@@ -1301,7 +1411,7 @@ jobs:
             echo '# A node whose apply keeps failing (`last apply` row): read why, on the host.'
             echo 'journalctl -u toon-auto-apply-<node>.service -n 50 --no-pager'
             echo '#   REFUSING: dirty working tree -> a human is mid-edit there; commit/stash/discard it.'
-            echo '#   FAILED: render.sh / pull / up -d / connector not healthy -> fix it in the node repo;'
+            echo '#   FAILED: render.sh / pull / up -d / not healthy -> fix it in the node repo;'
             echo '#   deploy/.applied keeps naming the last commit that DID apply until then.'
             echo ''
             echo '# The faucet has no timer: roll it back by hand, from the checkout root on the host.'
@@ -1311,28 +1421,24 @@ jobs:
             echo '```'
             echo ""
             if [ "$PEERING" != "success" ] || [ "$PAID_VERDICT" != "success" ]; then
-              echo "### Recovering a peering"
+              echo "### Recovering a route"
               echo ""
-              echo "A peering is not rolled back — it is re-established, or re-priced, from the"
-              echo "operator surface of the node that owns the row (ADR 0058). Reads need only the"
-              echo "bearer token; writes are RFC 9421-signed with \`docs/operators/sign-write.sh\`."
+              echo "Every devnet route is a committed \`[[routes]]\` row in toon-protocol/relay's"
+              echo "\`deploy/connector.toml\`: a missing or mispriced one is fixed there, by a"
+              echo "reviewed change the relay's timer applies. A runtime route is a row on the one"
+              echo "connector's operator surface (ADR 0058), on loopback port 3000. Reads need only"
+              echo "the bearer token; writes are RFC 9421-signed with \`docs/operators/sign-write.sh\`."
               echo ""
               echo '```sh'
-              echo '# On the host, in that node deploy/ dir, see what it thinks it forwards and to whom:'
+              echo '# On the host, in /root/relay/deploy: what runtime routes and peers does it hold?'
               echo 'T=$(cat operator-bearer.token)'
-              echo '# <port>: relay 3000, gateway 4001, gas 4002, store 4003 (docker compose port connector ...)'
-              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/routes/peers'
-              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:<port>/peers'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:3000/routes/peers'
+              echo 'curl -s -H "Authorization: Bearer $T" http://127.0.0.1:3000/peers'
               echo ''
-              echo '# A DANGLING FORWARD is a runtime row the config no longer owns. Delete it:'
+              echo '# A SHADOWED ROUTE is a runtime row over a committed prefix. Delete it:'
               echo './sign-write.sh -k operator-write.key -X DELETE -p /routes/peers/<prefix>'
               echo ''
-              echo '# A peering whose channel ids moved, or that cannot be dialled, is'
-              echo '# re-established from the far side URL — the same write that made it:'
-              echo './sign-write.sh -k operator-write.key -X POST -p /peers \'
-              echo '  -b "{\"id\":\"<peer>\",\"url\":\"https://…/ilp\",\"fee\":1,\"max_packet_amount\":100000}"'
-              echo ''
-              echo '# Then prove a packet actually crosses, rather than assuming it does:'
+              echo '# Then prove a packet reaches each app, rather than assuming it does:'
               echo 'gh workflow run fleet-health.yml -f paid_probe=send'
               echo '```'
               echo ""

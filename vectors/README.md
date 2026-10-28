@@ -143,6 +143,13 @@ All byte fields are lowercase hex, no `0x` prefix, except where a section says a
 literal string that rides the wire. `schema_version` bumps only when a field's meaning changes in a
 way that would make existing replay code misread it; a purely additive field does not bump it.
 
+**`schema_version` 9** (issue #1532): a new top-level `client_edge` section. `f03_rejects` has four
+cases — one per client-edge reject reason (`underpayment`, `undercollateralized`,
+`amount_over_charge`, `probe_terminates_here`) — each with `code`, `accumulated_cost`, `reason`,
+`http_headers` (the `toon-accumulated-cost` and `toon-reject-reason` pair) and `btp_protocol_data`
+(the same two entries as `name` / `content_type` / `data_hex`). The message is not pinned. Nothing
+existing changed. See `docs/protocol/client-edge-spec.md` §1.6.
+
 **`schema_version` 7** (issue #1384,
 [ADR 0075](../docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision
 14): **every claim is a voucher.** The `toon-channel` claim scheme is retired, and every section

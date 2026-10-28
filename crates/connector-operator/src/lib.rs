@@ -51,6 +51,7 @@
 //! be shipped by it -- mounted with the surface, absent without it, and
 //! granting no authority the reads and writes do not already grant.
 
+mod day_totals;
 mod rfc9421;
 mod write_auth;
 
@@ -77,7 +78,7 @@ pub mod test_support {
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -86,8 +87,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use connector_client_edge::ClientClaimGate;
+use connector_config::WriteScope;
 use connector_domain::x402::X402BatchSettlementTerms;
-use connector_domain::{PacketResponse, Prepare, Price};
+use connector_domain::{Prepare, Price};
+use connector_runtime::DepositGate;
 use connector_runtime::{
     BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
     ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
@@ -96,10 +99,10 @@ use connector_runtime::{
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
+pub use day_totals::{DayTotals, DayTotalsError, DAY_TOTALS_JOURNAL};
 use url::Url;
-use write_auth::{authenticate_write, AuditRecord, WriteAuth};
-
-const OCTET_STREAM: &str = "application/octet-stream";
+pub use write_auth::ControllerKeySource;
+use write_auth::{authenticate_write, AuditRecord, WriteAuth, WriteKeyView};
 
 /// This node's own identity: the active signing key and the address
 /// derived from it (ADR 0012's signer, read rather than exercised).
@@ -187,17 +190,55 @@ pub fn router_with_batch_channels(
     declared_rates: Option<DeclaredRates>,
     batch_channels: Option<Arc<BatchChannels>>,
 ) -> Router {
+    router_with_controller_keys(
+        connector,
+        claim_gate,
+        signer,
+        bearer_token,
+        write_keys,
+        Vec::new(),
+        None,
+        declared_rates,
+        batch_channels,
+    )
+}
+
+/// [`router_with_batch_channels`] plus the restricted write keys of
+/// controllers (ADR 0078): each may make only the writes its scope names,
+/// until its expiry, and a write outside them is answered `403`. A key in
+/// `write_keys` keeps every write. `day_totals` is where a spending limit
+/// counts: a restricted key with a limit and no `day_totals` is refused every
+/// packet, because a count that cannot be journaled refuses the packet.
+/// `controller_keys` is a fixed list or `[operator] controller_keys_file`
+/// itself, which is then read again on every signed request (ADR 0079).
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_controller_keys(
+    connector: Arc<Connector>,
+    claim_gate: Arc<ClientClaimGate>,
+    signer: Arc<dyn Signer>,
+    bearer_token: impl Into<String>,
+    write_keys: Vec<[u8; 32]>,
+    controller_keys: impl Into<ControllerKeySource>,
+    day_totals: Option<DayTotals>,
+    declared_rates: Option<DeclaredRates>,
+    batch_channels: Option<Arc<BatchChannels>>,
+) -> Router {
     let state = OperatorState {
         connector,
         claim_gate,
         signer,
         bearer_token: Arc::from(bearer_token.into()),
-        write_auth: Arc::new(WriteAuth::new(write_keys)),
+        write_auth: Arc::new(WriteAuth::with_controller_keys(
+            write_keys,
+            controller_keys,
+            day_totals.map(Arc::new),
+        )),
         rates: declared_rates,
         batch: batch_channels,
     };
 
-    // Reads: gated by the bearer token and nothing else. Writes: gated by
+    // Reads: gated by the bearer token, or a write key's signature in its
+    // place (ADR 0079), and nothing else. Writes: gated by
     // an RFC 9421 signature and nothing else (ADR 0008) -- `route_layer`
     // only wraps the routes already added to `reads` when it is called,
     // so `writes`, merged in afterward, is never behind the bearer token.
@@ -211,14 +252,23 @@ pub fn router_with_batch_channels(
         .route("/rates", get(rates))
         .route("/identity", get(identity))
         .route("/audit-log", get(audit_log))
+        .route("/write-keys", get(write_key_list))
         .route("/metrics", get(metrics))
+        .route("/packets", get(packet_history))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_bearer_token,
+            require_read_auth,
         ));
 
+    // ADR 0082: an originated packet is read up to the same request limit
+    // the client edge reads one at, so an operator can send what a route
+    // on this node admits.
+    let request_limit = state.connector.request_limit().bytes();
     let writes = Router::new()
-        .route("/packets", post(originate_packet))
+        .route(
+            "/packets",
+            post(originate_packet).layer(DefaultBodyLimit::max(request_limit)),
+        )
         .route("/routes/leased", post(create_leased_route))
         .route("/peers", post(upsert_peer))
         .route("/peers/:id", delete(remove_peer))
@@ -281,36 +331,76 @@ async fn dashboard() -> Response {
 /// module docs.
 fn require_write_auth(
     state: &OperatorState,
+    write: WriteScope,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     authenticate_write(
         &state.write_auth,
+        write,
         method.as_str(),
         uri.path(),
         headers,
         body,
     )
-    .map(|_| ())
-    .map_err(|error| (StatusCode::UNAUTHORIZED, error.to_string()))
+    .map(|verified| verified.keyid)
+    .map_err(|error| match error.refusal_reason() {
+        // The signature verified: the caller is known, and what it asked is
+        // outside its authority (ADR 0078). Nothing was signed, journaled or
+        // sent, and nothing is in the audit log.
+        Some(reason) => {
+            state.connector.metrics().record_write_refused(reason);
+            tracing::warn!(
+                method = method.as_str(),
+                path = uri.path(),
+                reason,
+                "operator write refused: {error}"
+            );
+            (StatusCode::FORBIDDEN, error.to_string())
+        }
+        None => (StatusCode::UNAUTHORIZED, error.to_string()),
+    })
 }
 
-async fn require_bearer_token<B>(
+/// The gate on every read: the bearer token, or -- with no `Authorization`
+/// header at all -- an RFC 9421 signature by a key that may sign a write
+/// (ADR 0079). A controller is handed a key and never the token, which is
+/// shared by every reader and cannot be revoked for one of them. A request
+/// that presents a token is judged by the token alone.
+async fn require_read_auth<B>(
     State(state): State<OperatorState>,
     request: Request<B>,
     next: Next<B>,
 ) -> Response {
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+    let headers = request.headers();
+    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        let presented = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "));
+        return match presented {
+            Some(token) if token == state.bearer_token.as_ref() => next.run(request).await,
+            _ => StatusCode::UNAUTHORIZED.into_response(),
+        };
+    }
 
-    match presented {
-        Some(token) if token == state.bearer_token.as_ref() => next.run(request).await,
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    let header_str = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let signed = state.write_auth.authenticate_read(
+        request.method().as_str(),
+        request.uri().path(),
+        header_str("signature-input"),
+        header_str("signature"),
+        header_str("content-digest"),
+    );
+    match signed {
+        Ok(()) => next.run(request).await,
+        // The caller is known and its key has expired (ADR 0078 decision 10).
+        Err(error) if error.refusal_reason().is_some() => {
+            (StatusCode::FORBIDDEN, error.to_string()).into_response()
+        }
+        Err(_) => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
@@ -400,6 +490,13 @@ async fn rates(State(state): State<OperatorState>) -> Json<Vec<RateView>> {
     })
 }
 
+/// `GET /write-keys`: every key that may sign a write -- its key id, whether
+/// it is restricted, its scope and its expiry (ADR 0078 decision 11). A
+/// read like any other: gated by the bearer token.
+async fn write_key_list(State(state): State<OperatorState>) -> Json<Vec<WriteKeyView>> {
+    Json(state.write_auth.keys())
+}
+
 async fn audit_log(State(state): State<OperatorState>) -> Json<Vec<AuditRecord>> {
     Json(state.write_auth.audit_log())
 }
@@ -417,9 +514,25 @@ async fn metrics(State(state): State<OperatorState>) -> Response {
         .into_response()
 }
 
+/// What `GET /packets` accepts.
+#[derive(serde::Deserialize)]
+struct PacketHistoryQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /packets`: the recent packets this node handled, newest first
+/// (ADR 0077). Always `200`, including when no history is kept. A read like
+/// any other: bearer token, nothing else.
+async fn packet_history(
+    State(state): State<OperatorState>,
+    axum::extract::Query(query): axum::extract::Query<PacketHistoryQuery>,
+) -> Json<connector_runtime::PacketHistoryView> {
+    Json(state.connector.packet_history(query.limit))
+}
+
 /// `POST /packets`: an operator originates a packet outward, exactly as
 /// the client edge does for an external caller -- decode a [`Prepare`],
-/// call [`Connector::handle_prepare`] once, encode the outcome. The one
+/// call [`Connector::originate_prepare`] once, encode the outcome. The one
 /// difference is what happens first: [`authenticate_write`] must accept
 /// the request's RFC 9421 signature before any of that runs.
 async fn originate_packet(
@@ -429,7 +542,9 @@ async fn originate_packet(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) =
+        require_write_auth(&state, WriteScope::Packets, &method, &uri, &headers, &body)
+    {
         return error.into_response();
     }
 
@@ -438,25 +553,19 @@ async fn originate_packet(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    // An operator-originated packet is handed to the connector exactly as
-    // a client's is. It declares no floor of its own: the
-    // `minimum_delivery = prepare.amount` convention that used to live
-    // here was a third convention no record ever carried, and it made
+    // An operator-originated packet is handed to the connector as an
+    // origination, which pays this node no fee (ADR 0061, #1466). It
+    // declares no floor of its own: the `minimum_delivery = prepare.amount`
+    // convention that used to live here was a third convention no record
+    // ever carried, and it made
     // `amount - fee >= minimum_delivery` unsatisfiable for any non-zero
     // fee, so a fee-charging peering could never carry an operator's
     // packet at all (ADR 0057, issue #1143). What bounds erosion now is
     // the claim covering each crossing.
-    let encoded = match state.connector.handle_prepare(prepare).await {
-        PacketResponse::Fulfill(fulfill) => fulfill.encode(),
-        PacketResponse::Reject(reject) => reject.encode(),
-    };
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, OCTET_STREAM)],
-        encoded,
-    )
-        .into_response()
+    // The cost never rides the OER encoding of a REJECT (ADR 0011), so it
+    // goes beside it on every REJECT, zero included: "absent" never has to
+    // carry meaning. The client edge's own answer does exactly that.
+    connector_client_edge::packet_response(state.connector.originate_prepare(prepare).await)
 }
 
 /// A `POST /routes/leased` request body: create or renew a leased route
@@ -489,7 +598,14 @@ async fn create_leased_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesLeased,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -544,6 +660,7 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
         PeerRouteTableError::UnknownPeerId { .. }
         | PeerRouteTableError::InvalidPrefix(_)
         | PeerRouteTableError::InvalidPeerId
+        | PeerRouteTableError::InvalidRequest(_)
         | PeerRouteTableError::PeerChannelUnbound(_)
         | PeerRouteTableError::PeerHasNoPayChannel { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
@@ -691,9 +808,11 @@ async fn upsert_peer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
-    }
+    let keyid = match require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
+    {
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
 
     let request: UpsertPeerRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -715,20 +834,27 @@ async fn upsert_peer(
         Some(Err(error)) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
+    let gate = state.write_auth.deposit_gate(&keyid);
     match state
         .connector
-        .establish_peering(
+        .establish_peering_with(
             request.id,
             &url,
             request.fee,
             request.max_packet_amount,
             chain,
             request.deposit,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
         )
         .await
     {
         Ok(established) => Json(established).into_response(),
-        Err(error) => establish_peering_error_response(error),
+        Err(error) => {
+            if let EstablishPeeringError::Outbound(outbound) = &error {
+                note_deposit_refused(&state, &method, &uri, outbound);
+            }
+            establish_peering_error_response(error)
+        }
     }
 }
 
@@ -744,7 +870,9 @@ async fn remove_peer(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) =
+        require_write_auth(&state, WriteScope::Peers, &method, &uri, &headers, &body)
+    {
         return error.into_response();
     }
 
@@ -772,6 +900,18 @@ struct UpsertPeerRouteRequest {
     prefix: String,
     peer_id: String,
     price: Price,
+    /// Opaque to the connector (ADR 0067); only checked to be an object.
+    /// Deserialized through `present` so an explicit `null` is kept and
+    /// refused rather than read as absent.
+    #[serde(default, deserialize_with = "present")]
+    request: Option<serde_json::Value>,
+}
+
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 /// `POST /routes/peers`: issue #884's runtime peer-route write.
@@ -783,7 +923,14 @@ async fn upsert_peer_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesPeers,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -792,10 +939,12 @@ async fn upsert_peer_route(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    match state
-        .connector
-        .upsert_runtime_peer_route(request.prefix, request.peer_id, request.price)
-    {
+    match state.connector.upsert_runtime_peer_route(
+        request.prefix,
+        request.peer_id,
+        request.price,
+        request.request,
+    ) {
         Ok(view) => Json(view).into_response(),
         Err(error) => peer_route_table_error_response(error),
     }
@@ -812,7 +961,14 @@ async fn remove_peer_route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::RoutesPeers,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
 
@@ -863,6 +1019,29 @@ const NOT_AN_OUTBOUND_X402_CHANNEL: &str =
      toon-channel funding, on either chain, is retired (ADR 0075) -- a peering pays over the \
      outbound x402 channel POST /peers opens and funds, so top that one up instead";
 
+/// A deposit refused by a controller's deposit limit is counted and logged
+/// like the other refusals (ADR 0078 decision 9). The channel write refused
+/// it before journaling or sending anything.
+fn note_deposit_refused(
+    state: &OperatorState,
+    method: &Method,
+    uri: &Uri,
+    error: &BatchChannelError,
+) {
+    if matches!(error, BatchChannelError::DepositRefused(_)) {
+        state
+            .connector
+            .metrics()
+            .record_write_refused("deposit-limit");
+        tracing::warn!(
+            method = method.as_str(),
+            path = uri.path(),
+            reason = "deposit-limit",
+            "operator write refused: {error}"
+        );
+    }
+}
+
 /// The status a failed x402 channel operation answers with.
 ///
 /// - `503`: this node has no x402 backend on that chain -- its own config.
@@ -874,6 +1053,7 @@ const NOT_AN_OUTBOUND_X402_CHANNEL: &str =
 ///   open, an RPC that failed.
 /// - `500`: the journal could not be written, so nothing was sent.
 /// - `400`: everything the request itself got wrong.
+/// - `403`: a controller's deposit limit refused the deposit (ADR 0078).
 fn batch_channel_error_response(error: BatchChannelError) -> Response {
     let status = match &error {
         BatchChannelError::NoBackend(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -883,6 +1063,7 @@ fn batch_channel_error_response(error: BatchChannelError) -> Response {
         BatchChannelError::StillOpening(_) => StatusCode::CONFLICT,
         BatchChannelError::InvalidTerms(_) => StatusCode::BAD_REQUEST,
         BatchChannelError::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        BatchChannelError::DepositRefused(_) => StatusCode::FORBIDDEN,
         BatchChannelError::Settlement(settlement) => match settlement {
             BatchSettlementError::WithdrawalNotDue { .. }
             | BatchSettlementError::NoWithdrawalPending(_)
@@ -932,9 +1113,17 @@ async fn open_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
-    }
+    let keyid = match require_write_auth(
+        &state,
+        WriteScope::ChannelsOpen,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
 
     let fields: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(&body) {
         Ok(fields) => fields,
@@ -943,7 +1132,7 @@ async fn open_channel(
     if !fields.contains_key("terms") {
         return (StatusCode::BAD_REQUEST, TOON_CHANNEL_OPEN_RETIRED).into_response();
     }
-    open_outbound_channel(&state, &body).await
+    open_outbound_channel(&state, &method, &uri, &keyid, &body).await
 }
 
 /// The answer to an x402 `POST /channels`: the channel, and whether this
@@ -955,7 +1144,13 @@ struct OpenedOutboundChannel {
     resumed: bool,
 }
 
-async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response {
+async fn open_outbound_channel(
+    state: &OperatorState,
+    method: &Method,
+    uri: &Uri,
+    keyid: &str,
+    body: &Bytes,
+) -> Response {
     let Some(batch) = state.batch.as_ref() else {
         return no_batch_backend();
     };
@@ -974,12 +1169,21 @@ async fn open_outbound_channel(state: &OperatorState, body: &Bytes) -> Response 
                 .into_response()
         }
     };
+    let gate = state.write_auth.deposit_gate(keyid);
     match batch
-        .open(&request.terms, url.as_ref(), request.deposit)
+        .open_with(
+            &request.terms,
+            url.as_ref(),
+            request.deposit,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
+        )
         .await
     {
         Ok((channel, resumed)) => Json(OpenedOutboundChannel { channel, resumed }).into_response(),
-        Err(error) => batch_channel_error_response(error),
+        Err(error) => {
+            note_deposit_refused(state, method, uri, &error);
+            batch_channel_error_response(error)
+        }
     }
 }
 
@@ -997,9 +1201,17 @@ async fn fund_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
-        return error.into_response();
-    }
+    let keyid = match require_write_auth(
+        &state,
+        WriteScope::ChannelsFund,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
+        Ok(keyid) => keyid,
+        Err(error) => return error.into_response(),
+    };
     // `total` is named before the body is parsed: it was toon-channel funding
     // to an absolute figure, retired by ADR 0075, and a body carrying it is
     // refused as that rather than as an unknown field.
@@ -1029,9 +1241,21 @@ async fn fund_channel(
     if !batch.outbound().knows(&channel_id) {
         return (StatusCode::BAD_REQUEST, NOT_AN_OUTBOUND_X402_CHANNEL).into_response();
     }
-    match batch.outbound().top_up(&channel_id, request.amount).await {
-        Ok(state) => Json(batch.outbound().view_of(&state)).into_response(),
-        Err(error) => batch_channel_error_response(error),
+    let gate = state.write_auth.deposit_gate(&keyid);
+    match batch
+        .outbound()
+        .top_up_with(
+            &channel_id,
+            request.amount,
+            gate.as_ref().map(|gate| gate as &dyn DepositGate),
+        )
+        .await
+    {
+        Ok(topped) => Json(batch.outbound().view_of(&topped)).into_response(),
+        Err(error) => {
+            note_deposit_refused(&state, &method, &uri, &error);
+            batch_channel_error_response(error)
+        }
     }
 }
 
@@ -1062,7 +1286,14 @@ async fn withdraw_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsWithdraw,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
     let Some(batch) = state.batch.as_ref() else {
@@ -1084,6 +1315,8 @@ async fn withdraw_channel(
 /// watchers and sweeps land vouchers on their own; this is the manual lever
 /// for planned maintenance. No request body: the voucher landed is the one
 /// the client edge accepted and journaled, never one the caller supplies.
+/// The answer is the channel's `GET /channels` row plus `transaction`, the
+/// one transaction that landed the voucher.
 ///
 /// Replaces the `toon-channel` `redeem`, `redeem-latest` and
 /// `cooperative-close` writes, deleted here. Landing the same voucher twice
@@ -1096,14 +1329,21 @@ async fn land_channel(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(error) = require_write_auth(&state, &method, &uri, &headers, &body) {
+    if let Err(error) = require_write_auth(
+        &state,
+        WriteScope::ChannelsLand,
+        &method,
+        &uri,
+        &headers,
+        &body,
+    ) {
         return error.into_response();
     }
     let Some(batch) = state.batch.as_ref() else {
         return no_batch_backend();
     };
     match batch.land(&channel_id).await {
-        Ok(view) => Json(view).into_response(),
+        Ok(landed) => Json(landed).into_response(),
         Err(error) => batch_channel_error_response(error),
     }
 }
@@ -1127,7 +1367,7 @@ fn node_identity(signer: &dyn Signer) -> Result<NodeIdentity, SignerError> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use connector_config::StaticRoute;
+    use connector_config::{ControllerKey, StaticRoute};
     use connector_runtime::{
         FakeAppClient, InMemoryJournal, InProcessPeerTransport, RouteSource, TestClock,
     };
@@ -1335,6 +1575,90 @@ mod tests {
         let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("toon_fees_earned_total"));
+    }
+
+    fn router_over(connector: Arc<Connector>) -> Router {
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+        router(
+            connector,
+            empty_claim_gate(),
+            signer,
+            "correct-token".to_string(),
+            vec![],
+            None,
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn packets_answers_off_when_no_history_is_kept_and_requires_the_bearer_token() {
+        let app = test_router(vec![], "correct-token");
+
+        let unauthenticated = get(app.clone(), "/packets", None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = get(app, "/packets", Some("correct-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"enabled": false, "capacity": 0, "dropped": 0, "packets": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn packets_lists_the_recent_packets_newest_first_and_honours_limit() {
+        let connector = Arc::new(
+            Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            )
+            .with_packet_history(5),
+        );
+        for destination in ["g.one", "g.two", "g.three"] {
+            connector
+                .handle_prepare(connector_domain::Prepare {
+                    amount: 9,
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    greeting: false,
+                    destination: destination.to_string(),
+                    data: Vec::new(),
+                })
+                .await;
+        }
+        for _ in 0..500 {
+            if connector.packet_history(None).packets.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let app = router_over(connector);
+
+        let all = body_json(get(app.clone(), "/packets", Some("correct-token")).await).await;
+        assert_eq!(all["enabled"], true);
+        assert_eq!(all["capacity"], 5);
+        assert_eq!(all["dropped"], 0);
+        let destinations: Vec<_> = all["packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["destination"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(destinations, ["g.three", "g.two", "g.one"]);
+        assert_eq!(all["packets"][0]["outcome"], "rejected");
+        assert_eq!(all["packets"][0]["code"], "F02");
+        assert_eq!(all["packets"][0]["amount"], 9);
+        assert!(all["packets"][0].get("direction").is_none());
+
+        let newest = body_json(get(app, "/packets?limit=1", Some("correct-token")).await).await;
+        assert_eq!(newest["packets"].as_array().unwrap().len(), 1);
+        assert_eq!(newest["packets"][0]["destination"], "g.three");
     }
 
     #[tokio::test]
@@ -1743,6 +2067,68 @@ mod tests {
             assert_eq!(reject.code, RejectCode::f02_unreachable());
         }
 
+        /// As [`router_with_write_keys`], over one route whose `max_bytes`
+        /// is `max_bytes` (or none).
+        fn router_over_a_route_limit(write_keys: Vec<[u8; 32]>, max_bytes: Option<u64>) -> Router {
+            let route = connector_config::StaticRoute::new_priced(
+                "g.example.upload",
+                "http://localhost:4000",
+                0,
+            )
+            .unwrap()
+            .with_max_bytes(max_bytes.and_then(connector_domain::PayloadLimit::new));
+            let connector = Arc::new(Connector::new(
+                vec![route],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                write_keys,
+                None,
+            )
+        }
+
+        /// ADR 0082 (issue #1529): `POST /packets` reads a body up to the
+        /// node's request limit -- 2 MiB until a route raises it, and then
+        /// enough to originate the largest packet that route admits.
+        #[tokio::test]
+        async fn an_originated_packet_is_read_up_to_the_request_limit() {
+            const MIB: usize = 1024 * 1024;
+            let keypair = keypair();
+            let body = Prepare {
+                destination: "g.example.upload".to_string(),
+                data: vec![0; 3 * MIB],
+                ..sample_prepare()
+            }
+            .encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            for (max_bytes, expected) in [
+                (None, StatusCode::PAYLOAD_TOO_LARGE),
+                (Some(4 * MIB as u64), StatusCode::OK),
+            ] {
+                let app = router_over_a_route_limit(vec![keypair.public.to_bytes()], max_bytes);
+                let response = app
+                    .oneshot(packets_request(
+                        body.clone(),
+                        Some(&sig_input),
+                        Some(&sig),
+                        Some(&digest),
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "max_bytes = {max_bytes:?}");
+            }
+        }
+
         #[tokio::test]
         async fn a_signature_from_a_key_not_on_the_allowlist_is_rejected() {
             let signer = keypair();
@@ -1909,6 +2295,169 @@ mod tests {
             assert_eq!(log[0]["path"], "/packets");
         }
 
+        /// Issue #1460: a REJECT answered by `POST /packets` carries its
+        /// accumulated cost in `TOON-Accumulated-Cost`, because the cost never
+        /// rides the OER bytes (ADR 0011). The operator's own node charges its
+        /// origination no fee (#1466), so the smallest path whose cost is not
+        /// zero is one hop further out: the peer it forwards to charges 7 and
+        /// relays a REJECT its own peer genuinely decided on.
+        #[tokio::test]
+        async fn a_reject_relayed_through_a_charging_peer_carries_that_peers_fee() {
+            use connector_runtime::PeerRoute;
+
+            let keypair = keypair();
+            let clock = Arc::new(TestClock::new(chrono::Utc::now()));
+            let third_hop = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                clock.clone(),
+            ));
+            let mut second_hop_transport = InProcessPeerTransport::new();
+            second_hop_transport.add_peer("third-hop", third_hop);
+            let second_hop = Arc::new(covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example", "third-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(second_hop_transport),
+                    clock.clone(),
+                )
+                .with_peer_fees([("third-hop".to_string(), 7)]),
+                "third-hop",
+            ));
+            let mut peer_transport = InProcessPeerTransport::new();
+            peer_transport.add_peer("second-hop", second_hop);
+            let connector = Arc::new(covering(
+                Connector::new(
+                    vec![],
+                    vec![PeerRoute::new("g.example", "second-hop")],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(peer_transport),
+                    clock,
+                ),
+                "second-hop",
+            ));
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+
+            let mut prepare = sample_prepare();
+            prepare.destination = "g.example.remote".to_string();
+            prepare.amount = 100;
+            let body = prepare.encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            let response = app
+                .oneshot(packets_request(
+                    body,
+                    Some(&sig_input),
+                    Some(&sig),
+                    Some(&digest),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(connector_btp::ACCUMULATED_COST_HEADER)
+                    .map(|value| value.to_str().unwrap()),
+                Some("7")
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let reject = connector_domain::Reject::decode(&bytes).expect("decode reject");
+            assert_eq!(reject.code, RejectCode::f02_unreachable());
+        }
+
+        /// A FULFILL has no cost to report, so it carries no such header.
+        #[tokio::test]
+        async fn a_fulfill_answered_by_packets_carries_no_cost_header() {
+            use connector_domain::{EnvelopeRequest, EnvelopeResponse};
+            use connector_runtime::AppOutcome;
+            use connector_signer::giftwrap::seal_request;
+
+            let keypair = keypair();
+            let route = connector_config::StaticRoute::new("g.example.app", "http://app.example/")
+                .expect("a valid route");
+            let app_client = Arc::new(FakeAppClient::new());
+            app_client.respond(
+                route.handler_url(),
+                AppOutcome::Answered {
+                    response: EnvelopeResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: b"delivered".to_vec(),
+                    },
+                },
+            );
+            let identity = LocalSigner::generate("operator-test-identity");
+            let identity_public_key = identity.public_key().expect("a public key");
+            let connector = Arc::new(
+                Connector::new(
+                    vec![route],
+                    vec![],
+                    app_client,
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_identity_signer(Arc::new(identity)),
+            );
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+
+            let plaintext = EnvelopeRequest {
+                method: "POST".to_string(),
+                target: "/".to_string(),
+                headers: vec![],
+                body: b"hello".to_vec(),
+            }
+            .encode();
+            let (data, _shared_secret) =
+                seal_request(&plaintext, &identity_public_key).expect("seal");
+            let mut prepare = sample_prepare();
+            prepare.destination = "g.example.app".to_string();
+            prepare.data = data;
+            let body = prepare.encode();
+            let (sig_input, sig, digest) = sign(&keypair, &body, 9_999_999_999);
+
+            let response = app
+                .oneshot(packets_request(
+                    body,
+                    Some(&sig_input),
+                    Some(&sig),
+                    Some(&digest),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .headers()
+                    .get(connector_btp::ACCUMULATED_COST_HEADER)
+                    .is_none(),
+                "a FULFILL carries no cost header"
+            );
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            connector_domain::Fulfill::decode(&bytes).expect("a FULFILL");
+        }
+
         #[tokio::test]
         async fn a_read_route_still_requires_the_bearer_token_and_not_a_write_signature() {
             let app = router_with_write_keys(vec![]);
@@ -1968,11 +2517,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            let cost_header = response
+                .headers()
+                .get(connector_btp::ACCUMULATED_COST_HEADER)
+                .map(|value| value.to_str().unwrap().to_owned());
 
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             let reject = connector_domain::Reject::decode(&bytes).expect("decode reject");
             assert_eq!(reject.code, RejectCode::t01_peer_unreachable());
             assert!(reject.message.contains("peer-1"), "{}", reject.message);
+            // Present on every REJECT, whatever its value; `decode` leaves
+            // the field zero because the cost never rides the OER bytes.
+            assert_eq!(cost_header.as_deref(), Some("0"));
         }
     }
 
@@ -2288,7 +2844,7 @@ mod tests {
         /// it dials, which settlement address it derives a channel from --
         /// is the behaviour under test. A fake handing back a value would
         /// skip the fetch, which is the half that is new.
-        fn serve_self_description(settlement_address: &str) -> SocketAddr {
+        pub(super) fn serve_self_description(settlement_address: &str) -> SocketAddr {
             // The fake chain's settled token: what the counterparty's x402
             // terms must name for this node's paying half to open on them.
             let ReceiverTerms::Evm(fake) =
@@ -2354,7 +2910,8 @@ mod tests {
         /// publishes it. Deliberately not this node's own and deliberately
         /// not an edge identity: the channel derives from the settlement
         /// address of the chain in question.
-        const COUNTERPARTY_SETTLEMENT: &str = "0x00000000000000000000000000000000000000aa";
+        pub(super) const COUNTERPARTY_SETTLEMENT: &str =
+            "0x00000000000000000000000000000000000000aa";
 
         /// The CAIP-2 network both nodes' x402 terms name.
         const NETWORK: &str = "eip155:31337";
@@ -2564,6 +3121,84 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
 
+        /// ADR 0067: `request` rides `POST /routes/peers`, comes back on
+        /// the write and on `GET /routes/peers`, a re-post without it
+        /// clears it, and a non-object is `400` with the table unchanged.
+        #[tokio::test]
+        async fn a_peer_routes_request_is_stored_cleared_and_validated() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
+            let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
+            app.clone()
+                .oneshot(signed(
+                    &keypair,
+                    "POST",
+                    "/peers",
+                    peer_body("runtime-hop", addr, 3),
+                ))
+                .await
+                .unwrap();
+            let post = |body: serde_json::Value| {
+                signed(
+                    &keypair,
+                    "POST",
+                    "/routes/peers",
+                    serde_json::to_vec(&body).unwrap(),
+                )
+            };
+            let read = |app: axum::Router| async move {
+                let response = get(app, "/routes/peers", Some("correct-token")).await;
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap()
+            };
+            let request = serde_json::json!({ "anything": ["goes"] });
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                    "price": 25, "request": request,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(created["request"], request);
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            for bad in [
+                serde_json::json!("s"),
+                serde_json::json!(1),
+                serde_json::json!([]),
+                serde_json::json!(null),
+                serde_json::json!(false),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(post(serde_json::json!({
+                        "prefix": "g.example.runtime", "peer_id": "runtime-hop",
+                        "price": 25, "request": bad,
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                assert!(String::from_utf8_lossy(&bytes).contains("request"));
+            }
+            assert_eq!(read(app.clone()).await[0]["request"], request);
+
+            let response = app
+                .clone()
+                .oneshot(post(serde_json::json!({
+                    "prefix": "g.example.runtime", "peer_id": "runtime-hop", "price": 25,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(read(app).await[0].get("request").is_none());
+        }
+
         /// A validly signed `DELETE /peers/:id` removes a runtime peer
         /// (issue #884); it no longer appears over `GET /peers`.
         #[tokio::test]
@@ -2689,6 +3324,1066 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+    }
+
+    /// A controller's restricted write key (ADR 0078): a write outside its
+    /// scope or after its expiry is a `403` that leaves no audit record, and a
+    /// key on `write_keys` keeps every write.
+    mod controller_key_writes {
+        use super::*;
+        use crate::rfc9421::{keyid_hex, sign_request};
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+
+        /// Every write of the surface, as `(method, path, the name that
+        /// governs it)`.
+        const WRITES: [(&str, &str, WriteScope); 10] = [
+            ("POST", "/packets", WriteScope::Packets),
+            ("POST", "/peers", WriteScope::Peers),
+            ("DELETE", "/peers/hop", WriteScope::Peers),
+            ("POST", "/routes/peers", WriteScope::RoutesPeers),
+            ("DELETE", "/routes/peers/g.hop", WriteScope::RoutesPeers),
+            ("POST", "/routes/leased", WriteScope::RoutesLeased),
+            ("POST", "/channels", WriteScope::ChannelsOpen),
+            ("POST", "/channels/c1/fund", WriteScope::ChannelsFund),
+            (
+                "POST",
+                "/channels/c1/withdraw",
+                WriteScope::ChannelsWithdraw,
+            ),
+            ("POST", "/channels/c1/land", WriteScope::ChannelsLand),
+        ];
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        fn app(write_keys: Vec<[u8; 32]>, controllers: Vec<ControllerKey>) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys,
+                controllers,
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn controller(
+            keypair: &Keypair,
+            scope: &[WriteScope],
+            expires: Option<u64>,
+        ) -> ControllerKey {
+            ControllerKey::new("agent", keypair.public.to_bytes(), scope.to_vec(), expires)
+        }
+
+        async fn write(
+            app: &Router,
+            keypair: &Keypair,
+            method: &str,
+            path: &str,
+        ) -> (StatusCode, String) {
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, method, path, &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        #[tokio::test]
+        async fn a_key_scoped_to_land_is_refused_a_withdrawal_and_leaves_no_audit_record() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(&key, &[WriteScope::ChannelsLand], None)],
+            );
+
+            let (status, body) = write(&app, &key, "POST", "/channels/c1/withdraw").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("scope"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+
+            let (status, _) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_ne!(status, StatusCode::FORBIDDEN);
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+            let audit = read(&app, "/audit-log").await;
+            assert!(audit.contains(&keyid_hex(&key)), "{audit}");
+            assert!(audit.contains("/channels/c1/land"), "{audit}");
+        }
+
+        #[tokio::test]
+        async fn each_named_write_admits_its_own_endpoints_and_no_other() {
+            for scope in WriteScope::ALL {
+                let key = Keypair::generate(&mut OsRng);
+                let app = app(
+                    vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                    vec![controller(&key, &[scope], None)],
+                );
+                for (method, path, governed_by) in WRITES {
+                    let (status, body) = write(&app, &key, method, path).await;
+                    if governed_by == scope {
+                        assert!(
+                            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                            "{scope} should admit {method} {path}: {status} {body}"
+                        );
+                    } else {
+                        assert_eq!(
+                            status,
+                            StatusCode::FORBIDDEN,
+                            "{scope} must not admit {method} {path}: {body}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_key_past_its_expiry_is_refused_naming_the_expiry() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(&key, &[WriteScope::ChannelsLand], Some(1))],
+            );
+            let (status, body) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("expiry"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+        }
+
+        #[tokio::test]
+        async fn a_key_before_its_expiry_still_writes() {
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![controller(
+                    &key,
+                    &[WriteScope::ChannelsLand],
+                    Some(9_999_999_999),
+                )],
+            );
+            let (status, _) = write(&app, &key, "POST", "/channels/c1/land").await;
+            assert_ne!(status, StatusCode::FORBIDDEN);
+            assert_ne!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_write_key_makes_every_write_with_and_without_controller_keys() {
+            let operator = Keypair::generate(&mut OsRng);
+            let controller_key = Keypair::generate(&mut OsRng);
+            let with = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(
+                    &controller_key,
+                    &[WriteScope::ChannelsLand],
+                    None,
+                )],
+            );
+            let without = app(vec![operator.public.to_bytes()], vec![]);
+            for app in [with, without] {
+                for (method, path, _) in WRITES {
+                    let (status, body) = write(&app, &operator, method, path).await;
+                    assert!(
+                        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+                        "{method} {path}: {status} {body}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unlisted_key_is_still_a_401() {
+            let app = app(vec![], vec![]);
+            let stranger = Keypair::generate(&mut OsRng);
+            let (status, _) = write(&app, &stranger, "POST", "/channels/c1/land").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_refused_write_counter_moves_on_scope_and_on_expiry() {
+            let scoped = Keypair::generate(&mut OsRng);
+            let expired = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![Keypair::generate(&mut OsRng).public.to_bytes()],
+                vec![
+                    controller(&scoped, &[WriteScope::ChannelsLand], None),
+                    ControllerKey::new(
+                        "late",
+                        expired.public.to_bytes(),
+                        vec![WriteScope::ChannelsLand],
+                        Some(1),
+                    ),
+                ],
+            );
+            write(&app, &scoped, "POST", "/channels/c1/withdraw").await;
+            write(&app, &expired, "POST", "/channels/c1/land").await;
+            let metrics = read(&app, "/metrics").await;
+            assert!(
+                metrics.contains(r#"toon_writes_refused_total{reason="scope"} 1"#),
+                "{metrics}"
+            );
+            assert!(
+                metrics.contains(r#"toon_writes_refused_total{reason="expiry"} 1"#),
+                "{metrics}"
+            );
+        }
+
+        #[tokio::test]
+        async fn write_keys_lists_both_kinds_behind_the_bearer_token() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(
+                    &agent,
+                    &[WriteScope::ChannelsLand, WriteScope::RoutesPeers],
+                    Some(1_893_456_000),
+                )],
+            );
+            assert_eq!(
+                get(app.clone(), "/write-keys", None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(&app, "/write-keys").await).unwrap();
+            let listed = listed.as_array().unwrap();
+            assert_eq!(listed.len(), 2);
+            assert_eq!(listed[0]["keyid"], keyid_hex(&operator));
+            assert_eq!(listed[0]["restricted"], false);
+            assert_eq!(listed[0]["scope"].as_array().unwrap().len(), 8);
+            assert_eq!(listed[1]["keyid"], keyid_hex(&agent));
+            assert_eq!(listed[1]["restricted"], true);
+            assert_eq!(
+                listed[1]["scope"],
+                serde_json::json!(["routes-peers", "channels-land"])
+            );
+            assert_eq!(listed[1]["expires"], "2030-01-01T00:00:00Z");
+        }
+    }
+
+    /// A controller's spending limit (ADR 0078): a packet is refused `403`
+    /// above the per-packet figure or past the day's, counts in full once
+    /// accepted whatever becomes of it, and the day's total outlives a restart.
+    mod spending_limit_writes {
+        use super::*;
+        use crate::rfc9421::sign_request;
+        use connector_config::SpendingLimit;
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tower::ServiceExt;
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        fn day(day: u32) -> chrono::DateTime<chrono::Utc> {
+            use chrono::TimeZone;
+            chrono::Utc
+                .with_ymd_and_hms(2030, 1, day, 12, 0, 0)
+                .unwrap()
+        }
+
+        fn limit(per_write: u64, per_day: u64) -> SpendingLimit {
+            SpendingLimit { per_write, per_day }
+        }
+
+        fn controller(keypair: &Keypair, limit: SpendingLimit) -> ControllerKey {
+            ControllerKey::new(
+                "agent",
+                keypair.public.to_bytes(),
+                vec![WriteScope::Packets],
+                None,
+            )
+            .with_spending_limit(limit)
+        }
+
+        /// A router over the controllers, counting into `journal` on `clock`
+        /// (or nowhere, for `None`).
+        fn app(
+            write_keys: Vec<[u8; 32]>,
+            controllers: Vec<ControllerKey>,
+            journal: Option<(&Path, Arc<TestClock>)>,
+        ) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let day_totals =
+                journal.map(|(path, clock)| DayTotals::open(path, clock).expect("journal opens"));
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys,
+                controllers,
+                day_totals,
+                None,
+                None,
+            )
+        }
+
+        /// Send a packet of `amount`. No route exists, so the connector
+        /// rejects it: what is under test is the count, not the outcome.
+        async fn send(
+            app: impl std::borrow::Borrow<Router>,
+            keypair: &Keypair,
+            amount: u64,
+        ) -> (StatusCode, String) {
+            let body = Prepare {
+                amount,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                greeting: false,
+                destination: "g.example.nowhere".to_string(),
+                data: vec![],
+            }
+            .encode();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) = sign_request(
+                keypair,
+                "POST",
+                "/packets",
+                &body,
+                created,
+                Some(9_999_999_999),
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("/packets")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.borrow().clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        async fn counted_today(app: &Router) -> u64 {
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(app, "/write-keys").await).unwrap();
+            listed[0]["spending_limit"]["counted_today"]
+                .as_u64()
+                .unwrap()
+        }
+
+        fn admitted(status: StatusCode) -> bool {
+            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED
+        }
+
+        #[tokio::test]
+        async fn a_packet_above_the_per_packet_figure_is_refused_and_counts_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 100))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+
+            let (status, body) = send(&app, &key, 11).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.starts_with("spending-limit:"), "{body}");
+            assert_eq!(counted_today(&app).await, 0);
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+
+            let (status, _) = send(&app, &key, 10).await;
+            assert!(admitted(status), "{status}");
+            assert_eq!(counted_today(&app).await, 10);
+        }
+
+        #[tokio::test]
+        async fn the_packet_that_would_pass_the_day_is_refused_and_the_next_day_is_fresh() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 25))],
+                Some((&dir.path().join("totals"), clock.clone())),
+            );
+
+            assert!(admitted(send(&app, &key, 10).await.0));
+            assert!(admitted(send(&app, &key, 10).await.0));
+            let (status, body) = send(&app, &key, 6).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("per-day"), "{body}");
+            assert_eq!(counted_today(&app).await, 20);
+            // What fits still goes through.
+            assert!(admitted(send(&app, &key, 5).await.0));
+            assert_eq!(send(&app, &key, 1).await.0, StatusCode::FORBIDDEN);
+
+            clock.set(day(2));
+            assert_eq!(counted_today(&app).await, 0);
+            assert!(admitted(send(&app, &key, 10).await.0));
+        }
+
+        #[tokio::test]
+        async fn a_rejected_packet_counts_in_full() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 30))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            // Every one of these is rejected: no route reaches the destination.
+            for _ in 0..3 {
+                let (status, _) = send(&app, &key, 10).await;
+                assert!(admitted(status), "{status}");
+            }
+            assert_eq!(counted_today(&app).await, 30);
+            assert_eq!(send(&app, &key, 1).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn concurrent_packets_never_take_the_total_above_the_day() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Arc::new(Keypair::generate(&mut OsRng));
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(1, 5))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            let mut tasks = Vec::new();
+            for _ in 0..20 {
+                let (app, key) = (app.clone(), key.clone());
+                tasks.push(tokio::spawn(async move { send(app, &key, 1).await.0 }));
+            }
+            let mut passed = 0;
+            for task in tasks {
+                if admitted(task.await.unwrap()) {
+                    passed += 1;
+                }
+            }
+            assert_eq!(passed, 5);
+            assert_eq!(counted_today(&app).await, 5);
+        }
+
+        #[tokio::test]
+        async fn the_total_survives_a_restart_and_removing_the_entry() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            {
+                let app = app(
+                    vec![],
+                    vec![controller(&key, limit(10, 15))],
+                    Some((&path, clock.clone())),
+                );
+                assert!(admitted(send(&app, &key, 10).await.0));
+            }
+            // A restart: the same journal, a fresh process.
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 15))],
+                Some((&path, clock.clone())),
+            );
+            assert_eq!(counted_today(&app).await, 10);
+            assert_eq!(send(&app, &key, 6).await.0, StatusCode::FORBIDDEN);
+
+            // The entry is removed for a restart, and added back the same day.
+            drop(app);
+            let without = self::app(vec![], vec![], Some((&path, clock.clone())));
+            drop(without);
+            let app = self::app(
+                vec![],
+                vec![controller(&key, limit(10, 15))],
+                Some((&path, clock)),
+            );
+            assert_eq!(counted_today(&app).await, 10);
+            assert_eq!(send(&app, &key, 6).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_count_that_cannot_be_journaled_refuses_the_packet() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let app = router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![],
+                vec![controller(&key, limit(10, 100))],
+                Some(DayTotals::unwritable(&path, clock).expect("journal opens")),
+                None,
+                None,
+            );
+            let (status, body) = send(&app, &key, 1).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("journaled"), "{body}");
+            assert_eq!(read(&app, "/audit-log").await, "[]");
+            assert_eq!(counted_today(&app).await, 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        }
+
+        #[tokio::test]
+        async fn a_write_key_is_never_counted_or_limited() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let operator = Keypair::generate(&mut OsRng);
+            let other = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![operator.public.to_bytes()],
+                vec![controller(&other, limit(1, 1))],
+                Some((&path, clock)),
+            );
+            for _ in 0..3 {
+                assert!(admitted(send(&app, &operator, 1_000_000).await.0));
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        }
+
+        #[tokio::test]
+        async fn write_keys_reports_the_limit_and_the_count_and_the_counter_moves() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let app = app(
+                vec![],
+                vec![controller(&key, limit(10, 25))],
+                Some((&dir.path().join("totals"), clock)),
+            );
+            assert!(admitted(send(&app, &key, 7).await.0));
+            let listed: serde_json::Value =
+                serde_json::from_str(&read(&app, "/write-keys").await).unwrap();
+            assert_eq!(
+                listed[0]["spending_limit"],
+                serde_json::json!({"per_write": 10, "per_day": 25, "counted_today": 7})
+            );
+            assert_eq!(send(&app, &key, 11).await.0, StatusCode::FORBIDDEN);
+            assert!(read(&app, "/metrics")
+                .await
+                .contains(r#"toon_writes_refused_total{reason="spending-limit"} 1"#));
+        }
+    }
+
+    /// A controller's deposit limit (ADR 0078): a channel open or top-up is
+    /// refused `403` above the per-write figure or past the day's, counts
+    /// when its channel write is journaled whatever becomes of the
+    /// transaction, and is a total of its own.
+    mod deposit_limit_writes {
+        use super::*;
+        use crate::rfc9421::sign_request;
+        use connector_config::DepositLimit;
+        use connector_runtime::OutboundChannels;
+        use connector_settlement::batch::{
+            BatchSettlementBackend, BatchSettlementPayer, InMemoryBatchChain,
+            InMemoryBatchSettlement, PayerExit,
+        };
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::RwLock;
+        use tower::ServiceExt;
+
+        static CREATED: AtomicU64 = AtomicU64::new(50_000);
+
+        fn day(day: u32) -> chrono::DateTime<chrono::Utc> {
+            use chrono::TimeZone;
+            chrono::Utc
+                .with_ymd_and_hms(2030, 1, day, 12, 0, 0)
+                .unwrap()
+        }
+
+        fn controller(keypair: &Keypair, per_write: u64, per_day: u64) -> ControllerKey {
+            ControllerKey::new(
+                "agent",
+                keypair.public.to_bytes(),
+                vec![
+                    WriteScope::Peers,
+                    WriteScope::ChannelsOpen,
+                    WriteScope::ChannelsFund,
+                    WriteScope::Packets,
+                ],
+                None,
+            )
+            .with_deposit_limit(DepositLimit { per_write, per_day })
+            .with_spending_limit(connector_config::SpendingLimit {
+                per_write: 1_000,
+                per_day: 1_000,
+            })
+        }
+
+        /// A node `0x01` holding 10,000 on a fake chain with `0x02`, whose
+        /// surface counts `controllers` into `journal`.
+        async fn node(
+            controllers: Vec<ControllerKey>,
+            journal: (&Path, Arc<TestClock>),
+        ) -> (Router, Arc<InMemoryBatchSettlement>) {
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let this = Arc::new(InMemoryBatchSettlement::on(
+                Arc::clone(&chain),
+                0x01,
+                86_400,
+            ));
+            this.fund(10_000);
+            let outbound = Arc::new(
+                OutboundChannels::restore(
+                    Arc::new(InMemoryJournal::new()),
+                    vec![(
+                        SettlementChain::Evm,
+                        Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                    )],
+                )
+                .await
+                .expect("an empty journal replays"),
+            );
+            let batch = Arc::new(BatchChannels::new(
+                Arc::clone(&outbound),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
+                )],
+                Arc::new(RwLock::new(Vec::new()))
+                    as Arc<dyn connector_settlement::batch::HeldVouchers>,
+                Vec::new(),
+            ));
+            // A peering opens on the same outbound channels a `POST
+            // /channels` does, so the two count into one day.
+            let connector = Arc::new(
+                Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )
+                .with_outbound_channels(
+                    outbound,
+                    vec![(SettlementChain::Evm, "eip155:31337".to_string())],
+                )
+                .with_self_description_source(Arc::new(
+                    connector_runtime::BoundedHttpSelfDescription::new(true, None),
+                ))
+                .with_peer_allow_plaintext_endpoints(true),
+            );
+            let app = router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![],
+                controllers,
+                Some(DayTotals::open(journal.0, journal.1).expect("journal opens")),
+                None,
+                Some(batch),
+            );
+            (app, this)
+        }
+
+        async fn send(
+            app: &Router,
+            keypair: &Keypair,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, String) {
+            let body = serde_json::to_vec(&body).unwrap();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, "POST", path, &body, created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn terms() -> serde_json::Value {
+            let address = format!("0x{}", "02".repeat(20));
+            serde_json::json!({
+                "network": "eip155:31337",
+                "asset": format!("0x{}", "70".repeat(20)),
+                "payTo": address,
+                "receiverAuthorizer": address,
+                "withdrawDelay": 86_400,
+                "name": "USDC",
+                "version": "2",
+            })
+        }
+
+        async fn open(app: &Router, key: &Keypair, deposit: u64) -> (StatusCode, String) {
+            send(
+                app,
+                key,
+                "/channels",
+                serde_json::json!({ "terms": terms(), "deposit": deposit }),
+            )
+            .await
+        }
+
+        async fn fund(app: &Router, key: &Keypair, id: &str, amount: u64) -> (StatusCode, String) {
+            send(
+                app,
+                key,
+                &format!("/channels/{id}/fund"),
+                serde_json::json!({ "amount": amount }),
+            )
+            .await
+        }
+
+        fn channel_id(body: &str) -> String {
+            let opened: serde_json::Value = serde_json::from_str(body).unwrap();
+            opened["id"].as_str().expect("an id").to_string()
+        }
+
+        async fn read(app: &Router, path: &str) -> String {
+            let response = get(app.clone(), path, Some("correct-token")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        async fn write_keys(app: &Router) -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&read(app, "/write-keys").await).unwrap()[0]
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn a_deposit_above_the_per_write_figure_is_refused_and_nothing_is_journaled() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 2_000)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(chain.balance(), 10_000, "nothing was sent");
+            assert_eq!(read(&app, "/channels").await, "[]", "nothing was journaled");
+            assert_eq!(write_keys(&app).await["deposit_limit"]["counted_today"], 0);
+
+            // The same figure by fund, on a channel the key could open.
+            let (status, body) = open(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let id = channel_id(&body);
+            let (status, body) = fund(&app, &key, &id, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+        }
+
+        #[tokio::test]
+        async fn opens_and_funds_share_the_day_and_the_write_that_passes_it_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 1_200)],
+                (&dir.path().join("totals"), clock.clone()),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let id = channel_id(&body);
+            // A fund is an increment, counted every time.
+            for _ in 0..2 {
+                let (status, body) = fund(&app, &key, &id, 300).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                1_100
+            );
+            let (status, body) = fund(&app, &key, &id, 101).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("per-day"), "{body}");
+            assert_eq!(chain.balance(), 10_000 - 1_100);
+            let (status, _) = open(&app, &key, 100).await;
+            assert_eq!(status, StatusCode::OK, "what fits still goes through");
+            assert!(read(&app, "/metrics")
+                .await
+                .contains(r#"toon_writes_refused_total{reason="deposit-limit"} 1"#));
+
+            clock.set(day(2));
+            assert_eq!(write_keys(&app).await["deposit_limit"]["counted_today"], 0);
+            let (status, body) = fund(&app, &key, &id, 300).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        async fn peer(app: &Router, key: &Keypair, deposit: u64) -> (StatusCode, String) {
+            let addr = super::runtime_peer_route_writes::serve_self_description(
+                super::runtime_peer_route_writes::COUNTERPARTY_SETTLEMENT,
+            );
+            send(
+                app,
+                key,
+                "/peers",
+                serde_json::json!({
+                    "id": "node-b",
+                    "url": format!("http://{addr}/ilp"),
+                    "fee": 0,
+                    "deposit": deposit,
+                }),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_peering_deposit_and_a_fund_share_the_day_and_a_repeat_peering_counts_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 500, 800)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = peer(&app, &key, 501).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.starts_with("deposit-limit:"), "{body}");
+            assert_eq!(chain.balance(), 10_000, "nothing was sent");
+            assert_eq!(read(&app, "/channels").await, "[]", "nothing was journaled");
+
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let established: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(established["channel"]["status"], "created");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            // Found: counted, this would pass the per-day figure.
+            let (status, body) = peer(&app, &key, 500).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let found: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(found["channel"]["status"], "found");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                500
+            );
+
+            let channels: serde_json::Value =
+                serde_json::from_str(&read(&app, "/channels").await).unwrap();
+            let id = channels[0]["id"].as_str().expect("an id").to_string();
+            let (status, body) = fund(&app, &key, &id, 301).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("per-day"), "{body}");
+            let (status, body) = fund(&app, &key, &id, 300).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                800
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deposit_whose_transaction_fails_still_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, chain) = node(
+                vec![controller(&key, 50_000, 50_000)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            // The node holds 10,000: the chain refuses the deposit.
+            let (status, body) = open(&app, &key, 20_000).await;
+            assert_ne!(status, StatusCode::OK, "{body}");
+            assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(chain.balance(), 10_000);
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                20_000
+            );
+        }
+
+        #[tokio::test]
+        async fn deposits_and_packets_are_counted_apart() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            let (app, _) = node(
+                vec![controller(&key, 500, 500)],
+                (&dir.path().join("totals"), clock),
+            )
+            .await;
+
+            let (status, body) = open(&app, &key, 400).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let packet = Prepare {
+                amount: 300,
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                greeting: false,
+                destination: "g.example.nowhere".to_string(),
+                data: vec![],
+            }
+            .encode();
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) = sign_request(
+                &key,
+                "POST",
+                "/packets",
+                &packet,
+                created,
+                Some(9_999_999_999),
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/packets")
+                        .header("signature-input", sig_input)
+                        .header("signature", sig)
+                        .header("content-digest", digest)
+                        .body(Body::from(packet))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+            let view = write_keys(&app).await;
+            assert_eq!(view["deposit_limit"]["counted_today"], 400);
+            assert_eq!(view["spending_limit"]["counted_today"], 300);
+            assert_eq!(
+                view["deposit_limit"],
+                serde_json::json!({"per_write": 500, "per_day": 500, "counted_today": 400})
+            );
+        }
+
+        #[tokio::test]
+        async fn the_total_survives_a_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let key = Keypair::generate(&mut OsRng);
+            {
+                let (app, _) = node(vec![controller(&key, 500, 600)], (&path, clock.clone())).await;
+                let (status, body) = open(&app, &key, 400).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            let (app, _) = node(vec![controller(&key, 500, 600)], (&path, clock)).await;
+            assert_eq!(
+                write_keys(&app).await["deposit_limit"]["counted_today"],
+                400
+            );
+            assert_eq!(open(&app, &key, 300).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_write_key_is_never_counted_or_limited() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("totals");
+            let clock = Arc::new(TestClock::new(day(1)));
+            let operator = Keypair::generate(&mut OsRng);
+            let other = Keypair::generate(&mut OsRng);
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let this = Arc::new(InMemoryBatchSettlement::on(chain, 0x01, 86_400));
+            this.fund(10_000);
+            let outbound = OutboundChannels::restore(
+                Arc::new(InMemoryJournal::new()),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementPayer>,
+                )],
+            )
+            .await
+            .unwrap();
+            let batch = Arc::new(BatchChannels::new(
+                Arc::new(outbound),
+                vec![(
+                    SettlementChain::Evm,
+                    Arc::clone(&this) as Arc<dyn BatchSettlementBackend>,
+                )],
+                Arc::new(RwLock::new(Vec::new()))
+                    as Arc<dyn connector_settlement::batch::HeldVouchers>,
+                Vec::new(),
+            ));
+            let app = router_with_controller_keys(
+                Arc::new(Connector::new(
+                    vec![],
+                    vec![],
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(TestClock::new(chrono::Utc::now())),
+                )),
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                vec![operator.public.to_bytes()],
+                vec![controller(&other, 1, 1)],
+                Some(DayTotals::open(&path, clock).unwrap()),
+                None,
+                Some(batch),
+            );
+            let (status, body) = open(&app, &operator, 5_000).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
         }
     }
 
@@ -3133,6 +4828,37 @@ mod tests {
             let (status, landed) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::OK, "{landed}");
             assert_eq!(landed["landed"], 300);
+            // The answer is the channel's row plus the one transaction that
+            // landed it; the listing keeps its shape, with no `transaction`.
+            let answer = landed.as_object().expect("an object");
+            for key in [
+                "id",
+                "scheme",
+                "chain",
+                "direction",
+                "status",
+                "counterparty",
+                "collateral",
+                "landed",
+                "watermark",
+            ] {
+                assert!(answer.contains_key(key), "{key} in {landed}");
+            }
+            assert!(
+                landed["transaction"]
+                    .as_str()
+                    .is_some_and(|transaction| !transaction.is_empty()),
+                "{landed}"
+            );
+            let listed = node.read("/channels").await;
+            assert!(
+                listed
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .all(|row| row.get("transaction").is_none()),
+                "{listed}"
+            );
             let (status, _) = node.write(&path, serde_json::Value::Null).await;
             assert_eq!(status, StatusCode::CONFLICT);
             let (status, _) = node
@@ -3213,6 +4939,291 @@ mod tests {
                 let response = app.clone().oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
             }
+        }
+    }
+
+    /// `controller_keys_file` is read again on every signed request, and a
+    /// read signed by a write key needs no bearer token (ADR 0079).
+    mod live_controller_keys_and_signed_reads {
+        use super::*;
+        use crate::rfc9421::{keyid_hex, sign_request};
+        use connector_config::ControllerKeysFile;
+        use ed25519_dalek::Keypair;
+        use rand::rngs::OsRng;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CREATED: AtomicU64 = AtomicU64::new(1_000);
+
+        /// One entry of the file, as an operator writes it.
+        fn entry(name: &str, keypair: &Keypair, scope: &str, expires: Option<&str>) -> String {
+            let expires = expires.map_or(String::new(), |at| format!("expires = \"{at}\"\n"));
+            format!(
+                "[{name}]\nkey = \"{}\"\nscope = [\"{scope}\"]\n{expires}",
+                keyid_hex(keypair)
+            )
+        }
+
+        /// A node whose restricted keys are whatever `file` holds, and whose
+        /// one operator key is `operator`.
+        fn app(file: &tempfile::NamedTempFile, operator: &Keypair) -> Router {
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            let write_keys = vec![operator.public.to_bytes()];
+            router_with_controller_keys(
+                connector,
+                empty_claim_gate(),
+                Arc::new(LocalSigner::generate("operator-test-key")),
+                "correct-token".to_string(),
+                write_keys.clone(),
+                ControllerKeysFile::new(file.path().to_path_buf(), write_keys),
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn file_holding(contents: &str) -> tempfile::NamedTempFile {
+            let file = tempfile::NamedTempFile::new().expect("temp controller keys file");
+            std::fs::write(file.path(), contents).expect("write controller keys");
+            file
+        }
+
+        async fn signed(
+            app: &Router,
+            keypair: &Keypair,
+            method: &str,
+            path: &str,
+        ) -> (StatusCode, String) {
+            let created = CREATED.fetch_add(1, Ordering::SeqCst);
+            let (sig_input, sig, digest) =
+                sign_request(keypair, method, path, &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        const LAND: &str = "/channels/c1/land";
+
+        fn admitted(status: StatusCode) -> bool {
+            status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED
+        }
+
+        #[tokio::test]
+        async fn a_key_removed_from_the_file_is_refused_its_next_write_and_read() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+            assert_eq!(
+                signed(&app, &agent, "GET", "/write-keys").await.0,
+                StatusCode::OK
+            );
+
+            std::fs::write(file.path(), "").expect("revoke");
+
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                signed(&app, &agent, "GET", "/write-keys").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        #[tokio::test]
+        async fn a_key_added_to_the_file_writes_with_no_restart() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+
+            std::fs::write(file.path(), entry("agent", &agent, "channels-land", None))
+                .expect("grant");
+
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+            let (_, listed) = signed(&app, &operator, "GET", "/write-keys").await;
+            assert!(listed.contains(&keyid_hex(&agent)), "{listed}");
+        }
+
+        #[tokio::test]
+        async fn a_scope_changed_in_the_file_binds_the_next_write() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+
+            std::fs::write(
+                file.path(),
+                entry("agent", &agent, "channels-withdraw", None),
+            )
+            .expect("narrow");
+
+            let (status, body) = signed(&app, &agent, "POST", LAND).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("scope"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_file_that_stops_parsing_refuses_every_restricted_key_and_no_operator_key() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let good = entry("agent", &agent, "channels-land", None);
+            let file = file_holding(&good);
+            let app = app(&file, &operator);
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+
+            for broken in [
+                "[agent\n".to_string(),
+                entry("agent", &agent, "not-a-write", None),
+                // A restricted key that is also the operator's.
+                entry("agent", &operator, "channels-land", None),
+            ] {
+                std::fs::write(file.path(), &broken).expect("break");
+                assert_eq!(
+                    signed(&app, &agent, "POST", LAND).await.0,
+                    StatusCode::UNAUTHORIZED,
+                    "{broken}"
+                );
+                assert!(
+                    admitted(signed(&app, &operator, "POST", LAND).await.0),
+                    "{broken}"
+                );
+            }
+
+            std::fs::remove_file(file.path()).expect("delete");
+            assert_eq!(
+                signed(&app, &agent, "POST", LAND).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+
+            std::fs::write(file.path(), &good).expect("repair");
+            assert!(admitted(signed(&app, &agent, "POST", LAND).await.0));
+        }
+
+        #[tokio::test]
+        async fn a_read_signed_by_any_write_key_needs_no_bearer_token() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry("agent", &agent, "channels-land", None));
+            let app = app(&file, &operator);
+
+            for path in ["/write-keys", "/peers", "/claims", "/metrics"] {
+                for key in [&operator, &agent] {
+                    let (status, body) = signed(&app, key, "GET", path).await;
+                    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                }
+            }
+            let stranger = Keypair::generate(&mut OsRng);
+            assert_eq!(
+                signed(&app, &stranger, "GET", "/peers").await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                get(app.clone(), "/peers", None).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        #[tokio::test]
+        async fn a_read_signed_for_one_path_does_not_read_another() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/claims")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_wrong_bearer_token_is_not_rescued_by_a_good_signature() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/peers")
+                .header(header::AUTHORIZATION, "Bearer wrong-token")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn a_signed_read_may_be_repeated_and_leaves_no_audit_record() {
+            let operator = Keypair::generate(&mut OsRng);
+            let file = file_holding("");
+            let app = app(&file, &operator);
+            let (sig_input, sig, digest) =
+                sign_request(&operator, "GET", "/peers", &[], 1_000, Some(9_999_999_999));
+            for _ in 0..2 {
+                let request = Request::builder()
+                    .uri("/peers")
+                    .header("signature-input", &sig_input)
+                    .header("signature", &sig)
+                    .header("content-digest", &digest)
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            let (_, audit) = signed(&app, &operator, "GET", "/audit-log").await;
+            assert_eq!(audit, "[]");
+        }
+
+        #[tokio::test]
+        async fn an_expired_key_is_refused_a_read_naming_the_expiry() {
+            let operator = Keypair::generate(&mut OsRng);
+            let agent = Keypair::generate(&mut OsRng);
+            let file = file_holding(&entry(
+                "agent",
+                &agent,
+                "channels-land",
+                Some("2020-01-01T00:00:00Z"),
+            ));
+            let app = app(&file, &operator);
+            let (status, body) = signed(&app, &agent, "GET", "/peers").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(body.contains("expir"), "{body}");
+            // The refused-write counter counts writes.
+            let (_, metrics) = signed(&app, &operator, "GET", "/metrics").await;
+            assert!(
+                !metrics.contains(r#"toon_writes_refused_total{reason="expiry"} 1"#),
+                "{metrics}"
+            );
         }
     }
 }

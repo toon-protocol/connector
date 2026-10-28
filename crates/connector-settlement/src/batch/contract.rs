@@ -196,7 +196,8 @@ where
     let state = backend
         .land(&held_on, voucher(&sign, &held_on, 100))
         .await
-        .expect("a voucher held on a restored channel lands");
+        .expect("a voucher held on a restored channel lands")
+        .state;
     assert_eq!(state.landed, 100);
     assert_eq!(
         backend.channel_state(&held_on).await.expect("state").landed,
@@ -263,7 +264,8 @@ where
     let state = backend
         .land(&channel, voucher(&sign, &channel, 300))
         .await
-        .expect("land");
+        .expect("land")
+        .state;
     assert_eq!(state.landed, 300);
     assert_eq!(
         state.collateral, 700,
@@ -318,7 +320,8 @@ where
     let state = backend
         .land(&channel, voucher(&sign, &channel, 1_001))
         .await
-        .expect("the refused voucher lands once the deposit covers it");
+        .expect("the refused voucher lands once the deposit covers it")
+        .state;
     assert_eq!(state.landed, 1_001);
     assert_eq!(state.collateral, 499);
 
@@ -356,7 +359,8 @@ where
     let state = backend
         .land(&other, voucher(&sign, &other, 400))
         .await
-        .expect("a held voucher lands while the payer is leaving");
+        .expect("a held voucher lands while the payer is leaving")
+        .state;
     assert_eq!(state.landed, 400);
     assert_eq!(state.collateral, 0);
     assert_eq!(
@@ -568,7 +572,8 @@ where
     let landed = receiver
         .land(&channel, first.clone())
         .await
-        .expect("a voucher the payer signed lands on the receiver's side");
+        .expect("a voucher the payer signed lands on the receiver's side")
+        .state;
     assert_eq!(landed.landed, 300);
     assert_eq!(landed.collateral, 1_200);
     let state = payer.outbound_state(&channel).await.expect("state");
@@ -676,7 +681,8 @@ where
     let landed = receiver
         .land(&channel, held)
         .await
-        .expect("the held voucher lands while the payer withdraws");
+        .expect("the held voucher lands while the payer withdraws")
+        .state;
     assert_eq!(landed.landed, 400);
 
     let_delay_pass().await;
@@ -874,6 +880,7 @@ where
             .land(&journaled, voucher)
             .await
             .expect("and what it signs lands")
+            .state
             .landed,
         400
     );
@@ -900,14 +907,23 @@ where
             .expect("restoring again")
             .signed,
         450,
-        "restoring a known channel raises its watermark and never lowers it"
+        "restoring a known channel raises its watermark"
+    );
+    assert_eq!(
+        node.restore_outbound(&record, 420)
+            .await
+            .expect("restoring again")
+            .signed,
+        420,
+        "and lowers it, when the caller stands by a lower figure (issue #1446)"
     );
     assert_eq!(
         node.restore_outbound(&record, 10)
             .await
             .expect("restoring again")
             .signed,
-        450
+        400,
+        "but never below what the chain shows landed"
     );
 
     // ...and winds down like any other.

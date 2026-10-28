@@ -23,7 +23,6 @@ pub use batch_payer::{
 pub use batch_settlement::EvmBatchSettlementBackend;
 pub use batch_watch::{
     claim_target, settle_due, Claimed, EvmBatchWatcher, SweepReport, BATCH_SWEEP_INTERVAL,
-    WITHDRAWAL_WATCH_INTERVAL,
 };
 /// A settlement table's endpoint, which [`EvmBatchSettlementBackend::connect`]
 /// takes in place of a URL (ADR 0073).

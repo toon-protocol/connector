@@ -22,6 +22,7 @@ pub struct Metrics {
     packets_total: IntCounterVec,
     packets_rejected_total: IntCounterVec,
     fees_earned_total: IntCounter,
+    writes_refused_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -49,6 +50,14 @@ impl Metrics {
             "Total flat per-packet fees earned across every peering relation (ADR 0010), counted on fulfilment.",
         )
         .expect("valid metric");
+        let writes_refused_total = IntCounterVec::new(
+            Opts::new(
+                "toon_writes_refused_total",
+                "Count of operator writes refused to a verified key outside its authority (ADR 0078), by reason.",
+            ),
+            &["reason"],
+        )
+        .expect("valid metric");
         let exposure = IntGauge::new(
             "toon_exposure",
             "Unclaimed exposure to peers. Always 0 and has no producer: the credit-window accounting this named was retired by ADR 0033 (issue #882). Nothing tracks trailing exposure, so there is nothing to report. The metric name is kept for scrape-config stability.",
@@ -69,6 +78,9 @@ impl Metrics {
         registry
             .register(Box::new(fees_earned_total.clone()))
             .expect("register metric");
+        registry
+            .register(Box::new(writes_refused_total.clone()))
+            .expect("register metric");
         // `exposure` and `settlement_total` have no producer (see their own
         // help text above): registered so the metric is present at its
         // decided name and stays at 0, with no field kept for a value
@@ -85,6 +97,7 @@ impl Metrics {
             packets_total,
             packets_rejected_total,
             fees_earned_total,
+            writes_refused_total,
         }
     }
 
@@ -99,6 +112,12 @@ impl Metrics {
 
     pub(crate) fn record_fee_earned(&self, amount: u64) {
         self.fees_earned_total.inc_by(amount);
+    }
+
+    /// An operator write refused to a key whose signature verified but whose
+    /// authority does not cover it (ADR 0078): `reason` is `scope`, `expiry`, `spending-limit` or `deposit-limit`.
+    pub fn record_write_refused(&self, reason: &str) {
+        self.writes_refused_total.with_label_values(&[reason]).inc();
     }
 
     /// Render every metric in Prometheus text exposition format.
@@ -137,6 +156,15 @@ mod tests {
         let text = metrics.encode();
         assert!(text.contains(r#"toon_packets_total{outcome="reject"} 1"#));
         assert!(text.contains(r#"toon_packets_rejected_total{code="F02"} 1"#));
+    }
+
+    #[test]
+    fn records_a_refused_write_by_reason() {
+        let metrics = Metrics::new();
+        metrics.record_write_refused("scope");
+        assert!(metrics
+            .encode()
+            .contains(r#"toon_writes_refused_total{reason="scope"} 1"#));
     }
 
     #[test]

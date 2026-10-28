@@ -443,6 +443,12 @@ struct StoredRoute {
     /// an old table unchanged, and a downgrade opens any table whose routes
     /// are all flat.
     price: Price,
+    /// What a client should send to use this route (ADR 0067), opaque.
+    /// Absent on a table written before runtime routes carried one, and
+    /// skipped on write when absent so a route without one is persisted
+    /// byte for byte as it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -559,7 +565,8 @@ impl PeerRouteStore {
             .map(|route| {
                 (
                     route.prefix.clone(),
-                    PeerRoute::new_scheduled(route.prefix, route.peer_id, route.price),
+                    PeerRoute::new_scheduled(route.prefix, route.peer_id, route.price)
+                        .with_request(route.request),
                 )
             })
             .collect();
@@ -591,6 +598,7 @@ impl PeerRouteStore {
                 peer_id: route.peer_id().to_string(),
                 fee: None,
                 price: route.price(),
+                request: route.request().cloned(),
             })
             .collect();
         stored_routes.sort_by(|a, b| a.prefix.cmp(&b.prefix));
@@ -676,6 +684,58 @@ mod tests {
         let (_store, read_peers, read_routes) = PeerRouteStore::open(&path).expect("re-open");
         assert_eq!(read_peers, peers);
         assert_eq!(read_routes, routes);
+    }
+
+    /// ADR 0067: a runtime route's `request` survives a restart, and a
+    /// route without one is written with no `request` member at all.
+    #[test]
+    fn a_routes_request_survives_a_restart_and_is_omitted_when_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runtime_peers.json");
+        let (store, _, _) = PeerRouteStore::open(&path).expect("open");
+
+        let mut peers = RuntimePeers::new();
+        peers.insert("apex-relay-2".to_string(), peering(3));
+        let request = serde_json::json!({ "method": "POST", "anything": [1, 2] });
+        let mut routes = HashMap::new();
+        routes.insert(
+            "g.example.with".to_string(),
+            PeerRoute::new_priced("g.example.with", "apex-relay-2", 25)
+                .with_request(Some(request.clone())),
+        );
+        routes.insert(
+            "g.example.without".to_string(),
+            PeerRoute::new_priced("g.example.without", "apex-relay-2", 25),
+        );
+        store.persist(&peers, &routes).expect("persist");
+
+        let text = fs::read_to_string(&path).expect("read table");
+        assert_eq!(text.matches("\"request\"").count(), 1, "{text}");
+
+        let (_store, _, read_routes) = PeerRouteStore::open(&path).expect("re-open");
+        assert_eq!(read_routes, routes);
+        assert_eq!(read_routes["g.example.with"].request(), Some(&request));
+        assert_eq!(read_routes["g.example.without"].request(), None);
+    }
+
+    /// A table written before routes carried a `request` still loads, and
+    /// re-saving its route writes no `request` member.
+    #[test]
+    fn a_table_written_before_request_existed_still_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runtime_peers.json");
+        fs::write(
+            &path,
+            r#"{"peers":[],"routes":[{"prefix":"g.example.old","peer_id":"p","price":7}]}"#,
+        )
+        .expect("write");
+
+        let (store, peers, routes) = PeerRouteStore::open(&path).expect("open");
+        assert_eq!(routes["g.example.old"].request(), None);
+
+        store.persist(&peers, &routes).expect("re-save");
+        let text = fs::read_to_string(&path).expect("read table");
+        assert!(!text.contains("\"request\""), "{text}");
     }
 
     /// ADR 0058: the endpoint, the edge identity and the channel binding

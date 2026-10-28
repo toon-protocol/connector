@@ -30,6 +30,7 @@ use connector_runtime::{
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
 };
+use connector_settlement::watch_interval::watch_interval;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
 use connector_signer::{LocalSigner, Signer, SignerError};
@@ -100,12 +101,21 @@ pub enum RuntimeError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// Another process already holds `state_dir`'s lock (issue #1318): two
+    /// processes over one directory each replay the journals once and keep
+    /// the watermarks in memory, so they diverge silently. Refused by name
+    /// rather than served.
+    StateDirHeld { path: PathBuf },
     /// A journal under `state_dir` exists but could not be replayed --
     /// unreadable, or carrying a line this build cannot decode. Refusing
     /// to start is the whole point: the only other option is to start with
     /// watermarks this node cannot vouch for, which is exactly the defect
     /// issue #605 describes.
     JournalUnreplayable { path: PathBuf, source: JournalError },
+    /// The controller day-totals journal under `state_dir` could not be
+    /// opened or replayed (ADR 0078 decision 8): refused rather than let a
+    /// key's day reset.
+    DayTotalsUnusable(connector_operator::DayTotalsError),
     /// Issue #884's runtime peer/route table under `state_dir` exists but
     /// could not be read (unreadable, or corrupt JSON) -- refusing to
     /// start rather than serve with a table this node cannot vouch for,
@@ -247,12 +257,20 @@ impl fmt::Display for RuntimeError {
                  memory, where a restart would make every already-spent claim replayable",
                 path.display()
             ),
+            RuntimeError::StateDirHeld { path } => write!(
+                f,
+                "state_dir {} is held by another connector process -- the connector refuses \
+                 to start over a directory a live node is serving from, because two processes \
+                 would each keep their own claim watermarks and settlement nonces",
+                path.display()
+            ),
             RuntimeError::JournalUnreplayable { path, source } => write!(
                 f,
                 "failed to replay the claim journal at {}: {source} -- the connector \
                  refuses to start rather than resume from watermarks it cannot vouch for",
                 path.display()
             ),
+            RuntimeError::DayTotalsUnusable(error) => write!(f, "{error}"),
             RuntimeError::RuntimePeerRouteTableUnusable { path, source } => write!(
                 f,
                 "failed to read the runtime peer/route table at {}: {source} -- the connector \
@@ -578,6 +596,34 @@ const OUTBOUND_CHANNEL_JOURNAL: &str = "outbound-channels.log";
 /// not an append-only journal line format like the two above (see
 /// `connector_runtime::PeerRouteStore`'s own docs for why).
 const RUNTIME_PEER_ROUTE_TABLE: &str = "runtime-peers.json";
+/// The file whose advisory lock says one process owns `state_dir` (issue
+/// #1318). Empty and never written: the journals themselves are not locked,
+/// so `FileJournal` and the table's write-then-rename work unchanged.
+const STATE_DIR_LOCK: &str = ".state-dir.lock";
+
+/// Take an exclusive OS advisory lock on `state_dir`, creating the directory
+/// if it is not there yet. The operating system releases it when the process
+/// exits for any reason, so a crash leaves nothing to clean up.
+fn lock_state_dir(state_dir: &Path) -> Result<std::fs::File, RuntimeError> {
+    let unusable = |source| RuntimeError::StateDirUnusable {
+        path: state_dir.to_path_buf(),
+        source,
+    };
+    std::fs::create_dir_all(state_dir).map_err(unusable)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join(STATE_DIR_LOCK))
+        .map_err(unusable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RuntimeError::StateDirHeld {
+            path: state_dir.to_path_buf(),
+        }),
+        Err(std::fs::TryLockError::Error(source)) => Err(unusable(source)),
+    }
+}
 
 /// Open `name` under this node's configured `state_dir`, creating the
 /// directory if it is not there yet.
@@ -621,6 +667,23 @@ fn warn_about_plaintext_peerings(config: &Config) {
             "peer_allow_plaintext_endpoints is set and this peering is dialed in the clear -- \
              every claim on it is readable on the wire. This is a loopback and test setting; \
              see docs/operators/btp-peer-transport-bringup.md"
+        );
+    }
+}
+
+/// Name every published `[node]` endpoint that only a payer on this host or
+/// docker network can dial (issue #1533). A warning, never a refusal: the same
+/// values are right in tests, `local/` topologies and a same-host trial.
+fn warn_about_host_local_endpoints(config: &Config) {
+    let Some(node) = config.node() else { return };
+    for (field, value) in node.host_local_endpoints() {
+        tracing::warn!(
+            field,
+            value,
+            "[node] {field} names a host no payer outside this machine can reach, and it is \
+             published as written in this node's self-description. Unless every payer is on \
+             this host or docker network, publish the URL a payer outside this host dials: \
+             the public https:// (or wss://) URL in front of the node"
         );
     }
 }
@@ -689,6 +752,10 @@ pub struct Runtime {
     /// surface can fund, withdraw from and sign on it from the first
     /// request.
     pub outbound_channels: Option<Arc<OutboundChannels>>,
+    /// The lock on `state_dir` (issue #1318), `Some` exactly when the node
+    /// names one. `run` moves it into the `RunningNode` it hands back, because
+    /// the runtime is dropped before the process stops serving.
+    pub state_dir_lock: Option<std::fs::File>,
 }
 
 /// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
@@ -714,6 +781,9 @@ pub struct Runtime {
 /// process exactly as the client edge's do. That ledger sits *above* the
 /// peer transport port and was untouched by #679's deletion.
 pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
+    // Issue #1318: the first thing done with `state_dir`, before any journal
+    // is read or any chain dialed.
+    let state_dir_lock = config.state_dir().map(lock_state_dir).transpose()?;
     let signer = build_signer(config.signer_key())?;
     // ADR 0075 decision 8, issue #1385: a node whose journals still hold
     // claims on TOON's own channels is refused by name before any chain is
@@ -726,6 +796,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // and the whole point of a loopback-and-test opt-in is that a node that
     // took it says so where an operator will see it.
     warn_about_plaintext_peerings(config);
+    warn_about_host_local_endpoints(config);
     // Issue #678 gap 2: the dial side, built from `[[peers]]`. A node with
     // no dialable peering still holds an empty `InProcessPeerTransport`, so
     // a packet routed to a peer is answered `T01 peer unreachable` rather
@@ -745,6 +816,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         .map(|route| {
             PeerRoute::new_scheduled(route.prefix(), route.peer_id(), route.price())
                 .with_request(route.request().cloned())
+                .with_max_bytes(route.max_bytes())
         })
         .collect();
     let mut connector = Connector::new(
@@ -782,6 +854,13 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // gap 3), so a peering established at runtime picks its carriage by
     // exactly the rule a config-file peering does.
     .with_peer_allow_plaintext_endpoints(config.peer_allow_plaintext_endpoints())
+    // ADR 0077: the operator's bounded, in-memory packet history, off unless
+    // `[operator] packet_history` names a size.
+    .with_packet_history(
+        config
+            .operator()
+            .map_or(0, |operator| operator.packet_history()),
+    )
     // Issue #884: the routing table IS the relationship set enforced at
     // load (`connector-config`'s `UnknownPeerId` check), so a runtime
     // write must never be able to add, update or remove a peer id the
@@ -1040,6 +1119,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         batch_settlement_evm,
         batch_settlement_solana,
         outbound_channels,
+        state_dir_lock,
     })
 }
 
@@ -1430,34 +1510,41 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// on neither chain starts nothing.
 ///
 /// - EVM: [`EvmBatchWatcher`] reads `WithdrawInitiated` every
-///   [`WITHDRAWAL_WATCH_INTERVAL`] and claims the latest voucher on a
-///   withdrawing channel at once, and every [`BATCH_SWEEP_INTERVAL`] claims
-///   every held voucher in one `claim` and then `settle`s.
+///   [`watch_interval`] of the node's `min_withdraw_delay_secs` and claims
+///   the latest voucher on a withdrawing channel at once, and every
+///   [`BATCH_SWEEP_INTERVAL`] claims every held voucher in one `claim` and
+///   then `settle`s.
 /// - Solana: [`SolanaBatchWatcher`] rediscovers every sponsored channel every
-///   [`CLOSING_WATCH_INTERVAL`] -- sealing a Closing one with its latest
-///   voucher, distributing a Sealed one, reclaiming a Distributed one's rent
-///   -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`].
+///   [`watch_interval`] of the node's `min_grace_period_secs` -- sealing a
+///   Closing one with its latest voucher, distributing a Sealed one,
+///   reclaiming a Distributed one's rent -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`]. The Open settle
+///   check runs only on a watch pass, so a longer watch rounds it up to the
+///   next pass.
+///
+/// Neither watch interval is configurable: [`watch_interval`] is the node's
+/// published minimum delay over ninety, clamped to ten seconds..fifteen
+/// minutes, so ninety passes fit inside the shortest delay any admitted
+/// channel can carry and an idle node spends no more RPC than that needs.
 ///
 /// Both backends read and write through the settlement table's one transport
 /// (ADR 0073): the watchers are built from the backends, never from a URL.
 ///
-/// [`WITHDRAWAL_WATCH_INTERVAL`]: connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL
+/// [`watch_interval`]: connector_settlement::watch_interval::watch_interval
 /// [`BATCH_SWEEP_INTERVAL`]: connector_settlement_evm::BATCH_SWEEP_INTERVAL
-/// [`CLOSING_WATCH_INTERVAL`]: connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL
 /// [`OPEN_SETTLE_INTERVAL`]: connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL
 fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
     let held: Arc<dyn HeldVouchers> = Arc::new(ClaimGateVouchers(Arc::clone(gate)));
     if let Some(backend) = &runtime.batch_settlement_evm {
         let watcher = EvmBatchWatcher::new(Arc::clone(backend), Arc::clone(&held));
         tokio::spawn(watcher.run(
-            connector_settlement_evm::WITHDRAWAL_WATCH_INTERVAL,
+            watch_interval(backend.min_withdraw_delay_secs()),
             connector_settlement_evm::BATCH_SWEEP_INTERVAL,
         ));
     }
     if let Some(backend) = &runtime.batch_settlement_solana {
         let watcher = SolanaBatchWatcher::new(Arc::clone(backend), held);
         tokio::spawn(watcher.run(
-            connector_settlement_solana::batch::CLOSING_WATCH_INTERVAL,
+            watch_interval(backend.min_grace_period_secs()),
             connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
         ));
     }
@@ -1530,7 +1617,7 @@ fn client_claim_gate(
 ///
 ///   * the three `[node]` fields are **configured**, because no process can
 ///     introspect them: a container sees `0.0.0.0:4000`, never
-///     `https://proxy.ario.devnet.toonprotocol.dev/ilp`;
+///     `https://toonprotocol.dev/ilp`;
 ///   * `peer_carriages` is `peer_expose`, i.e. which listeners this node
 ///     opens. **Which** carriages exist, never **who** rides them -- peer
 ///     identities and per-peering terms are operator-private (ND-09);
@@ -1639,12 +1726,32 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     Ok(match config.operator() {
         Some(operator) => {
             let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
-            app.merge(connector_operator::router_with_batch_channels(
+            // A spending limit counts in a journal under `state_dir` (ADR
+            // 0078 decision 8), opened here so a node with nowhere to write
+            // it fails at boot rather than at a controller's first packet.
+            let day_totals = match config.state_dir() {
+                Some(state_dir) => Some(
+                    connector_operator::DayTotals::open(
+                        &state_dir.join(connector_operator::DAY_TOTALS_JOURNAL),
+                        Arc::new(connector_runtime::SystemClock),
+                    )
+                    .map_err(RuntimeError::DayTotalsUnusable)?,
+                ),
+                None => None,
+            };
+            app.merge(connector_operator::router_with_controller_keys(
                 connector,
                 claim_gate,
                 signer,
                 operator.bearer_token().to_string(),
                 operator.write_keys().to_vec(),
+                // The file itself, not the list it held at boot: the operator
+                // surface reads it again on every signed request (ADR 0079).
+                operator.controller_keys_file().cloned().map_or_else(
+                    || connector_operator::ControllerKeySource::Fixed(Vec::new()),
+                    connector_operator::ControllerKeySource::File,
+                ),
+                day_totals,
                 declared_rates(runtime, config),
                 batch_channels,
             ))
@@ -2061,6 +2168,13 @@ btp_endpoint = "wss://apex.example/ilp/btp"
                 r#"
 client_edge_addr = "127.0.0.1:0"
 
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
+
 [signer]
 key_file = "{}"
 "#,
@@ -2133,6 +2247,13 @@ key_file = "{}"
             format!(
                 r#"
 client_edge_addr = "127.0.0.1:0"
+
+# A destination something serves: a claim riding a packet to one nothing
+# serves is never looked at (issue #1446).
+[[routes]]
+prefix = "g.example.unmatched"
+handler_url = "http://localhost:4000/"
+price = 1
 
 [signer]
 key_file = "{}"
@@ -2543,6 +2664,67 @@ write_keys = ["{key}"]
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The node reads `controller_keys_file` itself, not the list it held
+    /// at boot (ADR 0079): a key removed from the file is refused its next
+    /// request by the same running router.
+    #[tokio::test]
+    async fn a_controller_key_removed_from_its_file_is_refused_with_no_restart() {
+        use connector_operator::signing::{keyid_hex, sign_request};
+
+        let secret = ed25519_dalek::SecretKey::from_bytes(&[7u8; 32]).expect("secret");
+        let agent = ed25519_dalek::Keypair {
+            public: (&secret).into(),
+            secret,
+        };
+        let controllers = tempfile::NamedTempFile::new().expect("controller keys file");
+        std::fs::write(
+            controllers.path(),
+            format!(
+                "[agent]\nkey = \"{}\"\nscope = [\"channels-land\"]\n",
+                keyid_hex(&agent)
+            ),
+        )
+        .expect("write controller keys");
+        let (config, _key_path) = config_with_raw_key_file(|key_path| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:0"
+
+[signer]
+key_file = "{}"
+
+[operator]
+bearer_token = "operator-secret"
+write_keys = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+controller_keys_file = "{}"
+"#,
+                key_path.display(),
+                controllers.path().display()
+            )
+        });
+        let runtime = build(&config).await.expect("build");
+        let app = router(&runtime, &config).expect("router");
+        let signed_read = |created: u64| {
+            let (sig_input, sig, digest) =
+                sign_request(&agent, "GET", "/peers", &[], created, Some(9_999_999_999));
+            let request = Request::builder()
+                .uri("/peers")
+                .header("signature-input", sig_input)
+                .header("signature", sig)
+                .header("content-digest", digest)
+                .body(Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+
+        assert_eq!(signed_read(1_000).await.unwrap().status(), StatusCode::OK);
+        std::fs::write(controllers.path(), "").expect("revoke");
+        assert_eq!(
+            signed_read(1_001).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// The dashboard is part of the operator surface (ADR 0066): mounted

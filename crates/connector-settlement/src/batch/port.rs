@@ -66,6 +66,17 @@ pub enum VoucherSigner {
     Solana([u8; 32]),
 }
 
+/// What [`BatchSettlementBackend::land`] reports: the channel as re-read
+/// after the landing, and the one transaction that landed the voucher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    /// The channel's state after the landing.
+    pub state: BatchChannelState,
+    /// The landing transaction in its chain-native spelling: EVM `0x` and 64
+    /// lowercase hex, Solana the base58 signature.
+    pub transaction: String,
+}
+
 /// A snapshot of a batch-settlement channel, read from its chain.
 ///
 /// `landed` and `collateral` are both cumulative-amount figures in the
@@ -559,8 +570,9 @@ impl std::fmt::Display for AdmissionRefusal {
 }
 
 /// Errors a [`BatchSettlementBackend`] reports. Every variant but
-/// [`Backend`](BatchSettlementError::Backend) is a rule of the port; that
-/// one is an I/O failure specific to how an implementation reaches its
+/// [`Refused`](BatchSettlementError::Refused) and
+/// [`Backend`](BatchSettlementError::Backend) is a rule of the port; those
+/// two are I/O failures specific to how an implementation reaches its
 /// chain.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BatchSettlementError {
@@ -681,6 +693,15 @@ pub enum BatchSettlementError {
     #[error("{0} is not deployed on this chain")]
     NotDeployed(String),
 
+    /// The chain's RPC endpoint refused a read (HTTP 403 or 429) after the
+    /// transport had retried it with backoff (ADR 0073 decision 5). Kept
+    /// apart from [`Backend`](BatchSettlementError::Backend) so a watch loop
+    /// can say so once while an endpoint keeps refusing, instead of once per
+    /// cycle. `endpoint` is `scheme://host[:port]`, never the URL, which may
+    /// carry an API key.
+    #[error("batch-settlement RPC endpoint {endpoint} refused the request with HTTP {status}")]
+    Refused { endpoint: String, status: u16 },
+
     #[error("batch-settlement backend error: {0}")]
     Backend(String),
 }
@@ -774,7 +795,8 @@ pub trait BatchSettlementBackend: Send + Sync {
     /// Land `voucher` on the admitted or restored `channel`, so its amount
     /// is recorded
     /// on chain in this node's favour: EVM `claim`; Solana `settle` while
-    /// Open and `settle_and_seal` while Closing. Returns the state after.
+    /// Open and `settle_and_seal` while Closing. Returns the state after and
+    /// the transaction sent (exactly one).
     ///
     /// Works on every status but `Sealed`, and that is the point: landing is
     /// what protects value already accepted once a payer begins to exit.
@@ -790,7 +812,7 @@ pub trait BatchSettlementBackend: Send + Sync {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError>;
+    ) -> Result<Landed, BatchSettlementError>;
 }
 
 /// The paying half of the settlement port (ADR 0075 decision 2): this node
@@ -877,10 +899,11 @@ pub trait BatchSettlementPayer: Send + Sync {
 
     /// Bring back a channel this node opened in an earlier process, from its
     /// journaled `record`, so this half can read, top up, sign on and
-    /// withdraw from it again. `signed` is the highest amount this node
-    /// journaled a voucher for on it; the watermark restored is the larger
-    /// of that and what the chain shows landed, so it never goes backwards
-    /// and never below what the receiver already holds on chain.
+    /// withdraw from it again. `signed` is the watermark the caller stands
+    /// by -- its journaled figure, or the receiver's report after a reject
+    /// (ADR 0075 decision 6, amended by issue #1446); the watermark restored
+    /// is the larger of that and what the chain shows landed, so it is never
+    /// below what the receiver already holds on chain.
     ///
     /// Refuses a record for another chain
     /// ([`WrongChain`](BatchSettlementError::WrongChain)), one whose channel
@@ -888,8 +911,9 @@ pub trait BatchSettlementPayer: Send + Sync {
     /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound): an open
     /// never sent, or not yet landed), and one naming a channel this node is
     /// not the payer of ([`NotOutbound`](BatchSettlementError::NotOutbound)).
-    /// Restoring a channel already known changes nothing but raises its
-    /// watermark to `signed` if that is higher.
+    /// Restoring a channel already known sets its watermark to that figure,
+    /// lowering it when `signed` is lower than the one held: the caller
+    /// decides, because a voucher a receiver never admitted is not owed.
     async fn restore_outbound(
         &self,
         record: &OutboundChannelRecord,

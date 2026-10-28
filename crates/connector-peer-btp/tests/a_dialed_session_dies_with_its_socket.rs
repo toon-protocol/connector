@@ -6,8 +6,9 @@
 //! one test is the exception it needs, and it is the exception because the
 //! defect lived precisely in the half a port hides: `ws`'s dialed session
 //! splits the websocket, and its two halves fail independently. A peer that
-//! restarts closes the connection, which the read half sees at once and the
-//! write half learns only on its next write -- so the writer sat waiting on
+//! restarts closes the connection, which the read half sees as soon as the
+//! kernel reports it and the write half learns only on its next write -- so
+//! the writer sat waiting on
 //! a channel that was still open over a socket that was not, the dial side
 //! read that channel as a live session, wrote the next PREPARE into it and
 //! then waited out the answer timeout for a RESPONSE no read loop was left
@@ -16,6 +17,12 @@
 //! What is asserted here is the repair, in the terms a caller has: the
 //! session says it is gone, and a send on it fails **at once** rather than
 //! hanging until `OUTBOUND_ANSWER_TIMEOUT`.
+//!
+//! Issue #1454 is the same defect one step earlier: a frame already written
+//! when the socket closes. Nothing was left to answer it, so it too waited
+//! out the timeout. It is now answered at the close with
+//! `ClosedBeforeAnswer` -- not `SessionGone`, because it *was* written and
+//! must not be resent.
 //!
 //! # Why `ws://` is the faithful scheme for this
 //!
@@ -118,4 +125,50 @@ async fn a_send_on_a_session_whose_socket_died_fails_at_once_rather_than_waiting
         matches!(sent, Err(OriginateError::SessionGone)),
         "expected SessionGone, got {sent:?}"
     );
+}
+
+/// Issue #1454: accepts one websocket, reads the first frame, and closes
+/// without answering it.
+async fn a_peer_that_reads_then_closes() -> Url {
+    use futures_util::StreamExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+    let endpoint = Url::parse(&format!(
+        "ws://{}/ilp/btp",
+        listener.local_addr().expect("bound")
+    ))
+    .expect("a well-formed endpoint");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the dial arrives");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("the websocket handshake completes");
+        let _ = socket.next().await;
+        drop(socket);
+    });
+    endpoint
+}
+
+/// A frame written into a session that then closes is answered at the close
+/// with `ClosedBeforeAnswer` -- neither `SessionGone` (which says it was
+/// never written, and licenses a resend) nor a wait out `Timeout`.
+async fn assert_closes_answer_a_waiting_send(dialer: TungsteniteDialer) {
+    let endpoint = a_peer_that_reads_then_closes().await;
+    let handle = dialer
+        .dial("peer-b", &endpoint)
+        .await
+        .expect("the peer is listening");
+
+    let sent = tokio::time::timeout(PROMPTLY, handle.send_message(&[], b"not a packet"))
+        .await
+        .expect("the close answers the waiting send");
+
+    assert!(
+        matches!(sent, Err(OriginateError::ClosedBeforeAnswer)),
+        "expected ClosedBeforeAnswer, got {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_only_session_answers_a_waiting_send_when_its_socket_closes() {
+    assert_closes_answer_a_waiting_send(TungsteniteDialer::new()).await;
 }

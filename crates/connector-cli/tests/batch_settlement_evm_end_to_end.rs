@@ -238,7 +238,8 @@ price = {PRICE}
             },
         )
         .await
-        .expect("the journaled voucher lands");
+        .expect("the journaled voucher lands")
+        .state;
     assert_eq!(landed.landed, u128::from(2 * PRICE));
     assert_eq!(
         x402.channel(&channel).await,

@@ -40,8 +40,9 @@
 #     B terminates at 1000, and 1100 - 100 == 1000 exactly, with no slack
 #
 # `local_topologies_load.rs` holds A's two figures in keys.sh's table, B's
-# `price` below in connector-b.toml and the rehearsal's AMOUNT/PRICE/FEE to
-# that one arithmetic; no container can notice a price or a fee quietly
+# `price` below in connector-b.toml and the rehearsal's AMOUNT/PRICE to
+# B's price (the rehearsal's packet is A's operator's own, so A forwards all of
+# it: ADR 0061, #1466); no container can notice a price or a fee quietly
 # dropped to zero.
 # =============================================================================
 

@@ -1,10 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use connector_domain::Price;
+use connector_domain::{PayloadLimit, Price};
 use serde::Deserialize;
 use url::Url;
 
 use crate::error::ConfigError;
+
+/// The largest `max_bytes` a route may declare (ADR 0082, raised from ADR
+/// 0081's 2 MiB): one definition, the domain's, since it also bounds how far
+/// a route can raise the node's [`connector_domain::RequestLimit`].
+pub use connector_domain::MAX_PAYLOAD_LIMIT;
 
 /// Maximum length of an ILP address, per RFC 0015.
 const MAX_ILP_ADDRESS_LEN: usize = 1023;
@@ -90,6 +95,16 @@ pub(crate) struct RawRoute {
     /// this row, not to a blob whose keys are the app's business.
     #[serde(default)]
     request: Option<toml::Table>,
+    /// The largest sealed payload, in bytes, a packet to this prefix may
+    /// carry (ADR 0081, issue #1530). Optional on both branches; absent means
+    /// no limit beyond the carriage's own. Validated by [`parse_max_bytes`].
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    /// Marks the route a payment route (ADR 0083, issue #1543). False when
+    /// absent; valid only with `handler_url`, and refused by name with a
+    /// `peer_id` ([`ConfigError::PaymentRouteForwards`]).
+    #[serde(default)]
+    payment: bool,
 }
 
 /// A `[[children]]` entry: a convenience form that desugars into a
@@ -197,6 +212,8 @@ pub struct StaticRoute {
     price: Price,
     transport_policy: TransportPolicy,
     request: Option<serde_json::Value>,
+    max_bytes: Option<PayloadLimit>,
+    payment: bool,
 }
 
 impl StaticRoute {
@@ -327,6 +344,37 @@ impl StaticRoute {
         self.request = Some(request);
         self
     }
+
+    /// The largest sealed payload a packet to this prefix may carry (ADR
+    /// 0081, issue #1530) -- refused `F00` above it, before any claim is
+    /// taken. `None` when the operator wrote no `max_bytes`, which is every
+    /// route before ADR 0081.
+    pub fn max_bytes(&self) -> Option<PayloadLimit> {
+        self.max_bytes
+    }
+
+    /// Attach a payload limit to a route built directly rather than from a
+    /// config file (ADR 0081) -- a fixture's shorthand for what
+    /// `[[routes]] max_bytes = ...` gives a config-loaded route.
+    pub fn with_max_bytes(mut self, max_bytes: Option<PayloadLimit>) -> StaticRoute {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Whether this is a payment route (ADR 0083, issue #1543): the payer
+    /// chooses the amount, and a peer arrival's claim must cover all of it.
+    /// False for every route before ADR 0083.
+    pub fn payment(&self) -> bool {
+        self.payment
+    }
+
+    /// Mark a route built directly rather than from a config file a payment
+    /// route (ADR 0083) -- a fixture's shorthand for `[[routes]] payment =
+    /// true`.
+    pub fn with_payment(mut self, payment: bool) -> StaticRoute {
+        self.payment = payment;
+        self
+    }
 }
 
 /// A route whose traffic this connector forwards to a peer rather than
@@ -341,6 +389,7 @@ pub struct PeerRouteConfig {
     peer_id: String,
     price: Price,
     request: Option<serde_json::Value>,
+    max_bytes: Option<PayloadLimit>,
 }
 
 impl PeerRouteConfig {
@@ -370,6 +419,14 @@ impl PeerRouteConfig {
     /// forwarded branch.
     pub fn request(&self) -> Option<&serde_json::Value> {
         self.request.as_ref()
+    }
+
+    /// The largest sealed payload a packet to this prefix may carry (ADR
+    /// 0081) -- see [`StaticRoute::max_bytes`]; a forwarding hop refuses on
+    /// it exactly as a termination does, since the length it measures is
+    /// carriage rather than content.
+    pub fn max_bytes(&self) -> Option<PayloadLimit> {
+        self.max_bytes
     }
 }
 
@@ -415,6 +472,8 @@ fn build_route(
         price,
         transport_policy,
         request: request.map(request_to_json),
+        max_bytes: None,
+        payment: false,
     })
 }
 
@@ -500,7 +559,30 @@ fn build_peer_route(
         peer_id,
         price,
         request: request.map(request_to_json),
+        max_bytes: None,
     })
+}
+
+/// Parse a `[[routes]]` entry's `max_bytes` (ADR 0081), refusing by name a
+/// value that is not a limit at all -- zero refuses every payload -- or one
+/// above [`MAX_PAYLOAD_LIMIT`], further than ADR 0082 lets a route raise
+/// the node's request limit.
+fn parse_max_bytes(prefix: &str, value: Option<u64>) -> Result<Option<PayloadLimit>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value > MAX_PAYLOAD_LIMIT {
+        return Err(ConfigError::RouteMaxBytesAboveLimit {
+            prefix: prefix.to_string(),
+            value,
+            limit: MAX_PAYLOAD_LIMIT,
+        });
+    }
+    PayloadLimit::new(value)
+        .map(Some)
+        .ok_or_else(|| ConfigError::RouteMaxBytesZero {
+            prefix: prefix.to_string(),
+        })
 }
 
 fn insert_unique_prefix(seen: &mut HashSet<String>, prefix: &str) -> Result<(), ConfigError> {
@@ -528,6 +610,11 @@ pub(crate) fn resolve_routes(
     let mut peer_routes = Vec::new();
 
     for raw in raw_routes {
+        // ADR 0083: a forward is never the end of a payment. Refused by name
+        // ahead of the target match so it is not read as anything else.
+        if raw.payment && raw.peer_id.is_some() {
+            return Err(ConfigError::PaymentRouteForwards { prefix: raw.prefix });
+        }
         // ADR 0061: a fee attaches to a peering, not to a route. Refused on
         // BOTH branches and before either is examined -- a terminated route
         // never had one to charge (issue #556's rule, unchanged), and a
@@ -538,16 +625,19 @@ pub(crate) fn resolve_routes(
         if raw.fee.is_some() {
             return Err(ConfigError::RouteFeeRemoved { prefix: raw.prefix });
         }
+        let max_bytes = parse_max_bytes(&raw.prefix, raw.max_bytes)?;
         match (raw.handler_url, raw.peer_id) {
             (Some(handler_url), None) => {
                 let transport_policy = parse_transport_policy(&raw.prefix, raw.transport)?;
-                let route = build_route(
+                let mut route = build_route(
                     raw.prefix,
                     handler_url,
                     raw.price,
                     transport_policy,
                     raw.request,
                 )?;
+                route.max_bytes = max_bytes;
+                route.payment = raw.payment;
                 insert_unique_prefix(&mut seen, route.prefix())?;
                 insert_consistent_handler_price(&mut handler_prices, &route)?;
                 routes.push(route);
@@ -568,7 +658,8 @@ pub(crate) fn resolve_routes(
                         value,
                     });
                 }
-                let route = build_peer_route(raw.prefix, peer_id, raw.price, raw.request)?;
+                let mut route = build_peer_route(raw.prefix, peer_id, raw.price, raw.request)?;
+                route.max_bytes = max_bytes;
                 insert_unique_prefix(&mut seen, route.prefix())?;
                 peer_routes.push(route);
             }
@@ -631,6 +722,8 @@ mod tests {
             price: Some(Price::flat(price)),
             transport: None,
             request: None,
+            max_bytes: None,
+            payment: false,
         }
     }
 
@@ -647,6 +740,8 @@ mod tests {
             price: Some(Price::flat(price)),
             transport: None,
             request: None,
+            max_bytes: None,
+            payment: false,
         }
     }
 
@@ -674,6 +769,50 @@ mod tests {
         let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 42)
             .expect("new_priced");
         assert_eq!(route.price(), Price::flat(42));
+    }
+
+    /// ADR 0081: a forwarding hop refuses on its own route's limit exactly as
+    /// a termination does, so `max_bytes` loads on the forwarded branch too.
+    #[test]
+    fn a_forwarded_route_carries_its_payload_limit() {
+        let mut raw = priced_peer_route("g.peer-b", "peer-b", 100);
+        raw.max_bytes = Some(4096);
+        let (_, peer_routes) = resolve_routes(None, vec![raw], vec![]).expect("resolve");
+        assert_eq!(peer_routes[0].max_bytes(), PayloadLimit::new(4096));
+    }
+
+    #[test]
+    fn a_payload_limit_at_the_maximum_loads_and_one_over_is_refused() {
+        let mut at = priced_route("g.example.at", "http://localhost:4000", 1);
+        at.max_bytes = Some(MAX_PAYLOAD_LIMIT);
+        let (routes, _) = resolve_routes(None, vec![at], vec![]).expect("at the limit loads");
+        assert_eq!(routes[0].max_bytes(), PayloadLimit::new(MAX_PAYLOAD_LIMIT));
+
+        let mut over = priced_peer_route("g.peer-b", "peer-b", 1);
+        over.max_bytes = Some(MAX_PAYLOAD_LIMIT + 1);
+        assert!(matches!(
+            resolve_routes(None, vec![over], vec![]),
+            Err(ConfigError::RouteMaxBytesAboveLimit { prefix, .. }) if prefix == "g.peer-b"
+        ));
+    }
+
+    /// ADR 0083: `payment = true` marks a route that ends at an app, and a
+    /// route that does not say so is not one.
+    #[test]
+    fn a_payment_route_loads_with_a_handler_and_is_refused_by_name_with_a_peer() {
+        let mut paid = priced_route("g.example.tip", "http://localhost:4000", 0);
+        paid.payment = true;
+        let plain = priced_route("g.example.app", "http://localhost:4001", 0);
+        let (routes, _) = resolve_routes(None, vec![paid, plain], vec![]).expect("resolve");
+        assert!(routes[0].payment());
+        assert!(!routes[1].payment());
+
+        let mut forward = priced_peer_route("g.peer-b", "peer-b", 1);
+        forward.payment = true;
+        assert!(matches!(
+            resolve_routes(None, vec![forward], vec![]),
+            Err(ConfigError::PaymentRouteForwards { prefix }) if prefix == "g.peer-b"
+        ));
     }
 
     #[test]
@@ -704,6 +843,8 @@ mod tests {
                 price: None,
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -726,6 +867,8 @@ mod tests {
                 price: Some(Price::flat(100)),
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -750,6 +893,8 @@ mod tests {
                 price: Some(Price::flat(100)),
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -773,6 +918,8 @@ mod tests {
                 price: Some(Price::flat(100)),
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -847,6 +994,8 @@ mod tests {
                 price: None,
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -939,6 +1088,8 @@ mod tests {
             price: Some(price),
             transport: None,
             request: None,
+            max_bytes: None,
+            payment: false,
         }
     }
 
@@ -975,6 +1126,8 @@ mod tests {
                 price: Some(Price::scheduled(100, 5)),
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1135,6 +1288,8 @@ mod tests {
                 price: None,
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1156,6 +1311,8 @@ mod tests {
                 price: None,
                 transport: None,
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1295,6 +1452,8 @@ mod tests {
                 price: Some(Price::flat(1000)),
                 transport: Some("btp".to_string()),
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1314,6 +1473,8 @@ mod tests {
                 price: Some(Price::flat(10)),
                 transport: Some("http".to_string()),
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1333,6 +1494,8 @@ mod tests {
                 price: Some(Price::flat(10)),
                 transport: Some("both".to_string()),
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1356,6 +1519,8 @@ mod tests {
                 price: Some(Price::flat(10)),
                 transport: Some("carrier-pigeon".to_string()),
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1382,6 +1547,8 @@ mod tests {
                 price: None,
                 transport: Some("btp".to_string()),
                 request: None,
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         );
@@ -1478,6 +1645,8 @@ mod tests {
                 price: Some(Price::flat(1000)),
                 transport: None,
                 request: Some(request),
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )
@@ -1524,6 +1693,8 @@ mod tests {
                     "protocol",
                     toml::Value::String("nip90".to_string()),
                 )])),
+                max_bytes: None,
+                payment: false,
             }],
             vec![],
         )

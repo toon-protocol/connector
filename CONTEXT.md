@@ -46,7 +46,7 @@ reads one is reading text from a stranger. _(Decided and not yet built — ADR 0
 **Request**:
 The operator-declared table naming what a client must send to use a route — protocol, parameters,
 whatever the app behind it expects. Written as `[[routes]] request = { ... }`, converted to JSON at
-load and published verbatim on that route's self-description entry and on the greeting for that
+load — or, for a runtime peer route, as a JSON object on `POST /routes/peers` — and published verbatim on that route's self-description entry and on the greeting for that
 destination; the connector confirms only that it **is** a table and reads none of its keys. Sourced
 by the operator writing it down, never by asking the app — matching the declaration against what the
 app actually registered is the app's own repository's problem, not this one's (ADR 0067). Absent,
@@ -167,6 +167,13 @@ The property of a route that ends at this connector, where a packet becomes a de
 an app. The point at which a payload stops being opaque: the terminating connector reads the
 packet's envelope to know what request to make.
 
+**Payment route**:
+A terminated route whose job is to be paid, not to sell work: the payer chooses the amount, at or
+above the route's **price**, and everything that arrives is the operator's. It still ends at an
+app, the operator's own, which is what learns that the payment arrived. A peer arrival below the
+price is refused, and one above it is not.
+_Avoid_: tip route (relay's word for the event that names one), raw route, transfer
+
 **Client destination**:
 An address that resolves to a live client session rather than to a handler. The connector delivers
 to that client and never terminates: it does not open the payload, does not derive a fulfilment,
@@ -223,6 +230,31 @@ form for each write that can be made at runtime, signed in the operator's browse
 the surface that the node happens to ship, with no authority of its own — the bearer token and
 the operator key it is fed are the operator's, and the key never leaves the browser.
 _Avoid_: admin panel, control panel, console
+
+**Write key**:
+A key allowed to make a write on the operator surface. An **operator's** write key may make every
+write. A **controller's** write key is restricted: it carries a **scope**, and may carry a
+**spending limit** and a **deposit limit**. It is revoked by removing its entry, with no restart.
+Any write key may also sign a read, in place of the bearer token.
+_Avoid_: admin key, API key, operator token
+
+**Scope**:
+The named writes a controller's write key may make. A write outside it is refused before anything
+is signed or sent.
+_Avoid_: role, permission, capability
+
+**Spending limit**:
+The most a controller's write key may send in packets, per packet and per UTC day. It counts every
+packet the key originates at its full amount, rejected or not, because originating a packet sends
+a claim: it bounds what the key exposed, not what the node lost. One bare figure, counted in the
+base units of whatever channel each packet is paid over.
+_Avoid_: cap (that is the largest packet a peering carries), budget, allowance, quota
+
+**Deposit limit**:
+The most a controller's write key may put into channels, per write and per UTC day, by peering,
+opening or funding. Separate from the **spending limit**, because a deposit stays the node's own
+money and a packet does not.
+_Avoid_: cap, funding limit
 
 ### Protocol surfaces
 
@@ -330,15 +362,54 @@ derived: a pair may hold several. A peering is two, one each way (ADR 0075).
 _Avoid_: channel (when ambiguous with a route or a stream)
 
 **Claim**:
-A signed statement of a payment channel's cumulative state, handed from payer to payee.
-Each claim supersedes the last, so a lost claim costs nothing and a replayed claim gains
-nothing. Every claim is a **voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)).
+A signed statement of a cumulative amount, handed from payer to payee, against something that
+holds value for the payee: a payment channel or an **allowance**. Each claim supersedes the last,
+so a lost claim costs nothing and a replayed claim gains nothing. A claim on a channel is a
+**voucher** ([ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md));
+a claim on an allowance is an **allowance claim** (#1511).
 Since #1384 a `toon-channel` claim — one with no `scheme`, or `scheme: "toon-channel"`, the scheme
 ADR 0075 retires — is refused by name at the client edge and on both peer carriages.
 _Avoid_: receipt, payment, balance proof; `toon-channel` (retired, ADR 0075)
 
 **Voucher**:
-A claim under x402's `batch-settlement` scheme (ADR 0074, ADR 0075) — the only kind.
+A claim under x402's `batch-settlement` scheme (ADR 0074, ADR 0075) — the only kind of claim on a
+payment channel, and the only kind a peer ever sends.
+_Avoid_: voucher for an **allowance claim**
+
+**Zk note**:
+A deposit in a vault that its owner spends by proving that some unspent note in the vault covers an
+amount, without saying which. Bound to one **zk edge**. What proves the spend is the vault's
+**proof program**, checked against its verification key.
+_Avoid_: shielded balance, private channel; circuit (for the proof program — a circuit is the overlay's)
+
+**Zk edge**:
+A connector whose client edge accepts payment from a **zk note**. It learns that a payment was made
+and how much, never by whom; it pays every hop beyond it with its own vouchers, as any connector does.
+
+**Allowance**:
+A budget a **zk edge** grants against one proof that a zk note covers it: an amount from a published
+set of tiers, a session key and an expiry. Opened by one proof, paid down by allowance claims, closed
+once, and charged once. Packets within one allowance can be linked to each other; packets across
+allowances cannot.
+_Avoid_: session (overloaded with the BTP session), credit, tab
+
+**Allowance claim**:
+A claim on an **allowance**, signed by its session key. It obeys a voucher's rules — a cumulative
+amount strictly above the watermark, an increase that covers the packet's charge — and never exceeds
+the allowance's budget.
+_Avoid_: session voucher, zk voucher
+
+**Open budget**:
+The sum of the budgets of a **zk edge**'s open allowances: what it may have paid downstream on the
+strength of proofs before any state advance is charged. Bounded by a cap the operator sets; an
+allowance that would exceed it is refused. The one place the risk **exposure** named returns, and
+only at a zk edge.
+_Avoid_: exposure (retired, ADR 0033), credit line, float
+
+**State advance**:
+The zk edge's signature over a zk note's next state once an allowance closes: the note's old balance
+less exactly the allowance's charge. It is what lets the payer spend the remainder.
+_Avoid_: receipt, refund
 
 **Sponsor**:
 A connector's Solana settlement key, in the seats it takes on a client's x402 `batch-settlement`
@@ -435,7 +506,10 @@ peering, held by the peering, denominated in that peering's unit — which at a 
 denomination is the **outgoing** leg's, subtracted after the conversion and not before
 ([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)). What varies
 by destination is the **price**; what a hop earns for crossing a denomination is the **spread**,
-a separate earning.
+a separate earning. A fee is for carrying someone else's packet, so a packet the node's own
+operator originates (`POST /packets`) pays that node no fee, and the node's fee is no part of
+that packet's cost ([ADR 0061](docs/adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md),
+update for #1466).
 _Avoid_: commission; using fee for the dealing margin — that is the **spread**
 
 **Price**:
@@ -462,6 +536,22 @@ the termination itself, all computing it from the same bytes so they cannot disa
 _Avoid_: using **price** for this — a price is what the route charges, a charge is what this
 packet cost.
 
+**Payload limit**:
+The largest sealed payload a route accepts — its `max_bytes`, measured on the same length its
+**price** is charged on ([ADR 0081](docs/adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md)).
+A packet over it is refused `F00` before any claim for it is taken, so it costs its sender nothing,
+and the limit is published wherever the price is. One above 2 MiB raises the node's **request
+limit** to carry it. Not to be confused with the **cap**, which bounds a packet's _amount_ at a peering.
+_Avoid_: ceiling (a retired term, above), size cap
+
+**Request limit**:
+The largest request body a node reads before it can see which route a packet is for — a
+`POST /ilp` body — derived from its routes: 2 MiB, or the largest **payload limit** plus 64 KiB of
+framing ([ADR 0082](docs/adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md)).
+Over it, a body is refused `413`. There is no key for it. A BTP socket reads at a fixed figure
+instead, the largest request limit any node can have, since responses share the socket.
+_Avoid_: max request size
+
 **Cost**:
 What a caller must send for a packet to be delivered: the fees of every hop that carries it, plus
 the **charge** of the route that terminates it. A reject states the cost of the path _that
@@ -474,6 +564,10 @@ charge can depend on payload length (ADR 0065), a probe's figure is exact for a 
 size; what answers every size is
 the terminating node's published **price**, on its greeting and its self-description.
 _Avoid_: total fee, quote
+
+**Reject reason**:
+The name of the situation a client-edge reject answers, carried beside its code where one code covers situations that need different moves from the sender: an `F03` may be an **underpayment**, an **undercollateralized** claim, an amount over the **charge** for forwarding, or a **probe** to a route that terminates here. A closed set. Only the connector that raised a reject attaches one; a relayed reject has none, so an absent reason means "not raised here", never "unknown", and the code and **cost** alone still tell the sender what to do (ADR 0051, issue #1532).
+_Avoid_: error subtype, claim-ack reason (that is the peer carriage's verdict on a claim, not a reject's)
 
 **Rate**:
 The declared terms on which one connector crosses one denomination boundary: a rational over
@@ -555,6 +649,13 @@ _Avoid_: DVM
 A build that makes a configuration a box already runs invalid — a new required key, a renamed
 field, a narrowed type. It may never ride an automatic tag move: either the change is made
 backward-compatible first, or a promotion lands the config before the image.
+
+**Packet history**:
+The recent packets a connector handled, held in memory for its operator to watch; bounded, lossy
+and gone on restart; never a record, and never read by anything that decides a packet's fate. A
+packet is **delivered** when it ended at one of the connector's apps, **forwarded** when it arrived
+from one side and left toward a peer, and **sent** when the operator originated it.
+_Avoid_: packet log, audit log, transaction history
 
 **Promotion**:
 Moving the tag a box follows to one specific build, deliberately. The only moment at which a

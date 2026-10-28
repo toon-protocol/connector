@@ -134,6 +134,24 @@ the operator wrote none. A connector MUST NOT fetch this fact from the app or an
 operator declares it, or it is absent.
 ([ADR 0067](../adr/0067-a-route-declares-its-request-shape-and-the-connector-never-reads-it.md))
 
+**CF-13e** `[operator]` — A route MAY carry `max_bytes`, the largest sealed payload, in bytes, a
+packet to it may carry, on either branch. A connector MUST refuse a packet whose `data` is longer
+with `F00`, at every gate that charges the route's price (CF-13b), and at the client edge MUST do so
+before any claim for that packet is read, so an oversize packet costs its sender nothing. A packet
+exactly `max_bytes` long MUST be priced and delivered as one without a limit is. A connector MUST
+publish the limit as `maxBytes` wherever it publishes the route's price, omitted where the route
+sets none, and MUST refuse at load, by name, a `max_bytes` of `0` or one above 64 MiB.
+([ADR 0081](../adr/0081-a-route-may-refuse-a-payload-over-its-limit-before-it-is-paid.md),
+[ADR 0082](../adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md))
+
+**CF-13f** `[connector]` — A connector MUST read every HTTP body that carries a packet — a
+`POST /ilp` or `POST /ilp/probe` body, and an operator's `POST /packets` — up to one **request
+limit**, and no further: 2 MiB, or the largest `max_bytes` of any configured route, terminating or
+forwarded, plus 64 KiB, whichever is larger. There is no key for it, and a body over it is answered
+`413`. Every BTP socket it accepts or dials MUST read a message, and a frame, up to 64 MiB plus
+64 KiB, the largest request limit any node can have, and a message over that ends the session.
+([ADR 0082](../adr/0082-a-route-may-raise-the-request-limit-to-carry-its-payload-limit.md))
+
 **CF-14** `[connector]` — Two routes naming the same handler MUST agree on its price, comparing whole
 schedules: same base and same slope.
 
@@ -325,7 +343,7 @@ spell it however it likes.
 | ------------------------------------------ | ------------------------------------- | -------- | ---------------------------------------------------- |
 | `client_edge_addr`                         | socket address                        | yes      | where the client edge binds — **not** its public URL |
 | `[signer]`                                 | table                                 | yes      | CF-06, the one identity key                          |
-| `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15                                        |
+| `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
 | `[[peers]]`                                | array of tables                       | —        | CF-16 – CF-20                                        |
 | `[[peer_channels]]`                        | array of tables                       | —        | CF-21, the peer book                                 |
 | `[[pay_channels]]`                         | array of tables                       | —        | CF-21, channels this node pays from                  |
@@ -364,7 +382,13 @@ CF-10, CF-11). Write `price = 0` where free is deliberate. A price is either a w
 `handler_url` (CF-15). `request` (CF-13d) is an optional arbitrary table, published unread wherever
 the route's price is published; unlike every other row in `[[routes]]`, its contents are not
 `deny_unknown_fields` — that guarantee stops at the row, not inside a blob whose keys are the app's
-business.
+business. `max_bytes` (CF-13e) is optional on either branch: a whole number of bytes from `1` to
+64 MiB, measured on the sealed payload a price is charged on, above which a packet is refused `F00`
+before it is paid for; one above 2 MiB raises the node's request limit to carry it (CF-13f). A
+`payment` is an optional boolean, false when absent, valid only with `handler_url` and refused by
+name with a `peer_id`: it marks a payment route, whose peer arrivals must be covered by their claim for
+the packet's whole `amount` ([ADR 0083](../adr/0083-a-payment-route-is-paid-whatever-arrives.md)).
+A `[[children]]` entry carries none of `request`, `max_bytes` or `payment`.
 
 **Peerings.** A peer row carries an `id`, an optional `endpoint` whose scheme selects the carriage, a
 `max_packet_amount` (CF-19's cap — `0` is refused by name, and there is no disabling spelling) and a

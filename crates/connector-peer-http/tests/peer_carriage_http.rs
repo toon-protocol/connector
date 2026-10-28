@@ -1153,6 +1153,7 @@ async fn a_response_carrying_no_ack_header_leaves_the_voucher_not_acknowledged()
                     message: String::new(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }
                 .encode(),
             );
@@ -1191,6 +1192,7 @@ async fn a_malformed_ack_header_leaves_the_voucher_not_acknowledged() {
                     message: String::new(),
                     data: Vec::new(),
                     accumulated_cost: 0,
+                    reason: None,
                 }
                 .encode(),
             );
@@ -1244,6 +1246,104 @@ async fn a_non_200_answer_is_no_ilp_answer_at_all() {
         !reached,
         "no fee of ours belongs on a hop that never forwarded"
     );
+}
+
+/// A client that answers a `402` carrying `header` as `Payment-Required`.
+struct Greets(Option<String>);
+
+#[async_trait]
+impl PeerHttpClient for Greets {
+    async fn post(
+        &self,
+        _endpoint: &Url,
+        _request: PeerRequest,
+    ) -> Result<PeerResponse, HttpDialError> {
+        let mut response = PeerResponse::refused(402);
+        if let Some(value) = &self.0 {
+            response
+                .headers
+                .push(connector_btp::PAYMENT_REQUIRED_HEADER, value.clone());
+        }
+        Ok(response)
+    }
+}
+
+const GREETING_TERMS: &[u8] = br#"{"x402Version":2,"resource":{"url":"g.nowhere"},
+    "extensions":{"toon":{"info":{"amount":"700","ilpAddress":"g.nowhere"}}}}"#;
+
+/// #1481: a `402` carrying readable terms is the far node's client edge
+/// greeting a claimless packet. It is an answer: an `F06` stating the quoted
+/// charge, the terms reported beside it, the peer counted as reached, and no
+/// voucher acknowledged.
+#[tokio::test]
+async fn a_402_with_terms_is_an_answer_quoting_the_charge() {
+    let header = connector_peer_http::headers::payment_required_header_value(GREETING_TERMS);
+    let transport = transport(Arc::new(Greets(Some(header))));
+
+    let forward = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+
+    assert!(forward.reached_peer);
+    assert_eq!(forward.ack, ClaimAckOutcome::NotSent);
+    assert_eq!(forward.payment_required.expect("terms").price(), Some(700));
+    match forward.response {
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            assert_eq!(reject.accumulated_cost, 700);
+            assert!(
+                !reject.message.contains("unreachable"),
+                "{}",
+                reject.message
+            );
+        }
+        other => panic!("expected F06, got {other:?}"),
+    }
+}
+
+/// #1481: a `402` whose terms are missing or unreadable is still no answer.
+#[tokio::test]
+async fn a_402_without_readable_terms_is_still_a_failed_dial() {
+    for header in [
+        None,
+        Some("not base64 !!".to_string()),
+        Some(connector_peer_http::headers::payment_required_header_value(
+            b"{ truncated",
+        )),
+    ] {
+        let transport = transport(Arc::new(Greets(header)));
+        let forward = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+        assert!(!forward.reached_peer);
+        assert!(forward.payment_required.is_none());
+        match forward.response {
+            PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "T01"),
+            other => panic!("expected T01, got {other:?}"),
+        }
+    }
+}
+
+/// #1481: terms riding any other non-`200` status are not read.
+#[tokio::test]
+async fn terms_on_a_5xx_are_not_read() {
+    let header = connector_peer_http::headers::payment_required_header_value(GREETING_TERMS);
+    struct Fault(String);
+    #[async_trait]
+    impl PeerHttpClient for Fault {
+        async fn post(
+            &self,
+            _endpoint: &Url,
+            _request: PeerRequest,
+        ) -> Result<PeerResponse, HttpDialError> {
+            let mut response = PeerResponse::refused(503);
+            response
+                .headers
+                .push(connector_btp::PAYMENT_REQUIRED_HEADER, self.0.clone());
+            Ok(response)
+        }
+    }
+    let forward = transport(Arc::new(Fault(header)))
+        .forward(PEER_ID, prepare("g.nowhere"), None)
+        .await;
+    assert!(!forward.reached_peer);
+    assert!(forward.payment_required.is_none());
 }
 
 // ─── §2.2, §2.4, §6.4(1): what cannot be reached, and why ───
@@ -1654,7 +1754,30 @@ async fn a_voucher_that_does_not_cover_the_routes_price_is_refused_with_the_gree
 
     assert_eq!(ack_on(&response), Some(ClaimAckOutcome::Accepted));
     assert_eq!(reject_code(&response), "F06");
+    assert_eq!(response.headers.get(ACCUMULATED_COST_HEADER), Some("25"));
     assert!(response.headers.get(PAYMENT_REQUIRED_HEADER).is_some());
+    assert!(app_client.deliveries().is_empty());
+}
+
+/// ADR 0081 (issue #1530) at the peer gate: a packet over the route's
+/// `max_bytes` is refused `F00` rather than greeted `F06` -- no voucher could
+/// buy it, so quoting terms for it would only invite a payment that cannot
+/// succeed -- and the app never sees it.
+#[tokio::test]
+async fn a_peer_arrival_over_the_routes_payload_limit_is_refused_f00_not_greeted() {
+    let book = VoucherBook::new();
+    let route = priced_route().with_max_bytes(connector_domain::PayloadLimit::new(16));
+    let app_client = serving_app(&route, b"never");
+    let peer = accepting(payee_with_route(route, Arc::clone(&app_client)), &book);
+    let mut oversize = prepare("g.example.app");
+    oversize.data = vec![0xab; 17];
+
+    let response = peer
+        .handle(request(Some(&peer_voucher(10)), oversize.encode()))
+        .await;
+
+    assert_eq!(reject_code(&response), "F00");
+    assert!(response.headers.get(PAYMENT_REQUIRED_HEADER).is_none());
     assert!(app_client.deliveries().is_empty());
 }
 
@@ -1688,6 +1811,10 @@ async fn a_peer_voucher_must_cover_the_schedule_at_this_packets_length() {
 
     assert_eq!(ack_on(&response), Some(ClaimAckOutcome::Accepted));
     assert_eq!(reject_code(&response), "F06");
+    assert_eq!(
+        response.headers.get(ACCUMULATED_COST_HEADER),
+        Some(expected.to_string().as_str())
+    );
     let terms = parse_greeting(&base64_decode(
         response
             .headers

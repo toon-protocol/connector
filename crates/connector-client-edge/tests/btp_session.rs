@@ -20,7 +20,8 @@ use connector_client_edge::{
 use connector_config::{StaticRoute, TransportPolicy};
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
 use connector_runtime::{
-    AppOutcome, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, TestClock,
+    AppOutcome, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, PeerRoute,
+    TestClock,
 };
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_digest, BatchChannelConfig,
@@ -229,11 +230,14 @@ fn evm_claim_json(amount: u64) -> String {
     .to_string()
 }
 
-/// A settlement backend admitting [`config`]'s channel with unbounded
-/// collateral: the chain these tests do not need, which only ever answers
-/// what a real backend would for that one channel.
+/// A settlement backend admitting [`config`]'s channel with `max_cumulative`
+/// collateral (unbounded unless a test is about the bound): the chain these
+/// tests do not need, which only ever answers what a real backend would for
+/// that one channel.
 #[derive(Debug)]
-struct OneChannel;
+struct OneChannel {
+    max_cumulative: u128,
+}
 
 #[async_trait]
 impl BatchSettlementChannels for OneChannel {
@@ -254,7 +258,7 @@ impl BatchSettlementChannels for OneChannel {
             (*channel_id == evm_batch_channel_id(&domain(), &config())).then_some(
                 AdmittedEvmVoucherChannel {
                     config: config(),
-                    max_cumulative: u128::MAX,
+                    max_cumulative: self.max_cumulative,
                 },
             ),
         )
@@ -268,11 +272,15 @@ impl BatchSettlementChannels for OneChannel {
     }
 }
 
-/// A gate over `journal` admitting vouchers on [`config`]'s channel.
-fn voucher_gate(journal: Arc<dyn connector_runtime::Journal>) -> ClientClaimGate {
+/// A gate over `journal` admitting vouchers on [`config`]'s channel, which
+/// holds `max_cumulative` of collateral.
+fn voucher_gate(
+    journal: Arc<dyn connector_runtime::Journal>,
+    max_cumulative: u128,
+) -> ClientClaimGate {
     ClientClaimGate::restore(journal)
         .expect("the journal replays")
-        .with_batch_settlement(Arc::new(OneChannel))
+        .with_batch_settlement(Arc::new(OneChannel { max_cumulative }))
 }
 
 fn test_clock() -> Arc<TestClock> {
@@ -338,18 +346,29 @@ async fn serve_edge_with_route(
             },
         },
     );
-    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("btp-session-test"));
-    let connector = Arc::new(
+    serve_connector(
         Connector::new(
             vec![route],
             vec![],
             app_client,
             Arc::new(InProcessPeerTransport::new()),
             test_clock(),
-        )
-        .with_identity_signer(signer.clone()),
-    );
-    let gate = voucher_gate(Arc::new(InMemoryJournal::new()));
+        ),
+        u128::MAX,
+    )
+    .await
+}
+
+/// Serve `connector` behind an edge whose one voucher channel holds
+/// `max_cumulative` of collateral; returns the address and the signer whose
+/// key prepares must seal to.
+async fn serve_connector(
+    connector: Connector,
+    max_cumulative: u128,
+) -> (SocketAddr, Arc<dyn Signer>) {
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("btp-session-test"));
+    let connector = Arc::new(connector.with_identity_signer(signer.clone()));
+    let gate = voucher_gate(Arc::new(InMemoryJournal::new()), max_cumulative);
     let app = connector_client_edge::router_with_gate(connector, signer.clone(), None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();
@@ -471,7 +490,12 @@ async fn a_claimless_prepare_to_a_priced_route_is_refused_with_the_terms() {
     let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F06");
     assert_eq!(reject.message, "No payment channel claim attached");
-    assert_eq!(pd(&answer, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    // The greeting states the charge its terms quote (#1481).
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
+    assert_eq!(pd(&answer, "toon-reject-reason"), None);
     let terms: serde_json::Value =
         serde_json::from_slice(pd(&answer, "payment-required").expect("the terms ride along"))
             .expect("the terms are the §1.4 JSON");
@@ -692,6 +716,117 @@ async fn a_replayed_claim_is_refused_with_the_http_taxonomy() {
     let reject = Reject::decode(&second.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F01");
     assert_eq!(pd(&second, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    // An `F01` is not one of the `F03` situations: no reason (#1532).
+    assert_eq!(pd(&second, "toon-reject-reason"), None);
+}
+
+/// Issue #1532, BTP-shaped: an underpaying voucher is `F03` with the charge
+/// as its cost and the reason `underpayment`, as it is over HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_underpaying_voucher_carries_the_underpayment_reason_over_btp() {
+    let (addr, signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let claim = evm_claim_json(PRICE - 1);
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &signer.public_key().unwrap()).encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F03");
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
+    assert_eq!(
+        pd(&answer, "toon-reject-reason"),
+        Some(b"underpayment".as_slice())
+    );
+}
+
+/// Issue #1532, BTP-shaped: a voucher above what the channel can pay is
+/// `F03` with cost `0` and the reason `undercollateralized` -- top up and
+/// resend the same voucher, not pay a stated amount.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_deposit_voucher_carries_the_undercollateralized_reason_over_btp() {
+    let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE).unwrap();
+    let (addr, signer) = serve_connector(
+        Connector::new(
+            vec![route],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ),
+        u128::from(PRICE - 1),
+    )
+    .await;
+    let mut session = connect(addr).await;
+    let claim = evm_claim_json(PRICE);
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &signer.public_key().unwrap()).encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F03");
+    assert_eq!(pd(&answer, "toon-accumulated-cost"), Some(b"0".as_slice()));
+    assert_eq!(
+        pd(&answer, "toon-reject-reason"),
+        Some(b"undercollateralized".as_slice())
+    );
+}
+
+/// Issue #1532, BTP-shaped: a PREPARE to a priced forwarded destination
+/// declaring an `amount` above the forwarding charge is `F03` with the
+/// charge as its cost and the reason `amount_over_charge`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_amount_over_the_forwarding_charge_carries_its_reason_over_btp() {
+    let (addr, signer) = serve_connector(
+        Connector::new(
+            vec![],
+            vec![PeerRoute::new_priced("g.test.far", "second-hop", PRICE)],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ),
+        u128::MAX,
+    )
+    .await;
+    let mut session = connect(addr).await;
+    let claim = evm_claim_json(PRICE);
+    let mut prepare = sealed_prepare("g.test.far", &signer.public_key().unwrap());
+    prepare.amount = PRICE + 1;
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &prepare.encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    let reject = Reject::decode(&answer.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F03");
+    assert_eq!(
+        pd(&answer, "toon-accumulated-cost"),
+        Some(PRICE.to_string().as_bytes())
+    );
+    assert_eq!(
+        pd(&answer, "toon-reject-reason"),
+        Some(b"amount_over_charge".as_slice())
+    );
 }
 
 /// Issue #869, BTP-shaped: a packet refused for its envelope's own target
@@ -735,6 +870,168 @@ async fn a_claim_covering_a_packet_refused_for_envelope_shape_is_never_spent_ove
     .await;
     let second = next_answer(&mut session).await;
     Fulfill::decode(&second.ilp_packet).expect("the unspent claim is still accepted");
+}
+
+/// ADR 0081 (issue #1530), BTP-shaped: a packet over its route's
+/// `max_bytes` is refused `F00` before its claim is ingested, on this
+/// carriage exactly as on HTTP. The identical claim then pays for a packet
+/// within the limit, which it could not had the refusal advanced the
+/// watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_covering_a_packet_over_the_payload_limit_is_never_spent_over_btp() {
+    const LIMIT: usize = 8192;
+    let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE)
+        .unwrap()
+        .with_max_bytes(connector_domain::PayloadLimit::new(LIMIT as u64));
+    let (addr, signer) = serve_edge_with_route(route, Arc::new(FakeAppClient::new())).await;
+    let mut session = connect(addr).await;
+    let receiver = signer.public_key().unwrap();
+    let claim = evm_claim_json(PRICE);
+
+    let fits = sealed_prepare("g.test.app", &receiver);
+    assert!(fits.data.len() <= LIMIT, "the in-limit packet must fit");
+    let mut over = fits.clone();
+    over.data.resize(LIMIT + 1, 0);
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &over.encode(),
+        ),
+    )
+    .await;
+    let first = next_answer(&mut session).await;
+    let reject = Reject::decode(&first.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F00");
+    assert!(
+        reject.message.contains("at most 8192 payload bytes"),
+        "the refusal names the limit, got: {}",
+        reject.message
+    );
+    assert!(
+        pd(&first, "payment-required").is_none(),
+        "an oversize packet is not greeted"
+    );
+
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &fits.encode(),
+        ),
+    )
+    .await;
+    let second = next_answer(&mut session).await;
+    Fulfill::decode(&second.ilp_packet).expect("the unspent claim still pays");
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// ADR 0082 (issue #1529), BTP-shaped: a route whose `max_bytes` is above
+/// 2 MiB is carried over BTP too, past tungstenite's own 16 MiB frame
+/// default, which a session no longer reads at.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_above_2_mib_takes_a_message_larger_than_the_library_default_over_btp() {
+    let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE)
+        .unwrap()
+        .with_max_bytes(connector_domain::PayloadLimit::new(20 * MIB as u64));
+    let app_client = Arc::new(FakeAppClient::new());
+    let (addr, signer) = serve_edge_with_route(route, app_client.clone()).await;
+    let mut session = connect(addr).await;
+
+    let body = vec![b'x'; 17 * MIB];
+    let envelope = EnvelopeRequest {
+        method: "POST".to_string(),
+        target: "/".to_string(),
+        headers: vec![],
+        body: body.clone(),
+    }
+    .encode();
+    let (data, _) =
+        connector_signer::giftwrap::seal_request(&envelope, &signer.public_key().unwrap())
+            .expect("seal");
+    let prepare = Prepare {
+        data,
+        ..sealed_prepare("g.test.app", &signer.public_key().unwrap())
+    };
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", evm_claim_json(PRICE).as_bytes())],
+            &prepare.encode(),
+        ),
+    )
+    .await;
+    let answer = next_answer(&mut session).await;
+    Fulfill::decode(&answer.ilp_packet).expect("a 17 MiB packet fulfils");
+    let deliveries = app_client.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].request.body, body, "the app gets every byte");
+}
+
+/// ADR 0082: a BTP socket reads at `BTP_MESSAGE_LIMIT`, a figure the node
+/// chose, and a message past it ends the session rather than being read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_past_the_btp_message_limit_ends_the_session() {
+    let (addr, _signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let oversize = btp_message(1, &[], &vec![0u8; connector_domain::BTP_MESSAGE_LIMIT]);
+    // The far side may close before the whole frame is written; whether the
+    // send itself errors is a race, so only the outcome is asserted.
+    let _ = session.send(WsMessage::Binary(oversize)).await;
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match session.next().await {
+                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "an oversize message must end the session");
+}
+
+/// Issue #1446, BTP-shaped: a voucher presented with a packet to a
+/// destination nothing will carry is rejected `F02` without being ingested,
+/// on this carriage exactly as on HTTP (§9's no-drift invariant). The
+/// identical voucher then pays for a packet to the served route, which it
+/// could not if the `F02` had advanced the watermark.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voucher_covering_a_packet_to_an_unrouted_destination_is_never_spent_over_btp() {
+    let (addr, signer) = serve_edge().await;
+    let mut session = connect(addr).await;
+    let receiver = signer.public_key().unwrap();
+    let claim = evm_claim_json(PRICE);
+
+    send(
+        &mut session,
+        btp_message(
+            1,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.nowhere.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let first = next_answer(&mut session).await;
+    let reject = Reject::decode(&first.ilp_packet).expect("an OER REJECT");
+    assert_eq!(reject.code.as_str(), "F02");
+
+    send(
+        &mut session,
+        btp_message(
+            2,
+            &[("payment-channel-claim", claim.as_bytes())],
+            &sealed_prepare("g.test.app", &receiver).encode(),
+        ),
+    )
+    .await;
+    let second = next_answer(&mut session).await;
+    Fulfill::decode(&second.ilp_packet).expect("the unspent voucher still pays");
 }
 
 /// §1.9 step 4: a standalone claim is ingested fire-and-forget -- no
@@ -1128,7 +1425,7 @@ async fn serve_slow_edge(
         )
         .with_identity_signer(signer.clone()),
     );
-    let gate = voucher_gate(journal);
+    let gate = voucher_gate(journal, u128::MAX);
     let app = connector_client_edge::router_with_gate(connector, signer.clone(), None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
     let addr = server.local_addr();

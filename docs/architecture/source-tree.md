@@ -84,9 +84,17 @@ connector-chain-rpc              the HTTP transport every settlement table's RPC
                                   the optional pinned circuit through `socks_proxy`. Holds
                                   no key and knows no channel
 
+connector-proxied-client         the one cached `reqwest` client through `socks_proxy`
+                                  (ADR 0070): rebuilt, re-resolving the proxy's host, when
+                                  the proxy cannot be reached. The only place a SOCKS
+                                  `reqwest::Proxy` is built for a long-lived client
+
 connector-settlement             the chain-agnostic settlement port + its contract suite
   ├─ port.rs, contract.rs        the port, and the one suite every backend is run against
   ├─ in_memory.rs                the fake — the first implementation to pass that suite
+  ├─ watch_interval.rs           how often both chains' batch watchers pass: the node's
+                                  published minimum delay over 90, clamped to
+                                  10 s..=15 min (#1531)
   └─ batch/                      a second port for x402 batch-settlement channels, in
                                   two halves (ADR 0074 decision 9, ADR 0075 decision 2).
                                   Receiving: admit, read collateral and lifecycle, land a
@@ -197,6 +205,12 @@ connector-cli                    config → runtime → merged routers → bound
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
+connector-zk-note                zk-note primitives (ADR 0080): kimchi Poseidon, the domain
+                                  tags and generator seeds (wire law), hashToGroup, the
+                                  balance commitment, the state message and its Mina Schnorr
+                                  signature — byte-identical to o1js, pinned by
+                                  fixtures/parity.json. Pure: no I/O, no clock, no connector
+                                  crate. Nothing calls it yet
 ```
 
 ### Test layout
@@ -243,14 +257,16 @@ settlement path since [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-
 outright in #1386. The contracts and program stay on chain; their deployment records moved to
 [`docs/deployments/`](../deployments/).
 
-**Mina is not in this repository at all.**
+**Mina is not a settlement chain here, and nothing here proves.**
 [ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md) dropped it as a settlement chain —
 the zkApp's methods need proof generation through o1js, which exists only in JavaScript, and a
 Node sidecar beside the binary was refused — and
 [ADR 0065](../adr/0065-mina-leaves-the-repository.md) then deleted the zkApp, the browser faucet
-dApp and the Mina tooling that record had left standing. The Cargo workspace has no Mina crate
-and the npm workspaces have no Mina package. What remains is the connector refusing a `mina`
-claim by name, which is wire behaviour, not Mina support.
+dApp and the Mina tooling that record had left standing. The npm workspaces have no Mina
+package. What remains of the old Mina support is the connector refusing a `mina` claim by name,
+which is wire behaviour. The one Mina-derived crate, `connector-zk-note`, is
+[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s verifier-side primitives over o1-labs
+`proof-systems` — no o1js, no proving, no settlement — and leaves both records standing.
 
 ### `tools/`
 
@@ -339,6 +355,7 @@ there".
 
 | Directory       | What it is                                                                                                                                                                                                                                                                                                 |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `guide/`        | The operator's guide, moved out of the README: run a node, put an app behind it, get paid, peer, the local peering lab, the operator surface, operating it.                                                                                                                                                |
 | `adr/`          | The numbered decisions, and the tiebreaker for everything else in this repository. `README.md` is the index — grouped by scope, with each record's own `**Status:**` line as the authority for whether it is live. Numbers are permanent and never reused.                                                 |
 | `protocol/`     | The wire specs the ADRs are implemented against: `client-edge-spec.md`, `peer-carriage-spec.md`, `operator-spec.md`, `configuration-spec.md`, `packet-flow-spec.md`, `payment-spec.md`, `self-description-spec.md`, `wire-vectors.md`.                                                                     |
 | `rfcs/`         | The Interledger RFCs this connector implements — see below.                                                                                                                                                                                                                                                |

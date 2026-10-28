@@ -92,6 +92,9 @@ rpc_url = "{rpc_url}"
 token_address = "{mint}"
 decimals = 6
 min_sponsored_deposit = 1
+# The shortest grace period x402 admits, so the watch runs at its fastest:
+# the default day would watch every fifteen minutes.
+min_grace_period_secs = 900
 
 [settlement.solana.key]
 key_file = "{settlement_key}"

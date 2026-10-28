@@ -9,7 +9,7 @@ channel lives in x402's audited `x402BatchSettlement` contract; on Solana in sol
 
 This page is for an operator with a priced route. It covers what a paying client does end to end,
 what your node does in return, every config key involved, who pays gas and why, and which tokens
-work. The README's [step 3](../../README.md#3-get-paid) is the short version.
+work. The guide's [step 3](../guide/get-paid.md) is the short version.
 
 The wire rules are [`client-edge-spec.md`](../protocol/client-edge-spec.md) §1.3, §1.4, §1.9, §1.10
 and §1.11. The keys are [`configuration-spec.md`](../protocol/configuration-spec.md). The exact
@@ -193,7 +193,7 @@ A channel's first accepted voucher journals the channel itself (`BatchChannelAdm
 
 `POST /channels/:id/land` lands an inbound channel's latest voucher now. It is the manual lever for
 planned maintenance. `GET /channels` and `GET /claims` show each channel with its direction,
-collateral and watermark. See the README's [operator surface](../../README.md#the-operator-surface).
+collateral and watermark. See the guide to the [operator surface](../guide/operator-surface.md).
 
 The one-day default minimum for `withdrawDelay` and `grace_period` is the window a delayed or
 censored landing transaction still has. Lowering it toward the 900-second floor narrows that
@@ -285,6 +285,38 @@ open into an account that would forfeit your payout (`receiving_account_unusable
 code at its fixed address (EVM), or that `payment-channels` is deployed and the mint is an SPL
 Token mint (Solana). It refuses a chain it is missing from, by name. A Solana key with no lamports
 is refused too. Fund both keys before the first boot.
+
+### When the settlement RPC is unreachable
+
+The two moments differ, on purpose:
+
+| When                       | What the node does                                                                                                                                                                                                                                                                                          | How you see it                                                                                                                                                                                                       |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **At boot**                | Retries each read three times (about 3.5 s), then refuses to start and exits non-zero; it does not restart itself. This holds if _any_ `[settlement.<chain>]` table cannot bind: a node with both tables and one unreachable chain does not start on the other.                                             | `[settlement.<chain>] could not be bound: … A node must reach the x402 contract or program its vouchers are signed for (ADR 0074, ADR 0075)`                                                                         |
+| **At runtime, node is up** | Stays up, with no grace period. Every voucher on the unreachable chain is refused, because a channel is read from the chain for every voucher and never answered from a cache. Nothing is latched: once the RPC answers, the next voucher on a channel the node already holds is accepted, with no restart. | The client gets a `T00` reject: "this connector could not look up the channel's counterparty". The node logs a `warn`: `refusing a voucher: could not resolve its batch-settlement channel`, with the lookup's error |
+
+Why they differ: configuration is validated once at boot (ADR 0009), and a node must reach the
+contract or program its vouchers are signed for (ADR 0074, ADR 0075), so a table it cannot bind is
+a misconfigured node, not a degraded one. Once serving, a voucher is never accepted on channel
+state the node could not read, so the only safe answer to an unreadable chain is to refuse.
+
+A chain that _answers_ but has no x402 contract or program is a different refusal, by name:
+`[settlement.<chain>] names a chain on which … is not deployed`. That one does not clear by waiting.
+
+With two tables at runtime, only vouchers for the chain whose RPC is down are refused; each
+chain's vouchers are resolved through that chain's own backend. A request that carries no voucher
+because its route is free (`price = 0`) never reads a channel, so it is not affected. A peer's
+voucher is not refused but left unacknowledged, so it stays pending and its resend is judged
+afresh. A failed lookup of a channel the node has not seen yet also spends the unresolvable-lookup
+budget, so first vouchers on new channels can get `T05` instead of `T00`, during the outage and for
+the rest of that budget's window after it.
+
+The boot refusal clears itself once the chain answers, so **run the node under a supervisor with a
+restart policy** (Docker `restart: unless-stopped`, systemd `Restart=on-failure`). It then
+loops until the RPC is reachable and serves from the first boot that binds.
+
+The old `channel_liveness_ttl_secs` and `channel_serve_stale_secs` keys are gone and refused by name
+at boot; there is no window to tune.
 
 ## Who pays gas, and why
 
@@ -380,17 +412,17 @@ curl -s -H "Authorization: Bearer $TOKEN" https://your-node.example/claims | jq
 Each paying channel shows `"scheme": "batch-settlement"` and a `cumulative_amount` that rises with
 every packet. Watch that watermark, not the count of claims. `nonce` is always `0`.
 
-| Symptom                                                            | Likely cause                                                                                                               |
-| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| Every client's EVM deposit fails at the facilitator or on chain    | Wrong `asset_eip712_name`/`asset_eip712_version`, or `"eip3009"` on a token without ERC-3009                               |
-| Permit2 payers are told they need ETH for an approval              | Your facilitator does not sponsor approvals for this token: allowlist it, or accept that such payers need ETH              |
-| First voucher refused: "does not admit"                            | The client's `ChannelConfig` names a zero `payerAuthorizer`, a short `withdrawDelay`, another token, or another receiver   |
-| Refused as "does not strictly exceed this channel's watermark"     | The client lost its store: it should ask `POST /ilp/claim-state`                                                           |
-| Refused as "more than the … this channel can pay"                  | The voucher is above what the channel holds, or a withdrawal lowered it: the client tops up and resubmits the same voucher |
-| Solana open: `receiving_account_unusable`                          | Your own token account for the mint does not exist (or is frozen): create it                                               |
-| Solana open: `deposit_below_minimum`, `grace_period_below_minimum` | The client ignored `extra.minDeposit` or `extra.withdrawDelay`                                                             |
-| Solana open: `sponsor_paused`                                      | Eight sponsored opens failed on chain in the last hour: look for a client sabotaging its own opens                         |
-| Refused as "could not look up the channel's counterparty"          | Your settlement RPC is not answering, not the client's fault                                                               |
+| Symptom                                                            | Likely cause                                                                                                                 |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Every client's EVM deposit fails at the facilitator or on chain    | Wrong `asset_eip712_name`/`asset_eip712_version`, or `"eip3009"` on a token without ERC-3009                                 |
+| Permit2 payers are told they need ETH for an approval              | Your facilitator does not sponsor approvals for this token: allowlist it, or accept that such payers need ETH                |
+| First voucher refused: "does not admit"                            | The client's `ChannelConfig` names a zero `payerAuthorizer`, a short `withdrawDelay`, another token, or another receiver     |
+| Refused as "does not strictly exceed this channel's watermark"     | The client lost its store: it should ask `POST /ilp/claim-state`                                                             |
+| Refused as "more than the … this channel can pay"                  | The voucher is above what the channel holds, or a withdrawal lowered it: the client tops up and resubmits the same voucher   |
+| Solana open: `receiving_account_unusable`                          | Your own token account for the mint does not exist (or is frozen): create it                                                 |
+| Solana open: `deposit_below_minimum`, `grace_period_below_minimum` | The client ignored `extra.minDeposit` or `extra.withdrawDelay`                                                               |
+| Solana open: `sponsor_paused`                                      | Eight sponsored opens failed on chain in the last hour: look for a client sabotaging its own opens                           |
+| Refused as "could not look up the channel's counterparty"          | Your settlement RPC is not answering, not the client's fault ([what the node does](#when-the-settlement-rpc-is-unreachable)) |
 
 ## Trust
 

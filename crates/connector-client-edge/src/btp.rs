@@ -46,10 +46,11 @@ use connector_btp::{
     decode_frame, encode_error, encode_response, reply, BtpDecodeError, BtpSessionHandle,
     OutboundRequests, ProtocolData, SessionGone, ACCUMULATED_COST_PROTOCOL, AUTH_PROTOCOL,
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
-    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL,
+    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
 };
 use connector_domain::client_claim::ClientClaim;
-use connector_domain::{PacketResponse, Prepare, Price, Reject, RejectCode};
+use connector_domain::BTP_MESSAGE_LIMIT;
+use connector_domain::{refuse_oversize, PacketResponse, Prepare, Price, Reject, RejectCode};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
 use connector_settlement::batch::ChannelPresentation;
@@ -68,7 +69,13 @@ pub(crate) async fn handle_btp_upgrade(
     State(state): State<Arc<ClientEdgeState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // ADR 0082: one message, and one frame, may be as large as the largest
+    // request any node can take -- a figure chosen here, never tungstenite's
+    // defaults. A frame gets the whole figure because a BTP client sends
+    // each message as one frame.
     ws.protocols(["btp"])
+        .max_message_size(BTP_MESSAGE_LIMIT)
+        .max_frame_size(BTP_MESSAGE_LIMIT)
         .on_upgrade(move |socket| btp_session(socket, state))
 }
 
@@ -460,6 +467,13 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
         content_type: CONTENT_TYPE_TEXT,
         data: reject.accumulated_cost.to_string().into_bytes(),
     }];
+    if let Some(reason) = reject.reason {
+        protocol_data.push(ProtocolData {
+            name: REJECT_REASON_PROTOCOL.to_string(),
+            content_type: CONTENT_TYPE_TEXT,
+            data: reason.as_str().as_bytes().to_vec(),
+        });
+    }
     protocol_data.extend(extra);
     encode_response(request_id, &protocol_data, &reject.encode())
 }
@@ -733,12 +747,10 @@ async fn handle_frame(
         .as_ref()
         .map_or(Price::FREE, |route| route.price);
     let charge = schedule.charge(prepare.data.len());
-    // Issue #1210: see `handle_ilp`'s mirror of this on the HTTP carriage --
-    // what a client should send to use this route, read off the same lookup
-    // its price and transport policy come from.
-    let request = client_route
-        .as_ref()
-        .and_then(|route| route.request.as_ref());
+    // Issue #1210 and ADR 0081: see `handle_ilp`'s mirror of this on the
+    // HTTP carriage -- the greeting reads the route's `request` and
+    // `max_bytes` off `client_route` itself, the lookup its price and
+    // transport policy come from.
     // Issue #807 / #1269: see `handle_ilp`'s mirror of this on the HTTP
     // carriage -- a PREPARE that declares `greeting` is structurally a
     // bootstrap probe, never a real payment attempt, regardless of
@@ -762,7 +774,7 @@ async fn handle_frame(
                 prepare.data.len(),
                 &state.node,
                 Some(policy.name()),
-                request,
+                client_route.as_ref(),
             );
             let reject = Reject {
                 code: RejectCode::f02_unreachable(),
@@ -774,6 +786,7 @@ async fn handle_frame(
                 ),
                 data: Vec::new(),
                 accumulated_cost: 0,
+                reason: None,
             };
             return reply(
                 replies,
@@ -791,6 +804,19 @@ async fn handle_frame(
         }
     }
 
+    // ADR 0081: see `handle_ilp`'s mirror of this on the HTTP carriage -- a
+    // packet over the route's `max_bytes` is refused before it is greeted or
+    // its claim is ingested, so it never spends the client's watermark.
+    if let Some(reject) = client_route.as_ref().and_then(|route| {
+        refuse_oversize(route.max_bytes, &prepare.destination, prepare.data.len())
+    }) {
+        return reply(
+            replies,
+            reject_response(frame.request_id, reject, Vec::new()),
+        )
+        .await;
+    }
+
     // The §1.4 greeting, BTP-shaped (§1.9 step 3): BTP cannot answer HTTP
     // 402, so the same terms JSON rides as protocolData on an F06 REJECT.
     // A claimless PREPARE to an unpriced route falls through unchanged,
@@ -803,14 +829,17 @@ async fn handle_frame(
             prepare.data.len(),
             &state.node,
             None,
-            request,
+            client_route.as_ref(),
         );
         let reject = Reject {
             code: RejectCode::f06_unexpected_payment(),
             triggered_by: String::new(),
             message: "No payment channel claim attached".to_string(),
             data: Vec::new(),
-            accumulated_cost: 0,
+            // The charge the terms above quote for this packet (0 for a
+            // `greeting` declared on an unpriced destination).
+            accumulated_cost: charge,
+            reason: None,
         };
         return reply(
             replies,
@@ -857,7 +886,7 @@ async fn handle_frame(
     // still routes `prepare` unchanged and raises the identical F00
     // itself.
     let admitted = match claim_json {
-        Some(json) if !state.connector.envelope_target_would_be_refused(&prepare) => {
+        Some(json) if !crate::claim_must_not_be_admitted(state, &prepare) => {
             match state.claim_gate.admit(&json, charge).await {
                 Ok(accepted) => Some(accepted),
                 Err(rejection) => {
@@ -1081,7 +1110,19 @@ mod tests {
         let gate = test_support::voucher_gate().with_payout_ledger(
             ledger_paying(test_support::address_of(&test_support::authorizer())).await,
         );
-        let state = Arc::new(test_state(gate));
+        let mut state = test_state(gate);
+        // A destination something serves: a claim to one nothing serves is
+        // never looked at (issue #1446), so would never be refused by name.
+        state.connector = Arc::new(connector_runtime::Connector::new(
+            vec![connector_config::StaticRoute::new("g.nowhere", "http://localhost:4000").unwrap()],
+            vec![],
+            Arc::new(connector_runtime::FakeAppClient::new()),
+            Arc::new(connector_runtime::InProcessPeerTransport::new()),
+            Arc::new(connector_runtime::TestClock::new(
+                chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2030, 1, 1, 0, 0, 0).unwrap(),
+            )),
+        ));
+        let state = Arc::new(state);
         let prepare = Prepare {
             amount: 0,
             expires_at: chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2031, 1, 1, 0, 0, 0)

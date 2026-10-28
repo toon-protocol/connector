@@ -55,7 +55,9 @@ use connector_btp::{
 };
 use connector_config::StaticRoute;
 use connector_domain::client_claim::{ClientClaim, EvmVoucherChannelConfig};
-use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
+use connector_domain::{
+    EnvelopeRequest, EnvelopeResponse, Fulfill, PacketResponse, Prepare, Price,
+};
 use connector_peer_btp::accept::{PeerAcceptPolicy, PeerSession, SessionEnd};
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::dial::{DialError, PeerDialer, PeerRelation};
@@ -1144,6 +1146,140 @@ async fn a_packet_after_the_far_side_restarts_is_redialled_rather_than_refused()
     );
 }
 
+// ─── issue #1454: a session that closes after the frame was written ───
+
+/// A payee whose first session reads a frame and then closes without
+/// answering it, and whose later sessions fulfil everything. Every frame
+/// any session read is counted, so a test can say how many copies of one
+/// PREPARE the peer received across all of them.
+struct ClosesAfterReading {
+    received: Arc<AtomicUsize>,
+    dials: AtomicUsize,
+}
+
+#[async_trait]
+impl PeerDialer for ClosesAfterReading {
+    async fn dial(&self, _peer_id: &str, _endpoint: &Url) -> Result<BtpSessionHandle, DialError> {
+        let first = self.dials.fetch_add(1, Ordering::SeqCst) == 0;
+        let (to_peer, mut to_peer_rx) = mpsc::channel::<Vec<u8>>(32);
+        let outbound = Arc::new(OutboundRequests::new());
+        let handle = BtpSessionHandle::new(to_peer, Arc::clone(&outbound));
+        let received = Arc::clone(&self.received);
+        tokio::spawn(async move {
+            while let Some(bytes) = to_peer_rx.recv().await {
+                received.fetch_add(1, Ordering::SeqCst);
+                let frame = decode_frame(&bytes).expect("our own encoder");
+                if first {
+                    // The read loop ends: what `ws` does on a closed socket.
+                    drop(to_peer_rx);
+                    outbound.close();
+                    return;
+                }
+                let fulfill = Fulfill {
+                    fulfillment: [7; 32],
+                    data: Vec::new(),
+                };
+                let answer = encode_response(frame.request_id, &[], &fulfill.encode());
+                let _ = outbound.resolve(decode_frame(&answer).expect("our own encoder"));
+            }
+        });
+        Ok(handle)
+    }
+}
+
+/// **Issue #1454.** A frame written into a session that then closes is
+/// rejected `T01` at the close, not at the answer timeout, and is **not**
+/// resent (§2.6): the peer may have acted on it. The next packet is carried
+/// on a fresh session.
+#[tokio::test]
+async fn a_frame_written_into_a_session_that_closes_is_rejected_t01_and_not_resent() {
+    let received = Arc::new(AtomicUsize::new(0));
+    let dialer = Arc::new(ClosesAfterReading {
+        received: Arc::clone(&received),
+        dials: AtomicUsize::new(0),
+    });
+    let transport = transport(Arc::clone(&dialer) as Arc<dyn PeerDialer>);
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport.forward(PEER_ID, prepare("g.nowhere"), None),
+    )
+    .await
+    .expect("answered at the close, not at the answer timeout");
+    match first.response {
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "T01");
+            assert!(reject.message.contains(PEER_ID), "{reject:?}");
+            assert!(
+                reject.message.contains("wss://peer.example/btp"),
+                "§2.2: the T01 names the endpoint too: {reject:?}"
+            );
+        }
+        other => panic!("expected T01, got {other:?}"),
+    }
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        1,
+        "the PREPARE reached the peer once, across every session"
+    );
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "no second attempt");
+
+    let second = transport.forward(PEER_ID, prepare("g.nowhere"), None).await;
+    assert!(
+        matches!(second.response, PacketResponse::Fulfill(_)),
+        "the next packet was fulfilled: {:?}",
+        second.response
+    );
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        2,
+        "the first PREPARE was not resent on the fresh session"
+    );
+    assert_eq!(dialer.dials.load(Ordering::SeqCst), 2, "on a fresh session");
+}
+
+/// Issue #1454, the symmetric dialed session (the ask-only one is covered in
+/// `a_dialed_session_dies_with_its_socket`): over a real socket whose far end
+/// reads the frame and closes, the waiting send is answered at the close.
+#[tokio::test]
+async fn a_symmetric_session_answers_a_waiting_send_when_its_socket_closes() {
+    use futures_util::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a free port");
+    let endpoint = Url::parse(&format!(
+        "ws://{}/ilp/btp",
+        listener.local_addr().expect("bound")
+    ))
+    .expect("a well-formed endpoint");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("the dial arrives");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("the websocket handshake completes");
+        let _ = socket.next().await;
+        drop(socket);
+    });
+
+    let book = ChannelBook::new();
+    let handle = connector_peer_btp::TungsteniteDialer::serving(carriage(payee(), &book))
+        .dial(PEER_ID, &endpoint)
+        .await
+        .expect("the peer is listening");
+
+    let sent = tokio::time::timeout(
+        Duration::from_secs(2),
+        handle.send_message(&[], b"not a packet"),
+    )
+    .await
+    .expect("the close answers the waiting send");
+    assert_eq!(
+        sent.err(),
+        Some(connector_btp::OriginateError::ClosedBeforeAnswer)
+    );
+}
+
 // ─── §2.2: a peer that cannot be dialed ───
 
 /// §2.2: whether the remote exposes what we dial is not locally
@@ -1171,7 +1307,11 @@ async fn a_peer_that_cannot_be_dialed_rejects_t01_and_was_never_reached() {
     match response {
         PacketResponse::Reject(reject) => {
             assert_eq!(reject.code.as_str(), "T01");
-            assert!(reject.message.contains(PEER_ID));
+            assert!(reject.message.contains(PEER_ID), "{reject:?}");
+            assert!(
+                reject.message.contains("wss://peer.example/btp"),
+                "§2.2: the T01 names the endpoint too: {reject:?}"
+            );
         }
         other => panic!("expected T01, got {other:?}"),
     }
@@ -1597,11 +1737,50 @@ async fn a_voucher_that_does_not_cover_the_routes_price_is_refused() {
 
     assert_eq!(ack, ClaimAckOutcome::Accepted);
     match response {
-        PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            // The terminating hop states its charge, so upstream fees add to it.
+            assert_eq!(reject.accumulated_cost, 25);
+        }
         other => panic!("expected an F06 reject, got {other:?}"),
     }
     assert!(payment_required.is_some());
     assert!(app_client.deliveries().is_empty());
+}
+
+/// On a route that prices by size, the refusal carries the schedule at the
+/// refused packet's own payload length: two lengths, two figures.
+#[tokio::test]
+async fn a_refusal_at_a_size_priced_route_carries_the_charge_for_its_length() {
+    let book = ChannelBook::new();
+    let route = StaticRoute::new_scheduled(
+        "g.example.app",
+        "http://localhost:4000",
+        Price::scheduled(25, 10),
+    )
+    .unwrap();
+    let app_client = serving_app(&route, b"free service");
+    let connector = bound(node(vec![route], Arc::clone(&app_client)));
+    let (_, transport) = dialing(carriage(connector, &book));
+
+    let mut costs = Vec::new();
+    for len in [10usize, 3000] {
+        let (mut sealed, _) = sealed_prepare(25);
+        sealed.data = vec![0xab; len];
+        let expected = Price::scheduled(25, 10).charge(sealed.data.len());
+        let PeerForward { response, .. } = transport
+            .forward(PEER_ID, sealed, paid_with(payer_voucher(1)))
+            .await;
+        match response {
+            PacketResponse::Reject(reject) => {
+                assert_eq!(reject.code.as_str(), "F06");
+                assert_eq!(reject.accumulated_cost, expected);
+                costs.push(reject.accumulated_cost);
+            }
+            other => panic!("expected an F06 reject, got {other:?}"),
+        }
+    }
+    assert_ne!(costs[0], costs[1]);
 }
 
 /// The boundary this gate exists to leave open: a voucher whose advance
@@ -1913,7 +2092,12 @@ async fn a_forwarded_arrival_that_undercovers_is_refused_once_this_peering_enfor
         .await;
 
     match response {
-        PacketResponse::Reject(reject) => assert_eq!(reject.code.as_str(), "F06"),
+        PacketResponse::Reject(reject) => {
+            assert_eq!(reject.code.as_str(), "F06");
+            // A forwarded route's refusal states no charge: that is the
+            // downstream hops' to add.
+            assert_eq!(reject.accumulated_cost, 0);
+        }
         other => panic!("expected an F06 reject, got {other:?}"),
     }
     let terms = payment_required.expect("the x402 greeting rode the reject");

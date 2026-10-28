@@ -13,6 +13,7 @@ members = [
     "crates/connector-domain",
     "crates/connector-runtime",
     "crates/connector-chain-rpc",
+    "crates/connector-proxied-client",
     "crates/connector-settlement",
     "crates/connector-settlement-evm",
     "crates/connector-settlement-solana",
@@ -28,6 +29,7 @@ members = [
     "crates/connector-cli",
     "crates/connector-bin",
     "crates/connector-vectors",
+    "crates/connector-zk-note",
 ]
 
 [workspace.package]

@@ -412,6 +412,7 @@ impl PeerSession {
                         message: "no peer route for this interaction".to_string(),
                         data: Vec::new(),
                         accumulated_cost: 0,
+                        reason: None,
                     },
                     ClaimAckOutcome::NotSent,
                 ))
@@ -456,6 +457,7 @@ impl PeerSession {
                 .await;
         }
 
+        let inbound_channel = price_gate::accepted_channel(ack, voucher);
         let permit = window_slot(&self.window).await;
         let state = Arc::clone(&self.state);
         let replies = self.replies.clone();
@@ -472,7 +474,7 @@ impl PeerSession {
             // of it and a forward out of this packet can be priced.
             let response = state
                 .connector
-                .handle_peer_prepare(Some(&peer_id), prepare)
+                .handle_peer_prepare_over(Some(&peer_id), prepare, inbound_channel.as_deref())
                 .await;
             let frame = encode_packet_response(&role, request_id, response, ack);
             let _ = reply(&replies, frame).await;

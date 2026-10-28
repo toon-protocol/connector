@@ -142,3 +142,18 @@ files and no devnet file are affected, since no devnet box sets a fee today.
 **`CONTEXT.md`'s Peering entry becomes literally true.** It already reads _"a counterparty key, a
 carriage to reach it on, a fee, and a cap"_ — a description of the peering that, until this record,
 named two fields the peering did not hold.
+
+## Update (#1466): an operator's own packet pays its node no fee
+
+A packet originated on the operator surface (`POST /packets`) crosses the node's own peering at no
+fee. The amount forwarded to the first peer, and covered by the voucher, is the packet's own
+amount; an amount below the peering's fee is not refused `R01` by the originating node (an
+amount-0 packet is forwarded under a challenge, as any packet moving no value is); and a reject
+relayed back to the operator does not gain this node's fee in its `accumulated_cost`. The
+per-packet cap still applies, and no denomination boundary is crossed, as before.
+
+**Why.** A fee pays for carrying _someone else's_ packet. The operator is paying its own
+connector, and charging itself is a transfer from the operator to the operator that only makes the
+packet dearer. A client's packet and a peer's packet are charged exactly as before, and so are
+their rejects; every hop after the originating node still takes its fee. Nothing about the wire
+changes. The fee-earned metric is likewise not recorded for an originated packet.

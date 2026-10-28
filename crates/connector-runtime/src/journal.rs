@@ -164,6 +164,10 @@ fn encode_line(entry: &JournalEntry) -> String {
             channel_id,
             cumulative_amount,
         } => format!("outbound_voucher_signed\t{channel_id}\t{cumulative_amount}"),
+        JournalEntry::OutboundWatermarkSet {
+            channel_id,
+            cumulative_amount,
+        } => format!("outbound_watermark_set\t{channel_id}\t{cumulative_amount}"),
     }
 }
 
@@ -231,6 +235,12 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
             })
         }
+        ["outbound_watermark_set", channel_id, cumulative_amount] => {
+            Ok(JournalEntry::OutboundWatermarkSet {
+                channel_id: channel_id.to_string(),
+                cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
+            })
+        }
         _ => Err(corrupt()),
     }
 }
@@ -263,17 +273,23 @@ impl FileJournal {
 }
 
 impl Journal for FileJournal {
+    /// A batch of one, so the entry and its newline go out in a single
+    /// `write_all` -- see `append_batch` (#1319).
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
-        let mut file = self.file.lock().expect("file journal lock poisoned");
-        writeln!(file, "{}", encode_line(entry))?;
-        file.sync_data()?;
-        Ok(())
+        self.append_batch(std::slice::from_ref(entry))
     }
 
     /// One buffered write and one `fsync` for the whole batch -- the fsync
     /// is the per-entry cost issue #686 exists to amortize, and batching
     /// `write` calls beside it keeps a batch's lines contiguous under the
     /// one lock hold.
+    ///
+    /// `append` is a batch of one, so a single entry and its newline also
+    /// reach the file in one `write_all`. The file is opened in append mode
+    /// and the lock only serialises writers inside this process; a separate
+    /// write for the newline (what `writeln!` issues) would let another
+    /// handle on the same file land between entry and newline and glue two
+    /// entries onto one line, which `read_all` refuses as corrupt (#1319).
     fn append_batch(&self, entries: &[JournalEntry]) -> Result<(), JournalError> {
         if entries.is_empty() {
             return Ok(());
@@ -301,6 +317,7 @@ impl Journal for FileJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn sample_entries() -> Vec<JournalEntry> {
         vec![
@@ -353,6 +370,10 @@ mod tests {
             JournalEntry::OutboundVoucherSigned {
                 channel_id: "evm:0xef01".to_string(),
                 cumulative_amount: u128::MAX,
+            },
+            JournalEntry::OutboundWatermarkSet {
+                channel_id: "evm:0xef01".to_string(),
+                cumulative_amount: 7,
             },
         ]
     }
@@ -476,5 +497,58 @@ mod tests {
             signature: vec![0xab],
         };
         assert_eq!(decode_line(&encode_line(&entry)).unwrap(), entry);
+    }
+
+    /// Probabilistic: against the old `writeln!` (entry and newline as two
+    /// writes) this fails often, not always, so a green run before the fix
+    /// proves nothing. The iteration count is sized to make that failure
+    /// reliable. Real file, real threads, no stand-in writer (ADR 0007).
+    #[test]
+    fn two_handles_on_one_file_never_glue_single_appends_onto_one_line() {
+        const PER_HANDLE: u64 = 3000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.log");
+        let handles: Vec<_> = (0..2)
+            .map(|_| Arc::new(FileJournal::open(&path).unwrap()))
+            .collect();
+
+        let writers: Vec<_> = handles
+            .iter()
+            .enumerate()
+            .map(|(h, journal)| {
+                let journal = Arc::clone(journal);
+                std::thread::spawn(move || {
+                    for i in 0..PER_HANDLE {
+                        journal
+                            .append(&JournalEntry::InboundFulfillmentRecorded {
+                                channel_id: format!("handle-{h}"),
+                                amount: i,
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let mut got: Vec<(String, u64)> = handles[0]
+            .read_all()
+            .expect("interleaved appends left an undecodable line")
+            .into_iter()
+            .map(|entry| match entry {
+                JournalEntry::InboundFulfillmentRecorded { channel_id, amount } => {
+                    (channel_id, amount)
+                }
+                other => panic!("unexpected entry {other:?}"),
+            })
+            .collect();
+        got.sort();
+        let mut want: Vec<(String, u64)> = (0..2)
+            .flat_map(|h| (0..PER_HANDLE).map(move |i| (format!("handle-{h}"), i)))
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
     }
 }

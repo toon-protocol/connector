@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
-    BatchSettlementError, ChannelPresentation, EvmChannelConfig, Voucher, VoucherSigner,
+    BatchSettlementError, ChannelPresentation, EvmChannelConfig, Landed, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_signer::{
@@ -69,7 +69,7 @@ use connector_signer::{
     BatchSettlementDomain, X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use ethers::abi::{AbiDecode, AbiEncode};
-use ethers::types::{Address, Bytes};
+use ethers::types::{Address, BlockId, BlockNumber, Bytes, TransactionReceipt};
 
 use crate::bindings::x402_batch_settlement::{
     ChannelConfig, ChannelsCall, ChannelsReturn, PendingWithdrawalsCall, PendingWithdrawalsReturn,
@@ -162,7 +162,7 @@ impl EvmBatchSettlementBackend {
         let contract_address = Address::from(X402_BATCH_SETTLEMENT_ADDRESS);
         let code = connector_chain_rpc::retry_read(|| client.get_code(contract_address, None))
             .await
-            .map_err(backend_error)?;
+            .map_err(rpc_error)?;
         if code.as_ref().is_empty() {
             return Err(BatchSettlementError::NotDeployed(format!(
                 "x402BatchSettlement ({contract_address:?})"
@@ -175,7 +175,7 @@ impl EvmBatchSettlementBackend {
                 .await
         })
         .await
-        .map_err(backend_error)?;
+        .map_err(rpc_error)?;
         if on_chain_decimals != expected_decimals {
             return Err(BatchSettlementError::Backend(format!(
                 "[settlement.evm] decimals is {expected_decimals}, but token {token:?} \
@@ -285,18 +285,59 @@ impl EvmBatchSettlementBackend {
     }
 
     /// `channels(id)` and `pendingWithdrawals(id)` in one `eth_call`, through
-    /// the contract's own `multicall`. See the module doc for why.
+    /// the contract's own `multicall`, at the endpoint's `latest`. See the
+    /// module doc for why. A read that follows a transaction this node saw
+    /// confirm is [`snapshot_after`](Self::snapshot_after) instead.
     pub(crate) async fn snapshot(&self, id: [u8; 32]) -> Result<Snapshot, BatchSettlementError> {
+        self.snapshot_at(id, None).await
+    }
+
+    /// [`snapshot`](Self::snapshot) at the block `receipt` names, for a read
+    /// that follows a transaction this node sent and saw confirm. Behind a
+    /// load-balanced endpoint a plain `latest` can be answered by a backend
+    /// that has not imported that block, and its answer is a valid-looking
+    /// state from before the write. An endpoint without the block answers a
+    /// call at it with an error, so that error is retried -- [`PIN_RETRIES`]
+    /// times, doubling from [`FIRST_PIN_BACKOFF`] -- and only then reported.
+    pub(crate) async fn snapshot_after(
+        &self,
+        id: [u8; 32],
+        receipt: &TransactionReceipt,
+    ) -> Result<Snapshot, BatchSettlementError> {
+        let block = receipt.block_number.ok_or_else(|| {
+            BatchSettlementError::Backend("the confirmed receipt names no block".to_string())
+        })?;
+        let mut attempt = 0;
+        loop {
+            match self.snapshot_at(id, Some(block.as_u64())).await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) if attempt >= PIN_RETRIES => {
+                    return Err(BatchSettlementError::Backend(format!(
+                        "block {block} is not readable: {error}"
+                    )))
+                }
+                Err(_) => {
+                    tokio::time::sleep(FIRST_PIN_BACKOFF * 2u32.pow(attempt)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn snapshot_at(
+        &self,
+        id: [u8; 32],
+        block: Option<u64>,
+    ) -> Result<Snapshot, BatchSettlementError> {
         let calls = vec![
             Bytes::from(ChannelsCall { channel_id: id }.encode()),
             Bytes::from(PendingWithdrawalsCall { channel_id: id }.encode()),
         ];
-        let answers = self
-            .contract
-            .multicall(calls)
-            .call()
-            .await
-            .map_err(backend_error)?;
+        let mut call = self.contract.multicall(calls);
+        if let Some(block) = block {
+            call = call.block(BlockId::Number(BlockNumber::Number(block.into())));
+        }
+        let answers = call.call().await.map_err(rpc_error)?;
         let [channel, pending] = answers.as_slice() else {
             return Err(BatchSettlementError::Backend(format!(
                 "x402BatchSettlement's multicall answered {} results for 2 calls",
@@ -454,7 +495,7 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
         &self,
         channel: &ChannelId,
         voucher: Voucher,
-    ) -> Result<BatchChannelState, BatchSettlementError> {
+    ) -> Result<Landed, BatchSettlementError> {
         let config = self.require_admitted(channel)?;
         let id = admitted_id(channel)?;
         let amount = voucher.cumulative_amount;
@@ -500,13 +541,36 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
             .send(self.contract.claim(vec![row]).tx)
             .await
             .map_err(backend_error)?;
-        confirm(&self.client, hash, self.confirm)
+        let receipt = confirm(&self.client, hash, self.confirm)
             .await
             .map_err(backend_error)?;
 
-        let after = self.snapshot(id).await?;
-        Ok(self.state(channel, &config, &after))
+        let after = self
+            .snapshot_after(id, &receipt)
+            .await
+            .map_err(|error| unread_after_write("the claim", error))?;
+        Ok(Landed {
+            state: self.state(channel, &config, &after),
+            transaction: format!("{hash:#x}"),
+        })
     }
+}
+
+/// How many times a read pinned to a confirmed transaction's block is
+/// retried while the endpoint lacks that block. A constant of the binary.
+pub(crate) const PIN_RETRIES: u32 = 5;
+
+/// The first wait between those attempts; each later one doubles it, so a
+/// block that never arrives costs 0.2 + 0.4 + 0.8 + 1.6 + 3.2 = 6.2s.
+pub(crate) const FIRST_PIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `error` from the read that follows `what`, a transaction that confirmed:
+/// the write happened, its result was not read, and nothing was recorded
+/// from an older reading.
+pub(crate) fn unread_after_write(what: &str, error: BatchSettlementError) -> BatchSettlementError {
+    BatchSettlementError::Backend(format!(
+        "{what} confirmed, and its result could not be read: {error}"
+    ))
 }
 
 /// The port's config as `connector-signer` hashes it: the same seven fields.
@@ -562,6 +626,21 @@ fn hex(bytes: &[u8]) -> String {
 
 pub(crate) fn backend_error<E: std::fmt::Display>(error: E) -> BatchSettlementError {
     BatchSettlementError::Backend(error.to_string())
+}
+
+/// Like [`backend_error`], for an error an RPC read returned: a refusal the
+/// transport reported (HTTP 403 or 429) keeps its endpoint and status, so a
+/// watch loop can recognise it.
+pub(crate) fn rpc_error<E: std::fmt::Display + connector_chain_rpc::AsRefused>(
+    error: E,
+) -> BatchSettlementError {
+    match error.refusal() {
+        Some(refused) => BatchSettlementError::Refused {
+            endpoint: refused.endpoint,
+            status: refused.status,
+        },
+        None => backend_error(error),
+    }
 }
 
 #[cfg(test)]

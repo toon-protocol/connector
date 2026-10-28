@@ -376,6 +376,38 @@ pub struct Reject {
     pub message: String,
     pub data: Vec<u8>,
     pub accumulated_cost: u64,
+    /// Why this connector raised an `F03` at the client edge (issue #1532),
+    /// `None` for every reject it did not raise itself -- a relayed one in
+    /// particular -- and for every other code. Like `accumulated_cost` it
+    /// rides beside the packet, never in the OER bytes, and never reaches a
+    /// peer.
+    pub reason: Option<RejectReason>,
+}
+
+/// The closed set of reasons a client-edge `F03` carries
+/// (`docs/protocol/client-edge-spec.md` §1.6, ADR 0051's issue #1532 update).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The voucher did not advance by the route's charge.
+    Underpayment,
+    /// The cumulative amount is above what the channel can pay.
+    Undercollateralized,
+    /// A forwarded packet declares an `amount` above the forwarding charge.
+    AmountOverCharge,
+    /// A probe to a route this connector terminates.
+    ProbeTerminatesHere,
+}
+
+impl RejectReason {
+    /// The ASCII token that rides on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::Underpayment => "underpayment",
+            RejectReason::Undercollateralized => "undercollateralized",
+            RejectReason::AmountOverCharge => "amount_over_charge",
+            RejectReason::ProbeTerminatesHere => "probe_terminates_here",
+        }
+    }
 }
 
 impl Reject {
@@ -426,6 +458,7 @@ impl Reject {
             message,
             data,
             accumulated_cost: 0,
+            reason: None,
         })
     }
 }
@@ -583,6 +616,7 @@ mod tests {
             message: "no route".to_string(),
             data: vec![],
             accumulated_cost: 0,
+            reason: None,
         };
         let encoded = reject.encode();
         assert_eq!(encoded[0], TYPE_REJECT);
@@ -597,6 +631,7 @@ mod tests {
             message: "declined".to_string(),
             data: vec![],
             accumulated_cost: 0,
+            reason: None,
         };
         let encoded = reject.encode();
         assert_eq!(Reject::decode(&encoded).expect("decode"), reject);
@@ -614,6 +649,7 @@ mod tests {
             message: "no route".to_string(),
             data: vec![],
             accumulated_cost: 42,
+            reason: None,
         };
         let encoded = reject.encode();
         let decoded = Reject::decode(&encoded).expect("decode");

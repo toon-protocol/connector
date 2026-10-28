@@ -18,7 +18,9 @@
 //!    `OutboundChannelAbandoned` once it provably never will (a Solana
 //!    `open` whose blockhash expired);
 //! 3. `OutboundVoucherSigned` for every voucher signed, **before** the
-//!    voucher is handed to anyone.
+//!    voucher is handed to anyone; and `OutboundWatermarkSet`, which a replay
+//!    sets rather than folds by max, when the receiver reports less than was
+//!    signed after a forward ended in a reject (issue #1446).
 //!
 //! What each crash leaves, and what the next attempt does:
 //!
@@ -36,9 +38,9 @@
 //! with one opening deposit however many times it is sent -- the settlement
 //! port's contract suite holds all three implementations to that.
 //!
-//! A restart restores every channel with the highest voucher journaled on
-//! it, never below what the chain shows landed, so the signed watermark
-//! never goes backwards. A node that lost this journal entirely restores
+//! A restart restores every channel with the watermark the journal ends on
+//! -- the highest voucher, unless a later `OutboundWatermarkSet` lowered it
+//! -- never below what the chain shows landed. A node that lost this journal entirely restores
 //! its watermark from the receiver's `POST /ilp/claim-state` instead, which
 //! is the peering's to wire (issue #1378).
 
@@ -50,7 +52,7 @@ use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::JournalEntry;
 use connector_settlement::batch::{
     BatchChannelState, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
-    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers,
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers, Landed,
     OutboundChannelRecord, OutboundChannelState, ReceiverTerms, SolanaReceiverTerms, Voucher,
     VoucherSigner,
 };
@@ -134,6 +136,18 @@ pub struct BatchChannelView {
     pub detail: Option<String>,
 }
 
+/// What `POST /channels/:id/land` answers: the channel as
+/// [`BatchChannelView`] reports it, plus the transaction that landed the
+/// voucher. A separate type so that `GET /channels` keeps its shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LandedChannel {
+    #[serde(flatten)]
+    pub view: BatchChannelView,
+    /// EVM: the transaction hash, `0x` and 64 lowercase hex. Solana: the
+    /// transaction signature, base58.
+    pub transaction: String,
+}
+
 /// What a failed batch-settlement channel operation reports.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BatchChannelError {
@@ -162,6 +176,20 @@ pub enum BatchChannelError {
     /// open was not sent, a voucher was not handed out.
     #[error("the outbound channel journal could not be written: {0}")]
     Journal(String),
+    /// A controller's deposit limit refused the deposit (ADR 0078), before
+    /// anything was journaled or sent. Carries the reason, which names it.
+    #[error("{0}")]
+    DepositRefused(String),
+}
+
+/// Where a deposit is counted against a controller's deposit limit (ADR 0078
+/// decision 4). Asked once per deposit that commits value: when an open is
+/// about to be journaled as a new channel -- never for a repeat that finds or
+/// resumes one -- and before every top-up, which is an increment each time.
+/// An `Err` is the reason the deposit is refused; the channel write then
+/// journals and sends nothing.
+pub trait DepositGate: Send + Sync {
+    fn count(&self, amount: u128) -> Result<(), String>;
 }
 
 impl From<JournalError> for BatchChannelError {
@@ -319,6 +347,18 @@ impl OutboundChannels {
                         tracked.signed = tracked.signed.max(cumulative_amount);
                     }
                 }
+                // Overwrites, where the voucher above folds by max: it
+                // exists to move a watermark down (issue #1446).
+                JournalEntry::OutboundWatermarkSet {
+                    channel_id,
+                    cumulative_amount,
+                } => {
+                    if let Some(tracked) =
+                        by_key.get(&channel_id).and_then(|id| channels.get_mut(id))
+                    {
+                        tracked.signed = cumulative_amount;
+                    }
+                }
                 // Another book's entry kinds never reach this file.
                 _ => {}
             }
@@ -437,6 +477,17 @@ impl OutboundChannels {
         terms: ReceiverTerms,
         deposit: u128,
     ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
+        self.open_with(terms, deposit, None).await
+    }
+
+    /// [`OutboundChannels::open`], counting a deposit that journals a new
+    /// channel with `gate` first. A resumed open counts nothing.
+    pub async fn open_with(
+        &self,
+        terms: ReceiverTerms,
+        deposit: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<(OutboundChannelState, bool), BatchChannelError> {
         let chain = chain_of(terms.chain());
         let payer = Arc::clone(self.payer(chain)?);
         let _opening = self.opening.lock().await;
@@ -461,7 +512,8 @@ impl OutboundChannels {
         let (mut record, mut resumed) = match pending {
             Some(record) => (record, true),
             None => (
-                self.prepare(&payer, chain, terms.clone(), deposit).await?,
+                self.prepare(&payer, chain, terms.clone(), deposit, gate)
+                    .await?,
                 false,
             ),
         };
@@ -478,7 +530,9 @@ impl OutboundChannels {
                     if !resumed {
                         return Err(BatchSettlementError::OpenLapsed(channel).into());
                     }
-                    record = self.prepare(&payer, chain, terms.clone(), deposit).await?;
+                    record = self
+                        .prepare(&payer, chain, terms.clone(), deposit, gate)
+                        .await?;
                     resumed = false;
                 }
                 Err(error) => return Err(error.into()),
@@ -496,7 +550,15 @@ impl OutboundChannels {
         chain: SettlementChain,
         terms: ReceiverTerms,
         deposit: u128,
+        gate: Option<&dyn DepositGate>,
     ) -> Result<OutboundChannelRecord, BatchChannelError> {
+        // Counted as the channel is journaled and before the open is built,
+        // so a refused deposit is neither signed nor sent; a deposit whose
+        // transaction then fails is not given back.
+        if let Some(gate) = gate {
+            gate.count(deposit)
+                .map_err(BatchChannelError::DepositRefused)?;
+        }
         let record = payer.prepare_open(terms, deposit).await?;
         self.append(JournalEntry::OutboundChannelOpening {
             channel_id: journal_key(chain, record.channel()),
@@ -522,7 +584,22 @@ impl OutboundChannels {
         id: &str,
         increment: u128,
     ) -> Result<OutboundChannelState, BatchChannelError> {
+        self.top_up_with(id, increment, None).await
+    }
+
+    /// [`OutboundChannels::top_up`], counting `increment` with `gate` before
+    /// it is sent -- every time, because it is an increment.
+    pub async fn top_up_with(
+        &self,
+        id: &str,
+        increment: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<OutboundChannelState, BatchChannelError> {
         let (channel, payer) = self.ready(id).await?;
+        if let Some(gate) = gate {
+            gate.count(increment)
+                .map_err(BatchChannelError::DepositRefused)?;
+        }
         Ok(payer.top_up(&channel, increment).await?)
     }
 
@@ -629,33 +706,50 @@ impl OutboundChannels {
         Ok(None)
     }
 
-    /// Raise an outbound channel's signed watermark to `amount`, where the
-    /// receiver reports holding a voucher that high (ADR 0075 decision 6:
-    /// the receiver's `POST /ilp/claim-state` is the watermark authority on
-    /// restore). A node that lost its journal would otherwise sign a voucher
-    /// that fails to advance; one that did not already stands at least this
-    /// high, and nothing changes.
+    /// Set an outbound channel's signed watermark to `amount`, the figure
+    /// the receiver reports holding a voucher for (ADR 0075 decision 6: the
+    /// receiver's `POST /ilp/claim-state` is the watermark authority, on
+    /// restore and after a reject, issue #1446). Higher than this node's
+    /// own, a node that lost its journal would otherwise sign a voucher that
+    /// fails to advance; lower, a voucher the receiver never admitted paid
+    /// for a packet it never carried, and the next voucher is signed above
+    /// the receiver's figure rather than above that one. Never below what
+    /// the chain shows landed, which the payer enforces. Returns the
+    /// watermark now standing.
     ///
-    /// Journaled as a signed voucher before it is believed, because it is
-    /// one: the receiver holds a voucher at `amount` only if this node's key
-    /// signed it.
-    pub async fn raise_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
+    /// Raising is journaled as a signed voucher before it is believed,
+    /// because it is one: the receiver holds a voucher at `amount` only if
+    /// this node's key signed it. Lowering is journaled as an
+    /// `OutboundWatermarkSet`, which a replay sets rather than folds by max.
+    ///
+    /// The caller decides that lowering is safe -- that no voucher has been
+    /// signed on the channel since the rejected one -- and holds the
+    /// channel's signing lock across the decision and this call.
+    pub async fn set_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
         let id = canonical_id(id);
         let tracked = self.tracked(&id)?;
-        if amount <= tracked.signed {
+        if amount == tracked.signed {
             return Ok(tracked.signed);
         }
         let payer = Arc::clone(self.payer(tracked.chain)?);
-        self.append(JournalEntry::OutboundVoucherSigned {
-            channel_id: journal_key(tracked.chain, tracked.record.channel()),
-            cumulative_amount: amount,
+        let channel_id = journal_key(tracked.chain, tracked.record.channel());
+        self.append(if amount > tracked.signed {
+            JournalEntry::OutboundVoucherSigned {
+                channel_id,
+                cumulative_amount: amount,
+            }
+        } else {
+            JournalEntry::OutboundWatermarkSet {
+                channel_id,
+                cumulative_amount: amount,
+            }
         })?;
-        payer.restore_outbound(&tracked.record, amount).await?;
+        let state = payer.restore_outbound(&tracked.record, amount).await?;
         if let Some(tracked) = self.channels().get_mut(&id) {
-            tracked.signed = tracked.signed.max(amount);
+            tracked.signed = state.signed;
             tracked.restored = true;
         }
-        Ok(amount)
+        Ok(state.signed)
     }
 
     /// The channel as its receiver is shown it -- on EVM with the config its
@@ -827,6 +921,18 @@ impl BatchChannels {
         counterparty_url: Option<&Url>,
         deposit: u128,
     ) -> Result<(BatchChannelView, bool), BatchChannelError> {
+        self.open_with(terms, counterparty_url, deposit, None).await
+    }
+
+    /// [`BatchChannels::open`], counting a deposit that journals a new
+    /// channel with `gate`.
+    pub async fn open_with(
+        &self,
+        terms: &X402BatchSettlementTerms,
+        counterparty_url: Option<&Url>,
+        deposit: u128,
+        gate: Option<&dyn DepositGate>,
+    ) -> Result<(BatchChannelView, bool), BatchChannelError> {
         let (chain, network) = match terms {
             X402BatchSettlementTerms::Evm(evm) => (SettlementChain::Evm, &evm.network),
             X402BatchSettlementTerms::Solana(solana) => (SettlementChain::Solana, &solana.network),
@@ -841,7 +947,7 @@ impl BatchChannels {
         }
         let terms =
             receiver_terms(terms, counterparty_url).map_err(BatchChannelError::InvalidTerms)?;
-        let (state, resumed) = self.outbound.open(terms, deposit).await?;
+        let (state, resumed) = self.outbound.open_with(terms, deposit, gate).await?;
         Ok((self.outbound.view_of(&state), resumed))
     }
 
@@ -895,7 +1001,7 @@ impl BatchChannels {
     /// Land the latest voucher held on the inbound channel `id` now (ADR
     /// 0075 decision 11): the manual lever beside the watchers and sweeps,
     /// for planned maintenance.
-    pub async fn land(&self, id: &str) -> Result<BatchChannelView, BatchChannelError> {
+    pub async fn land(&self, id: &str) -> Result<LandedChannel, BatchChannelError> {
         let id = canonical_id(id);
         let held = self
             .held
@@ -906,10 +1012,10 @@ impl BatchChannels {
         let chain = chain_of(held.presentation.chain());
         let backend = self.receiver(chain)?;
         read_inbound(backend.as_ref(), &held.presentation).await?;
-        let state = backend
+        let Landed { state, transaction } = backend
             .land(held.presentation.channel(), held.voucher.clone())
             .await?;
-        Ok(BatchChannelView {
+        let view = BatchChannelView {
             id,
             scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
@@ -920,7 +1026,8 @@ impl BatchChannels {
             landed: Some(state.landed),
             watermark: held.voucher.cumulative_amount,
             detail: None,
-        })
+        };
+        Ok(LandedChannel { view, transaction })
     }
 }
 
@@ -1225,6 +1332,43 @@ mod tests {
         }
     }
 
+    /// Issue #1446: a watermark lowered to the receiver's figure is durable.
+    /// The voucher entries fold by max, so without an entry that overwrites
+    /// on replay a restart would sign from the old, higher figure again --
+    /// and the chain's landed figure still bounds it from below.
+    #[tokio::test]
+    async fn a_lowered_watermark_survives_a_journal_replay() {
+        for exit in [PayerExit::Withdrawal, PayerExit::Close] {
+            let world = World::new(exit);
+            let journal = Arc::new(InMemoryJournal::new());
+            let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+            let (state, _) = outbound
+                .open(world.receiver.published_terms(), 1_000)
+                .await
+                .expect("open");
+            let id = state.on_chain.id.0.clone();
+            outbound.sign_voucher(&id, 100).await.expect("sign");
+            outbound.sign_voucher(&id, 300).await.expect("sign");
+
+            assert_eq!(outbound.set_watermark(&id, 100).await.unwrap(), 100);
+            assert_eq!(outbound.signed(&id), Some(100));
+
+            let restarted = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+            assert_eq!(restarted.signed(&id), Some(100), "replay sets, not max");
+            assert_eq!(
+                restarted
+                    .sign_voucher(&id, 150)
+                    .await
+                    .unwrap()
+                    .cumulative_amount,
+                150,
+                "the next voucher is signed above the lowered figure"
+            );
+            // A raise is still a raise.
+            assert_eq!(restarted.set_watermark(&id, 500).await.unwrap(), 500);
+        }
+    }
+
     /// Crash between journaling and sending: the node restarts holding a
     /// record nothing on chain matches. The channel is listed as opening,
     /// and a retried open toward the same receiver sends **that** record --
@@ -1271,6 +1415,53 @@ mod tests {
             assert_ne!(second.on_chain.id, state.on_chain.id);
             assert_eq!(outbound.views().await.len(), 2);
         }
+    }
+
+    /// A gate that adds up what it is asked to count.
+    #[derive(Default)]
+    struct Counted(std::sync::Mutex<u128>);
+
+    impl DepositGate for Counted {
+        fn count(&self, amount: u128) -> Result<(), String> {
+            *self.0.lock().unwrap() += amount;
+            Ok(())
+        }
+    }
+
+    /// ADR 0078 decision 4: a retried open that resumes its journaled
+    /// channel counts nothing against a deposit limit; the next open, a
+    /// channel of its own, counts its deposit.
+    #[tokio::test]
+    async fn a_resumed_open_counts_nothing_and_a_new_one_counts_its_deposit() {
+        let world = World::new(PayerExit::Withdrawal);
+        let journal = Arc::new(InMemoryJournal::new());
+        let record = world
+            .payer()
+            .prepare_open(world.receiver.published_terms(), 1_000)
+            .await
+            .expect("prepare");
+        journal
+            .append(&JournalEntry::OutboundChannelOpening {
+                channel_id: journal_key(chain_name(PayerExit::Withdrawal), record.channel()),
+                record: record.encode(),
+            })
+            .unwrap();
+        let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
+        let gate = Counted::default();
+
+        let (_, resumed) = outbound
+            .open_with(world.receiver.published_terms(), 1_000, Some(&gate))
+            .await
+            .expect("the retried open");
+        assert!(resumed);
+        assert_eq!(*gate.0.lock().unwrap(), 0, "a resumed open counts nothing");
+
+        let (_, resumed) = outbound
+            .open_with(world.receiver.published_terms(), 1_000, Some(&gate))
+            .await
+            .expect("a second open");
+        assert!(!resumed);
+        assert_eq!(*gate.0.lock().unwrap(), 1_000);
     }
 
     /// A pending open resumes only for the same open: a request with another
@@ -1444,7 +1635,8 @@ mod tests {
             assert_eq!(view.landed, Some(0));
 
             let landed = channels.land(&channel.0).await.expect("land");
-            assert_eq!(landed.landed, Some(300));
+            assert_eq!(landed.view.landed, Some(300));
+            assert!(!landed.transaction.is_empty());
             assert_eq!(
                 channels.land(&channel.0).await.unwrap_err(),
                 BatchChannelError::Settlement(BatchSettlementError::StaleVoucher {

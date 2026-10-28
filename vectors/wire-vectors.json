@@ -1,5 +1,5 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "envelope": {
     "valid": [
       {
@@ -860,6 +860,98 @@
         "blockchain": "solana",
         "request_entry_json": "{\"blockchain\":\"solana\",\"channelAccount\":\"F49NU9xTZh4LaPM3bGsnAg5EUaBUcrSLDYcj9SF59gTG\",\"expires\":4102444800,\"scheme\":\"toon-channel\",\"signature\":\"ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYA==\"}",
         "response_entry_json": "{\"blockchain\":\"solana\",\"channelId\":\"F49NU9xTZh4LaPM3bGsnAg5EUaBUcrSLDYcj9SF59gTG\",\"error\":\"toon-channel-refused\",\"ok\":false}"
+      }
+    ]
+  },
+  "client_edge": {
+    "f03_rejects": [
+      {
+        "name": "f03_underpayment",
+        "code": "F03",
+        "accumulated_cost": 250,
+        "reason": "underpayment",
+        "http_headers": [
+          ["toon-accumulated-cost", "250"],
+          ["toon-reject-reason", "underpayment"]
+        ],
+        "btp_protocol_data": [
+          {
+            "name": "toon-accumulated-cost",
+            "content_type": 1,
+            "data_hex": "323530"
+          },
+          {
+            "name": "toon-reject-reason",
+            "content_type": 1,
+            "data_hex": "756e6465727061796d656e74"
+          }
+        ]
+      },
+      {
+        "name": "f03_undercollateralized",
+        "code": "F03",
+        "accumulated_cost": 0,
+        "reason": "undercollateralized",
+        "http_headers": [
+          ["toon-accumulated-cost", "0"],
+          ["toon-reject-reason", "undercollateralized"]
+        ],
+        "btp_protocol_data": [
+          {
+            "name": "toon-accumulated-cost",
+            "content_type": 1,
+            "data_hex": "30"
+          },
+          {
+            "name": "toon-reject-reason",
+            "content_type": 1,
+            "data_hex": "756e646572636f6c6c61746572616c697a6564"
+          }
+        ]
+      },
+      {
+        "name": "f03_amount_over_charge",
+        "code": "F03",
+        "accumulated_cost": 250,
+        "reason": "amount_over_charge",
+        "http_headers": [
+          ["toon-accumulated-cost", "250"],
+          ["toon-reject-reason", "amount_over_charge"]
+        ],
+        "btp_protocol_data": [
+          {
+            "name": "toon-accumulated-cost",
+            "content_type": 1,
+            "data_hex": "323530"
+          },
+          {
+            "name": "toon-reject-reason",
+            "content_type": 1,
+            "data_hex": "616d6f756e745f6f7665725f636861726765"
+          }
+        ]
+      },
+      {
+        "name": "f03_probe_terminates_here",
+        "code": "F03",
+        "accumulated_cost": 250,
+        "reason": "probe_terminates_here",
+        "http_headers": [
+          ["toon-accumulated-cost", "250"],
+          ["toon-reject-reason", "probe_terminates_here"]
+        ],
+        "btp_protocol_data": [
+          {
+            "name": "toon-accumulated-cost",
+            "content_type": 1,
+            "data_hex": "323530"
+          },
+          {
+            "name": "toon-reject-reason",
+            "content_type": 1,
+            "data_hex": "70726f62655f7465726d696e617465735f68657265"
+          }
+        ]
       }
     ]
   }
