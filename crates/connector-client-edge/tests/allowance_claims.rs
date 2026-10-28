@@ -1403,3 +1403,189 @@ mod endpoints {
         assert_eq!(body["error"], "zk_note_not_offered");
     }
 }
+
+// -- An allowance claim over the client BTP carriage (client-edge-spec.md
+// §1.9), in the `payment-channel-claim` protocolData a voucher rides in --
+
+mod btp {
+    use super::*;
+    use connector_config::StaticRoute;
+    use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
+    use connector_runtime::{AppOutcome, Connector, FakeAppClient, InProcessPeerTransport};
+    use connector_signer::{LocalSigner, PublicKeyBytes, Signer};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    const PRICE: u64 = 100;
+    const BTP_RESPONSE: u8 = 1;
+    const BTP_MESSAGE: u8 = 6;
+
+    /// A MESSAGE frame, as `@toon-protocol/client` writes one.
+    fn btp_message(request_id: u32, protocol_data: &[(&str, &[u8])], ilp: &[u8]) -> Vec<u8> {
+        let mut out = vec![BTP_MESSAGE];
+        out.extend_from_slice(&request_id.to_be_bytes());
+        out.push(u8::try_from(protocol_data.len()).unwrap());
+        for (name, data) in protocol_data {
+            out.push(u8::try_from(name.len()).unwrap());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        out.extend_from_slice(&u32::try_from(ilp.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(ilp);
+        out
+    }
+
+    /// A RESPONSE frame's type, request id and ILP packet.
+    fn parse_response(buf: &[u8]) -> (u8, u32, Vec<u8>) {
+        let be32 = |at: usize| u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+        let frame_type = buf[0];
+        let request_id = be32(1);
+        let mut pos = 5;
+        let count = usize::from(buf[pos]);
+        pos += 1;
+        for _ in 0..count {
+            pos += 1 + usize::from(buf[pos]) + 2;
+            pos += 4 + be32(pos) as usize;
+        }
+        let len = be32(pos) as usize;
+        (frame_type, request_id, buf[pos + 4..pos + 4 + len].to_vec())
+    }
+
+    fn sealed_prepare(receiver: &PublicKeyBytes) -> Prepare {
+        let envelope = EnvelopeRequest {
+            method: "POST".to_string(),
+            target: "/".to_string(),
+            headers: vec![],
+            body: b"paid by an allowance".to_vec(),
+        }
+        .encode();
+        let (data, _) =
+            connector_signer::giftwrap::seal_request(&envelope, receiver).expect("seal");
+        Prepare {
+            amount: PRICE,
+            expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+            greeting: false,
+            destination: "g.test.app".to_string(),
+            data,
+        }
+    }
+
+    type Session = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn answer(session: &mut Session) -> (u8, u32, Vec<u8>) {
+        loop {
+            let frame = session.next().await.expect("open").expect("a frame");
+            if let WsMessage::Binary(bytes) = frame {
+                return parse_response(&bytes);
+            }
+        }
+    }
+
+    async fn send(session: &mut Session, frame: Vec<u8>) {
+        session.send(WsMessage::Binary(frame)).await.expect("sent");
+    }
+
+    /// ADR 0080 decision 2: an allowance claim pays for a packet over BTP
+    /// exactly as over HTTP -- admitted, its watermark advanced under the
+    /// allowance's key, the packet fulfilled -- and the same claim again
+    /// buys nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_allowance_claim_pays_for_a_packet_over_btp() {
+        let edge = Edge::new();
+        let gate = edge.gate();
+        let payer = Payer::new(&edge, 60).provable(&edge);
+        let id = grant(&gate, &payer).await.allowance_id;
+
+        let route = StaticRoute::new_priced("g.test.app", "http://localhost:4000", PRICE).unwrap();
+        let app_client = Arc::new(FakeAppClient::new());
+        app_client.respond(
+            route.handler_url(),
+            AppOutcome::Answered {
+                response: EnvelopeResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: b"app said yes".to_vec(),
+                },
+            },
+        );
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("allowance-btp-test"));
+        let connector = Arc::new(
+            Connector::new(
+                vec![route],
+                vec![],
+                app_client,
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::clone(&edge.clock) as Arc<dyn Clock>,
+            )
+            .with_identity_signer(signer.clone()),
+        );
+        let app = connector_client_edge::router_with_gate(connector, signer.clone(), None, gate);
+        let server =
+            axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
+        let addr = server.local_addr();
+        tokio::spawn(server);
+        let (mut session, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ilp/btp"))
+            .await
+            .expect("upgraded");
+
+        send(
+            &mut session,
+            btp_message(1, &[("auth", br#"{"peerId":"p","secret":""}"#)], &[]),
+        )
+        .await;
+        assert_eq!(answer(&mut session).await.0, BTP_RESPONSE);
+
+        let receiver = signer.public_key().unwrap();
+        let claim = payer.claim(id, PRICE);
+        send(
+            &mut session,
+            btp_message(
+                2,
+                &[("payment-channel-claim", claim.as_bytes())],
+                &sealed_prepare(&receiver).encode(),
+            ),
+        )
+        .await;
+        let (frame_type, request_id, packet) = answer(&mut session).await;
+        assert_eq!((frame_type, request_id), (BTP_RESPONSE, 2));
+        Fulfill::decode(&packet).unwrap_or_else(|_| {
+            let reject = Reject::decode(&packet).expect("an OER packet");
+            panic!("refused {} {:?}", reject.code.as_str(), reject.message)
+        });
+        let accepted: Vec<_> = edge
+            .entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::InboundClaimAccepted {
+                    channel_id,
+                    cumulative_amount,
+                    ..
+                } => Some((channel_id, cumulative_amount)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![(id.channel_key(), u128::from(PRICE))],
+            "the allowance's watermark is journaled under its key"
+        );
+
+        // Resent, it advances nothing and pays for nothing.
+        send(
+            &mut session,
+            btp_message(
+                3,
+                &[("payment-channel-claim", claim.as_bytes())],
+                &sealed_prepare(&receiver).encode(),
+            ),
+        )
+        .await;
+        let (_, _, packet) = answer(&mut session).await;
+        let reject = Reject::decode(&packet).expect("a REJECT");
+        assert_eq!(reject.code.as_str(), "F03");
+    }
+}
