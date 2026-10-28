@@ -22,7 +22,7 @@
 #     and initialised, because a FiatToken's initialisers write the state that
 #     makes it work. It is what gives a deposit ERC-3009's
 #     `receiveWithAuthorization`. Named "USDC", version "2", 6 decimals, as
-#     Base's is -- the EIP-712 domain every `[settlement.evm]` table under
+#     Base's is -- the EIP-712 domain every `[settlement.eip155.31337]` table under
 #     `local/` names.
 #
 # USDC IS MINTED ON DEMAND, NEVER DRIPPED. Anvil's account 1 is the token's
