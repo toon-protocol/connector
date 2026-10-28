@@ -1,6 +1,6 @@
 //! What a terminating connector tells the app about the payment that
-//! brought a packet to it (ADR 0040, issue #994): three request headers on
-//! the delivery, and only when this connector itself verified the payment
+//! brought a packet to it (ADR 0040, issue #994): request headers on the
+//! delivery -- three from ADR 0040 and `X-TOON-Network` from ADR 0086 -- and only when this connector itself verified the payment
 //! they describe.
 //!
 //! The TypeScript prototype sent the same three header names from sources
@@ -60,11 +60,19 @@ pub const AMOUNT_HEADER: &str = "X-TOON-Amount";
 /// channel key's own namespace, never off the destination address.
 pub const CHAIN_HEADER: &str = "X-TOON-Chain";
 
+/// The CAIP-2 network the paying channel was verified on (ADR 0086 decision
+/// 14, issue #1600): `eip155:<chainId>` or `solana:<genesis prefix>`. What
+/// tells an app on a node settling on several EVM networks whose base units
+/// [`AMOUNT_HEADER`] is in, which [`CHAIN_HEADER`]'s two values cannot.
+/// Read off the network this node verified the channel's claim on, never
+/// off anything the sender wrote.
+pub const NETWORK_HEADER: &str = "X-TOON-Network";
+
 /// Every header name this module owns. One list, used both to strip a
 /// caller's spelling of these names and to inject this connector's own, so
 /// the two can never drift apart: a name that can be injected is a name
 /// that is always stripped first.
-const ATTRIBUTION_HEADERS: [&str; 3] = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADER];
+const ATTRIBUTION_HEADERS: [&str; 4] = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER];
 
 /// A payment this connector verified for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +86,10 @@ pub(crate) struct PaymentAttribution<'a> {
     /// route reached from a peer, the packet's own `amount`, which the
     /// voucher's advance had to cover instead (ADR 0083).
     pub charge: u64,
+    /// The CAIP-2 network this node verified that channel's claim on, or
+    /// `None` when it holds no network for the channel's chain -- in which
+    /// case [`NETWORK_HEADER`] is omitted rather than guessed.
+    pub network: Option<&'a str>,
 }
 
 /// The settlement chain a channel key names: the namespace ahead of its
@@ -132,6 +144,11 @@ pub(crate) fn apply_payment_attribution(
             .headers
             .push((CHAIN_HEADER.to_string(), chain.to_string()));
     }
+    if let Some(network) = attribution.network {
+        request
+            .headers
+            .push((NETWORK_HEADER.to_string(), network.to_string()));
+    }
 }
 
 #[cfg(test)]
@@ -163,9 +180,11 @@ mod tests {
             Some(PaymentAttribution {
                 channel_key: "evm:0xabc",
                 charge: 1000,
+                network: Some("eip155:8453"),
             }),
         );
 
+        assert_eq!(header(&request, NETWORK_HEADER), Some("eip155:8453"));
         assert_eq!(header(&request, PAYER_HEADER), Some("evm:0xabc"));
         assert_eq!(header(&request, AMOUNT_HEADER), Some("1000"));
         assert_eq!(header(&request, CHAIN_HEADER), Some("evm"));
@@ -179,11 +198,14 @@ mod tests {
             Some(PaymentAttribution {
                 channel_key: "solana:9xQeWv",
                 charge: 7,
+                network: None,
             }),
         );
 
         assert_eq!(header(&request, PAYER_HEADER), Some("solana:9xQeWv"));
         assert_eq!(header(&request, CHAIN_HEADER), Some("solana"));
+        // No network held for the chain: omitted, never guessed.
+        assert_eq!(header(&request, NETWORK_HEADER), None);
     }
 
     #[test]
@@ -203,6 +225,7 @@ mod tests {
             Some(PaymentAttribution {
                 channel_key: "evm:0xabc",
                 charge: 0,
+                network: Some("eip155:8453"),
             }),
         );
         assert!(request.headers.is_empty());
@@ -217,6 +240,7 @@ mod tests {
             ("x-toon-payer".to_string(), "evm:0xvictim".to_string()),
             ("X-TOON-AMOUNT".to_string(), "1".to_string()),
             ("X-Toon-Chain".to_string(), "solana".to_string()),
+            ("x-toon-network".to_string(), "eip155:1".to_string()),
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
 
@@ -226,11 +250,21 @@ mod tests {
             Some(PaymentAttribution {
                 channel_key: "evm:0xreal",
                 charge: 1000,
+                network: Some("eip155:8453"),
             }),
         );
         assert_eq!(header(&overwritten, PAYER_HEADER), Some("evm:0xreal"));
         assert_eq!(header(&overwritten, AMOUNT_HEADER), Some("1000"));
         assert_eq!(header(&overwritten, CHAIN_HEADER), Some("evm"));
+        assert_eq!(header(&overwritten, NETWORK_HEADER), Some("eip155:8453"));
+        assert_eq!(
+            overwritten
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(NETWORK_HEADER))
+                .count(),
+            1
+        );
         // Exactly one of each -- a stripped name cannot also arrive twice.
         assert_eq!(
             overwritten
@@ -246,6 +280,7 @@ mod tests {
         assert_eq!(header(&stripped, PAYER_HEADER), None);
         assert_eq!(header(&stripped, AMOUNT_HEADER), None);
         assert_eq!(header(&stripped, CHAIN_HEADER), None);
+        assert_eq!(header(&stripped, NETWORK_HEADER), None);
         // Everything that is not ours is untouched.
         assert_eq!(header(&stripped, "content-type"), Some("application/json"));
     }

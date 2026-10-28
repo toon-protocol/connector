@@ -1288,6 +1288,16 @@ impl Connector {
             .map(|(_, network)| network.as_str())
     }
 
+    /// The CAIP-2 network a payment on `channel_key` was verified on (ADR
+    /// 0086 decision 14): this node's own network on the chain the key's
+    /// namespace names. A claim is only ever admitted on a chain this node
+    /// holds a backend for, and holds one network per chain, so the chain
+    /// decides it. `None` for a key with no chain this node settles on.
+    fn verified_network(&self, channel_key: &str) -> Option<&str> {
+        let (namespace, _) = channel_key.split_once(':')?;
+        self.x402_network(namespace.parse::<SettlementChain>().ok()?)
+    }
+
     /// Register an x402 peering's outbound channel as the hop `peer_id` is
     /// paid on (ADR 0075 decision 6): from here every forward to `peer_id`
     /// carries a voucher on that channel, or the peer-role challenge when
@@ -3638,10 +3648,12 @@ impl Connector {
             (Some(channel_key), _) => Some(PaymentAttribution {
                 channel_key,
                 charge,
+                network: self.verified_network(channel_key),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
                 channel_key,
                 charge: prepare.amount,
+                network: self.verified_network(channel_key),
             }),
             _ => None,
         };
@@ -4395,8 +4407,13 @@ mod tests {
     /// that a header is *absent*.
     mod payment_attribution {
         use super::*;
-        use crate::attribution::{AMOUNT_HEADER, CHAIN_HEADER, PAYER_HEADER};
+        use crate::attribution::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER};
         use crate::Delivery;
+
+        /// The networks this node verifies payments on, as its greeting
+        /// publishes them: one per chain (ADR 0086 decision 14).
+        const EVM_NETWORK: &str = "eip155:31337";
+        const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 
         /// The channel key the client edge admits a covering EVM claim
         /// under -- `ClientClaim::channel_key`'s own spelling.
@@ -4432,7 +4449,11 @@ mod tests {
                 StaticRoute::new_priced("g.example.app", "http://localhost:4000", price).unwrap();
             let app_client = Arc::new(FakeAppClient::new());
             app_client.respond(route.handler_url(), answered(b"stored"));
-            let connector = connector_with(vec![route], app_client.clone(), test_clock());
+            let mut connector = connector_with(vec![route], app_client.clone(), test_clock());
+            connector.x402_networks = vec![
+                (SettlementChain::Evm, EVM_NETWORK.to_string()),
+                (SettlementChain::Solana, SOLANA_NETWORK.to_string()),
+            ];
             let prepare = Prepare {
                 data: sealed_data,
                 ..prepare("g.example.app", b"unused")
@@ -4461,6 +4482,27 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), Some(PAYING_CHANNEL));
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+        }
+
+        /// ADR 0086 decision 14: the app is told the CAIP-2 network the
+        /// paying channel was verified on, so it knows whose base units
+        /// `X-TOON-Amount` is in -- for an EVM channel and a Solana one.
+        #[tokio::test]
+        async fn a_paid_delivery_names_the_network_its_claim_was_verified_on() {
+            let (data, _secret) = sealed_envelope_request_data(b"an event");
+            let delivery = deliver(PRICE, Some(PAYING_CHANNEL), data).await;
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(EVM_NETWORK));
+            assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+
+            let (data, _secret) = sealed_envelope_request_data(b"an event");
+            let delivery = deliver(
+                PRICE,
+                Some("solana:9xQeWvG816bUx9EPjHmaT23yvVM2ZHbGrX"),
+                data,
+            )
+            .await;
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(SOLANA_NETWORK));
+            assert_eq!(header(&delivery, CHAIN_HEADER), Some("solana"));
         }
 
         /// The chain is read off the admitted claim's own namespace, not
@@ -4495,6 +4537,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
         }
 
         /// A free route charged nothing, so there is no payment to
@@ -4508,6 +4551,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
         }
 
         /// The spoof defence: a sender who seals its own `X-TOON-Payer`
@@ -4524,6 +4568,7 @@ mod tests {
                     ),
                     ("x-toon-amount".to_string(), "1".to_string()),
                     ("X-Toon-Chain".to_string(), "solana".to_string()),
+                    ("x-toon-network".to_string(), SOLANA_NETWORK.to_string()),
                 ],
                 b"an event",
             );
@@ -4533,6 +4578,17 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), Some(PAYING_CHANNEL));
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(EVM_NETWORK));
+            assert_eq!(
+                delivery
+                    .request
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(NETWORK_HEADER))
+                    .count(),
+                1,
+                "the sender's network must be removed, not joined by ours"
+            );
             assert_eq!(
                 delivery
                     .request
@@ -4555,6 +4611,7 @@ mod tests {
                 ("X-TOON-Payer".to_string(), "evm:0xvictim".to_string()),
                 ("X-TOON-Amount".to_string(), "999999".to_string()),
                 ("X-TOON-Chain".to_string(), "evm".to_string()),
+                ("X-TOON-Network".to_string(), EVM_NETWORK.to_string()),
                 ("Content-Type".to_string(), "application/json".to_string()),
             ];
             let (data, _secret) =
@@ -4565,6 +4622,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
             // The sender's other headers are its own business and reach
             // the app untouched.
             assert_eq!(header(&delivery, "content-type"), Some("application/json"));

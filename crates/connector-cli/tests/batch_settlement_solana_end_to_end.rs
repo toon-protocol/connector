@@ -149,6 +149,10 @@ price = {PRICE}
     // retired toon-channel paid-write test): the app is told which channel
     // paid for each write, how much, and on what chain -- the channel the
     // voucher was verified against, not anything the sender wrote.
+    // ADR 0086 decision 14: and on which network, in CAIP-2 -- the
+    // validator's own genesis hash, cut to its first 32 characters.
+    let genesis = rpc.get_genesis_hash().await.expect("genesis hash");
+    let network = format!("solana:{}", &genesis.to_string()[..32]);
     for write in recorded.lock().unwrap().iter() {
         assert_eq!(write.header("x-toon-payer"), Some(key.as_str()));
         assert_eq!(
@@ -156,6 +160,7 @@ price = {PRICE}
             Some(PRICE.to_string().as_str())
         );
         assert_eq!(write.header("x-toon-chain"), Some("solana"));
+        assert_eq!(write.header("x-toon-network"), Some(network.as_str()));
     }
 
     let entries = FileJournal::open(state_dir.path().join(CLIENT_EDGE_JOURNAL))

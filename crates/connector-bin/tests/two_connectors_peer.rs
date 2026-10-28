@@ -1532,8 +1532,9 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives_over_http() 
 /// at default `forwarded_claim_enforcement`. A voucher covering only the
 /// charge buys nothing above it (`F03`, the app never called); one covering
 /// the amount reaches the app with `X-TOON-Amount` that amount, and
-/// `X-TOON-Payer` / `X-TOON-Chain` naming the inbound peering channel, over
-/// whatever the caller forged under those names.
+/// `X-TOON-Payer` / `X-TOON-Chain` naming the inbound peering channel, and
+/// `X-TOON-Network` its CAIP-2 network (ADR 0086 decision 14), over whatever
+/// the caller forged under those names.
 async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Carriage) {
     const CHARGE: u64 = 50;
     let Some(fixture) = PeerFixture::spawn().await else {
@@ -1549,6 +1550,7 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Ca
         ("X-TOON-Amount".to_string(), "999999".to_string()),
         ("x-toon-payer".to_string(), "evm:forged".to_string()),
         ("X-Toon-Chain".to_string(), "forged".to_string()),
+        ("x-toon-network".to_string(), "eip155:1".to_string()),
     ];
     let prepare_of = |amount: u64, body: &[u8]| {
         let (data, _shared) =
@@ -1586,6 +1588,7 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Ca
         vec![format!("evm:{}", fixture.payer_channel)]
     );
     assert_eq!(app.header(0, "x-toon-chain"), vec!["evm"]);
+    assert_eq!(app.header(0, "x-toon-network"), vec!["eip155:31337"]);
 
     // (2) The voucher advances by 400 and the packet declares 700: covers the
     // charge, not the amount. Refused F03; the wrap is never opened.

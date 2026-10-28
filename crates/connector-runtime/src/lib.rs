@@ -37,7 +37,7 @@ pub use app_client::{AppClient, AppOutcome, Delivery, FakeAppClient, HttpAppClie
 // about the payment that brought a packet to it (ADR 0040) -- exported so
 // a test, an operator tool or a second implementation names them from one
 // place rather than retyping a string literal.
-pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, PAYER_HEADER};
+pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER};
 pub use batch_channels::{
     receiver_terms, BatchChannelError, BatchChannelView, BatchChannelViewStatus, BatchChannels,
     ChannelDirection, DepositGate, LandedChannel, OutboundChannels, WithdrawStep,

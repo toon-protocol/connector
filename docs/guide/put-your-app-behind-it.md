@@ -12,8 +12,9 @@ forge or withhold one.
 
 The one thing this connector adds is attribution, on a request it took the
 payment for itself: `X-TOON-Payer` (the paying channel), `X-TOON-Amount` (what
-that request was charged) and `X-TOON-Chain`. Your app is free to ignore all
-three — it is handed them so it can log or rate-limit by payer if it wants to,
+that request was charged), `X-TOON-Chain` and `X-TOON-Network` (the CAIP-2
+network, such as `eip155:8453`, whose base units the amount is in). Your app is
+free to ignore all four — it is handed them so it can log or rate-limit by payer if it wants to,
 not so it can decide anything about the payment. They are absent on a request
 this node did not take the payment for, so treat them as optional. Whatever a
 caller writes under those names is stripped before your app sees it.

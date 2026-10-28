@@ -170,6 +170,8 @@ price = {PRICE}
             Some(PRICE.to_string().as_str())
         );
         assert_eq!(write.header("x-toon-chain"), Some("evm"));
+        // ADR 0086 decision 14: the CAIP-2 network, anvil's default chain id.
+        assert_eq!(write.header("x-toon-network"), Some("eip155:31337"));
     }
 
     // Journaled: the channel, with the config that restores it, and each
