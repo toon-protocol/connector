@@ -89,7 +89,12 @@ impl Edge {
     /// The gate, as the node would build it at boot: replayed from the
     /// journal, then given its zk edge.
     fn gate(&self) -> ClientClaimGate {
-        ClientClaimGate::restore(self.journal())
+        self.gate_over(self.journal())
+    }
+
+    /// [`Self::gate`], over a journal of the test's choosing.
+    fn gate_over(&self, journal: Arc<dyn Journal>) -> ClientClaimGate {
+        ClientClaimGate::restore(journal)
             .expect("replays")
             .with_zk_edge(ZkEdge {
                 vault: Arc::clone(&self.vault) as Arc<dyn ZkNoteVault>,
@@ -480,6 +485,66 @@ async fn a_nullifier_is_spent_once_across_allowances_and_restarts() {
             .unwrap_err(),
         AllowanceRefusal::NullifierSpent
     );
+}
+
+/// The edge's journal on a disk that refuses the next `failures` appends,
+/// and then recovers: a full disk, freed.
+struct FullDisk {
+    inner: Arc<FileJournal>,
+    failures: std::sync::atomic::AtomicUsize,
+}
+
+impl Journal for FullDisk {
+    fn append(&self, entry: &JournalEntry) -> Result<(), connector_runtime::JournalError> {
+        use std::sync::atomic::Ordering;
+        let left = self.failures.load(Ordering::SeqCst);
+        if left > 0 {
+            self.failures.store(left - 1, Ordering::SeqCst);
+            return Err(connector_runtime::JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "disk full",
+            )));
+        }
+        self.inner.append(entry)
+    }
+
+    fn read_all(&self) -> Result<Vec<JournalEntry>, connector_runtime::JournalError> {
+        self.inner.read_all()
+    }
+}
+
+/// ADR 0080 decision 11: a grant whose journal entry fails is refused, and
+/// leaves no grant record behind -- so the retry writes the only grant for
+/// its nullifier, and the challenger never reads a grant the edge forgot.
+#[tokio::test]
+async fn a_grant_the_journal_refuses_leaves_no_evidence_and_a_retry_writes_one() {
+    let edge = Edge::new();
+    let gate = edge.gate_over(Arc::new(FullDisk {
+        inner: edge.journal(),
+        failures: std::sync::atomic::AtomicUsize::new(1),
+    }));
+    let payer = Payer::new(&edge, 8).provable(&edge);
+
+    assert_eq!(
+        gate.admit_allowance(payer.request()).await.unwrap_err(),
+        AllowanceRefusal::NotDurable
+    );
+    assert!(edge.evidence().is_empty(), "the failed grant left a record");
+    assert!(edge.entries().is_empty());
+
+    let granted = grant(&gate, &payer).await;
+    let records = edge.evidence();
+    assert_eq!(records.len(), 1, "one grant for one nullifier");
+    let Record::Grant(record) = Record::from_payload(&records[0]).expect("a record") else {
+        panic!("a grant record");
+    };
+    assert_eq!(
+        record.allowance_id,
+        granted.allowance_id.as_bytes().to_vec()
+    );
+    drop(gate);
+    // And the edge boots on what it left.
+    edge.gate();
 }
 
 #[tokio::test]

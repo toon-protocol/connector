@@ -17,7 +17,10 @@
 //! grant record is appended to the evidence file and fsynced, then
 //! [`JournalEntry::AllowanceGranted`] -- the spent nullifier, the record's
 //! hash and the terms -- is appended to the journal and fsynced, and only
-//! then is the grant returned. A nullifier is reserved, under the ledger's
+//! then is the grant returned. A grant the journal refuses is cut back out
+//! of the evidence file before the refusal is answered, so a retry writes
+//! the only grant record for its nullifier, and the challenger never reads
+//! a grant this edge does not remember. A nullifier is reserved, under the ledger's
 //! lock, from the moment its local checks pass, so two requests spending one
 //! note at once open one allowance.
 //!
@@ -546,10 +549,15 @@ impl ClientClaimGate {
         })
         .to_payload()
         .map_err(|error| AllowanceRefusal::Malformed(error.to_string()))?;
-        let evidence_hash = edge.evidence.append(&payload).map_err(|error| {
+        // Pending until the journal holds the grant: a grant the journal
+        // refuses is cut back out of the evidence file, so a retry writes
+        // the only grant record for this nullifier. The file stays locked
+        // meanwhile, so nothing is appended after it.
+        let pending = edge.evidence.append_pending(&payload).map_err(|error| {
             tracing::error!(%error, "refusing an allowance: its evidence could not be written");
             AllowanceRefusal::NotDurable
         })?;
+        let evidence_hash = pending.hash();
         self.journal
             .append(&JournalEntry::AllowanceGranted {
                 allowance_id: allowance_id.to_string(),
@@ -566,6 +574,7 @@ impl ClientClaimGate {
                 tracing::error!(%error, "refusing an allowance: its grant could not be journaled");
                 AllowanceRefusal::NotDurable
             })?;
+        pending.keep();
         {
             let mut ledger = self.zk_ledger.lock().expect("zk ledger lock poisoned");
             ledger.allowances.insert(
