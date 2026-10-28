@@ -1546,6 +1546,32 @@ for them. Inside the client's transaction, it would void the payer's signature, 
 message before the node sees it, and would put the sponsor key in a second instruction, which
 `sponsor_misused` exists to refuse.
 
+### 1.12 Opening and closing a zk-note allowance: `/ilp/zk-note/allowances` (issue #1523)
+
+[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md) decisions 4 and 8. HTTP only, mounted on
+every node beside §1.11's endpoint; a node without the `[zk_note]` table answers both `404`
+`zk_note_not_offered`. The bytes are pinned by `vectors/wire-vectors.json`'s `zk_note` section, which
+is normative where this prose and it disagree (ADR 0021).
+
+- `POST /ilp/zk-note/allowances` with `{"proof": <o1js JsonProof>, "sessionKey": "B62…",
+"expiresAt": "<ms>"}` opens an allowance, checked cheapest refusal first (decision 3), and answers
+  `200 {"allowanceId", "tier", "expiresAt"}` once the grant is durable. The same path with
+  `{"allowanceId", "signature"}`, the session key's signature over the close fields, closes it: claims
+  on it are refused (`claim rejected: its allowance is closed`) at once, and the answer is what the
+  successor fetch would answer at that moment.
+- `GET /ilp/zk-note/allowances/:id/successor` answers `202 {"allowanceId", "status": "pending"}` until
+  the charge Δ — the final watermark, read once every forward in flight on the allowance has resolved
+  and any uncarried one rolled back — is journaled, and then `200 {"allowanceId", "status": "signed",
+"charge", "commitment": {"x", "y"}, "anchor", "signature": {"r", "s"}}`, the same bytes every time.
+  It only reads. An allowance also closes at its expiry, by a sweep that runs periodically and once at
+  boot, and when a claim reaches its budget.
+- A refusal is `{"error": <rule>, "detail"}`: `400` for a malformed request, `404` for no zk edge or
+  an unknown allowance, `503` when the vault cannot be read or the grant not made durable, and `422`
+  for every other rule. No refusal and no log line carries the proof, a nullifier or a session key.
+
+A packet paid by an allowance claim reaches the app with `X-TOON-Amount` and `X-TOON-Chain` (the
+vault's Mina network) and **without** `X-TOON-Payer` (ADR 0040 as amended by ADR 0080 decision 6).
+
 ## 2. What version 1 does not do
 
 Version 1 has no field or header identifying its own version. That is the gap §3 closes: version

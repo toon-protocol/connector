@@ -552,7 +552,8 @@ what a refresh changes is an observation.
 and its absence leaves `scheme: "zk-note"` an unknown scheme, refused exactly as before. It names
 `vault` (the vault's `B62…` zkApp address), `network` (`"mina:mainnet"` or `"mina:devnet"`),
 `graphql_url` and `rpc_via_socks_proxy` (held to ADR 0073's two rules, as a settlement table is),
-`state_key_file` (the key successor states are signed with, by path, never inline),
+`state_key_file` (the key successor states are signed with, by path, never inline: a Mina secret key in
+base58, `EK…`, as Mina's tooling exports it),
 `verification_key_hash` (a decimal field element), `tiers` (nanomina, a subset of zk_toon's
 `policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
 quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest

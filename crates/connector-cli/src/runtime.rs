@@ -1610,7 +1610,9 @@ fn client_claim_gate(
     let budget = UnresolvableLookupBudgetPolicy::default();
     // The gate's zk edge (`ClientClaimGate::with_zk_edge`) needs a
     // `ZkNoteVault`, and the only one is the in-memory fake. #1514's Mina
-    // adapter is what this refusal becomes the construction of.
+    // adapter is what this refusal becomes the construction of -- with
+    // `ClientClaimGate::run_allowance_sweep` spawned beside it (#1523): the
+    // boot sweep already runs inside `with_zk_edge`.
     if config.zk_note().is_some() {
         return Err(RuntimeError::ZkNoteVaultNotBuilt);
     }
