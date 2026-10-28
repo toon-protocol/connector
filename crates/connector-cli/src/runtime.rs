@@ -614,11 +614,11 @@ async fn build_solana_batch_settlement(
         batch.min_sponsored_deposit(),
     )
     .await
-    .map_err(|source| unbound(&table, source))?;
+    .map_err(|source| unbound(table, source))?;
     let backend = match socks_proxy {
         Some(proxy) => backend
             .with_socks_proxy(proxy)
-            .map_err(|source| unbound(&table, source))?,
+            .map_err(|source| unbound(table, source))?,
         None => backend,
     };
     Ok(Arc::new(backend))
