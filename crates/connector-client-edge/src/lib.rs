@@ -73,7 +73,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use connector_config::TransportPolicy;
-use connector_domain::client_claim::ClientClaim;
+use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
     agreed_required_transport, published_required_transport, refuse_oversize, EdgeIdentity,
@@ -89,6 +89,7 @@ mod btp;
 mod channels;
 mod claim_gate;
 mod claim_state;
+mod evidence_file;
 mod lookup_budget;
 mod outbound_ledger;
 mod peer;
@@ -97,12 +98,17 @@ mod session_route;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod voucher_evidence;
+pub mod zk_note;
 pub use batch_settlement::{
     first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
     AdmittedSolanaVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
-pub use claim_gate::{ClaimIngestRejection, ClientClaimGate};
+pub use claim_gate::{
+    AllowanceGrant, AllowanceRefusal, AllowanceRequest, ClaimIngestRejection, ClientClaimGate,
+    ZkEdge, ZkEdgeRestoreError,
+};
+pub use evidence_file::{EvidenceFile, EvidenceFileError, EVIDENCE_FILE};
 pub use lookup_budget::{
     LookupBudgetBound, LookupBudgetExhausted, UnresolvableLookupBudget,
     UnresolvableLookupBudgetPolicy, DEFAULT_UNRESOLVABLE_LOOKUPS_PER_SIGNER,
@@ -984,7 +990,7 @@ pub(crate) struct AdmittedWatermark {
 
 impl AdmittedWatermark {
     /// Read `claim`'s own cumulative amount.
-    pub(crate) fn of(claim: &ClientClaim) -> AdmittedWatermark {
+    pub(crate) fn of(claim: &ClientEdgeClaim) -> AdmittedWatermark {
         AdmittedWatermark {
             cumulative_amount: claim.transferred_amount(),
         }
@@ -1024,7 +1030,12 @@ async fn extract_and_validate_claim(
     )?;
     let claim = state.claim_gate.ingest(&claim_json, charge).await?;
     let channel_key = claim.channel_key();
-    let plaintext_signer = (!wrapped).then(|| claim.signer().to_string());
+    // An allowance claim has no signer to declare: who pays is what the
+    // proof hides (ADR 0080).
+    let plaintext_signer = claim
+        .voucher()
+        .filter(|_| !wrapped)
+        .map(|voucher| voucher.signer().to_string());
     let watermark = AdmittedWatermark::of(&claim);
     // Best-effort liveness bookkeeping for issue #693's claim-state
     // endpoint (`ClientClaimGate::note_claim_time`'s own doc): happens only
