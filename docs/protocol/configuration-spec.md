@@ -549,7 +549,11 @@ numeraire. A quote is read over its network's settlement table's RPC endpoint, a
 token on another network is refused; and
 a path that ends anywhere but the numeraire is refused too, because a cross rate is composed as
 `(X/numeraire) ÷ (Y/numeraire)` and a leg answering in another unit would be composed as though it had
-not. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because
+not. So only a token on the numeraire's own network can quote itself: a `[[tokens]]` row on any other
+network — USDC on 31338 when the numeraire is USDC on 31337 — needs a `[[rates]]` row with a `rate`,
+from it or to it, and without one is refused at load by name (ADR 0086 decision 13). A rate-less row
+only tightens guards, so it does not count. A node that declares no numeraire quotes nothing and is
+not held to this. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because
 direction is the trade — and carries a `rate = { numerator, denominator }` over base units, guard
 overrides, or both; a row naming a token no `[[tokens]]` row declares is refused, and a rate with a
 zero half is refused in the domain's own words with the row named. `[rate_guards]` states `spread`,
