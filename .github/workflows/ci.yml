@@ -315,6 +315,13 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
 
+      # connector-settlement-xrpl's tests run the pinned `rippleci/xrpld` image in Docker (ADR
+      # 0084, issue #1610): the first container-backed tier-3 chain. The hosted runner ships
+      # Docker; this step makes that a stated dependency rather than an assumption, and
+      # `require_xrpld()` fails the test under CI=true if the daemon or the pull is missing.
+      - name: Docker for the xrpld test chain
+        run: docker version
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

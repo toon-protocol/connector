@@ -95,7 +95,7 @@ binary** instead (ADR 0084). The harness spawns it itself, lazily: never a
 hand-started container. Each test gets fresh accounts and its own channels, all
 funding goes through one funder, and a test that moves the clock still gets its
 own chain. A Docker-only chain is pinned by digest and fails CI and skips locally
-without Docker, like a missing binary. Its containers carry a
+without Docker, like a missing binary — `connector_settlement_xrpl::test_support::Xrpld::spawn` is the first, one container per test. Its containers carry a
 `toon.test-chain.owner` label and are cleared at the next spawn, so none outlives
 the next run. A chain is admitted only if the harness can spawn, as one process
 or one container, a chain that runs the deployed program unmodified. A public

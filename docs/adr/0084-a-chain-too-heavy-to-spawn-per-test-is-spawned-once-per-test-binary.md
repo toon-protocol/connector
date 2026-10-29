@@ -4,7 +4,7 @@
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
-**Falsifier:** `crates/**/*.rs` matching `toon\.test-chain\.owner` — decision 4 prescribes this label for every container a shared-tier harness spawns. A match means the shared tier has been built and this Status line is stale. Like ADR 0048's falsifier, it is a name this record prescribes, so an implementer who chooses another label slips past it.
+**Falsifier:** `crates/**/*.rs` matching `fn spawn_shared` — the name this record prescribes for the harness entry point that spawns a chain once per test binary. A match means the shared tier has been built and this Status line is stale. Like ADR 0048's falsifier, it is a name this record prescribes, so an implementer who chooses another name slips past it. (It was `toon\.test-chain\.owner` until #1610; see the Update at the end.)
 
 **A chain-backed test spawns its own disposable chain, as before. A chain too heavy for that may
 instead be spawned once per test binary, by the harness itself, with each test isolated by fresh
@@ -150,3 +150,14 @@ works in Rust, is one way) and its delay tests run in bounded time.
 before then. CONTRIBUTING.md says so.
 
 **Nothing changes for EVM, Solana or XRPL.** They stay per test.
+
+## Update (issue #1610)
+
+The `toon.test-chain.owner` label is no longer evidence of a shared tier. The XRPL test chain
+(`connector_settlement_xrpl::test_support::Xrpld`, the first container-backed chain) is spawned **per
+test**, as decision 2 says XRPL stays, and it applies decision 4's label and orphan sweep to its
+containers: a container left by a killed run is removed by the next spawn, by owner PID. Per-test
+containers need that as much as shared ones, since `--rm` does nothing for a process that was killed.
+So the falsifier now looks for the shared tier's own entry point, `fn spawn_shared`, which does not
+exist yet. The "Rust gate will need Docker" consequence has come true for `connector-settlement-xrpl`
+alone; CONTRIBUTING.md says so.

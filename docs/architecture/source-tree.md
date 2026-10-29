@@ -126,6 +126,9 @@ connector-settlement-evm         real EVM backend: the batch-settlement port ove
   └─ batch_watch.rs              its watcher and sweep (ADR 0074 decision 5): claims at
                                   once on a WithdrawInitiated, and periodically claims
                                   every channel in one `claim`, then `settle`s
+connector-settlement-xrpl        XRPL settlement (spec #1596). So far only the test chain:
+                                  test_support::Xrpld, a stand-alone `xrpld` in a container,
+                                  pinned by digest, one per test (ADR 0084)
 connector-settlement-solana      real Solana backend, speaking solana-foundation's
                                   payment-channels wire directly (ADR 0075). TOON's own
                                   program, which this crate's wire bound to before that

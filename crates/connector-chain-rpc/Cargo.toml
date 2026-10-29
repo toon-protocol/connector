@@ -10,11 +10,14 @@ license.workspace = true
 evm = ["dep:ethers"]
 # The `RpcSender` the Solana backend's `RpcClient` rides (ADR 0073).
 solana = ["dep:solana-rpc-client", "dep:solana-rpc-client-api"]
+# The XRPL JSON-RPC client a settlement table's XRPL clients ride (ADR 0073).
+# No SDK: the wire is plain JSON over the table's one `RpcTransport`.
+xrpl = []
 # `FakeRpc`, a JSON-RPC-over-HTTP server that answers, fails, stalls or
 # drops as a test scripts it. It BINDS A LISTENER, so the shipped binary
 # must not carry it -- the same reason `connector-runtime` gates its SOCKS5
 # fake behind `test-support`.
-test-support = ["tokio/net", "tokio/io-util"]
+test-support = ["tokio/net", "tokio/io-util", "tokio/macros"]
 
 [dependencies]
 # `socks` for the pinned settlement circuit (ADR 0073 decision 3): the same
@@ -36,7 +39,7 @@ solana-rpc-client = { version = "=2.1.0", optional = true }
 solana-rpc-client-api = { version = "=2.1.0", optional = true }
 
 [dev-dependencies]
-connector-chain-rpc = { path = ".", features = ["evm", "solana", "test-support"] }
+connector-chain-rpc = { path = ".", features = ["evm", "solana", "xrpl", "test-support"] }
 # The real SOCKS5 server fake ADR 0070 already ships (`Socks5TestServer`):
 # the only way to assert which socket a dial reached, and under which
 # SOCKS username.
