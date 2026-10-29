@@ -238,6 +238,7 @@ async fn evm_batch_settlement_backend_upholds_the_contract() {
                 })
             },
             unopened,
+            holds_other_tokens: true,
         }
     })
     .await;

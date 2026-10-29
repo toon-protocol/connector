@@ -157,24 +157,29 @@ pub enum ChannelPresentation {
     /// judge is read from it, and the implementation re-derives the PDA from
     /// the account's own seed fields before trusting any of them.
     Solana { channel: ChannelId },
+    /// XRPL: the channel's id alone, 64 lowercase hex characters (ADR 0087
+    /// decision 2). A `PayChannel` is a ledger entry the id names, and every
+    /// field the admission rules judge is read from it.
+    Xrpl { channel: ChannelId },
 }
 
 impl ChannelPresentation {
     /// The channel this presentation names.
     pub fn channel(&self) -> &ChannelId {
         match self {
-            ChannelPresentation::Evm { channel, .. } | ChannelPresentation::Solana { channel } => {
-                channel
-            }
+            ChannelPresentation::Evm { channel, .. }
+            | ChannelPresentation::Solana { channel }
+            | ChannelPresentation::Xrpl { channel } => channel,
         }
     }
 
-    /// The chain this presentation is for: `"evm"` or `"solana"`, the same
+    /// The chain this presentation is for: `"evm"`, `"solana"` or `"xrpl"`, the same
     /// spelling as the config's `[settlement.<chain>]` table.
     pub fn chain(&self) -> &'static str {
         match self {
             ChannelPresentation::Evm { .. } => "evm",
             ChannelPresentation::Solana { .. } => "solana",
+            ChannelPresentation::Xrpl { .. } => "xrpl",
         }
     }
 }
@@ -209,6 +214,7 @@ pub struct Voucher {
 pub enum ReceiverTerms {
     Evm(EvmReceiverTerms),
     Solana(SolanaReceiverTerms),
+    Xrpl(XrplReceiverTerms),
 }
 
 impl ReceiverTerms {
@@ -218,17 +224,20 @@ impl ReceiverTerms {
         match self {
             ReceiverTerms::Evm(_) => "evm",
             ReceiverTerms::Solana(_) => "solana",
+            ReceiverTerms::Xrpl(_) => "xrpl",
         }
     }
 
     /// The shortest delay the counterparty admits a channel with, in
-    /// seconds: EVM `withdrawDelay`, Solana `grace_period`. A channel this
+    /// seconds: EVM `withdrawDelay`, Solana `grace_period`, XRPL
+    /// `SettleDelay`. A channel this
     /// node opens carries exactly this, which is how long winding it down
     /// takes (ADR 0075, Consequences).
     pub fn min_delay_secs(&self) -> u64 {
         match self {
             ReceiverTerms::Evm(terms) => terms.min_withdraw_delay_secs,
             ReceiverTerms::Solana(terms) => terms.min_grace_period_secs,
+            ReceiverTerms::Xrpl(terms) => terms.min_settle_delay_secs,
         }
     }
 }
@@ -269,6 +278,18 @@ pub struct SolanaReceiverTerms {
     /// `sponsorEndpoint`, resolved against the counterparty's URL: where
     /// the payer-signed `open` is posted (ADR 0074 decision 9).
     pub sponsor_endpoint: String,
+}
+
+/// An XRPL counterparty's terms: what the `PaymentChannelCreate` this node
+/// builds toward it must name (ADR 0087 decision 9). A channel holds XRP and
+/// nothing else, so there is no asset to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrplReceiverTerms {
+    /// `payTo`: the counterparty's classic `r…` settlement address, which the
+    /// channel's `Destination` must be.
+    pub receiver: String,
+    /// `minSettleDelay`: the counterparty's minimum `SettleDelay`, in seconds.
+    pub min_settle_delay_secs: u64,
 }
 
 /// A channel a payer opened, as the receiver is shown it, and the signer
@@ -574,11 +595,12 @@ pub enum AdmissionRefusal {
     NotPayableToThisNode { field: &'static str },
     /// EVM `token` or Solana `mint` is not the token this node settles in.
     TokenNotSettled,
-    /// EVM `withdrawDelay` or Solana `grace_period` is below this node's
+    /// EVM `withdrawDelay`, Solana `grace_period` or XRPL `SettleDelay` is below this node's
     /// published minimum.
     DelayBelowMinimum { delay_secs: u64, minimum_secs: u64 },
     /// Solana: the channel is not Open. A channel already closing or sealed
-    /// can back no new voucher.
+    /// can back no new voucher. XRPL: its `Expiration` is already set, so its
+    /// payer has begun to leave.
     NotOpen,
     /// EVM: `payerAuthorizer` is zero, whatever `payer` is (ADR 0074
     /// decision 2, amended 2026-09-25). With none the contract checks a
@@ -588,6 +610,14 @@ pub enum AdmissionRefusal {
     /// node already accepted. The client names a `payerAuthorizer` instead
     /// (decision 6).
     NoPayerAuthorizer,
+    /// XRPL: the channel carries a `CancelAfter`, of any value (ADR 0087
+    /// decision 9). It is an immutable deadline this node cannot see coming
+    /// and could lose a held voucher to.
+    CancelAfter,
+    /// XRPL: the channel's `PublicKey` is neither a compressed secp256k1 key
+    /// nor an `0xED`-prefixed Ed25519 key, so no voucher could be checked
+    /// against it.
+    InvalidChannelKey,
 }
 
 impl std::fmt::Display for AdmissionRefusal {
@@ -608,6 +638,10 @@ impl std::fmt::Display for AdmissionRefusal {
             ),
             AdmissionRefusal::NotOpen => write!(f, "it is not open"),
             AdmissionRefusal::NoPayerAuthorizer => write!(f, "it names no payerAuthorizer"),
+            AdmissionRefusal::CancelAfter => write!(f, "it carries a CancelAfter"),
+            AdmissionRefusal::InvalidChannelKey => {
+                write!(f, "its PublicKey is not a valid channel key")
+            }
         }
     }
 }
@@ -670,6 +704,12 @@ pub enum BatchSettlementError {
     /// Solana: the channel is sealed, and nothing more can land on it.
     #[error("batch-settlement channel '{0}' is sealed")]
     ChannelSealed(ChannelId),
+
+    /// A voucher above the most the chain can name, never truncated: `max` is
+    /// the chain's real ceiling, not its integer type's (XRPL: 10¹⁷ drops,
+    /// Solana: `u64::MAX`). Nothing was submitted.
+    #[error("an amount of {amount} exceeds the chain's ceiling of {max}")]
+    AmountExceedsChain { amount: u128, max: u64 },
 
     /// The signature could not be put in the form the chain verifies, found
     /// before submission.

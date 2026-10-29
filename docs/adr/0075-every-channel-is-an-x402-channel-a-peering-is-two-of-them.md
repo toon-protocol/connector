@@ -953,6 +953,16 @@ carry their misfits on their own issues; Mina (#1552) applies this rule rather t
 **This amends decision 2**: "held to the suite unmodified" holds as written, and a suite clause is one
 that holds on every chain; the fixture, not the suite, absorbs a chain's clock and fees.
 
+**Built (issue #1612): XRPL's receiving half.** `XrplBatchSettlement` is held to
+`assert_upholds_the_contract` against a spawned `xrpld`. One clause did not hold on every chain, and rule
+1 says what that means: "a channel in another token is refused" cannot be asked of a `PayChannel`, which
+holds XRP only. The fixture says so with `holds_other_tokens: false` (true on EVM and Solana), and the
+suite skips that clause for it, the one change the suite took. The port gained `ChannelPresentation::Xrpl`,
+`ReceiverTerms::Xrpl`, `AdmissionRefusal::CancelAfter` and `InvalidChannelKey`, and
+`BatchSettlementError::AmountExceedsChain`, which Solana's `land`, `open` and `top_up` now return where
+they returned `Backend(String)`. An `Expiration` already set is the existing `NotOpen`, and a short
+`SettleDelay` the existing `DelayBelowMinimum`.
+
 ## Update (issue #1564) — whose code a channel may bind to
 
 [ADR 0085](0085-whose-code-a-channel-may-bind-to.md) (owner, 2026-10-28) amends decision 1. A channel

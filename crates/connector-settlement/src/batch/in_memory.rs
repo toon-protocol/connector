@@ -705,6 +705,9 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         let (token, receiver) = match &terms {
             ReceiverTerms::Evm(evm) => (evm.token[0], evm.receiver[0]),
             ReceiverTerms::Solana(solana) => (solana.mint[0], solana.receiver[0]),
+            // `require` above refused it: the fake is an EVM- or Solana-shaped
+            // chain, and has no XRPL shape.
+            ReceiverTerms::Xrpl(_) => unreachable!("the fake settles on no XRPL chain"),
         };
         if token != SETTLED_TOKEN {
             return Err(BatchSettlementError::TokenNotShared);
@@ -746,6 +749,7 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
                 last_valid_block_height: ledger.now + OPEN_LIFETIME_SECS,
             },
             (ReceiverTerms::Evm(_), None) => unreachable!("an EVM-shaped chain reserves a config"),
+            (ReceiverTerms::Xrpl(_), _) => unreachable!("the fake settles on no XRPL chain"),
         })
     }
 

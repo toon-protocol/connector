@@ -670,6 +670,7 @@ fn fixture(
             })
         },
         unopened,
+        holds_other_tokens: true,
     }
 }
 

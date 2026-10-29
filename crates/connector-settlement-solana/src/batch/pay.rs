@@ -486,11 +486,11 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
         if Pubkey::new_from_array(terms.mint) != self.mint {
             return Err(BatchSettlementError::TokenNotShared);
         }
-        let deposit_units = u64::try_from(deposit).map_err(|_| {
-            BatchSettlementError::Backend(format!(
-                "a deposit of {deposit} does not fit payment-channels' u64"
-            ))
-        })?;
+        let deposit_units =
+            u64::try_from(deposit).map_err(|_| BatchSettlementError::AmountExceedsChain {
+                amount: deposit,
+                max: u64::MAX,
+            })?;
         let grace_period = u32::try_from(terms.min_grace_period_secs).map_err(|_| {
             BatchSettlementError::Backend(format!(
                 "a grace period of {}s does not fit payment-channels' u32",
@@ -565,11 +565,11 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
             unreachable!("record_address admits only a Solana record");
         };
         let receiver = Pubkey::new_from_array(*receiver);
-        let deposit_units = u64::try_from(*deposit).map_err(|_| {
-            BatchSettlementError::Backend(format!(
-                "a deposit of {deposit} does not fit payment-channels' u64"
-            ))
-        })?;
+        let deposit_units =
+            u64::try_from(*deposit).map_err(|_| BatchSettlementError::AmountExceedsChain {
+                amount: *deposit,
+                max: u64::MAX,
+            })?;
         let opened = |account: &wire::ChannelAccount| OpenedChannel {
             presentation: ChannelPresentation::Solana {
                 channel: id.clone(),
@@ -717,11 +717,11 @@ impl BatchSettlementPayer for SolanaBatchSettlement {
                 return Err(BatchSettlementError::ChannelSealed(channel.clone()))
             }
         }
-        let increment = u64::try_from(increment).map_err(|_| {
-            BatchSettlementError::Backend(format!(
-                "a top-up of {increment} does not fit payment-channels' u64"
-            ))
-        })?;
+        let increment =
+            u64::try_from(increment).map_err(|_| BatchSettlementError::AmountExceedsChain {
+                amount: increment,
+                max: u64::MAX,
+            })?;
         let landed = self
             .submit_confirmed(&[wire::top_up_instruction(
                 &self.program_id,

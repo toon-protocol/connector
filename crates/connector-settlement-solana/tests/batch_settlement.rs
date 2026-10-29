@@ -212,6 +212,7 @@ async fn solana_batch_settlement_upholds_the_contract() {
         begin_exit,
         sign,
         unopened: presentation(&Pubkey::new_unique()),
+        holds_other_tokens: true,
     };
 
     assert_upholds_the_contract(|| async move { fixture }).await;
@@ -309,6 +310,26 @@ async fn solana_only_rules_hold_against_the_deployed_program() {
     let channel = payer.open(&open, &world.sponsor).await.expect("open");
     let id = ChannelId(channel.to_string());
     backend.admit(presentation(&channel)).await.expect("admit");
+
+    // A voucher wider than the program's `u64` is refused by the port's one
+    // named error, never truncated -- before anything is read or sent.
+    let too_wide = u128::from(u64::MAX) + 1;
+    assert_eq!(
+        backend
+            .land(
+                &id,
+                Voucher {
+                    cumulative_amount: too_wide,
+                    signature: vec![0; 64],
+                },
+            )
+            .await
+            .unwrap_err(),
+        BatchSettlementError::AmountExceedsChain {
+            amount: too_wide,
+            max: u64::MAX,
+        }
+    );
     let impostor = Keypair::new();
     let forged = impostor
         .sign_message(&connector_signer::solana_voucher_message(

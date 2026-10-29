@@ -852,7 +852,8 @@ fn voucher_sender(presentation: &connector_settlement::batch::ChannelPresentatio
         connector_settlement::batch::ChannelPresentation::Evm { config, .. } => {
             format!("0x{}", hex_lower(&config.payer_authorizer))
         }
-        connector_settlement::batch::ChannelPresentation::Solana { channel } => channel.0.clone(),
+        connector_settlement::batch::ChannelPresentation::Solana { channel }
+        | connector_settlement::batch::ChannelPresentation::Xrpl { channel } => channel.0.clone(),
     }
 }
 
@@ -1545,6 +1546,9 @@ impl Connector {
                     }
                     connector_settlement::batch::ChannelPresentation::Solana { .. } => {
                         SettlementChain::Solana
+                    }
+                    connector_settlement::batch::ChannelPresentation::Xrpl { .. } => {
+                        SettlementChain::Xrpl
                     }
                 });
         let receivers: Vec<VoucherSigner> = self

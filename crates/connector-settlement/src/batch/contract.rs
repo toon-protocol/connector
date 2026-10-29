@@ -72,6 +72,14 @@ pub struct BatchContractFixture {
     /// A presentation, for this backend's chain, of a channel that does not
     /// exist.
     pub unopened: ChannelPresentation,
+    /// Whether a channel on this chain can hold a token other than the one
+    /// the backend settles in. True on EVM and Solana. False on XRPL, whose
+    /// `PayChannel` holds XRP and nothing else (ADR 0087 decision 6), so the
+    /// clause "a channel in another token is refused" does not hold there and,
+    /// by ADR 0075's update (#1565), belongs to a suite only for the chains
+    /// where it does. When false, the fixture's `open` is never asked for
+    /// `in_settled_token: false`.
+    pub holds_other_tokens: bool,
 }
 
 fn voucher(sign: &SignFn, channel: &ChannelId, cumulative_amount: u128) -> Voucher {
@@ -104,6 +112,7 @@ where
         begin_exit,
         sign,
         unopened,
+        holds_other_tokens,
     } = build().await;
     assert!(
         minimum_delay_secs > 901,
@@ -139,15 +148,17 @@ where
         "a channel paying someone else is not this node's to accept vouchers on"
     );
 
-    let foreign_token = open(ChannelTerms {
-        in_settled_token: false,
-        ..admissible
-    })
-    .await;
-    assert_eq!(
-        refusal(backend.admit(foreign_token.presentation.clone()).await),
-        AdmissionRefusal::TokenNotSettled
-    );
+    if holds_other_tokens {
+        let foreign_token = open(ChannelTerms {
+            in_settled_token: false,
+            ..admissible
+        })
+        .await;
+        assert_eq!(
+            refusal(backend.admit(foreign_token.presentation.clone()).await),
+            AdmissionRefusal::TokenNotSettled
+        );
+    }
 
     let short_delay = open(ChannelTerms {
         delay_secs: minimum_delay_secs - 1,
@@ -415,7 +426,8 @@ pub struct PayingContractFixture {
 /// The shape of [`PayingContractFixture::restart`].
 pub type RestartFn = Box<dyn Fn() -> BoxFuture<'static, Arc<dyn BatchSettlementPayer>> + Send>;
 
-/// `terms`, naming a token no node settles in.
+/// `terms`, naming a token no node settles in. XRPL has none to name: a
+/// channel holds XRP only, so its terms come back as they were.
 fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
     match terms.clone() {
         ReceiverTerms::Evm(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
@@ -426,6 +438,7 @@ fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
             mint: terms.mint.map(|byte| !byte),
             ..terms
         }),
+        ReceiverTerms::Xrpl(terms) => ReceiverTerms::Xrpl(terms),
     }
 }
 
@@ -445,6 +458,11 @@ fn for_the_other_chain(terms: &ReceiverTerms) -> ReceiverTerms {
             receiver: [0x5a; 20],
             token: [0x5b; 20],
             min_withdraw_delay_secs: terms.min_grace_period_secs,
+        }),
+        ReceiverTerms::Xrpl(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
+            receiver: [0x5a; 20],
+            token: [0x5b; 20],
+            min_withdraw_delay_secs: terms.min_settle_delay_secs,
         }),
     }
 }
@@ -1011,6 +1029,7 @@ mod tests {
             // The fake verifies no signature, so any bytes do.
             sign: Box::new(|_channel, _amount| vec![0u8; 65]),
             unopened,
+            holds_other_tokens: true,
         }
     }
 
