@@ -26,6 +26,8 @@ use crate::settlement::{
     check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
     SettlementTables,
 };
+use crate::zk_note::{resolve_zk_note, RawZkNoteTable, ZkNoteConfig};
+use connector_domain::AssetId;
 
 /// The config file's shape exactly as written -- convenience forms
 /// (`children`) intact, nothing yet validated. `deny_unknown_fields`
@@ -254,6 +256,11 @@ struct RawConfig {
     /// `[[rates]]` row overrides any of them for its own pair.
     #[serde(default)]
     rate_guards: Option<RawRateGuards>,
+    /// `[zk_note]`: the opt-in table that makes this node a zk edge (ADR
+    /// 0080). Absent -- every config before it -- and `scheme: "zk-note"`
+    /// is an unknown scheme, exactly as it always was.
+    #[serde(default)]
+    zk_note: Option<RawZkNoteTable>,
 }
 
 /// The client edge's own defaults for the unresolvable-lookup shaper
@@ -312,6 +319,7 @@ pub struct Config {
     denomination: DenominationConfig,
     peering_assets: PeeringAssets,
     client_channel_assets: ClientChannelAssets,
+    zk_note: Option<ZkNoteConfig>,
 }
 
 impl Config {
@@ -329,7 +337,7 @@ impl Config {
         Self::from_toml_str(&text, path)
     }
 
-    fn from_toml_str(text: &str, path: &Path) -> Result<Config, ConfigError> {
+    pub(crate) fn from_toml_str(text: &str, path: &Path) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source: Box::new(source),
@@ -516,8 +524,35 @@ impl Config {
         // forever. All three keys absent is the default value and checks
         // nothing, which is what "a node that declares none of it behaves
         // exactly as it does today" means here.
-        let denomination =
-            resolve_denomination(raw.tokens, raw.rates, raw.rate_guards, settlement_tables)?;
+        let zk_note = raw
+            .zk_note
+            .map(|table| resolve_zk_note(table, socks_proxy.as_ref()))
+            .transpose()?;
+        let denomination = resolve_denomination(
+            raw.tokens,
+            raw.rates,
+            raw.rate_guards,
+            settlement_tables,
+            zk_note.is_some(),
+        )?;
+        // ADR 0080 decision 7, as amended: a zk edge prices in MINA, and a
+        // forward out of it is paid in a settlement asset, so it crosses a
+        // denomination at a rate the operator declared -- no TWAP source
+        // quotes MINA. Every settlement table this node pays a next hop in
+        // therefore needs a `[[rates]]` row from `mina:native` to its token,
+        // refused here naming the missing pair rather than at the first
+        // forward. A zk edge with no settlement table forwards nothing.
+        if zk_note.is_some() {
+            for settlement in &settlements {
+                let to = settlement.asset();
+                if denomination.rate(&AssetId::mina_native(), &to).is_none() {
+                    return Err(ConfigError::ZkNoteRateMissing {
+                        from: AssetId::mina_native(),
+                        to,
+                    });
+                }
+            }
+        }
         // ADR 0071 decision 1 (issue #1292): which of those declared tokens
         // each peering's channels are denominated in, so that a forward can
         // ask whether its two legs hold different ones without asking a
@@ -542,7 +577,12 @@ impl Config {
         // Resolved from the settlement tables alone and keyed by chain,
         // because the channel this has to cover is one no config names
         // (ADR 0052, issue #502).
-        let client_channel_assets = resolve_client_channel_assets(&settlements, &denomination)?;
+        // A zk edge's allowance claims are its client edge's too: their
+        // packets are denominated in the vault's asset (ADR 0080 decision 7,
+        // as amended), whose rate to every settlement token was required
+        // above.
+        let client_channel_assets =
+            resolve_client_channel_assets(&settlements, &denomination, zk_note.is_some())?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         // The unresolvable-lookup budget (issue #613). Every one of these
         // is refused at zero: each zero either switches the
@@ -685,6 +725,13 @@ impl Config {
             if path.exists() && !path.is_dir() {
                 return Err(ConfigError::StateDirNotADirectory { path: path.clone() });
             }
+        } else if zk_note.is_some() {
+            // ADR 0080 decision 11: a zk edge journals every spent nullifier
+            // and keeps its evidence file under state_dir. Without one, a
+            // restart would let a note open a second allowance from a state
+            // it already spent. First, because it is the more specific
+            // diagnosis on a zk edge that also settles.
+            return Err(ConfigError::ZkNoteWithoutStateDir);
         } else if !peer_channels.is_empty() {
             // The peer half of the same rule: a peer's voucher watermark
             // is no less a replay defence than a client's, and it is the
@@ -734,7 +781,13 @@ impl Config {
             denomination,
             peering_assets,
             client_channel_assets,
+            zk_note,
         })
+    }
+
+    /// The `[zk_note]` table, when this node is a zk edge (ADR 0080).
+    pub fn zk_note(&self) -> Option<&ZkNoteConfig> {
+        self.zk_note.as_ref()
     }
 
     /// Everything this node declares about denomination (ADR 0071

@@ -357,6 +357,7 @@ spell it however it likes.
 | `[[tokens]]`                               | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
 | `[[rates]]`                                | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
 | `[rate_guards]`                            | table                                 | —        | ADR 0071, this node's dealing policy                 |
+| `[zk_note]`                                | table                                 | —        | ADR 0080, makes this node a zk edge                  |
 | `state_dir`                                | path                                  | CF-39    | where durable state lives                            |
 
 **How the file is read.** Every table in it is `deny_unknown_fields`, so an unrecognised key — a typo,
@@ -546,6 +547,26 @@ Declaring tokens alone produces no rate and needs none, which is what a same-ass
 declares.
 Nothing here is an environment variable and nothing is mutable: the file declares the _source_, and
 what a refresh changes is an observation.
+
+**`[zk_note]` makes a node a zk edge** ([ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)),
+and its absence leaves `scheme: "zk-note"` an unknown scheme, refused exactly as before. It names
+`vault` (the vault's `B62…` zkApp address), `network` (`"mina:mainnet"` or `"mina:devnet"`),
+`graphql_url` and `rpc_via_socks_proxy` (held to ADR 0073's two rules, as a settlement table is),
+`state_key_file` (the key successor states are signed with, by path, never inline: a Mina secret key in
+base58, `EK…`, as Mina's tooling exports it),
+`verification_key_hash` (a decimal field element), `tiers` (nanomina, a subset of zk_toon's
+`policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
+quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest
+tier). The vault's asset is native MINA, 9 decimals; the table declares it by existing, as the
+`AssetId` `mina:native`, which a `[[rates]]` row may name as its `from` and which the settlement
+tables still refuse; `[[tokens]]` refuses it by name (`TokenMinaNative`). A zk edge that also settles
+pays its next hops in a settlement asset, so it needs a `[[rates]]` row from `mina:native` to each
+`[settlement.<chain>]` table's token, and is refused naming the missing pair without one; a packet paid
+by an allowance claim is denominated in `mina:native`, so a forward out of it converts at that rate
+(ADR 0071). It requires `state_dir`, where its spent nullifiers are
+journaled and its evidence file, `zk-note-evidence.bin`, is kept. This build parses and validates the
+table but refuses to boot with it: the Mina vault adapter that reads the vault and verifies proofs is
+connector#1514.
 
 **`[[client_identities]]`.** Each entry is an `id` a request presents in `ILP-Peer-Id` and the `secret`
 it must present in `Authorization: Bearer <secret>`; an empty or omitted secret makes that identity a

@@ -75,6 +75,9 @@ tracing = "0.1"
 # questions about a URL, asked of the same crate every other URL in this
 # workspace is parsed by.
 url = "2"
+# The zk edge's state key (ADR 0080): read from `[zk_note] state_key_file`
+# for the greeting's and self-description's `stateKey`.
+connector-zk-note = { path = "../connector-zk-note" }
 
 [dev-dependencies]
 # `FakeRpc` behind the SOCKS5 fake: the proxied settlement route is asserted

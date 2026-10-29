@@ -43,7 +43,9 @@
 use connector_domain::EnvelopeRequest;
 
 /// The client channel a covering claim was accepted on -- "who paid",
-/// as the only form of it this connector can honestly assert.
+/// as the only form of it this connector can honestly assert. Stated only
+/// when it is known (ADR 0040 as amended by ADR 0080 decision 6): never for
+/// a packet paid by an allowance claim, whose payer the proof hides.
 pub const PAYER_HEADER: &str = "X-TOON-Payer";
 
 /// What that claim had to advance by for this delivery: what this connector
@@ -57,7 +59,8 @@ pub const PAYER_HEADER: &str = "X-TOON-Payer";
 pub const AMOUNT_HEADER: &str = "X-TOON-Amount";
 
 /// The settlement chain the paying channel lives on -- read off the
-/// channel key's own namespace, never off the destination address.
+/// channel key's own namespace, never off the destination address. For an
+/// allowance claim, the vault's CAIP-2 Mina network (ADR 0080 decision 6).
 pub const CHAIN_HEADER: &str = "X-TOON-Chain";
 
 /// Every header name this module owns. One list, used both to strip a
@@ -69,15 +72,44 @@ const ATTRIBUTION_HEADERS: [&str; 3] = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADE
 /// A payment this connector verified for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaymentAttribution<'a> {
-    /// The chain-namespaced client channel key the covering claim was
-    /// admitted under (`evm:0x<64 hex>` or `solana:<base58>`).
-    pub channel_key: &'a str,
+    /// The claim key the covering claim was admitted under: a voucher's
+    /// chain-namespaced channel key (`evm:0x<64 hex>` or `solana:<base58>`),
+    /// or an allowance's claim key (`zk-note:<allowance id>`).
+    pub claim_key: &'a str,
     /// What this connector charged for this packet -- the route's schedule
     /// at this packet's own payload length -- which is exactly what that
     /// claim had to cover (ADR 0020, ADR 0028, ADR 0065). At a payment
     /// route reached from a peer, the packet's own `amount`, which the
     /// voucher's advance had to cover instead (ADR 0083).
     pub charge: u64,
+    /// The Mina network (`mina:devnet`, `mina:mainnet`) a zk edge's vault
+    /// lives on, when this node is one: what `X-TOON-Chain` states for a
+    /// packet paid by an allowance claim (ADR 0080 decision 6).
+    pub zk_note_network: Option<&'a str>,
+}
+
+impl PaymentAttribution<'_> {
+    /// Who paid, when it is known (ADR 0040 as amended by ADR 0080): the
+    /// channel key for a voucher, and nothing for an allowance claim, whose
+    /// payer the proof hides.
+    fn payer(&self) -> Option<&str> {
+        (!self.is_allowance()).then_some(self.claim_key)
+    }
+
+    /// The chain the payment was verified on: the channel key's namespace
+    /// for a voucher, the vault's Mina network for an allowance claim.
+    fn chain(&self) -> Option<&str> {
+        if self.is_allowance() {
+            self.zk_note_network
+        } else {
+            chain_of(self.claim_key)
+        }
+    }
+
+    /// Whether the claim key is an allowance's, which names no chain.
+    fn is_allowance(&self) -> bool {
+        connector_domain::client_claim::AllowanceId::from_claim_key(self.claim_key).is_some()
+    }
 }
 
 /// The settlement chain a channel key names: the namespace ahead of its
@@ -120,14 +152,15 @@ pub(crate) fn apply_payment_attribution(
         return;
     }
 
-    request.headers.push((
-        PAYER_HEADER.to_string(),
-        attribution.channel_key.to_string(),
-    ));
+    if let Some(payer) = attribution.payer() {
+        request
+            .headers
+            .push((PAYER_HEADER.to_string(), payer.to_string()));
+    }
     request
         .headers
         .push((AMOUNT_HEADER.to_string(), attribution.charge.to_string()));
-    if let Some(chain) = chain_of(attribution.channel_key) {
+    if let Some(chain) = attribution.chain() {
         request
             .headers
             .push((CHAIN_HEADER.to_string(), chain.to_string()));
@@ -161,8 +194,9 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "evm:0xabc",
+                claim_key: "evm:0xabc",
                 charge: 1000,
+                zk_note_network: None,
             }),
         );
 
@@ -177,8 +211,9 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "solana:9xQeWv",
+                claim_key: "solana:9xQeWv",
                 charge: 7,
+                zk_note_network: None,
             }),
         );
 
@@ -201,8 +236,9 @@ mod tests {
         apply_payment_attribution(
             &mut request,
             Some(PaymentAttribution {
-                channel_key: "evm:0xabc",
+                claim_key: "evm:0xabc",
                 charge: 0,
+                zk_note_network: None,
             }),
         );
         assert!(request.headers.is_empty());
@@ -224,8 +260,9 @@ mod tests {
         apply_payment_attribution(
             &mut overwritten,
             Some(PaymentAttribution {
-                channel_key: "evm:0xreal",
+                claim_key: "evm:0xreal",
                 charge: 1000,
+                zk_note_network: None,
             }),
         );
         assert_eq!(header(&overwritten, PAYER_HEADER), Some("evm:0xreal"));
@@ -248,5 +285,29 @@ mod tests {
         assert_eq!(header(&stripped, CHAIN_HEADER), None);
         // Everything that is not ours is untouched.
         assert_eq!(header(&stripped, "content-type"), Some("application/json"));
+    }
+
+    /// ADR 0040 as amended by ADR 0080 decision 6: a packet paid by an
+    /// allowance claim states the amount and the Mina network, and never a
+    /// payer -- not the allowance key, not anything else -- because who paid
+    /// is what the proof hides. A spoofed payer is still stripped.
+    #[test]
+    fn an_allowance_claim_states_amount_and_mina_network_and_no_payer() {
+        let mut request = request_with(vec![(
+            "X-TOON-Payer".to_string(),
+            "evm:0xvictim".to_string(),
+        )]);
+        apply_payment_attribution(
+            &mut request,
+            Some(PaymentAttribution {
+                claim_key: "zk-note:00112233445566778899aabbccddeeff",
+                charge: 250,
+                zk_note_network: Some("mina:devnet"),
+            }),
+        );
+        assert_eq!(header(&request, PAYER_HEADER), None);
+        assert_eq!(header(&request, AMOUNT_HEADER), Some("250"));
+        assert_eq!(header(&request, CHAIN_HEADER), Some("mina:devnet"));
+        assert_eq!(request.headers.len(), 2);
     }
 }

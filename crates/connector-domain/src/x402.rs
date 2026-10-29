@@ -85,7 +85,16 @@ impl X402PaymentRequired {
     /// Every `batch-settlement` entry this greeting offers, in the order the
     /// emitting node's chains were walked.
     pub fn batch_settlement_offers(&self) -> impl Iterator<Item = &X402BatchSettlementOption> {
-        self.accepts.iter()
+        self.accepts
+            .iter()
+            .filter(|offer| offer.scheme == BATCH_SETTLEMENT_SCHEME)
+    }
+
+    /// The `zk-note` entry a zk edge greets with (ADR 0080), if any.
+    pub fn zk_note_offer(&self) -> Option<&X402BatchSettlementOption> {
+        self.accepts
+            .iter()
+            .find(|offer| offer.scheme == ZK_NOTE_SCHEME)
     }
 
     /// What the **greeted packet** costs, in the asset's base units: the
@@ -470,6 +479,75 @@ pub struct X402BatchSettlementOption {
 pub enum X402BatchSettlementExtra {
     Evm(X402BatchSettlementEvmExtra),
     Solana(X402BatchSettlementSolanaExtra),
+    /// A `zk-note` entry's (ADR 0080): it carries none of either chain's
+    /// required fields, nor they its.
+    ZkNote(X402ZkNoteExtra),
+}
+
+/// The `scheme` of every x402 channel entry.
+const BATCH_SETTLEMENT_SCHEME: &str = "batch-settlement";
+
+/// The `scheme` of a zk edge's entry (ADR 0080 decision 1).
+const ZK_NOTE_SCHEME: &str = "zk-note";
+
+/// A zk edge's standing terms (ADR 0080 decisions 7 and 8, #1523): the one
+/// fact both the greeting's `zk-note` entry and the self-description's
+/// `zkNote` project (ND-11). Read off the `[zk_note]` table and the state
+/// key it names, never declared twice. It states no count of allowances,
+/// open or otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct X402ZkNoteTerms {
+    /// The vault's CAIP-2 network, `mina:mainnet` or `mina:devnet`.
+    pub network: String,
+    /// `slip44:12586`, native MINA's SLIP-44 coin type: with `network`,
+    /// the CAIP-19 `mina:<network>/slip44:12586` (TOON's own composition;
+    /// the `mina` namespace has no CAIP-19 profile).
+    pub asset: String,
+    /// The vault's zkApp address, `B62…`.
+    pub pay_to: String,
+    /// The request proof's verification key hash, a decimal field element.
+    pub verification_key_hash: String,
+    /// The zk edge's state public key, `B62…`: whose signature a successor
+    /// carries, and whose x a payer enters as `edge` in the binding tag.
+    pub state_key: String,
+    /// The budgets this edge grants, nanomina as decimal strings, ascending.
+    pub tiers: Vec<String>,
+    /// The longest allowance it grants, in seconds.
+    pub allowance_lifetime_secs: u64,
+    /// Where allowances are opened and closed.
+    pub allowance_endpoint: String,
+}
+
+/// [`X402BatchSettlementOption::extra`] for a `zk-note` entry: what a
+/// wallet needs to prove a request this edge admits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct X402ZkNoteExtra {
+    pub verification_key_hash: String,
+    pub state_key: String,
+    pub tiers: Vec<String>,
+    pub allowance_lifetime_secs: u64,
+    pub allowance_endpoint: String,
+}
+
+/// Project [`X402ZkNoteTerms`] into the greeting's `accepts[]` entry.
+fn zk_note_accept(fact: &X402ZkNoteTerms, amount: String) -> X402BatchSettlementOption {
+    X402BatchSettlementOption {
+        scheme: ZK_NOTE_SCHEME.to_string(),
+        network: fact.network.clone(),
+        amount,
+        asset: fact.asset.clone(),
+        pay_to: fact.pay_to.clone(),
+        max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
+        extra: X402BatchSettlementExtra::ZkNote(X402ZkNoteExtra {
+            verification_key_hash: fact.verification_key_hash.clone(),
+            state_key: fact.state_key.clone(),
+            tiers: fact.tiers.clone(),
+            allowance_lifetime_secs: fact.allowance_lifetime_secs,
+            allowance_endpoint: fact.allowance_endpoint.clone(),
+        }),
+    }
 }
 
 /// x402 EVM batch-settlement spec `#L81-L97`: `receiverAuthorizer` and
@@ -540,7 +618,7 @@ fn batch_settlement_accept(
 ) -> X402BatchSettlementOption {
     match fact {
         X402BatchSettlementTerms::Evm(evm) => X402BatchSettlementOption {
-            scheme: "batch-settlement".to_string(),
+            scheme: BATCH_SETTLEMENT_SCHEME.to_string(),
             network: evm.network.clone(),
             amount,
             asset: evm.asset.clone(),
@@ -556,7 +634,7 @@ fn batch_settlement_accept(
             }),
         },
         X402BatchSettlementTerms::Solana(solana) => X402BatchSettlementOption {
-            scheme: "batch-settlement".to_string(),
+            scheme: BATCH_SETTLEMENT_SCHEME.to_string(),
             network: solana.network.clone(),
             amount,
             asset: solana.asset.clone(),
@@ -641,9 +719,14 @@ pub fn terms_body(terms: &GreetingTerms<'_>) -> Vec<u8> {
         .map(|node| node.batch_settlements.as_slice())
         .unwrap_or(&[]);
     let amount = price.charge(payload_len).to_string();
+    // ADR 0080: a zk edge's one `zk-note` entry, after them.
     let accepts = batch_settlements
         .iter()
         .map(|fact| batch_settlement_accept(fact, amount.clone()))
+        .chain(
+            node.and_then(|node| node.zk_note.as_ref())
+                .map(|fact| zk_note_accept(fact, amount.clone())),
+        )
         .collect();
     let terms = X402PaymentRequired {
         x402_version: X402_VERSION,
@@ -1076,6 +1159,68 @@ mod tests {
         let terms = parse_greeting(&body).expect("well-formed");
         assert_eq!(terms.price(), Some(1000));
         assert_eq!(terms.batch_settlement_offers().count(), 2);
+    }
+
+    fn zk_note_fact() -> X402ZkNoteTerms {
+        X402ZkNoteTerms {
+            network: "mina:devnet".to_string(),
+            asset: "slip44:12586".to_string(),
+            pay_to: "B62qvault".to_string(),
+            verification_key_hash: "1234".to_string(),
+            state_key: "B62qstate".to_string(),
+            tiers: vec!["10000000".to_string(), "100000000".to_string()],
+            allowance_lifetime_secs: 3600,
+            allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
+        }
+    }
+
+    /// ADR 0080 decisions 7 and 8 (#1523): a zk edge's greeting carries one
+    /// `zk-note` entry beside its `batch-settlement` ones, in the x402
+    /// entries' shape -- `network` plus `asset` read as the CAIP-19
+    /// `mina:devnet/slip44:12586`, `payTo` is the vault -- with the pins a
+    /// wallet needs in `extra`, and no count of anything.
+    #[test]
+    fn a_zk_edge_greets_with_one_zk_note_entry() {
+        let facts = NodeFacts {
+            batch_settlements: vec![evm_batch_settlement_fact()],
+            zk_note: Some(zk_note_fact()),
+            ..Default::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.ario",
+            price: Price::flat(1000),
+            node: Some(&facts),
+            ..Default::default()
+        });
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let accepts = value["accepts"].as_array().unwrap();
+        assert_eq!(accepts.len(), 2);
+        assert_eq!(
+            accepts[1],
+            serde_json::json!({
+                "scheme": "zk-note",
+                "network": "mina:devnet",
+                "amount": "1000",
+                "asset": "slip44:12586",
+                "payTo": "B62qvault",
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "verificationKeyHash": "1234",
+                    "stateKey": "B62qstate",
+                    "tiers": ["10000000", "100000000"],
+                    "allowanceLifetimeSecs": 3600,
+                    "allowanceEndpoint": "/ilp/zk-note/allowances"
+                }
+            })
+        );
+
+        let terms = parse_greeting(&body).expect("well-formed");
+        assert_eq!(terms.batch_settlement_offers().count(), 1);
+        assert_eq!(terms.zk_note_offer(), Some(&accepts_option(&accepts[1])));
+    }
+
+    fn accepts_option(value: &serde_json::Value) -> X402BatchSettlementOption {
+        serde_json::from_value(value.clone()).expect("an accepts entry")
     }
 
     /// A node that settles on no chain -- and a peer carriage, which

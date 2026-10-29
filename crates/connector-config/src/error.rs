@@ -1216,6 +1216,17 @@ pub enum ConfigError {
         source: AssetIdError,
     },
 
+    /// A `[[tokens]]` row naming `mina:native` (ADR 0080 decision 7, as
+    /// amended): native MINA is a zk-note vault's asset and no settlement
+    /// table's, so no channel holds it and no TWAP quotes it. A zk edge
+    /// deals it only as a `[[rates]]` row's `from`.
+    #[error(
+        "[[tokens]] asset '{value}' is refused: native MINA is the [zk_note] vault's asset, not \
+         a token this connector settles or quotes. On a zk edge, name it as a [[rates]] row's \
+         'from' instead (ADR 0080)"
+    )]
+    TokenMinaNative { value: String },
+
     /// Two `[[tokens]]` rows for one token. Refused rather than merged: a
     /// rate table is keyed by token, so the second row is either a typo or
     /// a disagreement, and a disagreement resolved silently is the one a
@@ -1503,4 +1514,86 @@ pub enum ConfigError {
         chain: SettlementChain,
         asset: AssetId,
     },
+
+    // -- [zk_note] (ADR 0080, issue #1522) --
+    /// The vault is not a Mina address.
+    #[error(
+        "[zk_note] vault '{value}' is not a Mina address (B62...): no payer could deposit into it"
+    )]
+    ZkNoteVaultInvalid { value: String },
+
+    /// A network other than the two a vault lives on.
+    #[error("[zk_note] network '{value}' is not 'mina:mainnet' or 'mina:devnet'")]
+    ZkNoteNetworkInvalid { value: String },
+
+    /// The GraphQL endpoint is not an http(s) URL.
+    #[error("[zk_note] graphql_url '{value}' is not an http or https URL")]
+    ZkNoteGraphqlUrlInvalid { value: String },
+
+    /// The vault's reads asked to ride a circuit on a node with none (ADR 0073).
+    #[error(
+        "[zk_note] sets rpc_via_socks_proxy = true but no top-level socks_proxy is set: there \
+         is no fallback to a direct connection, so the vault could never be read. Set \
+         socks_proxy or remove rpc_via_socks_proxy"
+    )]
+    ZkNoteViaSocksProxyWithoutProxy,
+
+    /// The vault's reads would ride a circuit to a plain http endpoint (ADR 0073).
+    #[error(
+        "[zk_note] graphql_url '{value}' is plain http, and rpc_via_socks_proxy = true would \
+         send it through an exit relay that can read and rewrite every answer (a known root, a \
+         spent nullifier). Use the endpoint's https URL; plain http over a circuit is accepted \
+         only for a .onion or .anyone host (ADR 0070, ADR 0073)"
+    )]
+    ZkNoteViaSocksProxyPlaintext { value: String },
+
+    /// The state key file does not exist.
+    #[error("[zk_note] state_key_file '{}' does not exist or is not a file", .0.display())]
+    ZkNoteStateKeyFileNotFound(PathBuf),
+
+    /// The verification key hash is not a decimal field element.
+    #[error(
+        "[zk_note] verification_key_hash '{value}' is not a Mina field element in decimal, the \
+         form a verification key's hash is printed in"
+    )]
+    ZkNoteVerificationKeyHashInvalid { value: String },
+
+    /// The tiers are empty, repeat, hold a zero, or name a tier zk_toon does not publish.
+    #[error("[zk_note] tiers are refused: {source}")]
+    ZkNoteTiersInvalid {
+        #[source]
+        source: connector_zk_note::tiers::TiersError,
+    },
+
+    /// An allowance lifetime of zero, or not well below zk_toon's challenge window.
+    #[error(
+        "[zk_note] allowance_lifetime_secs = {secs} is refused: it must be above 0 and at most \
+         {max_secs}, a quarter of zk_toon's challenge window, so that an allowance closes, its \
+         charge is journaled and its evidence reaches the challenger well inside the window"
+    )]
+    ZkNoteAllowanceLifetimeInvalid { secs: u64, max_secs: u64 },
+
+    /// A cap no allowance could ever fit under.
+    #[error(
+        "[zk_note] open_budget_cap = {cap} is below the smallest published tier {tier}: no \
+         allowance could ever be opened"
+    )]
+    ZkNoteOpenBudgetCapBelowTier { cap: u64, tier: u64 },
+
+    /// A zk edge with nowhere to journal its spent nullifiers or keep its evidence.
+    #[error(
+        "[zk_note] is set but 'state_dir' is not: a zk edge journals every spent nullifier and \
+         keeps its evidence file under state_dir, and one held only in memory would let a note \
+         open a second allowance from a state it already spent after a restart. Set a \
+         top-level state_dir to a directory this node can write"
+    )]
+    ZkNoteWithoutStateDir,
+
+    /// A zk edge that forwards in a settlement asset has no declared rate out of MINA.
+    #[error(
+        "[zk_note] is set and this node pays its next hops in '{to}', but no [[rates]] row \
+         declares a rate for '{from}' -> '{to}': no TWAP source quotes MINA, so the rate a \
+         forward crosses at must be declared (ADR 0080 decision 7, ADR 0071)"
+    )]
+    ZkNoteRateMissing { from: AssetId, to: AssetId },
 }

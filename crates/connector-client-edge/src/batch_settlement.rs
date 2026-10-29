@@ -271,6 +271,13 @@ pub fn first_toon_channel_entry(entries: &[JournalEntry]) -> Option<String> {
             JournalEntry::BatchChannelAdmitted { channel_id, .. } => {
                 Some(canonical_channel_key(channel_id))
             }
+            // An allowance's watermark (ADR 0080) rides the same entry kinds
+            // under `zk-note:<id>`; its grant is what makes that key an
+            // allowance's rather than a retired channel's.
+            JournalEntry::AllowanceGranted { allowance_id, .. } => Some(format!(
+                "{}:{allowance_id}",
+                connector_domain::client_claim::ZK_NOTE_NAMESPACE
+            )),
             _ => None,
         })
         .collect();

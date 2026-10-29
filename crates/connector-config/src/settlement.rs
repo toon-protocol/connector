@@ -177,11 +177,16 @@ impl SettlementChain {
     }
 }
 
-impl From<AssetChain> for SettlementChain {
-    fn from(chain: AssetChain) -> SettlementChain {
+/// Fallible, because one chain a token can live on has no settlement
+/// backend: Mina, whose one asset is a zk-note vault's (ADR 0080).
+impl TryFrom<AssetChain> for SettlementChain {
+    type Error = AssetChain;
+
+    fn try_from(chain: AssetChain) -> Result<SettlementChain, AssetChain> {
         match chain {
-            AssetChain::Evm => SettlementChain::Evm,
-            AssetChain::Solana => SettlementChain::Solana,
+            AssetChain::Evm => Ok(SettlementChain::Evm),
+            AssetChain::Solana => Ok(SettlementChain::Solana),
+            AssetChain::Mina => Err(AssetChain::Mina),
         }
     }
 }
@@ -434,17 +439,46 @@ pub(crate) fn check_settlement_rpc_routes(
 ) -> Result<(), ConfigError> {
     for settlement in settlements.iter().filter(|s| s.rpc_via_socks_proxy()) {
         let table = settlement.chain().name();
-        if socks_proxy.is_none() {
-            return Err(ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table });
-        }
         let url = Url::parse(settlement.rpc_url())
             .expect("resolve_rpc_url already parsed every settlement rpc_url");
-        if url.scheme() == "http" && !crate::is_onion_endpoint(&url) {
-            return Err(ConfigError::SettlementRpcViaSocksProxyPlaintext {
+        check_circuit_route(&url, socks_proxy).map_err(|refusal| match refusal {
+            CircuitRouteRefusal::WithoutProxy => {
+                ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table }
+            }
+            CircuitRouteRefusal::Plaintext => ConfigError::SettlementRpcViaSocksProxyPlaintext {
                 table,
                 value: settlement.rpc_url().to_string(),
-            });
-        }
+            },
+        })?;
+    }
+    Ok(())
+}
+
+/// Which of ADR 0073's two rules a read opted onto the circuit breaks.
+/// Each table that may opt in -- `[settlement.<chain>]` and `[zk_note]` --
+/// names it in its own error, because what an exit relay could rewrite is
+/// that table's to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CircuitRouteRefusal {
+    /// The node configures no `socks_proxy` to ride.
+    WithoutProxy,
+    /// Plain `http://` to a host that is not an onion address.
+    Plaintext,
+}
+
+/// ADR 0073's rules for one endpoint whose table set
+/// `rpc_via_socks_proxy = true`: the node has a `socks_proxy`, and the URL
+/// is https unless its host is an onion address, which authenticates the
+/// service itself (ADR 0070 decision 2).
+pub(crate) fn check_circuit_route(
+    url: &Url,
+    socks_proxy: Option<&Url>,
+) -> Result<(), CircuitRouteRefusal> {
+    if socks_proxy.is_none() {
+        return Err(CircuitRouteRefusal::WithoutProxy);
+    }
+    if url.scheme() == "http" && !crate::is_onion_endpoint(url) {
+        return Err(CircuitRouteRefusal::Plaintext);
     }
     Ok(())
 }
@@ -1157,7 +1191,7 @@ key_file = "{key}"
     #[test]
     fn the_two_chain_enums_translate_both_ways() {
         for chain in [SettlementChain::Evm, SettlementChain::Solana] {
-            assert_eq!(SettlementChain::from(chain.asset_chain()), chain);
+            assert_eq!(SettlementChain::try_from(chain.asset_chain()), Ok(chain));
             // The two spellings are the same word, which is what keeps an
             // `evm:` asset and an `[settlement.evm]` table comparable.
             assert_eq!(chain.asset_chain().as_str(), chain.name());

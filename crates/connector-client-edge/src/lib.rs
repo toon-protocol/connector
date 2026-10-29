@@ -73,7 +73,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use connector_config::TransportPolicy;
-use connector_domain::client_claim::ClientClaim;
+use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
     agreed_required_transport, published_required_transport, refuse_oversize, EdgeIdentity,
@@ -89,6 +89,7 @@ mod btp;
 mod channels;
 mod claim_gate;
 mod claim_state;
+mod evidence_file;
 mod lookup_budget;
 mod outbound_ledger;
 mod peer;
@@ -97,12 +98,19 @@ mod session_route;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod voucher_evidence;
+pub mod zk_note;
+mod zk_note_http;
 pub use batch_settlement::{
     first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
     AdmittedSolanaVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
-pub use claim_gate::{ClaimIngestRejection, ClientClaimGate};
+pub use claim_gate::{
+    AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
+    ClaimIngestRejection, ClientClaimGate, InFlightForward, NotAZkEdge, SignedSuccessor,
+    SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
+};
+pub use evidence_file::{EvidenceFile, EvidenceFileError, EVIDENCE_FILE};
 pub use lookup_budget::{
     LookupBudgetBound, LookupBudgetExhausted, UnresolvableLookupBudget,
     UnresolvableLookupBudgetPolicy, DEFAULT_UNRESOLVABLE_LOOKUPS_PER_SIGNER,
@@ -112,6 +120,7 @@ pub use lookup_budget::{
 pub use outbound_ledger::{ClientPayoutLedger, PayoutVoucher};
 pub use peer::PeerCarriages;
 pub use session_registry::SESSION_LEASE_BACKSTOP_TTL;
+pub use zk_note_http::{successor_json, zk_note_router, ZK_NOTE_ALLOWANCES_PATH};
 
 /// The BTP carriage's default per-session in-flight window (issue #688):
 /// how many of one session's frames may be past claim admission at once.
@@ -967,6 +976,10 @@ struct AdmittedClaim {
     /// What [`crate::claim_gate::ClientClaimGate::admit`] just advanced
     /// [`Self::channel_key`]'s watermark to (issue #1012).
     watermark: AdmittedWatermark,
+    /// Held until the packet has resolved, past any rollback: an
+    /// allowance is charged only once none of its forwards is in flight
+    /// (ADR 0080 decision 4). Inert for a voucher.
+    in_flight: InFlightForward,
 }
 
 /// The watermark one admitted claim advanced its channel to (issue
@@ -984,7 +997,7 @@ pub(crate) struct AdmittedWatermark {
 
 impl AdmittedWatermark {
     /// Read `claim`'s own cumulative amount.
-    pub(crate) fn of(claim: &ClientClaim) -> AdmittedWatermark {
+    pub(crate) fn of(claim: &ClientEdgeClaim) -> AdmittedWatermark {
         AdmittedWatermark {
             cumulative_amount: claim.transferred_amount(),
         }
@@ -1022,9 +1035,14 @@ async fn extract_and_validate_claim(
         wrapped,
         state.wrap_receiver_secret.as_ref(),
     )?;
-    let claim = state.claim_gate.ingest(&claim_json, charge).await?;
-    let channel_key = claim.channel_key();
-    let plaintext_signer = (!wrapped).then(|| claim.signer().to_string());
+    let (claim, in_flight) = state.claim_gate.ingest_forward(&claim_json, charge).await?;
+    let channel_key = claim.claim_key();
+    // An allowance claim has no signer to declare: who pays is what the
+    // proof hides (ADR 0080).
+    let plaintext_signer = claim
+        .voucher()
+        .filter(|_| !wrapped)
+        .map(|voucher| voucher.signer().to_string());
     let watermark = AdmittedWatermark::of(&claim);
     // Best-effort liveness bookkeeping for issue #693's claim-state
     // endpoint (`ClientClaimGate::note_claim_time`'s own doc): happens only
@@ -1034,6 +1052,7 @@ async fn extract_and_validate_claim(
         channel_key,
         plaintext_signer,
         watermark,
+        in_flight,
     }))
 }
 
@@ -1401,6 +1420,9 @@ async fn handle_ilp(
     // rejects can name exactly this claim to `ClientClaimGate::roll_back`
     // below. `None` on every path `client_channel_id` is also `None` on.
     let mut admitted_claim_watermark = None;
+    // ADR 0080 decision 4: the admitted claim's packet, in flight until it
+    // has resolved and any uncarried forward been rolled back below.
+    let mut in_flight = None;
     // Issue #869: the converse of the invariant stated above -- a packet
     // whose envelope will be refused for its own target shape
     // (`AppOutcome::Refused`, F00) is never going to reach the app either,
@@ -1426,6 +1448,7 @@ async fn handle_ilp(
                 state.connector.recognize_channel(&admitted.channel_key);
                 plaintext_claim_signer = admitted.plaintext_signer;
                 admitted_claim_watermark = Some(admitted.watermark);
+                in_flight = Some(admitted.in_flight);
                 client_channel_id = Some(admitted.channel_key);
             }
             Ok(None) => {}
@@ -1456,6 +1479,7 @@ async fn handle_ilp(
         &response,
     )
     .await;
+    drop(in_flight);
     packet_response(response)
 }
 
@@ -3128,6 +3152,7 @@ mod tests {
                 peer_carriages: vec!["btp".to_string()],
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
+                zk_note: None,
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3239,6 +3264,7 @@ mod tests {
                 peer_carriages: Vec::new(),
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
+                zk_note: None,
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,
@@ -3309,6 +3335,7 @@ mod tests {
                 peer_carriages: Vec::new(),
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
+                zk_note: None,
             },
             DEFAULT_BTP_SESSION_WINDOW,
             None,

@@ -247,6 +247,7 @@ fn payee_document(
                 network,
                 signer: payee,
             }],
+            zk_note: None,
         },
         None,
         Vec::new(),
