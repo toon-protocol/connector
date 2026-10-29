@@ -17,6 +17,7 @@ members = [
     "crates/connector-settlement",
     "crates/connector-settlement-evm",
     "crates/connector-settlement-solana",
+    "crates/connector-settlement-xrpl",
     "crates/connector-rate-source",
     "crates/connector-rate-source-evm",
     "crates/connector-signer",

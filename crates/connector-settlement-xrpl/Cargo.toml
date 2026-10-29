@@ -1,0 +1,26 @@
+[package]
+name = "connector-settlement-xrpl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# `test_support::Xrpld`, the disposable stand-alone chain. Gated for the
+# reason the EVM and Solana crates gate theirs: a downstream crate's tests
+# cannot see anything behind `#[cfg(test)]`, and the shipped binary must
+# not carry a harness that shells out to `docker`.
+test-util = ["connector-chain-rpc/test-support", "dep:tokio", "dep:tempfile", "dep:serde_json"]
+
+[dependencies]
+# The XRPL JSON-RPC client over a table's one `RpcTransport` (ADR 0073).
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl"] }
+serde_json = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["sync", "time"], optional = true }
+
+[dev-dependencies]
+connector-settlement-xrpl = { path = ".", features = ["test-util"] }
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl", "test-support"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }

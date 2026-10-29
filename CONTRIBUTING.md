@@ -54,7 +54,7 @@ After reading the documentation above:
 - **Node.js** >= 22.11.0
 - **npm** 10.x or higher
 - **Git** 2.x
-- **Docker** - Docker Desktop or Docker Engine. Needed for `local/` (the shipped image against real containerised chains) and for the `docker-compose.yml` chain profiles. The Rust test gate does **not** need it yet: every chain-backed test spawns its own `anvil` or `solana-test-validator` and throws it away. Once a chain that ships only as a Docker image is admitted to the shared tier ([ADR 0084](docs/adr/0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md)), the gate needs Docker for that chain.
+- **Docker** - Docker Desktop or Docker Engine. Needed for `local/` (the shipped image against real containerised chains) and for the `docker-compose.yml` chain profiles. The Rust test gate needs it for `connector-settlement-xrpl` only (XRPL's `xrpld` stand-alone, pinned by digest, one container per test; [ADR 0084](docs/adr/0084-a-chain-too-heavy-to-spawn-per-test-is-spawned-once-per-test-binary.md)). Those tests skip locally without Docker and fail under `CI`, like a missing `anvil`. Every other chain-backed test spawns its own `anvil` or `solana-test-validator` and throws it away.
 - **Familiarity** with TypeScript and Interledger Protocol basics
 
 ### Initial Setup
@@ -386,6 +386,7 @@ and reports `passed` in `0.00s` is worse than a missing test, which is what issu
 | `anvil` (Foundry)       | `curl -L https://foundry.paradigm.xyz \| bash`                   | `connector-settlement-evm`, `connector-operator`, `connector-cli`, `connector-client-edge`, `connector-bin` |
 | `forge`                 | same                                                             | `connector-rate-source-evm`, which builds `OracleMockPool.sol` for its TWAP tests                           |
 | `solana-test-validator` | `sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"` | `connector-settlement-solana`, `connector-cli`, `connector-bin`                                             |
+| Docker                  | Docker Desktop or Docker Engine                                  | `connector-settlement-xrpl`: runs the pinned `rippleci/xrpld` image, one container per test                 |
 
 **That Solana version is not `stable` and not arbitrary.** It is the one Solana CLI this
 repository installs anywhere (issue #1386 removed `packages/solana-program` and the separate

@@ -1450,6 +1450,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-settlement-xrpl"
+version = "0.1.0"
+dependencies = [
+ "connector-chain-rpc",
+ "connector-settlement-xrpl",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "connector-signer"
 version = "0.1.0"
 dependencies = [

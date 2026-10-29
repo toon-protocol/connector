@@ -56,6 +56,8 @@ pub mod evm;
 mod fake;
 #[cfg(feature = "solana")]
 pub mod solana;
+#[cfg(feature = "xrpl")]
+pub mod xrpl;
 #[cfg(feature = "test-support")]
 pub use fake::{FakeRpc, RpcCall, RpcReply};
 
