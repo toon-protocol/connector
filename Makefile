@@ -199,6 +199,14 @@ LOCAL_NODES_onion := connector-a connector-b
 LOCAL_NODES_dealing := connector-a connector-b connector-c
 LOCAL_NODES = $(LOCAL_NODES_$(LOCAL_TOPOLOGY))
 
+# The chains a topology runs beyond the shared `anvil` and `solana-validator`,
+# started and waited on with them -- before local/keys.sh funds anything on
+# them. Only solo has one: its second anvil, on chain id 31338 (ADR 0086
+# decision 15), the same seeded chain on another network.
+# `local_topologies_load.rs` holds this list to keys.sh's EVM_NETWORKS.
+LOCAL_CHAINS_solo := anvil-31338
+LOCAL_CHAINS = $(LOCAL_CHAINS_$(LOCAL_TOPOLOGY))
+
 # The image the topologies run. Built from this working tree, deliberately: the
 # question is whether THIS commit's image boots, and pulling a published tag
 # would answer it about some other commit.
@@ -237,11 +245,11 @@ local-up: local-preflight local-build
 		echo "       Known topologies: solo two-hop mixed-chain onion dealing."; \
 		exit 1; \
 	}
-	@$(LOCAL_COMPOSE) up -d --wait anvil solana-validator || { \
+	@$(LOCAL_COMPOSE) up -d --wait anvil solana-validator $(LOCAL_CHAINS) || { \
 		echo ""; \
 		echo "ERROR: the chains did not come up. Compose's own message is above:"; \
-		echo "         'address already in use'  -- something else already holds 8545 or"; \
-		echo "                                      8899. 'ss -tlnp | grep 8545' names it."; \
+		echo "         'address already in use'  -- something else already holds 8545, 8546"; \
+		echo "                                      or 8899. 'ss -tlnp | grep 8545' names it."; \
 		echo "         'is unhealthy'            -- the container started but never passed"; \
 		echo "                                      its gate. anvil's gate is 'the seed's"; \
 		echo "                                      last contract has code', so an"; \

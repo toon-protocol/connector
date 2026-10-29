@@ -16,6 +16,48 @@
 # =============================================================================
 
 services:
+  # ── The second EVM network (ADR 0086 decision 15) ──────────────────────────
+  # The root `anvil` on another chain id, and nothing else different: the same
+  # image, the same entrypoint and seed from the same read-only mounts, the
+  # same healthcheck. Every address the seed places or deploys is fixed by
+  # account and nonce, so USDC and x402 land at the SAME addresses as on
+  # 31337 -- two networks whose assets differ only in the chain id, which is
+  # the case CAIP identifiers exist for. Only solo starts it: every other
+  # topology keeps one EVM network.
+  #
+  # Published on 8546, where local/keys.sh funds the node on it; the
+  # connector reaches it by service name, `anvil-31338:8545`.
+  anvil-31338:
+    image: ghcr.io/foundry-rs/foundry:latest
+    profiles: [solo]
+    entrypoint: []
+    command: ['sh', '/anvil/entrypoint.sh']
+    environment:
+      ANVIL_CHAIN_ID: '31338'
+    # Repo-root-relative, like every path in this file (see `connector`).
+    volumes:
+      - ./infra/anvil:/anvil:ro
+      - ./crates/connector-settlement-evm/contracts:/evm:ro
+    ports:
+      - '8546:8545'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+    # docker-compose.yml's anvil healthcheck, verbatim: healthy means seeded.
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          "cast call 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 'isMinter(address)(bool)' 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --rpc-url http://localhost:8545 2>/dev/null | grep -q true || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
   # ── The payment-oblivious app ──────────────────────────────────────────────
   # The connector image's second binary. Not published: only the connector
   # dials it, which is what makes "an unpaid packet never reaches the app"
@@ -61,6 +103,8 @@ services:
     depends_on:
       anvil:
         condition: service_healthy
+      anvil-31338:
+        condition: service_healthy
       solana-validator:
         condition: service_healthy
       stub-app:
@@ -101,27 +145,55 @@ services:
   sender:
     image: connector-rust:local
     profiles: [sender]
-    entrypoint: ['/usr/local/bin/connector']
+    #
+    # Before the packet, each EVM network (ADR 0086 decision 15), asked of two
+    # witnesses: the node's own greeting, which must offer one x402 entry per
+    # network; and each network's anvil, which must hold the channel the node
+    # opened there with its own signed `POST /channels` (local/keys.sh's
+    # `channels` stage, NETWORK_CHANNELS) -- funded on that network and absent
+    # from the other. `$$` is compose's escape for a literal `$`.
+    entrypoint: ['/bin/sh', '-c']
     command:
-      - send
-      - --operator
-      - http://connector:3000
-      - --operator-key
-      - /app/data/operator-send.key
-      - --to
-      - g.local.solo
-      - --seal-to
-      - http://connector:3000/ilp
-      - --target
-      - /
-      - --amount
-      - '0'
-      - --body
-      - /app/data/payload.json
-      - --expect-fulfill
+      - |
+        set -e
+        . /app/rehearsal.sh
+        DEPOSIT=100000000
+        GREETING=$$(wget -q -O - http://connector:3000/ilp)
+        for NETWORK in 31337 31338; do
+          case "$$GREETING" in
+            *'"network":"eip155:'"$$NETWORK"'"'*) ;;
+            *)
+              echo "NO NETWORK: the greeting offers no x402 entry on eip155:$$NETWORK" >&2
+              echo "$$GREETING" >&2
+              exit 1
+              ;;
+          esac
+          if [ ! -s "/app/networks/$$NETWORK" ]; then
+            echo "NO CHANNEL: local/keys.sh opened no channel on eip155:$$NETWORK this run." >&2
+            exit 1
+          fi
+        done
+        A=$$(cat /app/networks/31337)
+        B=$$(cat /app/networks/31338)
+        evm_channel_holds "$$A" "$$DEPOSIT" eip155:31337 http://anvil:8545
+        evm_channel_absent "$$A" http://anvil-31338:8545 eip155:31337
+        evm_channel_holds "$$B" "$$DEPOSIT" eip155:31338 http://anvil-31338:8545
+        evm_channel_absent "$$B" http://anvil:8545 eip155:31338
+        /usr/local/bin/connector send \
+          --operator     http://connector:3000 \
+          --operator-key /app/data/operator-send.key \
+          --to           g.local.solo \
+          --seal-to      http://connector:3000/ilp \
+          --target       / \
+          --amount       0 \
+          --body         /app/data/payload.json \
+          --expect-fulfill
     # Repo-root-relative, as above.
     volumes:
       - ./local/.keys/solo/connector:/app/data:ro
+      # The channel key of each network's channel, written by keys.sh this run.
+      - ./local/.keys/solo/networks:/app/networks:ro
+      - ./local/rehearsal.sh:/app/rehearsal.sh:ro
 
 volumes:
   solo-state:

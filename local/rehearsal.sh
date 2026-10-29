@@ -43,12 +43,15 @@ rpc() {
 
 # The EVM channel `$1` (`evm:0x...`) holds at least `$2` base units in
 # `x402BatchSettlement` itself: the contract's own `channels(id)`, whose first
-# word is the channel's balance. `$3` names the peering in a failure.
+# word is the channel's balance. `$3` names the peering in a failure, and `$4`
+# is the anvil to ask -- the shared one on 31337 unless named, which on solo it
+# is: each of its EVM networks is its own anvil (ADR 0086 decision 15).
 evm_channel_holds() {
   id=${1#evm:}
+  anvil=${4:-http://anvil:8545}
   answer=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003\",\"data\":\"0x7a7ebd7b${id#0x}\"},\"latest\"]}" \
-    http://anvil:8545) || {
-    echo "NO CHANNEL: eth_call channels($id) failed against the local anvil." >&2
+    "$anvil") || {
+    echo "NO CHANNEL: eth_call channels($id) failed against $anvil." >&2
     exit 1
   }
   word=$(echo "$answer" | sed -n 's/.*"result":"0x\([0-9a-f]\{64\}\).*/\1/p')
@@ -66,7 +69,25 @@ evm_channel_holds() {
     echo "               answer: $answer" >&2
     exit 1
   fi
-  echo "--- '$3': x402BatchSettlement holds $held in $id (at least $2)"
+  echo "--- '$3': x402BatchSettlement holds $held in $id on $anvil (at least $2)"
+}
+
+# The EVM channel `$1` does NOT exist on the anvil at `$2`: its
+# `channels(id)` there is all zeroes. A channel opened on one network that also
+# showed up on another would mean two tables reached one chain. `$3` names it.
+evm_channel_absent() {
+  id=${1#evm:}
+  answer=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003\",\"data\":\"0x7a7ebd7b${id#0x}\"},\"latest\"]}" \
+    "$2") || {
+    echo "NO ANSWER: eth_call channels($id) failed against $2." >&2
+    exit 1
+  }
+  words=$(echo "$answer" | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')
+  if [ -z "$words" ] || [ -n "$(echo "$words" | tr -d 0)" ]; then
+    echo "WRONG NETWORK: '$3' ($id) is not absent from $2: $answer" >&2
+    exit 1
+  fi
+  echo "--- '$3': $id does not exist on $2"
 }
 
 # The Solana channel `$1` (`solana:<account>`) is an account of

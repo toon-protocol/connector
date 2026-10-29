@@ -60,7 +60,7 @@ price = 0
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file = "/app/data/operator-write-keys"
 
-# ── Settlement: BOTH chains, live at once ────────────────────────────────────
+# ── Settlement: BOTH chains, live at once -- and EVM on two networks ─────────
 # Deliberately both. `connector-cli`'s
 # `a_both_chains_config_attaches_and_routes_both_backends` proves this concern
 # in-process; nothing else stands a node up with an EVM and a Solana
@@ -91,6 +91,26 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
 [settlement.eip155.31337.key]
+key_file = "/app/data/settlement.key"
+
+# ── A second EVM network: the same chain on another chain id (ADR 0086) ──────
+# `anvil-31338` is the root anvil run again on 31338 (local/solo/compose.yml),
+# seeded by the same `infra/anvil/seed.sh`, so its USDC is at the SAME address
+# as 31337's -- which is why every asset here is CAIP-19 and every voucher names
+# its network: the token address alone cannot say which chain a value is on.
+# The node checks at boot that this RPC answers `eth_chainId` with 31338, that
+# x402 is placed there, and that no two tables report one chain id; it then
+# publishes one `accepts[]` entry per table. Same key file as 31337's: one
+# settlement address on every network (user story 3), funded on both by
+# `local/keys.sh`.
+[settlement.eip155.31338]
+rpc_url = "http://anvil-31338:8545"
+token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.31338.key]
 key_file = "/app/data/settlement.key"
 
 # `token_address` is the deterministic mock mint from

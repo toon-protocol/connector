@@ -78,6 +78,11 @@ services:
       - app # issue #221 — reused by the app profile
     entrypoint: []
     command: ['sh', '/anvil/entrypoint.sh']
+    # The entrypoint takes its chain id from here and refuses to start
+    # without one. `local/solo` runs a second anvil on 31338 from the same
+    # entrypoint and seed (ADR 0086 decision 15).
+    environment:
+      ANVIL_CHAIN_ID: '31337'
     volumes:
       - ./infra/anvil:/anvil:ro
       - ./crates/connector-settlement-evm/contracts:/evm:ro
