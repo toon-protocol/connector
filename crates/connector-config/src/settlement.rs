@@ -158,6 +158,10 @@ pub(crate) struct RawSettlementKeyConfig {
 pub enum SettlementChain {
     Evm,
     Solana,
+    /// The ledger's own `PayChannel` (ADR 0087). A voucher signer and a
+    /// channel can name it from this build; its `[settlement.xrpl.<id>]` table
+    /// is read by the backend ticket that follows (#1596).
+    Xrpl,
 }
 
 impl SettlementChain {
@@ -170,6 +174,7 @@ impl SettlementChain {
         match self {
             SettlementChain::Evm => "evm",
             SettlementChain::Solana => "solana",
+            SettlementChain::Xrpl => "xrpl",
         }
     }
 
@@ -185,6 +190,7 @@ impl SettlementChain {
         match self {
             SettlementChain::Evm => AssetChain::Evm,
             SettlementChain::Solana => AssetChain::Solana,
+            SettlementChain::Xrpl => AssetChain::Xrpl,
         }
     }
 }
@@ -199,6 +205,7 @@ impl TryFrom<AssetChain> for SettlementChain {
             AssetChain::Evm => Ok(SettlementChain::Evm),
             AssetChain::Solana => Ok(SettlementChain::Solana),
             AssetChain::Mina => Err(AssetChain::Mina),
+            AssetChain::Xrpl => Ok(SettlementChain::Xrpl),
         }
     }
 }
@@ -216,6 +223,7 @@ impl std::str::FromStr for SettlementChain {
         match value {
             "evm" => Ok(SettlementChain::Evm),
             "solana" => Ok(SettlementChain::Solana),
+            "xrpl" => Ok(SettlementChain::Xrpl),
             other => Err(UnknownSettlementChain(other.to_string())),
         }
     }
@@ -230,6 +238,7 @@ pub(crate) fn settlement_heading(chain: impl std::fmt::Display) -> &'static str 
     match chain.to_string().parse::<SettlementChain>() {
         Ok(SettlementChain::Evm) => "[settlement.eip155.<chainId>]",
         Ok(SettlementChain::Solana) => "[settlement.solana]",
+        Ok(SettlementChain::Xrpl) => "[settlement.xrpl.<id>]",
         Err(_) => "[settlement.<chain>]",
     }
 }
@@ -242,6 +251,7 @@ pub(crate) fn network_heading(network: &Network) -> String {
         Network::Solana(_) => "[settlement.solana]".to_string(),
         // Mina has no settlement table: its one asset is the zk-note vault's.
         Network::Mina(_) => "[zk_note]".to_string(),
+        Network::Xrpl(xrpl) => format!("[settlement.xrpl.{}]", xrpl.network_id()),
     }
 }
 
@@ -255,7 +265,7 @@ impl std::fmt::Display for UnknownSettlementChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown settlement chain '{}' -- supported chains: evm, solana",
+            "unknown settlement chain '{}' -- supported chains: evm, solana, xrpl",
             self.0
         )
     }
@@ -648,6 +658,8 @@ impl SettlementTables {
         match chain {
             SettlementChain::Evm => !self.eip155.is_empty(),
             SettlementChain::Solana => self.solana,
+            // No `[settlement.xrpl.<id>]` table is read yet (ADR 0087, #1596).
+            SettlementChain::Xrpl => false,
         }
     }
 
@@ -666,7 +678,8 @@ impl SettlementTables {
     ) -> Result<Option<Network>, ConfigError> {
         let Some(written) = written else {
             return match (chain, self.eip155.as_slice()) {
-                (SettlementChain::Solana, _) | (SettlementChain::Evm, []) => Ok(None),
+                (SettlementChain::Solana | SettlementChain::Xrpl, _)
+                | (SettlementChain::Evm, []) => Ok(None),
                 (SettlementChain::Evm, [only]) => Ok(Some(Network::Eip155(*only))),
                 (SettlementChain::Evm, many) => Err(ConfigError::ChannelRowNetworkAmbiguous {
                     table,
@@ -754,6 +767,9 @@ impl SettledNetworks {
             Network::Solana(_) => self.solana,
             // No settlement backend holds MINA (ADR 0080 decision 7).
             Network::Mina(_) => false,
+            // Nor does one hold XRP yet: no `[settlement.xrpl.<id>]` table is
+            // read until the XRPL backend lands (ADR 0087, #1596).
+            Network::Xrpl(_) => false,
         }
     }
 }

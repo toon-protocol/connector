@@ -1,5 +1,5 @@
 {
-  "schema_version": 11,
+  "schema_version": 12,
   "envelope": {
     "valid": [
       {
@@ -614,6 +614,100 @@
       "signature_base58": "23pytmL2R4RcZukDPv27ejMwhsJ1uay5CDmNVxdwnFnRTdn5RDgnPZygbVAGesBSKeyoqUbeNCnMwn1si7sy3wsA",
       "json": "{\"blockchain\":\"solana\",\"channelId\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expiresAt\":0,\"maxClaimableAmount\":\"5000\",\"messageId\":\"vector-fixture:voucher:solana:1\",\"network\":\"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1\",\"scheme\":\"batch-settlement\",\"senderId\":\"AB3FQHskSYuWVw4M9EpGdxNzrAjBNiYGpbH4CVzLFene\",\"signature\":\"23pytmL2R4RcZukDPv27ejMwhsJ1uay5CDmNVxdwnFnRTdn5RDgnPZygbVAGesBSKeyoqUbeNCnMwn1si7sy3wsA\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
     },
+    "xrpl": {
+      "secp256k1": {
+        "name": "claim_voucher_xrpl_secp256k1",
+        "network": "xrpl:1",
+        "algorithm": "secp256k1",
+        "family_seed": "snoPBrXtMeMyMHUVTgbuqAfg1SUTb",
+        "public_key_hex": "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020",
+        "account_id_hex": "b5f762798a53d543a014caf8b297cff8f2f937e8",
+        "classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+        "payer_classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+        "destination_classic_address": "rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC",
+        "channel_sequence": 7,
+        "channel_id_hex": "61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136",
+        "max_claimable_amount": "5000000",
+        "signed_message_hex": "434c4d0061e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d13600000000004c4b40",
+        "signed_digest_hex": "f9000ffb019d8c1d7994019b19e4e122ed96c3a9290559139abb04087a5d17ef",
+        "signature_hex": "3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2",
+        "json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"5000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+      },
+      "ed25519": {
+        "name": "claim_voucher_xrpl_ed25519",
+        "network": "xrpl:1",
+        "algorithm": "ed25519",
+        "family_seed": "sEdSPx8CLbFUna3DJdvJ74aQPLdemqu",
+        "public_key_hex": "EDF9096653463E3A0B79A67E69D9E66AB83D93D4E867335ADE5DAFE8467F4F1734",
+        "account_id_hex": "9a26172134bfda9708a73305af2776a26db7b4f5",
+        "classic_address": "rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC",
+        "payer_classic_address": "rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC",
+        "destination_classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+        "channel_sequence": 8,
+        "channel_id_hex": "a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f",
+        "max_claimable_amount": "5000000",
+        "signed_message_hex": "434c4d00a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f00000000004c4b40",
+        "signed_digest_hex": null,
+        "signature_hex": "d23946e837f2a10ab783e4115939f35703cf72ecbfc8f8c7b8a46a06c8b1e686c309e7c757e4a13fc9b548b252bb98fc3127f455ed8e223b3265d0e0bfd62505",
+        "json": "{\"blockchain\":\"xrpl\",\"channelId\":\"a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f\",\"maxClaimableAmount\":\"5000000\",\"messageId\":\"vector-fixture:voucher:xrpl:ed25519\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC\",\"signature\":\"d23946e837f2a10ab783e4115939f35703cf72ecbfc8f8c7b8a46a06c8b1e686c309e7c757e4a13fc9b548b252bb98fc3127f455ed8e223b3265d0e0bfd62505\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+      },
+      "channel_id": [
+        {
+          "name": "xrpl_channel_id_reference",
+          "source_classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+          "source_account_id_hex": "b5f762798a53d543a014caf8b297cff8f2f937e8",
+          "destination_classic_address": "rLNaPoKeeBjZe2qs6x52yVPZpZ8td4dc6w",
+          "destination_account_id_hex": "d2e44c9faf7be9c536219800a6e698e4c7d2c911",
+          "sequence": 5,
+          "preimage_hex": "0078b5f762798a53d543a014caf8b297cff8f2f937e8d2e44c9faf7be9c536219800a6e698e4c7d2c91100000005",
+          "channel_id_hex": "d53c24f11bea8ec2256fcb3f85371265dacb031b39d1da676a22393497c0ed9f"
+        },
+        {
+          "name": "xrpl_channel_id_secp256k1_pays_ed25519",
+          "source_classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+          "source_account_id_hex": "b5f762798a53d543a014caf8b297cff8f2f937e8",
+          "destination_classic_address": "rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC",
+          "destination_account_id_hex": "9a26172134bfda9708a73305af2776a26db7b4f5",
+          "sequence": 7,
+          "preimage_hex": "0078b5f762798a53d543a014caf8b297cff8f2f937e89a26172134bfda9708a73305af2776a26db7b4f500000007",
+          "channel_id_hex": "61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136"
+        },
+        {
+          "name": "xrpl_channel_id_ed25519_pays_secp256k1",
+          "source_classic_address": "rEhh6f9rj5UUBhFzGGaxS5zYU2CCqKFXBC",
+          "source_account_id_hex": "9a26172134bfda9708a73305af2776a26db7b4f5",
+          "destination_classic_address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+          "destination_account_id_hex": "b5f762798a53d543a014caf8b297cff8f2f937e8",
+          "sequence": 8,
+          "preimage_hex": "00789a26172134bfda9708a73305af2776a26db7b4f5b5f762798a53d543a014caf8b297cff8f2f937e800000008",
+          "channel_id_hex": "a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f"
+        }
+      ],
+      "claim_binds_no_network": {
+        "name": "claim_voucher_xrpl_binds_no_network",
+        "claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"5000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:0\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+        "network": "xrpl:0",
+        "signature_verifies": true
+      },
+      "above_ceiling": {
+        "name": "claim_voucher_xrpl_above_ceiling",
+        "max_drops": "100000000000000000",
+        "amount": "100000000000000001",
+        "amount_above_u64": "18446744073709551616",
+        "claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000001\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+        "claim_above_u64_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"18446744073709551616\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+        "expected_error": "amount_exceeds_chain",
+        "signing_refused": true,
+        "at_ceiling_claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
+      },
+      "invalid": [
+        {
+          "name": "claim_voucher_xrpl_network_missing",
+          "claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"5000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+          "expected_error": "network_missing"
+        }
+      ]
+    },
     "amount_only_watermark": [
       {
         "name": "voucher_amount_equal_to_watermark_is_refused",
@@ -730,6 +824,64 @@
         "signature_verifies": false,
         "entry_json": "{\"blockchain\":\"solana\",\"channelAccount\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expires\":4102444800,\"network\":\"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1\",\"scheme\":\"batch-settlement\",\"signature\":\"4450sYkrSQUkZ70ZRZbNxP3mjqjoNbFBrOkjMUs7O5tZcAE8yNGKnp5OwSsby+kECwr2e29q9f8U4S+tHO75Cg==\"}"
       }
+    ],
+    "xrpl": [
+      {
+        "name": "voucher_claim_state_xrpl_secp256k1_valid",
+        "network": "xrpl:1",
+        "channel_public_key_hex": "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020",
+        "channel_id_hex": "61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136",
+        "expires": 4102444800,
+        "signer_family_seed": "snoPBrXtMeMyMHUVTgbuqAfg1SUTb",
+        "signed_for_network": "xrpl:1",
+        "signed_message_hex": "746f6f6e2d7872706c2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631067872706c3a3161e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d13600000000f4865700",
+        "signature_hex": "3044022067999e202a8236b6ce50be5f4d225ee0f4e5c4e675be6351a5ecb6161994581502207ba71c764ba45c9a4991e5acc159b1c9c3b1bf29d991a293f3dcbdee35478d1d",
+        "signature_verifies": true,
+        "verifies_as_claim": false,
+        "entry_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":4102444800,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"3044022067999e202a8236b6ce50be5f4d225ee0f4e5c4e675be6351a5ecb6161994581502207ba71c764ba45c9a4991e5acc159b1c9c3b1bf29d991a293f3dcbdee35478d1d\"}"
+      },
+      {
+        "name": "voucher_claim_state_xrpl_ed25519_valid",
+        "network": "xrpl:1",
+        "channel_public_key_hex": "EDF9096653463E3A0B79A67E69D9E66AB83D93D4E867335ADE5DAFE8467F4F1734",
+        "channel_id_hex": "a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f",
+        "expires": 4102444800,
+        "signer_family_seed": "sEdSPx8CLbFUna3DJdvJ74aQPLdemqu",
+        "signed_for_network": "xrpl:1",
+        "signed_message_hex": "746f6f6e2d7872706c2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631067872706c3a31a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f00000000f4865700",
+        "signature_hex": "fd0e216fbeaad37a7c5baaa0e5a20c7530073527362568f018716913fc43ac95b8937148c721187f866769e67d13b71b3805b5be789e6348aaf36200e3097d0a",
+        "signature_verifies": true,
+        "verifies_as_claim": false,
+        "entry_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"a6ae6337d2b88d6bd4b97aa38be60661b7cab966f980a5b2937de4058e65cd8f\",\"expires\":4102444800,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"fd0e216fbeaad37a7c5baaa0e5a20c7530073527362568f018716913fc43ac95b8937148c721187f866769e67d13b71b3805b5be789e6348aaf36200e3097d0a\"}"
+      },
+      {
+        "name": "voucher_claim_state_xrpl_wrong_key",
+        "network": "xrpl:1",
+        "channel_public_key_hex": "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020",
+        "channel_id_hex": "61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136",
+        "expires": 4102444800,
+        "signer_family_seed": "sscqjjf6JGnbrPEY7HoZZB9MkPi25",
+        "signed_for_network": "xrpl:1",
+        "signed_message_hex": "746f6f6e2d7872706c2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631067872706c3a3161e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d13600000000f4865700",
+        "signature_hex": "3045022100a85d6ff2ff0716c8585d5ccc79137034e649d1b4880fed28c1cda5cfcbaa59d80220440512c9c2bf6a6f09f1e8350da36b95092f8d77eb2c061948eedbd04c4a0b32",
+        "signature_verifies": false,
+        "verifies_as_claim": false,
+        "entry_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":4102444800,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"3045022100a85d6ff2ff0716c8585d5ccc79137034e649d1b4880fed28c1cda5cfcbaa59d80220440512c9c2bf6a6f09f1e8350da36b95092f8d77eb2c061948eedbd04c4a0b32\"}"
+      },
+      {
+        "name": "voucher_claim_state_xrpl_other_network",
+        "network": "xrpl:1",
+        "channel_public_key_hex": "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020",
+        "channel_id_hex": "61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136",
+        "expires": 4102444800,
+        "signer_family_seed": "snoPBrXtMeMyMHUVTgbuqAfg1SUTb",
+        "signed_for_network": "xrpl:0",
+        "signed_message_hex": "746f6f6e2d7872706c2d766f75636865722d636c61696d2d73746174652d6368616c6c656e67652d7631067872706c3a3061e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d13600000000f4865700",
+        "signature_hex": "30440220607b97c3f40363b3bd4fe357e0383b375927b150584cbca48a9411cf22aa39960220709db78e24eca3cb0b5b850844ce9fa0751c026adace28c79ec76382026e8abc",
+        "signature_verifies": false,
+        "verifies_as_claim": false,
+        "entry_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":4102444800,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"30440220607b97c3f40363b3bd4fe357e0383b375927b150584cbca48a9411cf22aa39960220709db78e24eca3cb0b5b850844ce9fa0751c026adace28c79ec76382026e8abc\"}"
+      }
     ]
   },
   "toon_channel_refused": {
@@ -822,6 +974,21 @@
       "signature_base58": "EcRKVsaadWKUjgtDwdv4Pg4wqNUd74Wbdx2PMdmGKzqhNXJGj9JBT1KrAvnZT2Zy3djEsmPcHYSHaZnmLoeoVzv",
       "json": "{\"blockchain\":\"solana\",\"channelId\":\"9NwekLkGKyq6JE1w63Sw5YhbGh5xWt8gHbeNE8ZHeJzf\",\"expiresAt\":0,\"maxClaimableAmount\":\"42000\",\"network\":\"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1\",\"scheme\":\"batch-settlement\",\"signature\":\"EcRKVsaadWKUjgtDwdv4Pg4wqNUd74Wbdx2PMdmGKzqhNXJGj9JBT1KrAvnZT2Zy3djEsmPcHYSHaZnmLoeoVzv\"}",
       "btp_transfer_hex": "070000251e000000000000a410010c7061796f75742d636c61696d0001000001337b22626c6f636b636861696e223a22736f6c616e61222c226368616e6e656c4964223a22394e77656b4c6b474b7971364a453177363353773559686247683578577438674862654e45385a48654a7a66222c22657870697265734174223a302c226d6178436c61696d61626c65416d6f756e74223a223432303030222c226e6574776f726b223a22736f6c616e613a457457545241425a61597136694d6665594b6f75527531363656553278716131222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a224563524b5673616164574b556a6774447764763450673477714e556437345762647832504d646d474b7a71684e584a476a394a4254314b7241766e5a54325a7933646a45736d506348595348615a6e6d4c6f656f567a76227d"
+    },
+    "xrpl": {
+      "name": "payout_voucher_xrpl",
+      "network": "xrpl:1",
+      "algorithm": "secp256k1",
+      "family_seed": "shszHZTF1ZiuQsqQbgpGtJGsirzFM",
+      "public_key_hex": "0393C3DA5DFFADB3FC2C57C1D1D7F7AAD5B56D890F4A8492DC86EBA5DF0C89AAA3",
+      "account_id_hex": "6200a5c8ae623ab14c6ddeb2106185c35c067c23",
+      "classic_address": "r9ABzofE99miC15Y8ra6KTo2Nw7iCDEqZm",
+      "channel_id_hex": "b4d21e42bf3e8345b74f873728fcae8ddc8a3c8d3d83d4b65e702511f1761025",
+      "max_claimable_amount": "42000",
+      "signed_message_hex": "434c4d00b4d21e42bf3e8345b74f873728fcae8ddc8a3c8d3d83d4b65e702511f1761025000000000000a410",
+      "signature_hex": "3044022022ee0c8f2348b3d6598dad0ed35aea2111990f102f86f280505790b06d72b1290220489a7d229b861ae3538b7097db5dea7fcf2ac3f99b9c3fc45a97e38e020133f1",
+      "json": "{\"blockchain\":\"xrpl\",\"channelId\":\"b4d21e42bf3e8345b74f873728fcae8ddc8a3c8d3d83d4b65e702511f1761025\",\"maxClaimableAmount\":\"42000\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"3044022022ee0c8f2348b3d6598dad0ed35aea2111990f102f86f280505790b06d72b1290220489a7d229b861ae3538b7097db5dea7fcf2ac3f99b9c3fc45a97e38e020133f1\"}",
+      "btp_transfer_hex": "070000251f000000000000a410010c7061796f75742d636c61696d00010000014b7b22626c6f636b636861696e223a227872706c222c226368616e6e656c4964223a2262346432316534326266336538333435623734663837333732386663616538646463386133633864336438336434623635653730323531316631373631303235222c226d6178436c61696d61626c65416d6f756e74223a223432303030222c226e6574776f726b223a227872706c3a31222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a223330343430323230323265653063386632333438623364363539386461643065643335616561323131313939306631303266383666323830353035373930623036643732623132393032323034383961376432323962383631616533353338623730393764623564656137666366326163336639396239633366633435613937653338653032303133336631227d"
     }
   },
   "client_auth_channel_challenge": {
@@ -889,6 +1056,38 @@
         "challenge_json": "{\"blockchain\":\"solana\",\"channelAccount\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expires\":2000000301,\"network\":\"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1\",\"scheme\":\"batch-settlement\",\"signature\":\"I+FobltwwLNjuf/+QvJhWmVB5dMHsB3a/tGLXJaWtxaLkdZmYSH3PBL6kFLAopGnS/8fxUS4woii7JYCfOBTDQ==\"}",
         "auth_entry_json": "{\"channelChallenge\":{\"blockchain\":\"solana\",\"channelAccount\":\"EBBduiozK9vBCemy4FcAjhVkby2FLPstxZxxN7jpgxtr\",\"expires\":2000000301,\"network\":\"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1\",\"scheme\":\"batch-settlement\",\"signature\":\"I+FobltwwLNjuf/+QvJhWmVB5dMHsB3a/tGLXJaWtxaLkdZmYSH3PBL6kFLAopGnS/8fxUS4woii7JYCfOBTDQ==\"},\"peerId\":\"g.toon.agent\",\"secret\":\"\"}",
         "btp_message_hex": "060000258601046175746800010000015c7b226368616e6e656c4368616c6c656e6765223a7b22626c6f636b636861696e223a22736f6c616e61222c226368616e6e656c4163636f756e74223a224542426475696f7a4b39764243656d79344663416a68566b627932464c507374785a78784e376a7067787472222c2265787069726573223a323030303030303330312c226e6574776f726b223a22736f6c616e613a457457545241425a61597136694d6665594b6f75527531363656553278716131222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a22492b466f626c7477774c4e6a75662f2b51764a68576d564235644d48734233612f74474c584a61577478614c6b645a6d5953483350424c366b464c416f70476e532f386678555334776f6969374a5943664f425444513d3d227d2c22706565724964223a22672e746f6f6e2e6167656e74222c22736563726574223a22227d00000000"
+      }
+    ],
+    "xrpl": [
+      {
+        "name": "client_auth_channel_challenge_xrpl_accepted",
+        "blockchain": "xrpl",
+        "now": 2000000000,
+        "expires": 2000000060,
+        "accepted": true,
+        "challenge_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":2000000060,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"304402203160dc37c13a8e17529e2c03137b3c58507952a8e83b122edb9ce68f3187ee7602207f3bbf1e433f311d4c8f21f48c8f768c61c7b77c66e3caa7901b34b74d90481f\"}",
+        "auth_entry_json": "{\"channelChallenge\":{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":2000000060,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"304402203160dc37c13a8e17529e2c03137b3c58507952a8e83b122edb9ce68f3187ee7602207f3bbf1e433f311d4c8f21f48c8f768c61c7b77c66e3caa7901b34b74d90481f\"},\"peerId\":\"g.toon.agent\",\"secret\":\"\"}",
+        "btp_message_hex": "060000258701046175746800010000017c7b226368616e6e656c4368616c6c656e6765223a7b22626c6f636b636861696e223a227872706c222c226368616e6e656c4964223a2236316539346138363139396337356432643635346162303039336366316633626463656337663565343135316530303232363461353630313439623564313336222c2265787069726573223a323030303030303036302c226e6574776f726b223a227872706c3a31222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a223330343430323230333136306463333763313361386531373532396532633033313337623363353835303739353261386538336231323265646239636536386633313837656537363032323037663362626631653433336633313164346338663231663438633866373638633631633762373763363665336361613739303162333462373464393034383166227d2c22706565724964223a22672e746f6f6e2e6167656e74222c22736563726574223a22227d00000000"
+      },
+      {
+        "name": "client_auth_channel_challenge_xrpl_refused_expired",
+        "blockchain": "xrpl",
+        "now": 2000000000,
+        "expires": 1999999999,
+        "accepted": false,
+        "challenge_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":1999999999,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"304502210090646f9c7317b5b1b9d4ff61c0700c45c19aae8b785c387a8ec305d4b4955700022020d8f2c01c19e3bf862ca17d921338bd8b5820bfd5d978c36cbcee03ea090e1b\"}",
+        "auth_entry_json": "{\"channelChallenge\":{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":1999999999,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"304502210090646f9c7317b5b1b9d4ff61c0700c45c19aae8b785c387a8ec305d4b4955700022020d8f2c01c19e3bf862ca17d921338bd8b5820bfd5d978c36cbcee03ea090e1b\"},\"peerId\":\"g.toon.agent\",\"secret\":\"\"}",
+        "btp_message_hex": "060000258801046175746800010000017e7b226368616e6e656c4368616c6c656e6765223a7b22626c6f636b636861696e223a227872706c222c226368616e6e656c4964223a2236316539346138363139396337356432643635346162303039336366316633626463656337663565343135316530303232363461353630313439623564313336222c2265787069726573223a313939393939393939392c226e6574776f726b223a227872706c3a31222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a2233303435303232313030393036343666396337333137623562316239643466663631633037303063343563313961616538623738356333383761386563333035643462343935353730303032323032306438663263303163313965336266383632636131376439323133333862643862353832306266643564393738633336636263656530336561303930653162227d2c22706565724964223a22672e746f6f6e2e6167656e74222c22736563726574223a22227d00000000"
+      },
+      {
+        "name": "client_auth_channel_challenge_xrpl_refused_too_far_ahead",
+        "blockchain": "xrpl",
+        "now": 2000000000,
+        "expires": 2000000301,
+        "accepted": false,
+        "challenge_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":2000000301,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"30450221009a1e5203aa2e6fe179c0b3f9cbaa4213fc92cb84788ac15bbc7aa4c988790822022073bbc257b6dec8e47419dc4a527b205c732e5523c1485cff903ceabfc6c8971f\"}",
+        "auth_entry_json": "{\"channelChallenge\":{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"expires\":2000000301,\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"signature\":\"30450221009a1e5203aa2e6fe179c0b3f9cbaa4213fc92cb84788ac15bbc7aa4c988790822022073bbc257b6dec8e47419dc4a527b205c732e5523c1485cff903ceabfc6c8971f\"},\"peerId\":\"g.toon.agent\",\"secret\":\"\"}",
+        "btp_message_hex": "060000258901046175746800010000017e7b226368616e6e656c4368616c6c656e6765223a7b22626c6f636b636861696e223a227872706c222c226368616e6e656c4964223a2236316539346138363139396337356432643635346162303039336366316633626463656337663565343135316530303232363461353630313439623564313336222c2265787069726573223a323030303030303330312c226e6574776f726b223a227872706c3a31222c22736368656d65223a2262617463682d736574746c656d656e74222c227369676e6174757265223a2233303435303232313030396131653532303361613265366665313739633062336639636261613432313366633932636238343738386163313562626337616134633938383739303832323032323037336262633235376236646563386534373431396463346135323762323035633733326535353233633134383563666639303363656162666336633839373166227d2c22706565724964223a22672e746f6f6e2e6167656e74222c22736563726574223a22227d00000000"
       }
     ]
   },

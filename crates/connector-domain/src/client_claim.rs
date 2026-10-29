@@ -116,12 +116,40 @@ pub struct SolanaVoucher {
     pub signature: String,
 }
 
+/// The most an XRPL voucher may name, in drops: XRP's total supply, 10¹⁷
+/// (ADR 0087 decision 2). `connector_signer::XRPL_MAX_DROPS` is the same
+/// figure, and `connector-vectors` holds the two equal.
+pub const XRPL_MAX_DROPS: u64 = 100_000_000_000_000_000;
+
+/// An XRPL **voucher**: a claim under x402's `batch-settlement` scheme on the
+/// ledger's own `PayChannel` (ADR 0087 decision 2, `xrpl-paychan-v1`). The
+/// signed message is the ledger's `CLM\0 ‖ channelId ‖ u64 drops`, which
+/// binds no network, so the network is required here and the account is
+/// unique to it (decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrplVoucher {
+    pub common: ClientClaimCommon,
+    /// The CAIP-2 network the voucher is on: required, an `xrpl` network.
+    pub network: Network,
+    /// The channel, 64 hex characters in the ledger's own spelling (no `0x`),
+    /// either case on the wire. Named by the voucher and read from the
+    /// ledger, never derived from it.
+    pub channel_id: String,
+    /// The cumulative drops the voucher authorises, at most
+    /// [`XRPL_MAX_DROPS`]. Wider is [`ClientClaimError::AmountExceedsChain`].
+    pub max_claimable_amount: u128,
+    /// The signature, hex: DER for a secp256k1 channel key, 64 raw bytes for
+    /// Ed25519.
+    pub signature: String,
+}
+
 /// A structurally valid claim (client-edge-spec.md §1.3): a voucher,
 /// discriminated on chain the way the wire's `blockchain` field does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientClaim {
     EvmVoucher(EvmVoucher),
     SolanaVoucher(SolanaVoucher),
+    XrplVoucher(XrplVoucher),
 }
 
 impl ClientClaim {
@@ -138,6 +166,12 @@ impl ClientClaim {
             ClientClaim::SolanaVoucher(voucher) => {
                 format!("{SOLANA_NAMESPACE}:{}", voucher.channel_id)
             }
+            ClientClaim::XrplVoucher(voucher) => {
+                format!(
+                    "{XRPL_CHANNEL_NAMESPACE}:{}",
+                    canonical_xrpl_id(&voucher.channel_id)
+                )
+            }
         }
     }
 
@@ -148,6 +182,7 @@ impl ClientClaim {
         match self {
             ClientClaim::EvmVoucher(voucher) => voucher.max_claimable_amount,
             ClientClaim::SolanaVoucher(voucher) => u128::from(voucher.max_claimable_amount),
+            ClientClaim::XrplVoucher(voucher) => voucher.max_claimable_amount,
         }
     }
 
@@ -158,6 +193,7 @@ impl ClientClaim {
         match self {
             ClientClaim::EvmVoucher(voucher) => &voucher.network,
             ClientClaim::SolanaVoucher(voucher) => &voucher.network,
+            ClientClaim::XrplVoucher(voucher) => &voucher.network,
         }
     }
 
@@ -165,6 +201,7 @@ impl ClientClaim {
         match self {
             ClientClaim::EvmVoucher(voucher) => &voucher.common,
             ClientClaim::SolanaVoucher(voucher) => &voucher.common,
+            ClientClaim::XrplVoucher(voucher) => &voucher.common,
         }
     }
 
@@ -190,6 +227,9 @@ impl ClientClaim {
             ClientClaim::SolanaVoucher(voucher) => {
                 format!("{SOLANA_NAMESPACE}:{}", voucher.common.sender_id)
             }
+            ClientClaim::XrplVoucher(voucher) => {
+                format!("{XRPL_CHANNEL_NAMESPACE}:{}", voucher.common.sender_id)
+            }
         }
     }
 
@@ -211,6 +251,10 @@ pub const EVM_NAMESPACE: &str = "evm";
 /// The chain namespace [`ClientClaim::channel_key`] prefixes a Solana
 /// `channelAccount` with.
 pub const SOLANA_NAMESPACE: &str = "solana";
+
+/// The chain namespace [`ClientClaim::channel_key`] prefixes an XRPL channel
+/// id with (ADR 0087 decision 2: the journal keys it `xrpl:<channel id>`).
+pub const XRPL_CHANNEL_NAMESPACE: &str = "xrpl";
 
 /// The canonical form of an already-namespaced channel key -- the key a
 /// watermark is filed under, and the only form a lookup of one may be
@@ -263,6 +307,10 @@ pub const SOLANA_NAMESPACE: &str = "solana";
 ///   different, non-32-byte value), so there is nothing to normalise and
 ///   normalising anyway would only risk merging two ids that are not the
 ///   same account.
+/// * `xrpl:` -- 64 lowercase hex characters, whenever the id is 64 hex
+///   characters (the ledger prints them in uppercase and hex has no case).
+///   Unique across XRPL networks only because one account is one network
+///   (ADR 0087 decision 4).
 /// * anything else -- identity, byte for byte. A key in no namespace this
 ///   function knows is left exactly as it was found rather than guessed
 ///   at: a journal's entry alphabet is shared with the peer semantics, whose
@@ -280,6 +328,9 @@ pub const SOLANA_NAMESPACE: &str = "solana";
 pub fn canonical_channel_key(key: &str) -> String {
     match key.split_once(':') {
         Some((EVM_NAMESPACE, id)) => format!("{EVM_NAMESPACE}:{}", canonical_evm_id(id)),
+        Some((XRPL_CHANNEL_NAMESPACE, id)) => {
+            format!("{XRPL_CHANNEL_NAMESPACE}:{}", canonical_xrpl_id(id))
+        }
         _ => key.to_string(),
     }
 }
@@ -292,6 +343,16 @@ fn canonical_evm_id(channel_id: &str) -> String {
     let hex = channel_id.strip_prefix("0x").unwrap_or(channel_id);
     if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         format!("0x{}", hex.to_ascii_lowercase())
+    } else {
+        channel_id.to_string()
+    }
+}
+
+/// The canonical spelling of an XRPL channel id: lowercase when it is 64 hex
+/// characters, otherwise untouched.
+fn canonical_xrpl_id(channel_id: &str) -> String {
+    if channel_id.len() == 64 && channel_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        channel_id.to_ascii_lowercase()
     } else {
         channel_id.to_string()
     }
@@ -336,6 +397,15 @@ pub enum ClientClaimError {
         max = u64::MAX
     )]
     AmountOutOfRange { amount: u128 },
+    /// An XRPL voucher names more drops than exist (ADR 0087 decision 2): a
+    /// valid `uint128` on the wire, above XRP's total supply. Refused by
+    /// name, never truncated -- a truncated amount is a different voucher
+    /// from the one the payer signed.
+    #[error(
+        "claim is structurally invalid: 'maxClaimableAmount' {amount} is above the {max} drops \
+         that exist -- refused, not truncated"
+    )]
+    AmountExceedsChain { amount: u128, max: u64 },
     /// A Solana voucher carries a nonzero `expiresAt` (ADR 0074 decision 3):
     /// value that could lapse before this connector lands it. x402 requires
     /// zero, so this is refused structurally.
@@ -350,7 +420,7 @@ pub enum ClientClaimError {
     /// a second one.
     #[error(
         "claim carries no 'network': since wire schema_version 11 every voucher names the \
-         CAIP-2 network it is on (eip155:<chainId> or solana:<genesis prefix>), and one \
+         CAIP-2 network it is on (eip155:<chainId>, solana:<genesis prefix> or xrpl:<id>), and one \
          without it is refused rather than guessed (ADR 0086)"
     )]
     NetworkMissing,
@@ -708,6 +778,44 @@ fn parse_solana_voucher(
     })
 }
 
+fn parse_xrpl_voucher(
+    obj: &serde_json::Map<String, Value>,
+    common: ClientClaimCommon,
+) -> Result<XrplVoucher, ClientClaimError> {
+    let network = required_network(obj, AssetChain::Xrpl)?;
+    let channel_id = required_str(obj, "channelId")?.to_string();
+    if channel_id.len() != 64 || !channel_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(malformed(
+            "an XRPL voucher's 'channelId' must be 64 hex characters (no 0x prefix)",
+        ));
+    }
+    let max_claimable_amount = required_voucher_amount_u128(obj)?;
+    if max_claimable_amount > u128::from(XRPL_MAX_DROPS) {
+        return Err(ClientClaimError::AmountExceedsChain {
+            amount: max_claimable_amount,
+            max: XRPL_MAX_DROPS,
+        });
+    }
+    let signature = required_str(obj, "signature")?.to_string();
+    // 64 bytes of Ed25519, or a DER ECDSA signature of at most 72.
+    if signature.len() % 2 != 0
+        || !(128..=144).contains(&signature.len())
+        || !signature.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(malformed(
+            "an XRPL voucher's 'signature' must be 128 to 144 hex characters (a DER ECDSA or \
+             Ed25519 signature, no 0x prefix)",
+        ));
+    }
+    Ok(XrplVoucher {
+        common,
+        network,
+        channel_id,
+        max_claimable_amount,
+        signature,
+    })
+}
+
 /// Parse and structurally validate a claim's JSON body (client-edge-spec.md
 /// §1.3): required fields per chain, and their formats. Does not check
 /// freshness, value or cryptography -- those are [`crate::validate_voucher`]
@@ -734,6 +842,7 @@ pub fn parse_client_claim(json: &str) -> Result<ClientClaim, ClientClaimError> {
     match blockchain {
         "evm" => parse_evm_voucher(obj, common).map(ClientClaim::EvmVoucher),
         "solana" => parse_solana_voucher(obj, common).map(ClientClaim::SolanaVoucher),
+        "xrpl" => parse_xrpl_voucher(obj, common).map(ClientClaim::XrplVoucher),
         other => Err(malformed(format!("unsupported blockchain '{other}'"))),
     }
 }
@@ -1128,6 +1237,96 @@ mod tests {
             channel = "ab".repeat(32),
             signature = "ab".repeat(64),
         )
+    }
+
+    fn xrpl_voucher_json() -> String {
+        format!(
+            r#"{{
+            "version": "1.0",
+            "blockchain": "xrpl",
+            "network": "xrpl:1",
+            "scheme": "batch-settlement",
+            "messageId": "voucher-3",
+            "timestamp": "2026-10-29T12:00:00Z",
+            "senderId": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            "channelId": "5DB01B7FFED6B67E6B0414DED11E051D2EE2B7619CE0EAA6286D67A3A4D5BDB3",
+            "maxClaimableAmount": "42",
+            "signature": "{}"
+        }}"#,
+            "ab".repeat(64)
+        )
+    }
+
+    #[test]
+    fn a_well_formed_xrpl_voucher_parses_and_is_keyed_by_its_lowercase_channel_id() {
+        let claim = parse_client_claim(&xrpl_voucher_json()).expect("parses");
+        let ClientClaim::XrplVoucher(voucher) = &claim else {
+            panic!("expected an XRPL voucher, got {claim:?}");
+        };
+        assert_eq!(voucher.max_claimable_amount, 42);
+        assert_eq!(claim.network().to_string(), "xrpl:1");
+        assert_eq!(
+            claim.channel_key(),
+            "xrpl:5db01b7ffed6b67e6b0414ded11e051d2ee2b7619ce0eaa6286d67a3a4d5bdb3"
+        );
+        assert_eq!(
+            canonical_channel_key(&claim.channel_key()),
+            claim.channel_key()
+        );
+    }
+
+    #[test]
+    fn an_xrpl_voucher_needs_an_xrpl_network() {
+        let json = xrpl_voucher_json();
+        assert_eq!(
+            parse_client_claim(&json.replace(r#""network": "xrpl:1","#, "")),
+            Err(ClientClaimError::NetworkMissing)
+        );
+        assert!(matches!(
+            parse_client_claim(&json.replace("xrpl:1", "eip155:1")),
+            Err(ClientClaimError::NetworkNotOnChain { .. })
+        ));
+        assert!(matches!(
+            parse_client_claim(&json.replace("xrpl:1", "xrpl:7")),
+            Err(ClientClaimError::NetworkInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn an_xrpl_amount_above_the_drop_ceiling_is_refused_by_name_never_truncated() {
+        let at = xrpl_voucher_json().replace(r#""42""#, &format!(r#""{XRPL_MAX_DROPS}""#));
+        assert!(parse_client_claim(&at).is_ok());
+        for above in [
+            u128::from(XRPL_MAX_DROPS) + 1,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) + 1,
+            u128::MAX,
+        ] {
+            let json = xrpl_voucher_json().replace(r#""42""#, &format!(r#""{above}""#));
+            assert_eq!(
+                parse_client_claim(&json),
+                Err(ClientClaimError::AmountExceedsChain {
+                    amount: above,
+                    max: XRPL_MAX_DROPS
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_xrpl_channel_id_or_signature_is_refused() {
+        let json = xrpl_voucher_json();
+        for bad in [
+            json.replace("5DB01B7F", "0x5DB01B7F"),
+            json.replace("5DB01B7F", "5DB01B7"),
+            json.replace(&"ab".repeat(64), &"ab".repeat(10)),
+            json.replace(&"ab".repeat(64), &"zz".repeat(64)),
+        ] {
+            assert!(matches!(
+                parse_client_claim(&bad),
+                Err(ClientClaimError::Malformed(_))
+            ));
+        }
     }
 
     fn solana_voucher_json() -> String {

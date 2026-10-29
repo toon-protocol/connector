@@ -1534,6 +1534,7 @@ impl Connector {
         let chain_of = |signer: &VoucherSigner| match signer {
             VoucherSigner::Evm(_) => SettlementChain::Evm,
             VoucherSigner::Solana(_) => SettlementChain::Solana,
+            VoucherSigner::Xrpl(_) => SettlementChain::Xrpl,
         };
         let channel_chain =
             outbound

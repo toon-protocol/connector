@@ -379,7 +379,7 @@ fn the_committed_claim_network_verdicts_replay() {
                         "network_domain_mismatch"
                     }
                 }
-                ClientClaim::SolanaVoucher(_) => "accepted",
+                ClientClaim::SolanaVoucher(_) | ClientClaim::XrplVoucher(_) => "accepted",
             }
         };
         assert_eq!(case["outcome"], outcome, "case {name}");
@@ -860,4 +860,163 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
     assert_eq!(answer["charge"], next["charge"]);
     assert_eq!(answer["signature"]["r"], next["signature"]["r"]);
     assert_eq!(answer["anchor"], next["signed_fields"][4]);
+}
+
+/// ADR 0087 decisions 2 and 3 (issue #1611): the committed XRPL vectors
+/// replay against the real signer and parser, read fresh from disk -- the
+/// artifact `toon-client`, `rig` and `swap` replay (ADR 0021). The keys are
+/// rebuilt from the committed family seeds, so a seed that decoded to
+/// another key fails here as well as a signature that did not verify.
+#[test]
+fn the_committed_xrpl_vectors_replay_against_the_real_implementation() {
+    use connector_domain::client_claim::{parse_client_claim, ClientClaim, ClientClaimError};
+    use connector_signer::{
+        decode_xrpl_classic_address, verify_xrpl_claim, verify_xrpl_voucher_claim_state_challenge,
+        xrpl_channel_id, xrpl_claim_message, XrplSigner, XRPL_CLAIM_PREFIX,
+    };
+
+    fn hex_bytes<const N: usize>(s: &str) -> [u8; N] {
+        hex::decode(s)
+            .unwrap_or_else(|e| panic!("{s} is not hex: {e}"))
+            .try_into()
+            .unwrap_or_else(|v: Vec<u8>| panic!("{s} is not {N} bytes, got {}", v.len()))
+    }
+    fn text<'a>(value: &'a serde_json::Value, field: &str) -> &'a str {
+        value[field].as_str().unwrap_or_else(|| panic!("{field}"))
+    }
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/wire-vectors.json");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the committed vectors"))
+            .expect("the committed vectors are valid JSON");
+    assert!(committed["schema_version"].as_u64().expect("version") >= 12);
+    let xrpl = &committed["claim_voucher"]["xrpl"];
+
+    // The offline channel-id derivation, from the committed accounts.
+    for case in xrpl["channel_id"].as_array().expect("channel_id cases") {
+        let source = decode_xrpl_classic_address(text(case, "source_classic_address")).unwrap();
+        let destination =
+            decode_xrpl_classic_address(text(case, "destination_classic_address")).unwrap();
+        assert_eq!(hex::encode(source), text(case, "source_account_id_hex"));
+        let sequence = u32::try_from(case["sequence"].as_u64().expect("sequence")).unwrap();
+        assert_eq!(
+            hex::encode(xrpl_channel_id(&source, &destination, sequence)),
+            text(case, "channel_id_hex"),
+            "{}",
+            text(case, "name")
+        );
+    }
+
+    let mut channels = Vec::new();
+    for key in ["secp256k1", "ed25519"] {
+        let case = &xrpl[key];
+        let signer = XrplSigner::from_family_seed(text(case, "family_seed")).expect("a seed");
+        assert_eq!(
+            hex::encode_upper(signer.public_key()),
+            text(case, "public_key_hex")
+        );
+        assert_eq!(signer.classic_address(), text(case, "classic_address"));
+        let channel_id: [u8; 32] = hex_bytes(text(case, "channel_id_hex"));
+        let amount: u128 = text(case, "max_claimable_amount").parse().expect("amount");
+        let message = xrpl_claim_message(&channel_id, amount).unwrap();
+        assert_eq!(message[..4], XRPL_CLAIM_PREFIX);
+        assert_eq!(hex::encode(message), text(case, "signed_message_hex"));
+        let signature = hex::decode(text(case, "signature_hex")).expect("hex");
+        assert!(
+            verify_xrpl_claim(&signer.public_key(), &channel_id, amount, &signature),
+            "{key}: the committed signature verifies against the committed key"
+        );
+        // Any one tampered byte of the channel id, the amount or the
+        // signature fails.
+        assert!(!verify_xrpl_claim(
+            &signer.public_key(),
+            &channel_id,
+            amount + 1,
+            &signature
+        ));
+        let mut other = channel_id;
+        other[31] ^= 1;
+        assert!(!verify_xrpl_claim(
+            &signer.public_key(),
+            &other,
+            amount,
+            &signature
+        ));
+        let mut bad = signature.clone();
+        bad[10] ^= 1;
+        assert!(!verify_xrpl_claim(
+            &signer.public_key(),
+            &channel_id,
+            amount,
+            &bad
+        ));
+        assert!(matches!(
+            parse_client_claim(text(case, "json")).expect("the committed voucher parses"),
+            ClientClaim::XrplVoucher(_)
+        ));
+        channels.push((signer, channel_id));
+    }
+
+    // A claim binds no network: it verifies as the same bytes on mainnet.
+    let relabelled = &xrpl["claim_binds_no_network"];
+    let claim = parse_client_claim(text(relabelled, "claim_json")).expect("parses");
+    assert_eq!(claim.network().to_string(), text(relabelled, "network"));
+    assert_eq!(claim.network().to_string(), "xrpl:0");
+
+    // The ceiling is refused by name, never truncated.
+    let ceiling = &xrpl["above_ceiling"];
+    let max: u64 = text(ceiling, "max_drops").parse().expect("max");
+    assert_eq!(max, 100_000_000_000_000_000);
+    for field in ["claim_json", "claim_above_u64_json"] {
+        assert!(matches!(
+            parse_client_claim(text(ceiling, field)),
+            Err(ClientClaimError::AmountExceedsChain { .. })
+        ));
+    }
+    assert!(parse_client_claim(text(ceiling, "at_ceiling_claim_json")).is_ok());
+    for invalid in xrpl["invalid"].as_array().expect("invalid") {
+        assert_eq!(
+            parse_client_claim(text(invalid, "claim_json")),
+            Err(ClientClaimError::NetworkMissing)
+        );
+    }
+
+    // The challenge: verifies exactly where the committed verdict says, and
+    // is never a claim.
+    for case in committed["voucher_claim_state_challenge"]["xrpl"]
+        .as_array()
+        .expect("xrpl claim-state cases")
+    {
+        let channel_key: [u8; 33] = hex_bytes(text(case, "channel_public_key_hex"));
+        let channel_id: [u8; 32] = hex_bytes(text(case, "channel_id_hex"));
+        assert!(
+            channels
+                .iter()
+                .any(|(signer, id)| signer.public_key() == channel_key && *id == channel_id),
+            "a challenge names one of the committed channels"
+        );
+        let signature = hex::decode(text(case, "signature_hex")).expect("hex");
+        let expires = case["expires"].as_u64().expect("expires");
+        let verifies = verify_xrpl_voucher_claim_state_challenge(
+            &channel_key,
+            text(case, "network"),
+            &channel_id,
+            expires,
+            &signature,
+        );
+        assert_eq!(
+            verifies,
+            case["signature_verifies"].as_bool().expect("verdict"),
+            "{}",
+            text(case, "name")
+        );
+        let signed = hex::decode(text(case, "signed_message_hex")).expect("hex");
+        assert_ne!(signed[..4], XRPL_CLAIM_PREFIX);
+        assert!(!verify_xrpl_claim(
+            &channel_key,
+            &channel_id,
+            u128::from(expires),
+            &signature
+        ));
+    }
 }

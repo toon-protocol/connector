@@ -7,7 +7,7 @@ see `crates/connector-vectors` and `docs/protocol/wire-vectors.md` for the invar
 is evidence of. This file is plain JSON so a client SDK can replay it without importing anything
 from this repository.
 
-`asset-ids.json` (schema 11, ADR 0086 decision 2) is its sibling: CAIP-19 asset ids on both chains
+`asset-ids.json` (schema 12 now; added at 11, ADR 0086 decision 2) is its sibling: CAIP-19 asset ids on both chains
 and the by-name refusal of every legacy spelling. It is kept out of `wire-vectors.json` because no
 asset id rides a packet, and ADR 0071 decision 7 keeps that file unit-silent. The same command
 regenerates both, and the same test gates both.
@@ -147,6 +147,15 @@ The other two, for completeness:
 All byte fields are lowercase hex, no `0x` prefix, except where a section says a field is the
 literal string that rides the wire. `schema_version` bumps only when a field's meaning changes in a
 way that would make existing replay code misread it; a purely additive field does not bump it.
+
+**`schema_version` 12** (issue #1611,
+[ADR 0087](../docs/adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)): XRPL's claim wire.
+`claim_voucher.xrpl`, `payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl` and
+`client_auth_channel_challenge.xrpl` are new; nothing existing changed bytes. A voucher's `signature`
+and `channelId` are plain hex (no `0x`), its `maxClaimableAmount` a decimal string of drops (at most
+10¹⁷), and the signed message is `"CLM\0" ‖ channelId ‖ drops (u64 BE)` — the ledger's, which binds no
+network. secp256k1 signs `SHA512Half(message)` and the signature is DER; Ed25519 signs the raw
+message. See `docs/protocol/wire-vectors.md`.
 
 **`schema_version` 9** (issue #1532): a new top-level `client_edge` section. `f03_rejects` has four
 cases — one per client-edge reject reason (`underpayment`, `undercollateralized`,

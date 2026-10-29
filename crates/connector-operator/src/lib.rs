@@ -782,6 +782,7 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
         | EstablishPeeringError::UnreadableSettlementAddress { .. }
         | EstablishPeeringError::NetworkMismatch { .. }
         | EstablishPeeringError::NoVoucherSigner { .. }
+        | EstablishPeeringError::ChainNotPeerable { .. }
         | EstablishPeeringError::InvalidTerms { .. } => {
             (StatusCode::BAD_GATEWAY, error.to_string()).into_response()
         }
