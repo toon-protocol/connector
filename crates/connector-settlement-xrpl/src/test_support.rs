@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use connector_chain_rpc::xrpl::{TxFate, XrplRpc};
+use connector_chain_rpc::xrpl::{TxFate, TxWait, XrplRpc};
 use connector_chain_rpc::RpcTransport;
 use serde_json::json;
 
@@ -53,6 +53,10 @@ pub const GENESIS_SECRET: &str = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb";
 
 /// The RPC port inside the container.
 const RPC_PORT: u16 = 5005;
+
+/// How long a spawn waits for a first answered `server_info` before it
+/// fails, measured from `docker run`.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
 
 /// What [`require_xrpld`] does about a missing chain: a pure function of the
 /// facts, so the CI rule is tested without Docker.
@@ -132,8 +136,22 @@ fn docker(args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new("docker").args(args).output()
 }
 
+/// Whether `pid` names a live process. `/proc` where there is one; `ps -p`
+/// where there is not (macOS), since a missing `/proc` would make every
+/// owner, this process included, look dead and have each spawn remove its
+/// siblings' chains.
 fn process_is_running(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    if std::path::Path::new("/proc/self").exists() {
+        return std::path::Path::new(&format!("/proc/{pid}")).exists();
+    }
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        // Unable to tell: keep the container rather than remove a live chain.
+        .unwrap_or(true)
 }
 
 /// Remove every harness container whose owning process is gone. A container
@@ -282,9 +300,11 @@ impl Xrpld {
         chain.rpc_url = format!("http://127.0.0.1:{port}");
 
         let rpc = chain.rpc();
+        let deadline = started + STARTUP_DEADLINE;
         let mut answered = false;
-        for _ in 0..600 {
-            if rpc.server_info().await.is_ok() {
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Ok(_)) = tokio::time::timeout(remaining, rpc.server_info()).await {
                 answered = true;
                 break;
             }
@@ -293,7 +313,7 @@ impl Xrpld {
         chain.startup = started.elapsed();
         assert!(
             answered,
-            "xrpld did not answer server_info within 60 s; its log:\n{}",
+            "xrpld did not answer server_info within {STARTUP_DEADLINE:?}; its log:\n{}",
             chain.logs()
         );
         chain
@@ -323,18 +343,18 @@ impl Xrpld {
             .unwrap_or_default()
     }
 
-    /// The container's memory use as `docker stats` reports it, for ADR
-    /// 0084's 1 GB line.
-    pub fn memory_usage(&self) -> String {
-        docker(&[
+    /// The container's memory use in bytes, as `docker stats` reports it,
+    /// for ADR 0084's 1 GB line. `None` when it cannot be read.
+    pub fn memory_bytes(&self) -> Option<u64> {
+        let out = docker(&[
             "stats",
             "--no-stream",
             "--format",
             "{{.MemUsage}}",
             &self.container,
         ])
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_default()
+        .ok()?;
+        parse_mem_usage(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// Pay `drops` from the genesis account to `address` and close the
@@ -363,7 +383,10 @@ impl Xrpld {
             .wait_for_tx(
                 &submitted.hash,
                 last_ledger_sequence,
-                Duration::from_millis(50),
+                TxWait {
+                    poll: Duration::from_millis(50),
+                    give_up_after: Duration::from_secs(30),
+                },
             )
             .await
             .expect("wait for the funding payment");
@@ -383,6 +406,25 @@ impl Xrpld {
     }
 }
 
+/// The used half of `docker stats`' `MemUsage` (`72.5MiB / 7.7GiB`), in
+/// bytes.
+fn parse_mem_usage(mem_usage: &str) -> Option<u64> {
+    let used = mem_usage.split('/').next()?.trim();
+    let split = used.find(|c: char| c.is_ascii_alphabetic())?;
+    let (number, unit) = used.split_at(split);
+    let scale: f64 = match unit {
+        "B" => 1.0,
+        "kB" | "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((number.trim().parse::<f64>().ok()? * scale) as u64)
+}
+
 impl Drop for Xrpld {
     fn drop(&mut self) {
         let _ = docker(&["rm", "-f", &self.container]);
@@ -399,6 +441,14 @@ mod tests {
         assert_eq!(availability(true, false), Availability::Run);
         assert_eq!(availability(false, false), Availability::Skip);
         assert_eq!(availability(false, true), Availability::Fail);
+    }
+
+    #[test]
+    fn docker_stats_memory_usage_reads_as_bytes() {
+        assert_eq!(parse_mem_usage("72.5MiB / 7.7GiB"), Some(76_021_760));
+        assert_eq!(parse_mem_usage("1.2GiB / 7.7GiB"), Some(1_288_490_188));
+        assert_eq!(parse_mem_usage("512KiB / 1GiB"), Some(524_288));
+        assert_eq!(parse_mem_usage("--"), None);
     }
 
     #[test]

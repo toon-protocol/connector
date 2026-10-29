@@ -16,11 +16,12 @@
 //! **Every wait is bounded by `LastLedgerSequence`** ([`XrplRpc::wait_for_tx`]).
 //! A transaction carries the last ledger it may land in, and the ledger
 //! itself says when that has passed, so the wait ends in [`TxFate::Landed`]
-//! or [`TxFate::KnownNotLanded`] and never in a hang. This is the answer to
-//! "did my send land?" that EVM gets from a receipt and a nonce.
+//! or [`TxFate::KnownNotLanded`] and never in a hang. A failed poll does not
+//! end it; an endpoint that answers nothing for [`TxWait::give_up_after`]
+//! does. This is the answer to "did my send land?" that EVM gets from a
+//! receipt and a nonce.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -30,7 +31,6 @@ use crate::{is_refusal, refusal_backoff, AsRefused, Refused, RpcTransport};
 #[derive(Debug)]
 pub struct XrplRpc {
     transport: RpcTransport,
-    requests: AtomicU64,
 }
 
 /// Why a request to an XRPL settlement endpoint did not produce a result.
@@ -157,6 +157,16 @@ pub struct TxStatus {
     pub meta: Value,
 }
 
+/// How [`XrplRpc::wait_for_tx`] paces itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxWait {
+    /// The wait between polls while the endpoint answers.
+    pub poll: Duration,
+    /// How long the endpoint may stay unreadable before the wait gives up
+    /// and returns the last error.
+    pub give_up_after: Duration,
+}
+
 /// How a bounded wait on a transaction ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxFate {
@@ -174,10 +184,7 @@ pub enum TxFate {
 
 impl XrplRpc {
     pub fn new(transport: RpcTransport) -> XrplRpc {
-        XrplRpc {
-            transport,
-            requests: AtomicU64::new(0),
-        }
+        XrplRpc { transport }
     }
 
     /// The transport this client rides.
@@ -185,16 +192,10 @@ impl XrplRpc {
         &self.transport
     }
 
-    /// How many requests this client has made, retried refusals excluded.
-    pub fn requests(&self) -> u64 {
-        self.requests.load(Ordering::Relaxed)
-    }
-
     /// One call: `params` is the single params object, and the answer is the
     /// `result` object of a `"status": "success"` response.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, XrplRpcError> {
         let endpoint = || self.transport.endpoint();
-        self.requests.fetch_add(1, Ordering::Relaxed);
         // Serialised once, so a refused request is resent byte for byte.
         let body = json!({ "method": method, "params": [params] }).to_string();
 
@@ -423,42 +424,70 @@ impl XrplRpc {
     /// Wait for the fate of a submitted transaction, bounded by its
     /// `LastLedgerSequence`.
     ///
-    /// Polls every `poll`. The validated ledger's index is read **before**
-    /// the transaction is looked up: if that index is already past
-    /// `last_ledger_sequence` and the lookup then finds the transaction in no
-    /// validated ledger, no ledger that could hold it is left, so the answer
-    /// is [`TxFate::KnownNotLanded`]. Read the other way round, a
+    /// Polls every `wait.poll`. The validated ledger's index is read
+    /// **before** the transaction is looked up: if that index is already
+    /// past `last_ledger_sequence` and the lookup then finds the transaction
+    /// in no validated ledger, no ledger that could hold it is left, so the
+    /// answer is [`TxFate::KnownNotLanded`]. Read the other way round, a
     /// transaction validated between the two reads would be called lost.
     ///
-    /// A failed read ends the wait with that error rather than being retried
-    /// blind: the caller holds the hash and can ask again.
+    /// A failed read does not end the wait (ADR 0073 decision 5): the
+    /// transaction may still land, so the loop backs off and polls again.
+    /// Only when nothing has answered for `wait.give_up_after` does it
+    /// return the last error, the one honest "I do not know"; the caller
+    /// holds the hash and can ask again.
     pub async fn wait_for_tx(
         &self,
         hash: &str,
         last_ledger_sequence: u32,
-        poll: Duration,
+        wait: TxWait,
     ) -> Result<TxFate, XrplRpcError> {
+        // The last time any read answered: `give_up_after` is measured from
+        // here, so it means nothing could be read for that long.
+        let mut last_answer = Instant::now();
+        let mut failures = 0u32;
         loop {
-            let validated_before = self.server_info().await?.validated_ledger;
-            if let Some(status) = self.tx(hash).await? {
-                if let (true, Some(ledger_index), Some(transaction_result)) = (
-                    status.validated,
-                    status.ledger_index,
-                    status.transaction_result,
-                ) {
-                    return Ok(TxFate::Landed {
-                        ledger_index,
-                        transaction_result,
-                        meta: status.meta,
-                    });
+            let polled = async {
+                let validated_before = self.server_info().await?.validated_ledger;
+                Ok::<_, XrplRpcError>((validated_before, self.tx(hash).await?))
+            };
+            match polled.await {
+                Ok((validated_before, status)) => {
+                    last_answer = Instant::now();
+                    failures = 0;
+                    if let Some(TxStatus {
+                        validated: true,
+                        ledger_index: Some(ledger_index),
+                        transaction_result: Some(transaction_result),
+                        meta,
+                    }) = status
+                    {
+                        return Ok(TxFate::Landed {
+                            ledger_index,
+                            transaction_result,
+                            meta,
+                        });
+                    }
+                    if validated_before.is_some_and(|seq| seq > last_ledger_sequence) {
+                        return Ok(TxFate::KnownNotLanded {
+                            last_ledger_sequence,
+                        });
+                    }
+                }
+                Err(error) => {
+                    if last_answer.elapsed() >= wait.give_up_after {
+                        return Err(error);
+                    }
+                    failures += 1;
                 }
             }
-            if validated_before.is_some_and(|seq| seq > last_ledger_sequence) {
-                return Ok(TxFate::KnownNotLanded {
-                    last_ledger_sequence,
-                });
-            }
-            tokio::time::sleep(poll).await;
+            // Backs off while polls fail, so an endpoint that is refusing or
+            // down is not polled at full speed; the first answer resets it.
+            let backoff = wait
+                .poll
+                .saturating_mul(2u32.saturating_pow(failures.min(4)))
+                .min(Duration::from_secs(8).max(wait.poll));
+            tokio::time::sleep(backoff).await;
         }
     }
 }

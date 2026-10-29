@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use connector_chain_rpc::xrpl::{TxFate, XrplRpc};
+use connector_chain_rpc::xrpl::{TxFate, TxWait, XrplRpc, XrplRpcError};
 use connector_chain_rpc::{FakeRpc, RpcReply, RpcTransport};
 use serde_json::{json, Value};
 
@@ -21,6 +21,11 @@ fn error(code: &str) -> RpcReply {
 fn client(fake: &FakeRpc) -> XrplRpc {
     XrplRpc::new(RpcTransport::direct(&fake.url()).expect("transport"))
 }
+
+const WAIT: TxWait = TxWait {
+    poll: Duration::from_millis(1),
+    give_up_after: Duration::from_secs(5),
+};
 
 fn server_info(validated: u32) -> RpcReply {
     success(json!({ "info": {
@@ -68,10 +73,7 @@ async fn a_wait_ends_known_not_landed_once_a_validated_ledger_is_past_the_bound(
         other => panic!("unexpected {other}"),
     })
     .await;
-    let fate = client(&fake)
-        .wait_for_tx("AB", 12, Duration::from_millis(1))
-        .await
-        .unwrap();
+    let fate = client(&fake).wait_for_tx("AB", 12, WAIT).await.unwrap();
     assert_eq!(
         fate,
         TxFate::KnownNotLanded {
@@ -95,10 +97,7 @@ async fn a_transaction_validated_just_before_the_bound_passes_is_landed_not_lost
         other => panic!("unexpected {other}"),
     })
     .await;
-    let fate = client(&fake)
-        .wait_for_tx("AB", 12, Duration::from_millis(1))
-        .await
-        .unwrap();
+    let fate = client(&fake).wait_for_tx("AB", 12, WAIT).await.unwrap();
     assert!(matches!(
         fate,
         TxFate::Landed { ledger_index: 12, ref transaction_result, .. }
@@ -114,9 +113,48 @@ async fn a_known_but_unvalidated_transaction_is_waited_on_until_the_bound() {
         other => panic!("unexpected {other}"),
     })
     .await;
-    let fate = client(&fake)
-        .wait_for_tx("AB", 6, Duration::from_millis(1))
-        .await
-        .unwrap();
+    let fate = client(&fake).wait_for_tx("AB", 6, WAIT).await.unwrap();
     assert!(matches!(fate, TxFate::KnownNotLanded { .. }));
+}
+
+#[tokio::test]
+async fn a_failed_poll_does_not_end_the_wait_for_a_transaction_that_may_land() {
+    // The first two polls lose their answers; the transaction landed anyway.
+    let fake = FakeRpc::spawn(|call| match call.method.as_str() {
+        "server_info" if call.nth < 2 => RpcReply::Drop,
+        "server_info" => server_info(12),
+        "tx" => success(json!({
+            "validated": true, "ledger_index": 11,
+            "meta": { "TransactionResult": "tesSUCCESS" }
+        })),
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    let fate = client(&fake).wait_for_tx("AB", 12, WAIT).await.unwrap();
+    assert!(matches!(
+        fate,
+        TxFate::Landed {
+            ledger_index: 11,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn an_endpoint_that_never_answers_ends_the_wait_with_its_error_not_a_hang() {
+    let fake = FakeRpc::spawn(|_| RpcReply::Drop).await;
+    let wait = TxWait {
+        poll: Duration::from_millis(1),
+        give_up_after: Duration::from_millis(50),
+    };
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        client(&fake).wait_for_tx("AB", 12, wait),
+    )
+    .await
+    .expect("the wait gives up rather than hanging");
+    assert!(
+        matches!(ended, Err(XrplRpcError::Transport { .. })),
+        "{ended:?}"
+    );
 }

@@ -4,13 +4,16 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use connector_chain_rpc::xrpl::TxFate;
+use connector_chain_rpc::xrpl::{TxFate, TxWait};
 use connector_settlement_xrpl::test_support::{
     require_xrpld, Xrpld, IMAGE, OWNER_LABEL, STANDALONE_NETWORK_ID,
 };
 use serde_json::json;
 
-const POLL: Duration = Duration::from_millis(50);
+const WAIT: TxWait = TxWait {
+    poll: Duration::from_millis(50),
+    give_up_after: Duration::from_secs(10),
+};
 
 #[tokio::test]
 async fn a_funded_account_reads_back_its_balance_through_the_transport_built_client() {
@@ -91,7 +94,7 @@ async fn a_transaction_that_passes_its_last_ledger_sequence_unlanded_is_reported
     };
     let waited = tokio::time::timeout(Duration::from_secs(20), async {
         tokio::join!(
-            rpc.wait_for_tx(&submitted.hash, last_ledger_sequence, POLL),
+            rpc.wait_for_tx(&submitted.hash, last_ledger_sequence, WAIT),
             closer
         )
         .0
@@ -149,8 +152,8 @@ async fn repeated_ledger_accept_advances_the_close_time_faster_than_the_wall_clo
 
 /// ADR 0084's line: a chain is "too heavy" for per-test spawning past 10 s
 /// to its first answer or 1 GB. The numbers are printed for the record
-/// (`--nocapture`); the 10 s half is an assertion, so a slower runner fails
-/// loudly instead of quietly breaching the ADR.
+/// (`--nocapture`), and both halves are assertions, so a slower or hungrier
+/// runner fails loudly instead of quietly breaching the ADR.
 #[tokio::test]
 async fn startup_is_inside_adr_0084s_line() {
     if !require_xrpld() {
@@ -161,16 +164,24 @@ async fn startup_is_inside_adr_0084s_line() {
     for _ in 0..5 {
         chain.funded_wallet(&rpc, 100_000_000).await;
     }
+    let memory = chain
+        .memory_bytes()
+        .expect("docker stats reports the chain's memory");
     eprintln!(
-        "xrpld: startup {:?}, memory after 5 funded accounts {}",
+        "xrpld: startup {:?}, memory after 5 funded accounts {} MB",
         chain.startup,
-        chain.memory_usage()
+        memory / 1_000_000
     );
     assert!(
         chain.startup < Duration::from_secs(10),
         "xrpld took {:?} to its first server_info: past ADR 0084's 10 s line, \
          so XRPL belongs in the once-per-binary tier",
         chain.startup
+    );
+    assert!(
+        memory < 1_000_000_000,
+        "xrpld uses {memory} bytes: past ADR 0084's 1 GB line, so XRPL belongs in the \
+         once-per-binary tier"
     );
 }
 

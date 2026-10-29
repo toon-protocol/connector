@@ -23,4 +23,4 @@ connector-settlement-xrpl = { path = ".", features = ["test-util"] }
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl", "test-support"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
