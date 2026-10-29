@@ -1796,7 +1796,9 @@ fn client_claim_gate(
     // `ZkNoteVault`, and the only one is the in-memory fake. #1514's Mina
     // adapter is what this refusal becomes the construction of -- with
     // `ClientClaimGate::run_allowance_sweep` spawned beside it (#1523): the
-    // boot sweep already runs inside `with_zk_edge`.
+    // boot sweep already runs inside `with_zk_edge`. The adapter also reads
+    // `Subsidy::read(vault, zk_note.subsidy_budget())` there, once, through the
+    // table's `RpcTransport`, and a failed read fails the boot (decision 14).
     if config.zk_note().is_some() {
         return Err(RuntimeError::ZkNoteVaultNotBuilt);
     }
@@ -1894,6 +1896,8 @@ fn zk_note_terms(
             .collect(),
         allowance_lifetime_secs: zk_note.allowance_lifetime().as_secs(),
         allowance_endpoint: connector_client_edge::ZK_NOTE_ALLOWANCES_PATH.to_string(),
+        subsidy: None,
+        subsidised_last_period: None,
     })
 }
 
@@ -2951,6 +2955,8 @@ open_budget_cap = 1000000000
                 verification_key_hash: "1".to_string(),
                 state_key: address.clone(),
                 tiers: vec!["10000000".to_string(), "100000000".to_string()],
+                subsidy: None,
+                subsidised_last_period: None,
                 allowance_lifetime_secs: 3600,
                 allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
             }

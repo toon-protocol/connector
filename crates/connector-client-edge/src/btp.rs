@@ -775,7 +775,7 @@ async fn handle_frame(
                 &prepare.destination,
                 schedule,
                 prepare.data.len(),
-                &state.node,
+                &state.greeting_node(),
                 Some(policy.name()),
                 client_route.as_ref(),
             );
@@ -830,7 +830,7 @@ async fn handle_frame(
             &prepare.destination,
             schedule,
             prepare.data.len(),
-            &state.node,
+            &state.greeting_node(),
             None,
             client_route.as_ref(),
         );

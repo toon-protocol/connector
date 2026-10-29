@@ -6,8 +6,10 @@
 //! written until every check has passed (decision 3, as amended): the
 //! request's structure, a tier this edge publishes, an expiry within the
 //! allowance lifetime, the proof being about this edge's own state key, a
-//! request time inside zk_toon's window of this edge's clock, no subsidy
-//! (until #1581), the binding tag -- and then the two refusals this gate's
+//! request time inside zk_toon's window of this edge's clock, the four
+//! refusals a subsidised proof adds (decision 14: not the smallest tier, not
+//! the current period, a closed budget, a per-period nullifier already
+//! seen), the binding tag -- and then the two refusals this gate's
 //! own records can make, a nullifier it already spent and the open-budget
 //! cap, before the three that cost a vault read: a known root, a nullifier
 //! unused on chain, and the proof. Every check that needs no vault runs
@@ -47,6 +49,16 @@
 //! ([`JournalEntry::AllowanceSuccessorSigned`]). A successor fetch only
 //! reads what that left.
 //!
+//! **A subsidised allowance** (decision 14, #1581) is admitted under the same
+//! verification key, and is paid from the subsidy budget rather than by the
+//! note. A grant reserves the full tier against the budget of the period it
+//! was granted in; the close replaces that reservation with Δ, and the
+//! remainder returns to that period's tally -- which is of no use to a later
+//! period, whose tally starts from the whole budget. The successor of a
+//! subsidised allowance carries the note's old balance unchanged: the note is
+//! charged 0, and Δ is the budget's. The per-period nullifier, the period and
+//! the reservation are journaled with the grant, so they survive a restart.
+//!
 //! Nothing here logs or reports a proof, a nullifier or a session key: a
 //! refusal names its rule, and a log line names the allowance by its opaque
 //! id.
@@ -54,6 +66,7 @@
 use std::time::Duration;
 
 use connector_domain::client_claim::{AllowanceClaim, AllowanceId};
+use connector_domain::AllowanceSubsidy;
 use connector_domain::{allowance_close_charge, validate_allowance_claim};
 use connector_runtime::Clock;
 use connector_zk_note::evidence::{evidence_hash, CloseRecord, GrantRecord, Record};
@@ -89,7 +102,50 @@ pub struct ZkEdge {
     pub allowance_lifetime: Duration,
     /// The most the budgets of all open allowances may sum to.
     pub open_budget_cap: u64,
+    /// The subsidy terms (decision 14): `None` while the `[zk_note]` table's
+    /// `subsidy_budget` is zero, which refuses every subsidised proof as
+    /// budget-closed.
+    pub subsidy: Option<Subsidy>,
     pub clock: Arc<dyn Clock>,
+}
+
+/// A zk edge's standing subsidy terms (ADR 0080 decision 14): the budget it
+/// pays per subsidy period, and the vault's creation time that the periods
+/// are counted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subsidy {
+    /// The most subsidised allowances may reserve in one period, in MINA base
+    /// units. Never zero: a zero budget is no `Subsidy` at all.
+    pub budget: u64,
+    /// When the vault was created, ms since the epoch.
+    pub vault_creation_ms: u64,
+}
+
+impl Subsidy {
+    /// Read the terms at boot: a zero `budget` reads nothing and offers no
+    /// subsidy, and a non-zero one reads the vault's creation time once.
+    ///
+    /// # Errors
+    /// [`crate::zk_note::ZkNoteVaultUnavailable`] when the read fails: a node
+    /// that cannot say which period it is in must not boot.
+    pub async fn read(
+        vault: &dyn ZkNoteVault,
+        budget: u64,
+    ) -> Result<Option<Subsidy>, crate::zk_note::ZkNoteVaultUnavailable> {
+        if budget == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Subsidy {
+            budget,
+            vault_creation_ms: vault.creation_time_ms().await?,
+        }))
+    }
+
+    /// The subsidy period `now_ms` falls in: zk_toon's, or `None` before the
+    /// vault was created.
+    fn period(&self, now_ms: u64) -> Option<u64> {
+        policy::subsidy_period(self.vault_creation_ms, now_ms)
+    }
 }
 
 /// A request to open an allowance: the request proof, and the two terms the
@@ -147,8 +203,20 @@ pub enum AllowanceRefusal {
          1 minute ahead of this zk edge's clock ({now})"
     )]
     RequestTimeOutsideWindow { request_time: u64, now: u64 },
-    #[error("allowance refused: subsidised allowances are not offered here")]
-    Subsidised,
+    #[error(
+        "allowance refused: a subsidised allowance is offered at the smallest tier only, not at \
+         {tier}"
+    )]
+    SubsidyTierNotSmallest { tier: u64 },
+    #[error(
+        "allowance refused: the proof is for subsidy period {period}, which is not the current \
+         one; prove again for the current period"
+    )]
+    SubsidyPeriodNotCurrent { period: String },
+    #[error("allowance refused: this zk edge's subsidy budget for the period is closed")]
+    SubsidyBudgetClosed,
+    #[error("allowance refused: the note has already used its subsidised allowance this period")]
+    SubsidyNullifierSpent,
     #[error(
         "allowance refused: the authorization tag does not bind this zk edge, the session \
          key, the tier and the expiry"
@@ -184,7 +252,10 @@ impl AllowanceRefusal {
             AllowanceRefusal::ExpiryOutsideLifetime { .. } => "expiry_outside_lifetime",
             AllowanceRefusal::ForeignStateKey => "foreign_state_key",
             AllowanceRefusal::RequestTimeOutsideWindow { .. } => "request_time_outside_window",
-            AllowanceRefusal::Subsidised => "subsidised",
+            AllowanceRefusal::SubsidyTierNotSmallest { .. } => "subsidy_tier_not_smallest",
+            AllowanceRefusal::SubsidyPeriodNotCurrent { .. } => "subsidy_period_not_current",
+            AllowanceRefusal::SubsidyBudgetClosed => "subsidy_budget_closed",
+            AllowanceRefusal::SubsidyNullifierSpent => "subsidy_nullifier_spent",
             AllowanceRefusal::TagDoesNotBind => "tag_does_not_bind",
             AllowanceRefusal::NullifierSpent => "nullifier_spent",
             AllowanceRefusal::OpenBudgetExceeded { .. } => "open_budget_exceeded",
@@ -251,6 +322,9 @@ struct Allowance {
     /// The proof's re-randomised commitment, which the successor charges.
     commitment: Commitment,
     state: AllowanceState,
+    /// The subsidy period a subsidised allowance was granted in: its tier is
+    /// reserved against that period's budget, and its note is charged 0.
+    subsidy_period: Option<u64>,
     /// Whether the close's start is journaled
     /// ([`JournalEntry::AllowanceClosing`]): once it is, a restart brings
     /// the allowance back closing. A close whose entry could not be written
@@ -262,6 +336,16 @@ struct Allowance {
 }
 
 impl Allowance {
+    /// What the allowance's final watermark Δ charges the note: Δ, or nothing
+    /// when the subsidy budget pays it (decision 14).
+    fn note_charge(&self, delta: u64) -> u64 {
+        if self.subsidy_period.is_some() {
+            0
+        } else {
+            delta
+        }
+    }
+
     /// Open or closing: its budget still rides on its forwards.
     fn is_open(&self) -> bool {
         matches!(self.state, AllowanceState::Open | AllowanceState::Closing)
@@ -276,7 +360,26 @@ pub(super) struct ZkLedger {
     spent: HashSet<[u8; 32]>,
     /// Nullifiers whose request is past its local checks and still being
     /// verified, with the tiers they reserve against the cap.
-    pending: HashMap<[u8; 32], u64>,
+    pending: HashMap<[u8; 32], PendingGrant>,
+    /// What subsidised allowances have reserved or been charged against each
+    /// period's budget: a grant adds its tier, a close gives back what Δ did
+    /// not use. A period's tally starts from nothing, so a remainder returned
+    /// after its period ended raises no later period's budget.
+    subsidy_used: HashMap<u64, u64>,
+    /// The per-period nullifiers seen in each period. A finished period's are
+    /// pruned: a proof for it can no longer be admitted.
+    subsidy_nullifiers: HashMap<u64, HashSet<[u8; 32]>>,
+    /// How many subsidised allowances each period granted. Pruned to the
+    /// current period and the last finished one.
+    subsidy_grants: HashMap<u64, u64>,
+}
+
+/// A request past its local checks and still being verified.
+#[derive(Debug, Clone)]
+struct PendingGrant {
+    tier: u64,
+    /// The period and per-period nullifier of a subsidised request.
+    subsidy: Option<(u64, [u8; 32])>,
 }
 
 impl ZkLedger {
@@ -295,12 +398,20 @@ impl ZkLedger {
                     session_key_is_odd,
                     commitment_x,
                     commitment_y,
+                    subsidy,
                 } => {
                     let corrupt =
                         || JournalError::Corrupt(format!("allowance_granted {allowance_id}"));
                     let id: AllowanceId = allowance_id.parse().map_err(|_| corrupt())?;
                     let x = field_from_le_bytes(session_key_x).ok_or_else(corrupt)?;
                     ledger.spent.insert(*nullifier);
+                    if let Some(subsidy) = subsidy {
+                        ledger.record_subsidised_grant(
+                            subsidy.period,
+                            subsidy.period_nullifier,
+                            *tier,
+                        );
+                    }
                     ledger.evidence.push((id, *evidence_hash));
                     ledger.allowances.insert(
                         id,
@@ -315,6 +426,7 @@ impl ZkLedger {
                             commitment: commitment_from_le_bytes(commitment_x, commitment_y)
                                 .ok_or_else(corrupt)?,
                             state: AllowanceState::Open,
+                            subsidy_period: subsidy.as_ref().map(|subsidy| subsidy.period),
                             closing_journaled: false,
                             in_flight: 0,
                         },
@@ -345,6 +457,7 @@ impl ZkLedger {
                         return Err(corrupt());
                     }
                     allowance.state = AllowanceState::Charged { charge: *charge };
+                    ledger.release_subsidy(allowance_id, *charge);
                 }
                 JournalEntry::AllowanceSuccessorSigned {
                     allowance_id,
@@ -362,7 +475,7 @@ impl ZkLedger {
                         return Err(corrupt());
                     };
                     allowance.state = AllowanceState::Signed(JournaledSuccessor {
-                        charge,
+                        charge: allowance.note_charge(charge),
                         commitment: commitment_from_le_bytes(commitment_x, commitment_y)
                             .ok_or_else(corrupt)?,
                         anchor: field_from_le_bytes(anchor).ok_or_else(corrupt)?,
@@ -383,6 +496,83 @@ impl ZkLedger {
         self.allowances.get_mut(&id)
     }
 
+    /// Reserve `tier` against `period`'s budget for a subsidised grant, and
+    /// remember its per-period nullifier.
+    fn record_subsidised_grant(&mut self, period: u64, period_nullifier: [u8; 32], tier: u64) {
+        let used = self.subsidy_used.entry(period).or_default();
+        *used = used.saturating_add(tier);
+        self.subsidy_nullifiers
+            .entry(period)
+            .or_default()
+            .insert(period_nullifier);
+        *self.subsidy_grants.entry(period).or_default() += 1;
+    }
+
+    /// A subsidised allowance's close: its reservation becomes Δ, and the
+    /// remainder returns to the period it was reserved in.
+    fn release_subsidy(&mut self, allowance_id: &str, delta: u64) {
+        let Some(allowance) = self.replayed(allowance_id) else {
+            return;
+        };
+        let (Some(period), tier) = (allowance.subsidy_period, allowance.tier) else {
+            return;
+        };
+        if let Some(used) = self.subsidy_used.get_mut(&period) {
+            *used = used.saturating_sub(tier.saturating_sub(delta));
+        }
+    }
+
+    /// Whether `period`'s budget still covers the smallest tier, counting
+    /// what requests being admitted have reserved.
+    fn subsidy_open(&self, budget: u64, period: u64) -> bool {
+        let pending: u64 = self
+            .pending
+            .values()
+            .filter_map(|pending| match pending.subsidy {
+                Some((p, _)) if p == period => Some(pending.tier),
+                _ => None,
+            })
+            .fold(0, u64::saturating_add);
+        let used = self.subsidy_used.get(&period).copied().unwrap_or(0);
+        budget.saturating_sub(used).saturating_sub(pending) >= policy::TIERS[0]
+    }
+
+    /// Whether a per-period nullifier is already seen in `period`, granted or
+    /// being admitted.
+    fn subsidy_nullifier_seen(&self, period: u64, period_nullifier: &[u8; 32]) -> bool {
+        self.subsidy_nullifiers
+            .get(&period)
+            .is_some_and(|seen| seen.contains(period_nullifier))
+            || self.pending.values().any(|pending| {
+                pending
+                    .subsidy
+                    .is_some_and(|(p, n)| p == period && n == *period_nullifier)
+            })
+    }
+
+    /// The refusal, if any, that `period`'s budget and nullifier make
+    /// (decision 14, refusals 3 and 4). Also forgets what finished periods
+    /// left behind, keeping only the last one's grant count for the
+    /// self-description.
+    fn subsidy_refusal(
+        &mut self,
+        budget: u64,
+        period: u64,
+        period_nullifier: &[u8; 32],
+    ) -> Option<AllowanceRefusal> {
+        self.subsidy_nullifiers.retain(|p, _| *p >= period);
+        self.subsidy_used.retain(|p, _| *p >= period);
+        self.subsidy_grants
+            .retain(|p, _| p.saturating_add(1) >= period);
+        if !self.subsidy_open(budget, period) {
+            return Some(AllowanceRefusal::SubsidyBudgetClosed);
+        }
+        if self.subsidy_nullifier_seen(period, period_nullifier) {
+            return Some(AllowanceRefusal::SubsidyNullifierSpent);
+        }
+        None
+    }
+
     /// The budgets of open allowances -- every allowance granted and not yet
     /// charged (ADR 0080 decision 5) -- and of those being admitted.
     fn open_budget(&self) -> u64 {
@@ -390,7 +580,7 @@ impl ZkLedger {
             .values()
             .filter(|allowance| allowance.is_open())
             .map(|allowance| allowance.tier)
-            .chain(self.pending.values().copied())
+            .chain(self.pending.values().map(|pending| pending.tier))
             .fold(0, u64::saturating_add)
     }
 }
@@ -502,10 +692,7 @@ impl ClientClaimGate {
                 now,
             });
         }
-        let zero = Field::from(0u64);
-        if public.subsidised || public.period != zero || public.period_nullifier != zero {
-            return Err(AllowanceRefusal::Subsidised);
-        }
+        let subsidy = self.check_subsidy(edge, public, now)?;
 
         // The binding tag: this edge, this session key, this tier, this expiry.
         let tag = expected_tag(
@@ -527,6 +714,14 @@ impl ClientClaimGate {
             if ledger.spent.contains(&nullifier) || ledger.pending.contains_key(&nullifier) {
                 return Err(AllowanceRefusal::NullifierSpent);
             }
+            // The authoritative check of what `check_subsidy` read.
+            if let (Some(subsidy), Some((period, period_nullifier))) = (&edge.subsidy, &subsidy) {
+                if let Some(refusal) =
+                    ledger.subsidy_refusal(subsidy.budget, *period, period_nullifier)
+                {
+                    return Err(refusal);
+                }
+            }
             let open = ledger.open_budget();
             if open.saturating_add(tier) > edge.open_budget_cap {
                 return Err(AllowanceRefusal::OpenBudgetExceeded {
@@ -535,7 +730,9 @@ impl ClientClaimGate {
                     cap: edge.open_budget_cap,
                 });
             }
-            ledger.pending.insert(nullifier, tier);
+            ledger
+                .pending
+                .insert(nullifier, PendingGrant { tier, subsidy });
             Reservation {
                 ledger: &self.zk_ledger,
                 nullifier,
@@ -602,6 +799,10 @@ impl ClientClaimGate {
                 session_key_is_odd: request.session_key.is_odd,
                 commitment_x: field_to_le_bytes(public.commitment.x),
                 commitment_y: field_to_le_bytes(public.commitment.y),
+                subsidy: subsidy.map(|(period, period_nullifier)| AllowanceSubsidy {
+                    period,
+                    period_nullifier,
+                }),
             })
             .map_err(|error| {
                 tracing::error!(%error, "refusing an allowance: its grant could not be journaled");
@@ -619,6 +820,7 @@ impl ClientClaimGate {
                     nullifier: public.nullifier,
                     commitment: public.commitment,
                     state: AllowanceState::Open,
+                    subsidy_period: subsidy.map(|(period, _)| period),
                     closing_journaled: false,
                     in_flight: 0,
                 },
@@ -628,6 +830,9 @@ impl ClientClaimGate {
             // so the open budget never counts it twice or not at all.
             ledger.pending.remove(&nullifier);
             ledger.spent.insert(nullifier);
+            if let Some((period, period_nullifier)) = subsidy {
+                ledger.record_subsidised_grant(period, period_nullifier, tier);
+            }
         }
         drop(reservation);
         tracing::info!(allowance = %allowance_id, tier, "granted a zk-note allowance");
@@ -636,6 +841,91 @@ impl ClientClaimGate {
             tier,
             expires_at_ms: request.expires_at_ms,
         })
+    }
+
+    /// The checks a proof's subsidy adds, in decision 14's order, before the
+    /// binding tag. Returns the period and per-period nullifier of a
+    /// subsidised proof that passes them; `None` for an unsubsidised one,
+    /// whose period and per-period nullifier must be zero.
+    fn check_subsidy(
+        &self,
+        edge: &ZkEdge,
+        public: &connector_zk_note::request::RequestPublic,
+        now: u64,
+    ) -> Result<Option<(u64, [u8; 32])>, AllowanceRefusal> {
+        let zero = Field::from(0u64);
+        if !public.subsidised {
+            if public.period != zero || public.period_nullifier != zero {
+                return Err(AllowanceRefusal::Malformed(
+                    "an unsubsidised proof states a subsidy period or per-period nullifier".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        // 1. The smallest tier.
+        if public.tier != policy::TIERS[0] {
+            return Err(AllowanceRefusal::SubsidyTierNotSmallest { tier: public.tier });
+        }
+        // Without a budget there is no period to measure against, and the
+        // budget is closed whatever the period.
+        let Some(subsidy) = edge.subsidy.as_ref() else {
+            return Err(AllowanceRefusal::SubsidyBudgetClosed);
+        };
+        // 2. The current period, with no grace at a boundary.
+        let current = subsidy.period(now);
+        let period = current
+            .filter(|current| public.period == Field::from(*current))
+            .ok_or_else(|| AllowanceRefusal::SubsidyPeriodNotCurrent {
+                period: connector_zk_note::note::field_to_string(public.period),
+            })?;
+        // 3. and 4. The budget and the per-period nullifier.
+        let period_nullifier = field_to_le_bytes(public.period_nullifier);
+        match self
+            .zk_ledger
+            .lock()
+            .expect("zk ledger lock poisoned")
+            .subsidy_refusal(subsidy.budget, period, &period_nullifier)
+        {
+            Some(refusal) => Err(refusal),
+            None => Ok(Some((period, period_nullifier))),
+        }
+    }
+
+    /// Whether a subsidised allowance can be opened right now, as the
+    /// greeting says it: `None` when this edge offers no subsidy, or is no zk
+    /// edge at all. It is not a promise -- the refusal is authoritative.
+    pub fn subsidy_open(&self) -> Option<bool> {
+        let edge = self.zk_edge.as_ref()?;
+        let subsidy = edge.subsidy.as_ref()?;
+        let Some(period) = subsidy.period(now_ms(edge.clock.as_ref())) else {
+            return Some(false);
+        };
+        Some(
+            self.zk_ledger
+                .lock()
+                .expect("zk ledger lock poisoned")
+                .subsidy_open(subsidy.budget, period),
+        )
+    }
+
+    /// How many subsidised allowances the last **finished** subsidy period
+    /// granted, for the self-description: never the current period's count.
+    /// `None` when this edge offers no subsidy.
+    pub fn subsidised_last_period(&self) -> Option<u64> {
+        let edge = self.zk_edge.as_ref()?;
+        let subsidy = edge.subsidy.as_ref()?;
+        let finished = subsidy
+            .period(now_ms(edge.clock.as_ref()))
+            .and_then(|current| current.checked_sub(1));
+        Some(finished.map_or(0, |period| {
+            self.zk_ledger
+                .lock()
+                .expect("zk ledger lock poisoned")
+                .subsidy_grants
+                .get(&period)
+                .copied()
+                .unwrap_or(0)
+        }))
     }
 
     /// [`Self::admit`]'s stages for an allowance claim: the allowance is
@@ -1101,6 +1391,10 @@ impl ZkParts {
                     return;
                 }
                 self.set_state(id, AllowanceState::Charged { charge });
+                self.ledger
+                    .lock()
+                    .expect("zk ledger lock poisoned")
+                    .release_subsidy(&id.to_string(), charge);
                 tracing::info!(allowance = %id, charge, "charged a closed zk-note allowance");
                 charge
             }
@@ -1111,6 +1405,11 @@ impl ZkParts {
         // The challenger's close record, before the successor is released
         // (zk_toon ADR 0004). Appended only if missing, so a close a crash
         // interrupted is finished without a second record.
+        //
+        // Both it and the successor carry what the *note* is charged: for a
+        // subsidised allowance that is nothing (decision 14), and Δ stays the
+        // subsidy budget's, in the journal.
+        let charge = allowance.note_charge(charge);
         let payload = match (Record::Close(CloseRecord {
             nullifier: allowance.nullifier,
             allowance_id: id.as_bytes().to_vec(),

@@ -1401,6 +1401,106 @@
         "15931261244497904593974800904686860579679831287262090221467383523479854498517",
         "23609710938582136209674766176580022005062284728318292191730508013982492143873"
       ]
+    },
+    "subsidised_allowance_request": {
+      "body": {
+        "expiresAt": "1793190600000",
+        "proof": {
+          "maxProofsVerified": 0,
+          "proof": "placeholder",
+          "publicInput": [
+            "17700447584960531649892932508362189777294777124086546292786750926952158731473",
+            "0",
+            "1919905652",
+            "1793188800000",
+            "10000000",
+            "32498688025257081",
+            "1402048275850249831217333829241309708764007113951822008512932195420901840377",
+            "10973064443765552371909477125396210303490182082364688095365251243569230016538",
+            "8808046940841023004275389567066421498636341359337100863041802439165669988950",
+            "1",
+            "11",
+            "123581013520228"
+          ],
+          "publicOutput": []
+        },
+        "sessionKey": "B62qnkiphcf5feTC6vCRa3rytfxr9FEHH4RAKH7Q4RZX4ytJ5wKzFqb"
+      },
+      "method": "POST",
+      "note": "the proof string is a placeholder; the period is zk_toon's policy::subsidy_period",
+      "path": "/ilp/zk-note/allowances",
+      "refusals": {
+        "budget_closed": "subsidy_budget_closed",
+        "per_period_nullifier_seen": "subsidy_nullifier_spent",
+        "period_not_the_current_one": "subsidy_period_not_current",
+        "tier_above_the_smallest": "subsidy_tier_not_smallest"
+      },
+      "subsidy_period": "11"
+    },
+    "subsidised_successor": {
+      "answer": {
+        "body": {
+          "allowanceId": "101112131415161718191a1b1c1d1e1f",
+          "anchor": "14527146394680666299581624866505915177787136731397364389364132090057819012268",
+          "charge": "0",
+          "commitment": {
+            "x": "10973064443765552371909477125396210303490182082364688095365251243569230016538",
+            "y": "8808046940841023004275389567066421498636341359337100863041802439165669988950"
+          },
+          "signature": {
+            "r": "6962890277559712925713492774411347274066286652846741279736413714143510623272",
+            "s": "21971632676556520666941574669019960962608349434489486676023767138963115285293"
+          },
+          "status": "signed"
+        },
+        "status": 200
+      },
+      "charge": "0",
+      "commitment_before": {
+        "x": "10973064443765552371909477125396210303490182082364688095365251243569230016538",
+        "y": "8808046940841023004275389567066421498636341359337100863041802439165669988950"
+      },
+      "note": "the note is charged 0; the allowance's final watermark is the subsidy budget's",
+      "nullifier": "32498688025257081",
+      "path": "/ilp/zk-note/allowances/101112131415161718191a1b1c1d1e1f/successor",
+      "signature": {
+        "hex": "0f64db3270dc49e7571310188797de82ec3d37005182091fe09293f9e7617428309380dea5312fb6afa45584fe018356a375be29d19951030b75dbafc4551b2d",
+        "r": "6962890277559712925713492774411347274066286652846741279736413714143510623272",
+        "s": "21971632676556520666941574669019960962608349434489486676023767138963115285293"
+      },
+      "signed_fields": [
+        "17700447584960531649892932508362189777294777124086546292786750926952158731473",
+        "0",
+        "10973064443765552371909477125396210303490182082364688095365251243569230016538",
+        "8808046940841023004275389567066421498636341359337100863041802439165669988950",
+        "14527146394680666299581624866505915177787136731397364389364132090057819012268"
+      ]
+    },
+    "greeting_subsidy": {
+      "closed": {
+        "allowanceEndpoint": "/ilp/zk-note/allowances",
+        "allowanceLifetimeSecs": 1800,
+        "stateKey": "B62qqTopzUw3Jji8zvDu1vBiSuS5NUbc32Xo74N1ZG75Zf5sT7uRqok",
+        "subsidy": "closed",
+        "tiers": ["10000000", "100000000", "1000000000"],
+        "verificationKeyHash": "1"
+      },
+      "not_offered": {
+        "allowanceEndpoint": "/ilp/zk-note/allowances",
+        "allowanceLifetimeSecs": 1800,
+        "stateKey": "B62qqTopzUw3Jji8zvDu1vBiSuS5NUbc32Xo74N1ZG75Zf5sT7uRqok",
+        "tiers": ["10000000", "100000000", "1000000000"],
+        "verificationKeyHash": "1"
+      },
+      "note": "subsidy is open or closed, computed when the greeting is served, and absent while the node's subsidy budget is zero; it never says how much remains",
+      "open": {
+        "allowanceEndpoint": "/ilp/zk-note/allowances",
+        "allowanceLifetimeSecs": 1800,
+        "stateKey": "B62qqTopzUw3Jji8zvDu1vBiSuS5NUbc32Xo74N1ZG75Zf5sT7uRqok",
+        "subsidy": "open",
+        "tiers": ["10000000", "100000000", "1000000000"],
+        "verificationKeyHash": "1"
+      }
     }
   }
 }

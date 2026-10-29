@@ -1586,6 +1586,20 @@ is normative where this prose and it disagree (ADR 0021).
   (`not_durable`; a close refused so still takes no claims, and is retried), and `422`
   for every other rule. No refusal and no log line carries the proof, a nullifier or a session key.
 
+**Subsidised allowances** (ADR 0080 decision 14, #1581). A request whose proof states `subsidised`
+is admitted under the same verification key, and is also refused by name, in this order, before the
+binding tag: `subsidy_tier_not_smallest` (its tier is not zk_toon's `TIERS[0]`),
+`subsidy_period_not_current` (its period is not `policy::subsidy_period(vault creation, now)`, with
+no grace at a boundary), `subsidy_budget_closed` (the period's budget no longer covers `TIERS[0]`, or
+the node's `subsidy_budget` is zero) and `subsidy_nullifier_spent` (its per-period nullifier is
+already journaled). A subsidised grant reserves the whole tier against its period's budget; its close
+replaces that with Δ. Its successor carries the note's old balance unchanged (`charge` is `"0"`):
+the note is charged nothing, and Δ is the budget's. The greeting's `zk-note` entry gains
+`extra.subsidy`, `"open"` or `"closed"`, read when the greeting is served, and omits it when the
+budget is zero; a wallet that read `"open"` may still be refused as closed. The self-description's
+`zkNote.subsidisedLastPeriod` counts the subsidised allowances granted in the last finished period,
+never the current one and never an amount.
+
 A packet paid by an allowance claim reaches the app with `X-TOON-Amount` and `X-TOON-Chain` (the
 vault's Mina network) and **without** `X-TOON-Payer` (ADR 0040 as amended by ADR 0080 decision 6).
 

@@ -12,6 +12,8 @@
 
 use connector_client_edge::{successor_json, SignedSuccessor, ZK_NOTE_ALLOWANCES_PATH};
 use connector_domain::client_claim::{AllowanceId, SCHEME_ZK_NOTE};
+use connector_domain::x402::{terms_body, GreetingTerms, X402ZkNoteTerms, ZkNoteSubsidy};
+use connector_domain::{NodeFacts, Price};
 use connector_signer::ZkStateSigner;
 use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::field_to_string;
@@ -44,6 +46,13 @@ pub struct ZkNoteVectors {
     pub allowance_claim: Value,
     pub allowance_close: Value,
     pub successor: Value,
+    /// A subsidised allowance's request (ADR 0080 decision 14, #1581).
+    pub subsidised_allowance_request: Value,
+    /// The successor of a subsidised allowance: the note is charged 0.
+    pub subsidised_successor: Value,
+    /// The greeting's zk-note `extra` as it reads while a subsidy is open,
+    /// closed, and not offered at all.
+    pub greeting_subsidy: Value,
 }
 
 fn keypair(secret: u64) -> Keypair {
@@ -176,6 +185,109 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         },
     });
 
+    // A subsidised allowance (decision 14): the smallest tier, the period the
+    // edge is in, and a per-period nullifier. The proof states all three
+    // publicly. Its successor charges the note nothing: the commitment
+    // carries over unchanged and only the anchor moves.
+    const SUBSIDY_PERIOD: u64 = 11;
+    let subsidised_tier = TIERS[0];
+    let subsidised_nullifier = Field::from(0x0073_7562_7369_6479_u64);
+    let subsidised_public = RequestPublic {
+        tier: subsidised_tier,
+        nullifier: subsidised_nullifier,
+        tag: expected_tag(
+            subsidised_nullifier,
+            &state_key,
+            &session_key,
+            subsidised_tier,
+            EXPIRES_AT_MS,
+        ),
+        subsidised: true,
+        period: Field::from(SUBSIDY_PERIOD),
+        period_nullifier: Field::from(0x7065_7269_6f64u64),
+        ..public.clone()
+    };
+    let subsidised_proof: Value =
+        serde_json::from_slice(&json_proof_for(&subsidised_public, "placeholder"))
+            .expect("a JsonProof is JSON");
+    let subsidised_allowance_request = json!({
+        "method": "POST",
+        "path": ZK_NOTE_ALLOWANCES_PATH,
+        "body": {
+            "proof": subsidised_proof,
+            "sessionKey": session_key.into_address(),
+            "expiresAt": EXPIRES_AT_MS.to_string(),
+        },
+        "subsidy_period": SUBSIDY_PERIOD.to_string(),
+        "refusals": {
+            "tier_above_the_smallest": "subsidy_tier_not_smallest",
+            "period_not_the_current_one": "subsidy_period_not_current",
+            "budget_closed": "subsidy_budget_closed",
+            "per_period_nullifier_seen": "subsidy_nullifier_spent",
+        },
+        "note": "the proof string is a placeholder; the period is zk_toon's policy::subsidy_period",
+    });
+    let subsidised_next = successor_state(&state_key, commitment, subsidised_nullifier, 0)
+        .expect("a signable successor");
+    assert_eq!(
+        subsidised_next.commitment, commitment,
+        "a zero charge leaves the balance commitment as it was"
+    );
+    let subsidised_signed = SignedSuccessor {
+        allowance_id,
+        charge: 0,
+        state_key: state_key.clone(),
+        commitment: subsidised_next.commitment,
+        anchor: subsidised_next.anchor,
+        signature: state.sign(&subsidised_next.message),
+    };
+    let subsidised_successor = json!({
+        "path": format!("{ZK_NOTE_ALLOWANCES_PATH}/{allowance_id}/successor"),
+        "nullifier": field_to_string(subsidised_nullifier),
+        "commitment_before": {
+            "x": field_to_string(commitment.x),
+            "y": field_to_string(commitment.y),
+        },
+        "charge": "0",
+        "signed_fields": fields_json(&subsidised_next.message.to_fields()),
+        "signature": signature_json(&subsidised_signed.signature),
+        "answer": { "status": 200, "body": successor_json(&subsidised_signed) },
+        "note": "the note is charged 0; the allowance's final watermark is the subsidy budget's",
+    });
+    let greeting_extra = |subsidy: Option<ZkNoteSubsidy>| -> Value {
+        let terms = X402ZkNoteTerms {
+            network: "mina:devnet".into(),
+            asset: "slip44:12586".into(),
+            pay_to: state_key.into_address(),
+            verification_key_hash: "1".into(),
+            state_key: state_key.into_address(),
+            tiers: TIERS.iter().map(u64::to_string).collect(),
+            allowance_lifetime_secs: 1_800,
+            allowance_endpoint: ZK_NOTE_ALLOWANCES_PATH.into(),
+            subsidy,
+            subsidised_last_period: None,
+        };
+        let facts = NodeFacts {
+            zk_note: Some(terms),
+            ..NodeFacts::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.vector",
+            price: Price::flat(1),
+            node: Some(&facts),
+            ..GreetingTerms::default()
+        });
+        let greeting: Value = serde_json::from_slice(&body).expect("a greeting is JSON");
+        greeting["accepts"][0]["extra"].clone()
+    };
+    let greeting_subsidy = json!({
+        "open": greeting_extra(Some(ZkNoteSubsidy::Open)),
+        "closed": greeting_extra(Some(ZkNoteSubsidy::Closed)),
+        "not_offered": greeting_extra(None),
+        "note": "subsidy is open or closed, computed when the greeting is served, and absent \
+                 while the node's subsidy budget is zero; it never says how much remains",
+    });
+
     ZkNoteVectors {
         zk_toon_commit: ZK_TOON_COMMIT,
         signing: json!({
@@ -195,5 +307,8 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         allowance_claim,
         allowance_close,
         successor,
+        subsidised_allowance_request,
+        subsidised_successor,
+        greeting_subsidy,
     }
 }

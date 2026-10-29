@@ -449,6 +449,8 @@ mod tests {
             tiers: vec!["100000000".to_string()],
             allowance_lifetime_secs: 3600,
             allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
+            subsidy: None,
+            subsidised_last_period: None,
         };
         let zk_edge = NodeFacts {
             zk_note: Some(terms.clone()),
