@@ -349,7 +349,7 @@ pub enum ClientClaimError {
     /// rather than guessed: the rule must not change when its operator adds
     /// a second one.
     #[error(
-        "claim carries no 'network': since wire schema_version 10 every voucher names the \
+        "claim carries no 'network': since wire schema_version 11 every voucher names the \
          CAIP-2 network it is on (eip155:<chainId> or solana:<genesis prefix>), and one \
          without it is refused rather than guessed (ADR 0086)"
     )]
@@ -468,10 +468,7 @@ pub fn required_network(
     if network.chain() != chain {
         return Err(ClientClaimError::NetworkNotOnChain {
             network,
-            blockchain: match chain {
-                AssetChain::Evm => EVM_NAMESPACE,
-                AssetChain::Solana => SOLANA_NAMESPACE,
-            },
+            blockchain: chain.as_str(),
         });
     }
     Ok(network)
@@ -741,8 +738,323 @@ pub fn parse_client_claim(json: &str) -> Result<ClientClaim, ClientClaimError> {
     }
 }
 
+/// The `scheme` of an allowance claim (ADR 0080 decision 1): a cumulative
+/// amount against a zk-note allowance, signed by the allowance's session
+/// key. Recognised only by a zk edge -- [`parse_client_edge_claim`] with
+/// `zk_note` set; everywhere else it is an unknown scheme, refused exactly
+/// as before ADR 0080.
+pub const SCHEME_ZK_NOTE: &str = "zk-note";
+
+/// The namespace of an allowance's key in the claim gate's watermarks:
+/// `zk-note:<allowance id>`. Opaque, so a log line naming the key names no
+/// nullifier and no session key.
+pub const ZK_NOTE_NAMESPACE: &str = "zk-note";
+
+/// An allowance id: 16 bytes the zk edge mints when it grants the
+/// allowance, spelled on the wire as 32 lowercase hex characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AllowanceId([u8; 16]);
+
+impl AllowanceId {
+    /// The id these bytes are.
+    pub const fn from_bytes(bytes: [u8; 16]) -> AllowanceId {
+        AllowanceId(bytes)
+    }
+
+    /// The id's bytes.
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// The allowance's claim key: what the claim gate holds its watermark
+    /// under, `zk-note:<id>`. Beside every voucher's channel key, in its
+    /// own namespace; an allowance is not a channel.
+    pub fn claim_key(&self) -> String {
+        format!("{ZK_NOTE_NAMESPACE}:{self}")
+    }
+
+    /// The id a claim key names, if it is an allowance's.
+    pub fn from_claim_key(key: &str) -> Option<AllowanceId> {
+        key.strip_prefix(ZK_NOTE_NAMESPACE)?
+            .strip_prefix(':')?
+            .parse()
+            .ok()
+    }
+}
+
+impl std::fmt::Display for AllowanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+impl std::str::FromStr for AllowanceId {
+    type Err = ClientClaimError;
+
+    /// Exactly 32 lowercase hex characters: the one spelling the zk edge
+    /// mints, so two spellings never name one allowance.
+    fn from_str(s: &str) -> Result<AllowanceId, ClientClaimError> {
+        let bytes = decode_lower_hex::<16>(s)
+            .ok_or_else(|| malformed("'allowanceId' must be 32 lowercase hex characters"))?;
+        Ok(AllowanceId(bytes))
+    }
+}
+
+/// An allowance claim (ADR 0080 decision 1, #1511): `{version, scheme:
+/// "zk-note", allowanceId, cumulativeAmount, signature}`, with no
+/// `blockchain`. Validated for shape only; the session-key signature is the
+/// gate's to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowanceClaim {
+    pub allowance_id: AllowanceId,
+    /// The cumulative amount, in the vault asset's base unit (nanomina).
+    pub cumulative_amount: u64,
+    /// The session key's Mina Schnorr signature, `rx ‖ s` big-endian.
+    pub signature: [u8; 64],
+}
+
+/// A claim a client edge reads: a voucher, or -- at a zk edge -- an
+/// allowance claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientEdgeClaim {
+    /// Boxed because a voucher is by far the larger of the two, now that it
+    /// names its network (ADR 0086) -- clippy's `large_enum_variant`, which
+    /// would otherwise make every allowance claim carry a voucher's stack.
+    Voucher(Box<ClientClaim>),
+    Allowance(AllowanceClaim),
+}
+
+impl ClientEdgeClaim {
+    /// The claim key the claim gate holds its watermark under: a voucher's
+    /// channel key, or an allowance's claim key.
+    pub fn claim_key(&self) -> String {
+        match self {
+            ClientEdgeClaim::Voucher(claim) => claim.channel_key(),
+            ClientEdgeClaim::Allowance(claim) => claim.allowance_id.claim_key(),
+        }
+    }
+
+    /// The cumulative amount the claim signs.
+    pub fn transferred_amount(&self) -> u128 {
+        match self {
+            ClientEdgeClaim::Voucher(claim) => claim.transferred_amount(),
+            ClientEdgeClaim::Allowance(claim) => u128::from(claim.cumulative_amount),
+        }
+    }
+
+    /// The voucher, when it is one.
+    pub fn voucher(&self) -> Option<&ClientClaim> {
+        match self {
+            ClientEdgeClaim::Voucher(claim) => Some(claim),
+            ClientEdgeClaim::Allowance(_) => None,
+        }
+    }
+}
+
+/// [`parse_client_claim`], and at a zk edge (`zk_note`) the allowance claim
+/// too (ADR 0080 decision 1). The order: `blockchain: "mina"` is refused by
+/// name first, unchanged; then `scheme: "zk-note"` branches off before the
+/// voucher arms require `blockchain`, and a zk-note claim that carries one
+/// is malformed. Without `zk_note` this *is* [`parse_client_claim`], so
+/// `zk-note` is an unknown scheme exactly as it always was.
+pub fn parse_client_edge_claim(
+    json: &str,
+    zk_note: bool,
+) -> Result<ClientEdgeClaim, ClientClaimError> {
+    if zk_note {
+        let value: Value =
+            serde_json::from_str(json).map_err(|e| ClientClaimError::InvalidJson(e.to_string()))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| malformed("claim must be a JSON object"))?;
+        if obj.get("blockchain").and_then(Value::as_str) == Some("mina") {
+            return Err(ClientClaimError::Mina);
+        }
+        if optional_str(obj, "scheme")?.as_deref() == Some(SCHEME_ZK_NOTE) {
+            return parse_allowance_claim(obj).map(ClientEdgeClaim::Allowance);
+        }
+    }
+    parse_client_claim(json).map(|claim| ClientEdgeClaim::Voucher(Box::new(claim)))
+}
+
+fn parse_allowance_claim(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<AllowanceClaim, ClientClaimError> {
+    if obj.contains_key("blockchain") {
+        return Err(malformed(
+            "a zk-note claim carries no 'blockchain' (ADR 0080 decision 1)",
+        ));
+    }
+    let version = required_str(obj, "version")?;
+    if version != "1.0" {
+        return Err(malformed(format!(
+            "unsupported claim version '{version}' (expected '1.0')"
+        )));
+    }
+    let allowance_id = required_str(obj, "allowanceId")?.parse()?;
+    let raw = required_str(obj, "cumulativeAmount")?;
+    if !is_canonical_decimal(raw) {
+        return Err(malformed(
+            "'cumulativeAmount' must be a decimal string with no sign or leading zero",
+        ));
+    }
+    let cumulative_amount = raw
+        .parse::<u64>()
+        .map_err(|_| malformed("'cumulativeAmount' does not fit 64 bits"))?;
+    let signature = decode_lower_hex::<64>(required_str(obj, "signature")?)
+        .ok_or_else(|| malformed("'signature' must be 128 lowercase hex characters"))?;
+    Ok(AllowanceClaim {
+        allowance_id,
+        cumulative_amount,
+        signature,
+    })
+}
+
+/// Whether `text` is a canonical decimal: one or more ASCII digits, no
+/// sign, and no leading zero unless it is `0`. The one spelling of an
+/// amount or a time on the zk-note wire, so two spellings never name one
+/// value.
+pub fn is_canonical_decimal(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
+}
+
+/// Exactly `2 * N` lowercase hex characters, as `N` bytes: the one spelling
+/// of an allowance id and a session-key signature on the zk-note wire.
+pub fn decode_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let bytes = s.as_bytes();
+    if bytes.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = (digit(bytes[2 * i])? << 4) | digit(bytes[2 * i + 1])?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
+    // -- Allowance claims (ADR 0080 decision 1, issue #1522) --
+
+    const ALLOWANCE_ID: &str = "00112233445566778899aabbccddeeff";
+
+    fn allowance_claim_json() -> String {
+        format!(
+            r#"{{"version":"1.0","scheme":"zk-note","allowanceId":"{ALLOWANCE_ID}","cumulativeAmount":"250","signature":"{}"}}"#,
+            "ab".repeat(64)
+        )
+    }
+
+    #[test]
+    fn a_zk_edge_reads_an_allowance_claim() {
+        let claim = parse_client_edge_claim(&allowance_claim_json(), true).expect("parses");
+        let ClientEdgeClaim::Allowance(claim) = claim else {
+            panic!("an allowance claim");
+        };
+        assert_eq!(claim.allowance_id.to_string(), ALLOWANCE_ID);
+        assert_eq!(claim.cumulative_amount, 250);
+        assert_eq!(claim.signature, [0xab; 64]);
+        assert_eq!(
+            claim.allowance_id.claim_key(),
+            format!("zk-note:{ALLOWANCE_ID}")
+        );
+        assert_eq!(
+            AllowanceId::from_claim_key(&claim.allowance_id.claim_key()),
+            Some(claim.allowance_id)
+        );
+    }
+
+    /// Without the zk-note table, `zk-note` is an unknown scheme, refused
+    /// with exactly the words it always was.
+    #[test]
+    fn without_the_table_zk_note_is_an_unknown_scheme_as_before() {
+        let expected = ClientClaimError::Malformed(
+            "unsupported claim scheme 'zk-note' (expected 'batch-settlement')".to_string(),
+        );
+        assert_eq!(
+            parse_client_claim(&allowance_claim_json()),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            parse_client_edge_claim(&allowance_claim_json(), false),
+            Err(expected)
+        );
+    }
+
+    #[test]
+    fn a_zk_note_claim_carrying_blockchain_is_malformed() {
+        let with = allowance_claim_json().replace(
+            r#""scheme":"zk-note""#,
+            r#""scheme":"zk-note","blockchain":"evm""#,
+        );
+        assert!(matches!(
+            parse_client_edge_claim(&with, true),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
+    /// `blockchain: "mina"` is still refused by name first, at a zk edge
+    /// too, whatever scheme it declares.
+    #[test]
+    fn a_mina_claim_is_refused_as_mina_at_a_zk_edge_even_as_zk_note() {
+        let mina = allowance_claim_json().replace(
+            r#""scheme":"zk-note""#,
+            r#""scheme":"zk-note","blockchain":"mina""#,
+        );
+        assert_eq!(
+            parse_client_edge_claim(&mina, true),
+            Err(ClientClaimError::Mina)
+        );
+        assert_eq!(parse_client_claim(&mina), Err(ClientClaimError::Mina));
+        let voucher =
+            solana_voucher_json().replace(r#""blockchain": "solana""#, r#""blockchain": "mina""#);
+        assert_eq!(
+            parse_client_edge_claim(&voucher, true),
+            Err(ClientClaimError::Mina)
+        );
+    }
+
+    #[test]
+    fn a_zk_edge_still_reads_vouchers() {
+        assert!(matches!(
+            parse_client_edge_claim(&solana_voucher_json(), true),
+            Ok(ClientEdgeClaim::Voucher(claim)) if matches!(*claim, ClientClaim::SolanaVoucher(_))
+        ));
+    }
+
+    #[test]
+    fn a_malformed_allowance_claim_names_what_is_wrong() {
+        for (from, to) in [
+            (ALLOWANCE_ID, "00112233445566778899AABBCCDDEEFF"),
+            (ALLOWANCE_ID, "0011"),
+            (r#""250""#, r#""0250""#),
+            (r#""250""#, r#""-1""#),
+            (r#""250""#, r#""18446744073709551616""#),
+            (r#""1.0""#, r#""2.0""#),
+        ] {
+            let bad = allowance_claim_json().replace(from, to);
+            assert!(
+                matches!(
+                    parse_client_edge_claim(&bad, true),
+                    Err(ClientClaimError::Malformed(_))
+                ),
+                "{to}"
+            );
+        }
+        let short_sig = allowance_claim_json().replace(&"ab".repeat(64), "ab");
+        assert!(matches!(
+            parse_client_edge_claim(&short_sig, true),
+            Err(ClientClaimError::Malformed(_))
+        ));
+    }
+
     use super::*;
 
     fn evm_channel_config_json() -> String {

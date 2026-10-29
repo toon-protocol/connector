@@ -349,6 +349,7 @@ mod tests {
                 peer_carriages: vec!["http".to_string()],
                 batch_settlements: Vec::new(),
                 voucher_signers: Vec::new(),
+                zk_note: None,
             },
             Some(EdgeIdentity {
                 key_id: "key-1".to_string(),

@@ -94,7 +94,10 @@ closes, which zkAPI cannot say.
      string is TOON's own composition: the `mina` namespace has no CAIP-19 profile
      ([research](../research/mina-tokens-and-stablecoins.md)).
    - **Inside the connector**, it is the `AssetId` `mina:native`. A `[[rates]]` row may name it;
-     `[[tokens]]` still may not.
+     `[[tokens]]` still may not. _Amended 2026-10-28 (owner decision, merge of #1607):_ ADR 0086
+     makes every `AssetId` CAIP-19, so inside the connector it is the same string the greeting
+     composes, `mina:mainnet/slip44:12586` or `mina:devnet/slip44:12586`, built from the table's
+     `network`. `mina:native` is refused by name like every other `<chain>:native`.
 
    No pool a TWAP source can read quotes MINA, so the rate out of it is a declared `[[rates]]`
    row, static for the process lifetime. The operator covers MINA's movement between restarts
@@ -259,7 +262,8 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
 - **Topping up a note.** Rejected (2026-10-28) for the reason in Consequences: it links a public
   deposit to a private state.
 - **The CAIP-19 string as the `AssetId`.** Rejected (2026-10-28): every `AssetId` is
-  `<chain>:<token>` with no network in it, and the zk-note table already fixes the network.
+  `<chain>:<token>` with no network in it, and the zk-note table already fixes the network. _Superseded the same day:_ ADR 0086 made every `AssetId` CAIP-19, so the premise
+  no longer holds and this option is now the decision (decision 7, as amended).
 - **An operator-writable MINA rate first.** Rejected for now (2026-10-28): ADR 0071 names it as
   the natural next step, but it is a change of its own and need not precede the zk edge. A
   static rate with a spread, under the open-budget cap, is enough to start.

@@ -870,6 +870,7 @@ fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
                 network,
                 signer: spelled(receiver),
             }],
+            zk_note: None,
         },
         // A secp256k1 edge identity, deliberately a different value from
         // the settlement address above: the two are not interchangeable.

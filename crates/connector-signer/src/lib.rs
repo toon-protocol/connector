@@ -15,6 +15,10 @@
 //! "a signature recovers to its signer's own public key" check
 //! (`src/contract.rs`).
 //!
+//! A zk edge's Mina state key (ADR 0080) is here too, as [`ZkStateSigner`]:
+//! read from its key file, held, and used to sign successor states, exposing
+//! nothing but its public half and that one operation.
+//!
 //! Deliberately absent, per ADR 0012: mnemonic recovery, seed management,
 //! human wallet authentication, a wallet database, and any fraud or
 //! anomaly rule engine. Those invariants are enforced elsewhere, by
@@ -48,6 +52,7 @@ mod local;
 pub mod nip59;
 mod signer;
 mod voucher_signature;
+mod zk_state;
 
 pub use address::{derive_evm_address, to_hex, Address};
 pub use claim_state_challenge::{
@@ -67,6 +72,7 @@ pub use voucher_signature::{
     VoucherSignature, SOLANA_VOUCHER_PREFIX, X402_BATCH_SETTLEMENT_ADDRESS,
     X402_BATCH_SETTLEMENT_EIP712_NAME, X402_BATCH_SETTLEMENT_EIP712_VERSION,
 };
+pub use zk_state::{ZkStateKeyError, ZkStateSigner};
 
 #[cfg(test)]
 mod contract;

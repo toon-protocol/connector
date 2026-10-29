@@ -23,7 +23,17 @@ connector-runtime = { path = "../connector-runtime" }
 # client payout is a voucher on one of this node's outbound x402 channels.
 connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer" }
+# The zk edge (ADR 0080): zk_toon's derivations, the request proof's public
+# inputs, the allowance claim's signature and the evidence file's bytes, all
+# through the one boundary crate that pins zk_toon.
+connector-zk-note = { path = "../connector-zk-note" }
 async-trait = "0.1"
+# The zk edge's clock is `connector_runtime::Clock`, which speaks chrono.
+chrono = "0.4"
+# An allowance id is 16 bytes from the OS: opaque, so a log line naming an
+# allowance names no nullifier and no session key.
+getrandom = "0.2"
+thiserror = "2"
 # `ws` for the client BTP websocket carriage (client-edge-spec.md §1.9, ADR
 # 0026); pulls tokio-tungstenite 0.20, already in the lockfile.
 axum = { version = "0.6", features = ["ws"] }
@@ -35,7 +45,7 @@ base64 = "0.22"
 bs58 = "0.5"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 # `time`: the unresolvable-lookup shaper (issue #613) holds a lookup for
 # its slot rather than refusing it, and that hold is a `sleep`. `sync`: the
 # claim gate's group commit (issue #686) resolves a claim's durability
@@ -49,8 +59,12 @@ tracing = "0.1"
 # that answer any more and a job id taken from it would be payee-forgeable.
 sha2 = "0.10"
 
+[features]
+# Exposes `zk_note::contract`, the `ZkNoteVault` contract suite, outside this
+# crate's own tests, so the Mina adapter (#1514) runs the same suite.
+test-util = []
+
 [dev-dependencies]
-chrono = "0.4"
 # `test-support` for `covering_fake`: a payable hop for every test here that
 # forwards to a peer (ADR 0042, ADR 0075 decision 6).
 connector-runtime = { path = "../connector-runtime", features = ["test-support"] }

@@ -264,7 +264,8 @@ impl RateSources {
                 .iter()
                 .find(|(held, _)| held.chain() == AssetChain::Solana)
                 .map(|(_, source)| source),
-            Network::Eip155(_) => None,
+            // No TWAP source quotes MINA (ADR 0080 decision 7).
+            Network::Eip155(_) | Network::Mina(_) => None,
         })
     }
 

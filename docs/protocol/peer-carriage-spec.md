@@ -516,7 +516,7 @@ LE)`.
  "channelAccount": "<base58>", "expires": 1800000000, "signature": "<base64 of 64 bytes>"}
 ```
 
-`network` is **required** (ADR 0086 decision 1, `schema_version` 10): a challenge with none is
+`network` is **required** (ADR 0086 decision 1, `schema_version` 11): a challenge with none is
 refused by name, and one on a network the receiver holds no table for proves nothing. A peer's
 voucher with no `network` is refused by name on both carriages, as a `toon-channel` claim is (§1.5).
 
@@ -1341,7 +1341,7 @@ The body in both cases is the same JSON, raw UTF-8 on BTP and `base64(JSON)` in 
 
 `network` is the CAIP-2 network of the voucher judged
 ([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 1,
-`schema_version` 10). A payer reads an ack as a verdict only when it names the network the payer's
+`schema_version` 11). A payer reads an ack as a verdict only when it names the network the payer's
 voucher named; one naming another network, or none, is **not acknowledged** (§6.3).
 
 `reason` is exactly one of `peer-semantics-pre-868.md` §3.4's four, unchanged and not extensible without a

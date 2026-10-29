@@ -206,7 +206,7 @@ pub enum RefusedEvidence {
     /// straggling peer is told why rather than silently downgraded.
     ToonChannelClaim,
     /// A voucher with no `network` (ADR 0086 decision 1): refused by name
-    /// for the same reason, so a peer that predates `schema_version` 10
+    /// for the same reason, so a peer that predates `schema_version` 11
     /// learns it must upgrade.
     NetworkMissingClaim,
 }

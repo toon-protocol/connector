@@ -65,7 +65,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::client_claim::{EVM_NAMESPACE, SOLANA_NAMESPACE};
-use crate::network::{Network, NetworkError};
+use crate::network::{MinaNetwork, Network, NetworkError, MINA_NETWORK_NAMESPACE};
+
+/// The family name of Mina, whose one asset is a zk-note vault's (ADR 0080
+/// decision 7, as amended).
+pub const MINA_NAMESPACE: &str = MINA_NETWORK_NAMESPACE;
+
+/// MINA's SLIP-44 coin type: native MINA is `mina:<network>/slip44:12586`.
+pub const MINA_SLIP44_COIN_TYPE: u32 = 12586;
 
 /// How many hex characters an EVM contract address is, unprefixed.
 const EVM_ADDRESS_HEX_LEN: usize = 40;
@@ -84,9 +91,10 @@ pub const SOLANA_TOKEN_NAMESPACE: &str = "token";
 /// type.
 pub const SLIP44_NAMESPACE: &str = "slip44";
 
-/// The settlement family a token lives in -- the two this connector has a
+/// The family a token lives in -- the two this connector has a settlement
 /// backend type for, named with the same two strings the rest of the workspace
-/// names them with ([`EVM_NAMESPACE`], [`SOLANA_NAMESPACE`]).
+/// names them with ([`EVM_NAMESPACE`], [`SOLANA_NAMESPACE`]) -- and Mina,
+/// whose one asset is a zk-note vault's (ADR 0080 decision 7, as amended).
 ///
 /// The family says which claim parser and which backend type; the
 /// [`Network`] says which instance. An asset's family is always read off its
@@ -97,14 +105,21 @@ pub enum AssetChain {
     Evm,
     /// The cluster `[settlement.solana]` names.
     Solana,
+    /// Native MINA, 9 decimals, held by the vault the `[zk_note]` table
+    /// names. Its one [`AssetId`] is `mina:<network>/slip44:12586`
+    /// ([`AssetId::mina`]); there is no Mina settlement backend, so a Mina
+    /// asset stays refused in `[[tokens]]` and in every settlement table, and
+    /// no TWAP source quotes it. A `[[rates]]` row may name it as its `from`.
+    Mina,
 }
 
 impl AssetChain {
-    /// The family's one spelling: `"evm"` or `"solana"`.
+    /// The family's one spelling: `"evm"`, `"solana"` or `"mina"`.
     pub const fn as_str(&self) -> &'static str {
         match self {
             AssetChain::Evm => EVM_NAMESPACE,
             AssetChain::Solana => SOLANA_NAMESPACE,
+            AssetChain::Mina => MINA_NAMESPACE,
         }
     }
 }
@@ -170,7 +185,8 @@ struct AssetParts {
 
 impl AssetId {
     /// A token by its contract or mint on `network`: an `erc20` on an
-    /// `eip155` network, a `token` on a `solana` one. An EVM contract is
+    /// `eip155` network, a `token` on a `solana` one, and native MINA -- Mina's
+    /// only asset, whatever `token` says -- on a `mina` one. An EVM contract is
     /// canonicalised to `0x` plus lowercase hex whenever it has an address's
     /// shape; a Solana mint is taken byte for byte.
     ///
@@ -190,6 +206,9 @@ impl AssetId {
                 namespace: AssetNamespace::Token,
                 reference: token.to_string(),
             })),
+
+            // Mina has one asset, so there is no token to name on it.
+            Network::Mina(mina) => AssetId::mina(mina),
         }
     }
 
@@ -205,6 +224,12 @@ impl AssetId {
             namespace: AssetNamespace::Slip44,
             reference: coin_type.to_string(),
         }))
+    }
+
+    /// Native MINA on `network`: the vault asset of a zk edge, and the only
+    /// Mina asset (ADR 0080 decision 7, as amended by ADR 0086's CAIP-19).
+    pub fn mina(network: MinaNetwork) -> AssetId {
+        AssetId::slip44(Network::Mina(network), MINA_SLIP44_COIN_TYPE)
     }
 
     /// The CAIP-2 network this token is on.
@@ -298,7 +323,12 @@ impl FromStr for AssetId {
                 {
                     return Err(invalid());
                 }
-                reference.parse::<u32>().map_err(|_| invalid())?.to_string()
+                let coin_type = reference.parse::<u32>().map_err(|_| invalid())?;
+                // Mina has one asset (ADR 0080 decision 7, as amended).
+                if matches!(network, Network::Mina(_)) && coin_type != MINA_SLIP44_COIN_TYPE {
+                    return Err(invalid());
+                }
+                coin_type.to_string()
             }
         };
         Ok(AssetId(Box::new(AssetParts {
@@ -421,7 +451,7 @@ pub enum AssetIdError {
     #[error(
         "'{value}' names the asset namespace '{namespace}', which this connector does not read \
          on {network}: an eip155 network holds erc20 and slip44 assets, a solana network \
-         token and slip44 assets (ADR 0086)"
+         token and slip44 assets, a mina network slip44:12586 alone (ADR 0086)"
     )]
     UnknownAssetNamespace {
         value: String,
@@ -565,9 +595,25 @@ mod tests {
         );
     }
 
+    /// ADR 0080 decision 7, as amended, in ADR 0086's grammar: native MINA
+    /// is `mina:<network>/slip44:12586`, and it is the only Mina asset.
+    #[test]
+    fn native_mina_is_the_one_mina_asset() {
+        let mina = "mina:devnet/slip44:12586"
+            .parse::<AssetId>()
+            .expect("native MINA");
+        assert_eq!(mina, AssetId::mina(MinaNetwork::Devnet));
+        assert_eq!(mina.chain(), AssetChain::Mina);
+        assert_eq!(mina.to_string(), "mina:devnet/slip44:12586");
+        assert_ne!(mina, AssetId::mina(MinaNetwork::Mainnet));
+        for other in ["mina:devnet/slip44:60", "mina:devnet/token:B62qFoo"] {
+            assert!(other.parse::<AssetId>().is_err(), "{other}");
+        }
+    }
+
     #[test]
     fn a_native_spelling_is_refused_by_name() {
-        for value in ["evm:native", "solana:native", "xrpl:native"] {
+        for value in ["evm:native", "solana:native", "xrpl:native", "mina:native"] {
             let error = value.parse::<AssetId>().expect_err("retired");
             assert!(
                 matches!(error, AssetIdError::LegacyNative { .. }),
