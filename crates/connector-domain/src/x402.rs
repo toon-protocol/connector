@@ -517,6 +517,29 @@ pub struct X402ZkNoteTerms {
     pub allowance_lifetime_secs: u64,
     /// Where allowances are opened and closed.
     pub allowance_endpoint: String,
+    /// Whether a subsidised allowance can be opened right now (ADR 0080
+    /// decision 14, #1581): `None` while the node's `subsidy_budget` is zero.
+    /// Computed when a greeting is served, so it is empty in the facts a node
+    /// boots with, and the greeting is the only place it is published. It
+    /// never says how much remains.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subsidy: Option<ZkNoteSubsidy>,
+    /// How many subsidised allowances were granted in the last **finished**
+    /// subsidy period -- never the current one, and no amount (decision 14).
+    /// Set where the self-description is served, and `None` while the node's
+    /// `subsidy_budget` is zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subsidised_last_period: Option<u64>,
+}
+
+/// Whether a subsidised allowance is on offer, as the greeting says it. A
+/// wallet that read `Open` may still be refused as closed; the refusal is
+/// authoritative.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ZkNoteSubsidy {
+    Open,
+    Closed,
 }
 
 /// [`X402BatchSettlementOption::extra`] for a `zk-note` entry: what a
@@ -529,6 +552,8 @@ pub struct X402ZkNoteExtra {
     pub tiers: Vec<String>,
     pub allowance_lifetime_secs: u64,
     pub allowance_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subsidy: Option<ZkNoteSubsidy>,
 }
 
 /// Project [`X402ZkNoteTerms`] into the greeting's `accepts[]` entry.
@@ -546,6 +571,7 @@ fn zk_note_accept(fact: &X402ZkNoteTerms, amount: String) -> X402BatchSettlement
             tiers: fact.tiers.clone(),
             allowance_lifetime_secs: fact.allowance_lifetime_secs,
             allowance_endpoint: fact.allowance_endpoint.clone(),
+            subsidy: fact.subsidy,
         }),
     }
 }
@@ -1171,6 +1197,8 @@ mod tests {
             tiers: vec!["10000000".to_string(), "100000000".to_string()],
             allowance_lifetime_secs: 3600,
             allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
+            subsidy: None,
+            subsidised_last_period: None,
         }
     }
 

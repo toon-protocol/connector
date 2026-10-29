@@ -107,7 +107,7 @@ pub use batch_settlement::{
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
-    ClaimIngestRejection, ClientClaimGate, InFlightForward, NotAZkEdge, SignedSuccessor,
+    ClaimIngestRejection, ClientClaimGate, InFlightForward, NotAZkEdge, SignedSuccessor, Subsidy,
     SuccessorStatus, ZkEdge, ZkEdgeRestoreError,
 };
 pub use evidence_file::{EvidenceFile, EvidenceFileError, EVIDENCE_FILE};
@@ -156,6 +156,40 @@ const REJECT_REASON_HEADER: &str = connector_btp::REJECT_REASON_HEADER;
 /// header. Its absence is what makes a request anonymous -- a first-class
 /// path, not a fallback.
 const PEER_ID_HEADER: &str = "ilp-peer-id";
+
+impl ClientEdgeState {
+    /// The node's facts as a greeting states them: a zk edge that offers a
+    /// subsidy says whether it is `open` or `closed` right now (ADR 0080
+    /// decision 14), read when the greeting is served and never an amount.
+    fn greeting_node(&self) -> std::borrow::Cow<'_, NodeFacts> {
+        let Some(open) = self.claim_gate.subsidy_open() else {
+            return std::borrow::Cow::Borrowed(&self.node);
+        };
+        let mut node = (*self.node).clone();
+        if let Some(zk_note) = node.zk_note.as_mut() {
+            zk_note.subsidy = Some(if open {
+                connector_domain::x402::ZkNoteSubsidy::Open
+            } else {
+                connector_domain::x402::ZkNoteSubsidy::Closed
+            });
+        }
+        std::borrow::Cow::Owned(node)
+    }
+
+    /// The node's facts as the self-description states them: how many
+    /// subsidised allowances the last finished subsidy period granted --
+    /// never the current period's, and no amount (decision 14).
+    fn description_node(&self) -> std::borrow::Cow<'_, NodeFacts> {
+        let Some(granted) = self.claim_gate.subsidised_last_period() else {
+            return std::borrow::Cow::Borrowed(&self.node);
+        };
+        let mut node = (*self.node).clone();
+        if let Some(zk_note) = node.zk_note.as_mut() {
+            zk_note.subsidised_last_period = Some(granted);
+        }
+        std::borrow::Cow::Owned(node)
+    }
+}
 
 struct ClientEdgeState {
     connector: Arc<Connector>,
@@ -635,7 +669,7 @@ async fn self_description(State(state): State<Arc<ClientEdgeState>>) -> Response
     );
 
     Json(NodeSelfDescription::describe(
-        &state.node,
+        &state.description_node(),
         edge_identity,
         routes,
         required_transport,
@@ -1365,7 +1399,7 @@ async fn handle_ilp(
                 schedule,
                 prepare.data.len(),
                 policy,
-                &state.node,
+                &state.greeting_node(),
                 client_route.as_ref(),
             );
         }
@@ -1386,7 +1420,7 @@ async fn handle_ilp(
             &prepare.destination,
             schedule,
             prepare.data.len(),
-            &state.node,
+            &state.greeting_node(),
             client_route.as_ref(),
         );
     }
@@ -3905,6 +3939,131 @@ mod tests {
         );
         // The legacy field is untouched: still an echo of the probed destination.
         assert_eq!(terms.toon().unwrap().ilp_address, "g.whatever");
+    }
+
+    /// A node that is a zk edge paying `budget` of subsidy per period (zero:
+    /// none), over an in-memory vault and a temp evidence file. The vault was
+    /// created ten and a half periods before the clock.
+    fn zk_edge_node(budget: u64) -> (Router, Arc<ClientClaimGate>, tempfile::TempDir) {
+        use crate::zk_note::InMemoryZkNoteVault;
+        use connector_zk_note::note::policy::{SUBSIDY_PERIOD_MS, TIERS};
+        use connector_zk_note::tiers::Tiers;
+        use connector_zk_note::{Scalar, SecKey};
+        let clock = test_clock();
+        let now = u64::try_from(connector_runtime::Clock::now(clock.as_ref()).timestamp_millis())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(
+            gate_without_backend()
+                .with_zk_edge(ZkEdge {
+                    vault: Arc::new(InMemoryZkNoteVault::new()),
+                    evidence: EvidenceFile::open(&dir.path().join(EVIDENCE_FILE)).unwrap(),
+                    state_signer: connector_signer::ZkStateSigner::from_base58(
+                        &SecKey::new(Scalar::from(5u64)).to_base58(),
+                    )
+                    .unwrap(),
+                    tiers: Tiers::new([TIERS[0]]).unwrap(),
+                    allowance_lifetime: std::time::Duration::from_secs(3_600),
+                    open_budget_cap: 10 * TIERS[0],
+                    subsidy: (budget > 0).then_some(Subsidy {
+                        budget,
+                        vault_creation_ms: now - 10 * SUBSIDY_PERIOD_MS - SUBSIDY_PERIOD_MS / 2,
+                    }),
+                    clock,
+                })
+                .unwrap(),
+        );
+        let connector = Arc::new(Connector::new(
+            vec![],
+            vec![],
+            Arc::new(FakeAppClient::new()),
+            Arc::new(InProcessPeerTransport::new()),
+            test_clock(),
+        ));
+        let app = router_with_node_facts(
+            connector,
+            test_signer(),
+            None,
+            Arc::clone(&gate),
+            NodeFacts {
+                zk_note: Some(connector_domain::x402::X402ZkNoteTerms {
+                    network: "mina:devnet".into(),
+                    asset: "slip44:12586".into(),
+                    pay_to: "B62q".into(),
+                    verification_key_hash: "1".into(),
+                    state_key: "B62q".into(),
+                    tiers: vec![TIERS[0].to_string()],
+                    allowance_lifetime_secs: 3_600,
+                    allowance_endpoint: ZK_NOTE_ALLOWANCES_PATH.into(),
+                    subsidy: None,
+                    subsidised_last_period: None,
+                }),
+                ..Default::default()
+            },
+            DEFAULT_BTP_SESSION_WINDOW,
+            None,
+            Arc::from([]),
+        );
+        (app, gate, dir)
+    }
+
+    async fn zk_greeting_extra(app: Router) -> serde_json::Value {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/ilp")
+            .body(Body::from(greeting_prepare("g.whatever").encode()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let greeting: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let zk = greeting["accepts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["scheme"] == "zk-note")
+            .expect("a zk edge's greeting has its zk-note entry")
+            .clone();
+        zk["extra"].clone()
+    }
+
+    /// ADR 0080 decision 14: the greeting says whether a subsidy is open or
+    /// closed -- read when it is served, never an amount -- and says nothing
+    /// at a node whose budget is zero. The self-description carries the last
+    /// finished period's count instead, and never the open/closed word.
+    #[tokio::test]
+    async fn the_greeting_says_open_or_closed_and_the_description_counts_the_last_period() {
+        use connector_zk_note::note::policy::TIERS;
+        let (app, gate, _dir) = zk_edge_node(5 * 10_000_000);
+        let extra = zk_greeting_extra(app.clone()).await;
+        assert_eq!(extra["subsidy"], "open");
+        assert!(
+            !extra.to_string().contains("50000000"),
+            "the greeting never says how much remains: {extra}"
+        );
+        let document = self_description_of(app.clone()).await;
+        assert_eq!(document["zkNote"]["subsidisedLastPeriod"], 0);
+        assert!(document["zkNote"].get("subsidy").is_none());
+
+        assert_eq!(gate.subsidy_open(), Some(true));
+
+        // A budget below the smallest tier is never open: served, it reads
+        // closed, and still never says how much remains.
+        let (app, gate, _dir) = zk_edge_node(TIERS[0] - 1);
+        let extra = zk_greeting_extra(app).await;
+        assert_eq!(extra["subsidy"], "closed");
+        assert!(
+            !extra.to_string().contains(&(TIERS[0] - 1).to_string()),
+            "the greeting never says how much remains: {extra}"
+        );
+        assert_eq!(gate.subsidy_open(), Some(false));
+
+        let (app, _gate, _dir) = zk_edge_node(0);
+        let extra = zk_greeting_extra(app.clone()).await;
+        assert!(extra.get("subsidy").is_none(), "{extra}");
+        let document = self_description_of(app).await;
+        assert!(document["zkNote"].get("subsidisedLastPeriod").is_none());
+        assert!(document["zkNote"].get("subsidy").is_none());
     }
 
     /// The absence half of the test above: a node with no `[node]` section

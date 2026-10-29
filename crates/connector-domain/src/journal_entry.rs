@@ -179,6 +179,12 @@ pub enum JournalEntry {
     /// `toon-channel`'s. `commitment` is the proof's re-randomised balance
     /// commitment, which the successor is charged from.
     ///
+    /// `subsidy` is set on a subsidised allowance (ADR 0080 decision 14,
+    /// #1581): the subsidy period it was granted in and its per-period
+    /// nullifier. The per-period nullifier is journaled with the grant, so
+    /// it is durable before the grant is answered and a restart still
+    /// refuses it; the period is the budget the tier is reserved against.
+    ///
     /// Written only by `connector_client_edge::ClientClaimGate`, into the
     /// client edge's own journal.
     AllowanceGranted {
@@ -191,6 +197,7 @@ pub enum JournalEntry {
         session_key_is_odd: bool,
         commitment_x: [u8; 32],
         commitment_y: [u8; 32],
+        subsidy: Option<AllowanceSubsidy>,
     },
     /// A zk edge stopped an allowance taking claims (ADR 0080 decision 4):
     /// on its session key's signed close, on a claim reaching its budget, or
@@ -205,6 +212,9 @@ pub enum JournalEntry {
     /// rewritten. Written, and fsynced, before the evidence file's close
     /// record and before the successor is signed, so a restart can finish
     /// a close but never charge it differently.
+    ///
+    /// For a subsidised allowance Δ is the subsidy budget's charge, not the
+    /// note's: the note is charged nothing.
     AllowanceClosed { allowance_id: String, charge: u64 },
     /// The successor state a zk edge signed for a closed allowance (ADR
     /// 0080 decision 11, #1523): zk_toon's state message over the charged
@@ -220,4 +230,14 @@ pub enum JournalEntry {
         signature_rx: [u8; 32],
         signature_s: [u8; 32],
     },
+}
+
+/// What a subsidised allowance adds to its [`JournalEntry::AllowanceGranted`]
+/// (ADR 0080 decision 14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowanceSubsidy {
+    /// The subsidy period the grant reserved its tier in.
+    pub period: u64,
+    /// The proof's per-period nullifier, 32 bytes little-endian.
+    pub period_nullifier: [u8; 32],
 }

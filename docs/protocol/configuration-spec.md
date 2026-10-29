@@ -580,7 +580,9 @@ base58, `EK…`, as Mina's tooling exports it),
 `verification_key_hash` (a decimal field element), `tiers` (nanomina, a subset of zk_toon's
 `policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
 quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest
-tier). The vault's asset is native MINA, 9 decimals; the table declares it by existing, as the
+tier) and, optionally, `subsidy_budget` (MINA base units per subsidy period, default 0: no subsidised
+allowance; a non-zero budget needs zk_toon's smallest tier among `tiers` and makes boot read the
+vault's creation time once, failing if it cannot — ADR 0080 decision 14). The vault's asset is native MINA, 9 decimals; the table declares it by existing, as the
 CAIP-19 `AssetId` `mina:<network>/slip44:12586` on the table's `network` (ADR 0086), which a
 `[[rates]]` row may name as its `from` and which the settlement tables still refuse; `[[tokens]]` refuses it by name (`TokenMinaNative`). A zk edge that also settles
 pays its next hops in a settlement asset, so it needs a `[[rates]]` row from that asset to each
