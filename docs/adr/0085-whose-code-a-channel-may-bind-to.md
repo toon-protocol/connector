@@ -1,6 +1,6 @@
 # Whose code a channel may bind to
 
-**Status:** Accepted (owner decision, 2026-10-28, #1564; part of map #1563). Nothing is built: the binary settles on EVM and Solana only, and this record admits no new chain. It sets the bar each later chain is held to. It **amends** [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 1, which admitted only x402's own deployed code, and it **records** #1558's amendment of the same decision for Mina, which no record had written down. The facts it rests on were read from primary sources on the day of decision: [research note](../research/whose-code-a-channel-may-bind-to.md).
+**Status:** Accepted (owner decision, 2026-10-28, #1564; part of map #1563). Nothing is built: the binary settles on EVM and Solana only, and this record admits no new chain. It sets the bar each later chain is held to. _Amended by [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md): decision 3's table gains its XRPL rows._ It **amends** [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 1, which admitted only x402's own deployed code, and it **records** #1558's amendment of the same decision for Mina, which no record had written down. The facts it rests on were read from primary sources on the day of decision: [research note](../research/whose-code-a-channel-may-bind-to.md).
 
 **Scope:** connector architecture — which on-chain code a node will bind a channel to, and how the binary pins it. A binding's wire (its voucher and claim-state challenge) is protocol law, and is decided in each chain's own record. See the [ADR index](README.md).
 
@@ -73,6 +73,8 @@ native primitive, boot checks that the RPC answers with the network id the entry
 `server_info`'s `network_id`). It checks a ledger feature only while that feature is still a live
 amendment. XRPL's PayChan is a retired amendment: its code always runs, and testnet reports it
 `enabled: false` while channels work there.
+
+_Amended (proposed, #1609, [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md) decision 5):_ the table gains XRPL rows, each with an **empty** binding and checked against `server_info.network_id`: `xrpl:0` (mainnet), `xrpl:1` (testnet), `xrpl:2` (devnet), and one stand-alone network, `xrpl:1000`, for the test harness and `local/` (testnet-class, at most 1024 so transactions carry no `NetworkID`, and not 0, 1 or 2). The mainnet row passes decision 5 as a native primitive. The body above is otherwise unchanged.
 
 ### 4. Adopting third-party code makes it TOON's
 
