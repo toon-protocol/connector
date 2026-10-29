@@ -402,6 +402,131 @@ max_move = {{ numerator = 5, denominator = 100 }}
     );
 }
 
+/// USDC on the second EVM network a two-network node settles on: the same
+/// contract address as [`USDC`], as on every anvil `seed.sh` seeds, and a
+/// different asset because it names a different network (ADR 0086 decision
+/// 13).
+const USDC_SECOND_NETWORK: &str = "eip155:31338/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+/// [`config_with_evm_settlement`]'s node with a second EVM table, on
+/// 31338, holding [`USDC_SECOND_NETWORK`].
+fn config_with_two_evm_networks(key_file: &Path, state_dir: &Path, declaration: &str) -> String {
+    config_with_evm_settlement(
+        key_file,
+        state_dir,
+        &format!(
+            r#"
+[settlement.eip155.31338]
+rpc_url = "http://127.0.0.1:8546"
+token_address = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.31338.key]
+key_file = "{key}"
+{declaration}"#,
+            key = key_file.display(),
+        ),
+    )
+}
+
+/// A dealing node's numeraire on 31337, and the same USDC on 31338.
+fn numeraire_and_second_network_usdc() -> String {
+    format!(
+        r#"
+[[tokens]]
+asset = "{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "{USDC_SECOND_NETWORK}"
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#
+    )
+}
+
+/// ADR 0086 decision 13: a quote path cannot leave its token's network, so
+/// only tokens on the numeraire's own network quote themselves. A token on
+/// any other network is priced by a static `[[rates]]` row or not at all --
+/// and "not at all" is a node that would refuse every forward across it,
+/// one `ttl` after nothing, so it is refused at load and named.
+#[test]
+fn exits_non_zero_on_a_token_off_the_numeraires_network_with_no_static_rate() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let config_file = write_config(&config_with_two_evm_networks(
+        key_file.path(),
+        state_dir.path(),
+        &numeraire_and_second_network_usdc(),
+    ));
+
+    let output = run(config_file.path());
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&USDC_SECOND_NETWORK.to_ascii_lowercase())
+            && stderr.contains("eip155:31337")
+            && stderr.contains("[[rates]]"),
+        "expected the refusal to name the token, the numeraire's network and the fix, got: \
+         {stderr}"
+    );
+}
+
+/// The same token with a static rate on either side of a row loads: the
+/// row is the operator's statement of what USDC on the other network is
+/// worth (ADR 0086 decision 13), and that is all the rule asks for.
+#[test]
+fn a_token_off_the_numeraires_network_loads_with_a_static_rate() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    for (from, to) in [(USDC_SECOND_NETWORK, USDC), (USDC, USDC_SECOND_NETWORK)] {
+        let config_file = write_config(&config_with_two_evm_networks(
+            key_file.path(),
+            state_dir.path(),
+            &format!(
+                "{}\n[[rates]]\nfrom = \"{from}\"\nto = \"{to}\"\nrate = {{ numerator = 1, \
+                 denominator = 1 }}\n",
+                numeraire_and_second_network_usdc()
+            ),
+        ));
+
+        let config = Config::load(config_file.path()).expect("a static rate prices the token");
+        let second: connector_domain::AssetId = USDC_SECOND_NETWORK.parse().expect("an asset id");
+        assert!(config.denomination().token(&second).is_some());
+    }
+}
+
+/// A rate-less row prices nothing -- it only tightens guards -- so it does
+/// not satisfy the rule either.
+#[test]
+fn exits_non_zero_when_the_only_row_naming_the_token_has_no_rate() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let config_file = write_config(&config_with_two_evm_networks(
+        key_file.path(),
+        state_dir.path(),
+        &format!(
+            "{}\n[[rates]]\nfrom = \"{USDC_SECOND_NETWORK}\"\nto = \"{USDC}\"\nttl_secs = 60\n",
+            numeraire_and_second_network_usdc()
+        ),
+    ));
+
+    let output = run(config_file.path());
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&USDC_SECOND_NETWORK.to_ascii_lowercase()),
+        "expected the refusal to name the token, got: {stderr}"
+    );
+}
+
 /// `deny_unknown_fields` reaches inside every new table too (ADR 0009): a
 /// key misspelled in one is a line silently dropped and a node running on
 /// a policy nobody wrote, which is the failure the posture exists for.
