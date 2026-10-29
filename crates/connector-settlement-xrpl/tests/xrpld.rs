@@ -66,7 +66,7 @@ async fn a_transaction_that_passes_its_last_ledger_sequence_unlanded_is_reported
     let payee = chain.funded_wallet(&rpc, 100_000_000).await;
 
     let account = rpc.account_info(&payer.address).await.unwrap().unwrap();
-    let last_ledger_sequence = rpc.fee().await.unwrap().current_ledger_index + 2;
+    let last_ledger_sequence = rpc.fee().await.unwrap().ledger_current_index + 2;
     // A sequence the account has not reached: the node holds it and never
     // applies it, so it cannot land.
     let submitted = rpc

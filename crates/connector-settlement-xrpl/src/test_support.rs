@@ -58,6 +58,12 @@ const RPC_PORT: u16 = 5005;
 /// fails, measured from `docker run`.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Held from `docker run` to the first answered `server_info`, so a test
+/// binary starts its chains one at a time. Eight started at once take 18–22 s
+/// each to answer where one alone takes under 4 s: without this, `startup`
+/// times the host's contention rather than the chain ADR 0084's line is about.
+static SPAWNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What [`require_xrpld`] does about a missing chain: a pure function of the
 /// facts, so the CI rule is tested without Docker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +255,7 @@ impl Xrpld {
     pub async fn spawn() -> Xrpld {
         use std::os::unix::fs::PermissionsExt;
 
+        let _spawning = SPAWNING.lock().await;
         clear_orphans();
         let dir = tempfile::tempdir().expect("a temp dir for the xrpld config");
         let config_path = dir.path().join("xrpld.cfg");
@@ -362,7 +369,7 @@ impl Xrpld {
     /// genesis account's sequence.
     pub async fn fund(&self, rpc: &XrplRpc, address: &str, drops: u64) {
         let _funder = self.funder.lock().await;
-        let current = rpc.fee().await.expect("fee").current_ledger_index;
+        let current = rpc.fee().await.expect("fee").ledger_current_index;
         let last_ledger_sequence = current + 20;
         let submitted = rpc
             .sign_and_submit(

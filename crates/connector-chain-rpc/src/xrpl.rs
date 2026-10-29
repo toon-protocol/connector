@@ -128,7 +128,7 @@ pub struct Fee {
     pub open_ledger_fee_drops: u64,
     /// The ledger the open ledger will become: a transaction submitted now
     /// can land in it at the earliest.
-    pub current_ledger_index: u32,
+    pub ledger_current_index: u32,
 }
 
 /// What `submit` answered about a transaction.
@@ -414,10 +414,10 @@ impl XrplRpc {
             base_fee_drops: drops("base_fee").ok_or_else(|| unreadable("drops.base_fee"))?,
             open_ledger_fee_drops: drops("open_ledger_fee")
                 .ok_or_else(|| unreadable("drops.open_ledger_fee"))?,
-            current_ledger_index: result["current_ledger_index"]
+            ledger_current_index: result["ledger_current_index"]
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| unreadable("current_ledger_index"))?,
+                .ok_or_else(|| unreadable("ledger_current_index"))?,
         })
     }
 
