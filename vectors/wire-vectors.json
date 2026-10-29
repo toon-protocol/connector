@@ -689,17 +689,6 @@
         "network": "xrpl:0",
         "signature_verifies": true
       },
-      "above_ceiling": {
-        "name": "claim_voucher_xrpl_above_ceiling",
-        "max_drops": "100000000000000000",
-        "amount": "100000000000000001",
-        "amount_above_u64": "18446744073709551616",
-        "claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000001\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
-        "claim_above_u64_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"18446744073709551616\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
-        "expected_error": "amount_exceeds_chain",
-        "signing_refused": true,
-        "at_ceiling_claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
-      },
       "invalid": [
         {
           "name": "claim_voucher_xrpl_network_missing",
@@ -707,6 +696,17 @@
           "expected_error": "network_missing"
         }
       ]
+    },
+    "xrpl_above_ceiling": {
+      "name": "claim_voucher_xrpl_above_ceiling",
+      "max_drops": "100000000000000000",
+      "amount": "100000000000000001",
+      "amount_above_u64": "18446744073709551616",
+      "claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000001\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+      "claim_above_u64_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"18446744073709551616\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}",
+      "expected_error": "amount_exceeds_chain",
+      "signing_refused": true,
+      "at_ceiling_claim_json": "{\"blockchain\":\"xrpl\",\"channelId\":\"61e94a86199c75d2d654ab0093cf1f3bdcec7f5e4151e002264a560149b5d136\",\"maxClaimableAmount\":\"100000000000000000\",\"messageId\":\"vector-fixture:voucher:xrpl:secp256k1\",\"network\":\"xrpl:1\",\"scheme\":\"batch-settlement\",\"senderId\":\"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh\",\"signature\":\"3044022030d8f2436668de6e6e66452870ccd6f630fccdfaaa6699dda98144189a23958402203fb822fb057fb8ded2cbdf476d32a2c18a41acc41038db63fde5a150b2985bc2\",\"timestamp\":\"2030-01-01T00:00:00.000Z\",\"version\":\"1.0\"}"
     },
     "amount_only_watermark": [
       {

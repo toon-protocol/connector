@@ -150,7 +150,7 @@ way that would make existing replay code misread it; a purely additive field doe
 
 **`schema_version` 12** (issue #1611,
 [ADR 0087](../docs/adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)): XRPL's claim wire.
-`claim_voucher.xrpl`, `payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl` and
+`claim_voucher.xrpl`, `claim_voucher.xrpl_above_ceiling`, `payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl` and
 `client_auth_channel_challenge.xrpl` are new; nothing existing changed bytes. A voucher's `signature`
 and `channelId` are plain hex (no `0x`), its `maxClaimableAmount` a decimal string of drops (at most
 10¹⁷), and the signed message is `"CLM\0" ‖ channelId ‖ drops (u64 BE)` — the ledger's, which binds no

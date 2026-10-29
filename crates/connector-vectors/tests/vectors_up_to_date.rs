@@ -964,7 +964,7 @@ fn the_committed_xrpl_vectors_replay_against_the_real_implementation() {
     assert_eq!(claim.network().to_string(), "xrpl:0");
 
     // The ceiling is refused by name, never truncated.
-    let ceiling = &xrpl["above_ceiling"];
+    let ceiling = &committed["claim_voucher"]["xrpl_above_ceiling"];
     let max: u64 = text(ceiling, "max_drops").parse().expect("max");
     assert_eq!(max, 100_000_000_000_000_000);
     for field in ["claim_json", "claim_above_u64_json"] {

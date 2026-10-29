@@ -663,8 +663,10 @@ mod tests {
             let signer = if use_ed { ed() } else { secp() };
             let signature = signer.sign_claim(&channel, drops as u128).unwrap();
             let key = signer.public_key();
-            // the amount
+            // the amount: one bit of its u64, and the next drop
             prop_assert!(!verify_xrpl_claim(&key, &channel, drops as u128 + 1, &signature));
+            let flipped = drops ^ (1u64 << (flip % 64));
+            prop_assert!(!verify_xrpl_claim(&key, &channel, flipped as u128, &signature));
             // the channel id
             let mut other = channel;
             other[flip % 32] ^= 1 << bit;
@@ -679,19 +681,34 @@ mod tests {
         #[test]
         fn challenges_round_trip_and_bind_network_channel_and_expiry(
             channel in any::<[u8; 32]>(),
-            expires in 0..u64::MAX,
+            network in "xrpl:[0-9]{1,5}",
+            expires in any::<u64>(),
             use_ed in any::<bool>(),
-            flip in 0usize..32,
+            flip in any::<usize>(),
+            bit in 0u8..8,
         ) {
             let signer = if use_ed { ed() } else { secp() };
             let key = signer.public_key();
-            let signature = signer.sign_claim_state_challenge("xrpl:1", &channel, expires).unwrap();
-            prop_assert!(verify_xrpl_voucher_claim_state_challenge(&key, "xrpl:1", &channel, expires, &signature));
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, "xrpl:0", &channel, expires, &signature));
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, "xrpl:1", &channel, expires + 1, &signature));
+            let signature = signer.sign_claim_state_challenge(&network, &channel, expires).unwrap();
+            prop_assert!(verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, expires, &signature));
+            // the network: one bit of one byte, kept ASCII so it stays a `str`
+            let mut other_network = network.clone().into_bytes();
+            let at = flip % other_network.len();
+            other_network[at] ^= 1 << (bit % 7);
+            let other_network = String::from_utf8(other_network).unwrap();
+            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &other_network, &channel, expires, &signature));
+            // the expiry
+            let other_expires = expires ^ (1u64 << (flip % 64));
+            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, other_expires, &signature));
+            // the channel id
             let mut other = channel;
-            other[flip] ^= 1;
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, "xrpl:1", &other, expires, &signature));
+            other[flip % 32] ^= 1 << bit;
+            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &other, expires, &signature));
+            // the signature
+            let mut bad = signature.clone();
+            let at = flip % bad.len();
+            bad[at] ^= 1 << bit;
+            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, expires, &bad));
         }
     }
 

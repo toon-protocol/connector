@@ -2745,6 +2745,9 @@ pub struct ClaimVoucherVectors {
     pub solana: VoucherSolanaCase,
     /// Schema 12 (ADR 0087): XRPL's claim wire. See [`xrpl`].
     pub xrpl: xrpl::ClaimVoucherXrplVectors,
+    /// Schema 12 (ADR 0087): an XRPL amount above the drop ceiling, refused
+    /// by name and never truncated. See [`xrpl::above_ceiling_case`].
+    pub xrpl_above_ceiling: xrpl::XrplAboveCeilingCase,
     pub amount_only_watermark: Vec<VoucherWatermarkCase>,
     pub invalid: Vec<VoucherInvalidClaimCase>,
 }
@@ -2755,6 +2758,7 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
     let evm_second_network = generate_voucher_evm_second_network_case(&evm);
     let solana = generate_voucher_solana_case();
     let xrpl = xrpl::generate_claim_voucher_xrpl_vectors();
+    let xrpl_above_ceiling = xrpl::above_ceiling_case(&xrpl.secp256k1);
     let amount_only_watermark = generate_voucher_watermark_cases();
     let mut invalid = generate_voucher_invalid_cases(&solana);
     invalid.extend(generate_voucher_network_missing_cases(&evm, &solana));
@@ -2765,6 +2769,7 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
         evm_second_network,
         solana,
         xrpl,
+        xrpl_above_ceiling,
         amount_only_watermark,
         invalid,
     }

@@ -9,7 +9,8 @@ authorisation, `"CLM\0" ‖ channelId[32] ‖ drops (u64 BE)`, signed by the cha
 message — and it **binds no network**, so the _account_ is bound to one. The ceiling is 10¹⁷ drops,
 refused by name (`AmountExceedsChain`) and never truncated. New: `claim_voucher.xrpl` (a claim per
 algorithm; `channel_id`, the offline `SHA512Half(0x0078 ‖ source ‖ destination ‖ sequence)`
-derivation; `claim_binds_no_network`; `above_ceiling`; an `invalid` voucher with no `network`),
+derivation; `claim_binds_no_network`; an `invalid` voucher with no `network`),
+`claim_voucher.xrpl_above_ceiling`,
 `payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl` (a challenge under its own domain tag
 that binds the CAIP-2 network, and is never a claim) and `client_auth_channel_challenge.xrpl`.
 Nothing existing changed bytes. The keys are published development family seeds; the channel ids,

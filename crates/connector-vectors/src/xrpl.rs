@@ -331,7 +331,7 @@ pub struct XrplAboveCeilingCase {
     pub at_ceiling_claim_json: String,
 }
 
-fn above_ceiling_case(secp: &VoucherXrplCase) -> XrplAboveCeilingCase {
+pub(crate) fn above_ceiling_case(secp: &VoucherXrplCase) -> XrplAboveCeilingCase {
     assert_eq!(
         XRPL_MAX_DROPS,
         connector_signer::XRPL_MAX_DROPS,
@@ -398,7 +398,6 @@ pub struct ClaimVoucherXrplVectors {
     /// The same signed claim names a different network and verifies all the
     /// same: a claim binds none (ADR 0087 decision 4).
     pub claim_binds_no_network: XrplClaimBindsNoNetworkCase,
-    pub above_ceiling: XrplAboveCeilingCase,
     pub invalid: Vec<VoucherInvalidClaimCase>,
 }
 
@@ -421,7 +420,6 @@ pub(crate) fn generate_claim_voucher_xrpl_vectors() -> ClaimVoucherXrplVectors {
     let claim_json = relabelled.to_string();
     let parsed = client_claim::parse_client_claim(&claim_json).expect("parses on mainnet too");
     assert_eq!(parsed.network(), &Network::Xrpl(XrplNetwork::Mainnet));
-    let above_ceiling = above_ceiling_case(&secp256k1);
     let invalid = vec![network_missing_case(&secp256k1)];
     ClaimVoucherXrplVectors {
         channel_id: generate_channel_id_cases(),
@@ -431,7 +429,6 @@ pub(crate) fn generate_claim_voucher_xrpl_vectors() -> ClaimVoucherXrplVectors {
             network: parsed.network().to_string(),
             signature_verifies: true,
         },
-        above_ceiling,
         invalid,
         secp256k1,
         ed25519,
