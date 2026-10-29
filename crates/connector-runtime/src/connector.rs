@@ -707,6 +707,19 @@ pub enum ConfigPeeringError {
          the channel this node opened toward that peer (GET /channels lists them)"
     )]
     OutboundChannelPaysSomeoneElse { peer_id: String, channel: String },
+    /// A `[[pay_channels]]` row on one network naming an outbound channel
+    /// this node holds on another (ADR 0086 decision 11).
+    #[error(
+        "the [[pay_channels]] row for peer '{peer_id}' is on {row}, and outbound channel \
+         '{channel}' is held on {held_on}: a peering is on one network (ADR 0086), so name the \
+         channel this node opened on {row}, or put the row on {held_on}"
+    )]
+    OutboundChannelOnAnotherNetwork {
+        peer_id: String,
+        channel: String,
+        row: String,
+        held_on: String,
+    },
     /// A `[[peer_channels]]` row's voucher signer is not in its chain's
     /// spelling. `Config::load` refuses one first; the second lock.
     #[error(
@@ -1474,6 +1487,7 @@ impl Connector {
         outbound_channel: &str,
         client_edge_url: &url::Url,
         answer_timeout: std::time::Duration,
+        network: Option<&connector_domain::Network>,
     ) -> Result<Self, ConfigPeeringError> {
         let Some(outbound) = self.outbound_channels.as_ref() else {
             return Err(ConfigPeeringError::NoOutboundChannels {
@@ -1485,6 +1499,18 @@ impl Connector {
                 peer_id: peer_id.to_string(),
                 channel: outbound_channel.to_string(),
             });
+        }
+        // A config peering is on the network its rows name (ADR 0086
+        // decision 11): the channel the row pays on must be held there.
+        if let (Some(row), Some(held_on)) = (network, outbound.network(outbound_channel)) {
+            if *row != held_on {
+                return Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
+                    peer_id: peer_id.to_string(),
+                    channel: outbound_channel.to_string(),
+                    row: row.to_string(),
+                    held_on: held_on.to_string(),
+                });
+            }
         }
         // A peering's settlement key both signs its vouchers toward this node
         // and receives this node's (ADR 0075 decision 4), so where the config
@@ -9867,7 +9893,7 @@ mod tests {
                     .with_config_peer_ids(["next-hop".to_string()])
                     .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None, None)
                     .expect("bind the signer")
-                    .with_config_pay_channel("next-hop", &channel, &url, timeout);
+                    .with_config_pay_channel("next-hop", &channel, &url, timeout, None);
                 if pays_it {
                     assert!(wired.is_ok(), "the channel pays {signer}");
                 } else {
@@ -9878,6 +9904,42 @@ mod tests {
                     ));
                 }
             }
+        }
+
+        /// ADR 0086 decision 11: a config peering resolves its network from
+        /// its rows, so a `[[pay_channels]]` row on one network naming an
+        /// outbound channel this node holds on another is refused at boot by
+        /// name -- and one on the channel's own network is wired.
+        #[tokio::test]
+        async fn a_config_pay_channel_must_be_on_its_channels_own_network() {
+            let url = url::Url::parse("https://next-hop.example/ilp").unwrap();
+            let timeout = std::time::Duration::from_secs(1);
+            let (connector, _, _, _, channel) = peered().await;
+            let elsewhere: connector_domain::Network = "eip155:8453".parse().unwrap();
+            let refused = connector
+                .with_config_peer_ids(["next-hop".to_string()])
+                .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&elsewhere));
+            match refused {
+                Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
+                    peer_id,
+                    row,
+                    held_on,
+                    ..
+                }) => {
+                    assert_eq!(peer_id, "next-hop");
+                    assert_eq!(row, "eip155:8453");
+                    assert_eq!(held_on, "eip155:31337");
+                }
+                Err(other) => panic!("expected a network refusal, got {other:?}"),
+                Ok(_) => panic!("expected a network refusal, got a wired peering"),
+            }
+
+            let (connector, _, _, _, channel) = peered().await;
+            let own: connector_domain::Network = "eip155:31337".parse().unwrap();
+            assert!(connector
+                .with_config_peer_ids(["next-hop".to_string()])
+                .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&own))
+                .is_ok());
         }
 
         fn prepare(amount: u64) -> Prepare {

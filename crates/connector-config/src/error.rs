@@ -520,6 +520,21 @@ pub enum ConfigError {
         networks: String,
     },
 
+    /// A config peering's `[[peer_channels]]` row and its `[[pay_channels]]`
+    /// row are on two networks of one chain (ADR 0086 decision 11): a
+    /// peering is on one network, both of its channels. A node that moves
+    /// value between networks does it with two peerings and a forward.
+    #[error(
+        "peering '{peer_id}' has its '[[peer_channels]]' row on {inbound} and its \
+         '[[pay_channels]]' row on {outbound}: both channels of a peering are on one network \
+         (ADR 0086 decision 11) -- put both rows on the same network, or make two peerings"
+    )]
+    PeeringNetworksDiffer {
+        peer_id: String,
+        inbound: String,
+        outbound: String,
+    },
+
     #[error(
         "'{value}' is named by two '[[peer_channels]]' rows: one voucher signer, or one inbound \
          channel, proves exactly one peering, and a second row would leave which one to file \
