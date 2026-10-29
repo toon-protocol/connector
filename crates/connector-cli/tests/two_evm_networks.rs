@@ -33,7 +33,9 @@ use connector_settlement::batch::{
 };
 use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
-use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
+use connector_settlement_evm::test_support::{
+    require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
+};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
 use tower::ServiceExt;
@@ -190,11 +192,16 @@ struct Files {
 
 impl Files {
     fn new() -> Files {
+        Self::with_settlement_key(DEPLOYER_PRIVATE_KEY)
+    }
+
+    /// A node settling as `settlement_key_hex` on every table.
+    fn with_settlement_key(settlement_key_hex: &str) -> Files {
         let mut signer_key = tempfile::NamedTempFile::new().expect("signer key");
         signer_key.write_all(&[0x07; 32]).expect("write");
         let mut settlement_key = tempfile::NamedTempFile::new().expect("settlement key");
         settlement_key
-            .write_all(DEPLOYER_PRIVATE_KEY.as_bytes())
+            .write_all(settlement_key_hex.as_bytes())
             .expect("write");
         Files {
             signer_key,
@@ -654,4 +661,317 @@ fn fixture(
         },
         unopened,
     }
+}
+
+// ─── Peering between two two-network nodes (#1603) ──────────────────────────
+//
+// ADR 0086 decisions 11 and 12: a peering is on one network, chosen with
+// `POST /peers`'s CAIP-2 `network` filter when the two nodes share several.
+// Each node is served on a real socket, so `POST /peers` reads the other's
+// self-description over HTTP exactly as it would in production.
+
+/// What each node deposits behind its own outbound channel.
+const PEERING_DEPOSIT: u128 = 10_000;
+/// What a `POST /channels/:id/fund` adds.
+const TOP_UP: u128 = 2_500;
+/// Each node's settlement account's USDC, on each network.
+const NODE_FUNDS: u128 = 1_000_000;
+
+/// A distinct `created` per signed request: the operator surface rejects a
+/// replayed signature (ADR 0008's #1067 amendment).
+static NEXT_CREATED: AtomicU64 = AtomicU64::new(3_000);
+
+/// Mint `NODE_FUNDS` of `net`'s USDC to each settlement key in `keys`.
+async fn fund_nodes(net: &Net, keys: &[&str]) {
+    for key in keys {
+        net.x402
+            .mint(net.token, wallet_of(key).address(), NODE_FUNDS)
+            .await;
+    }
+}
+
+fn wallet_of(key: &str) -> LocalWallet {
+    key.parse::<LocalWallet>().expect("a settlement key")
+}
+
+/// One node settling on every network in `nets` as `settlement_key`, on a
+/// real socket, with an operator write key and plaintext peering allowed.
+struct PeerNode {
+    name: &'static str,
+    addr: std::net::SocketAddr,
+    operator: ed25519_dalek::Keypair,
+    /// Held so the node's key files and state outlive the test.
+    _files: Files,
+    _runtime: connector_cli::Runtime,
+    router: axum::Router,
+}
+
+impl PeerNode {
+    async fn boot(name: &'static str, settlement_key: &str, nets: &[&Net]) -> PeerNode {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the node");
+        let addr = listener.local_addr().expect("the node's address");
+        let operator = ed25519_dalek::Keypair::generate(&mut rand::rngs::OsRng);
+        let files = Files::with_settlement_key(settlement_key);
+        let tables: String = nets
+            .iter()
+            .map(|net| net.table(files.settlement_key.path(), ""))
+            .collect();
+        let write_key: String = operator
+            .public
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let config = support::load_config(&format!(
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+peer_allow_plaintext_endpoints = true
+
+[node]
+addresses     = ["g.example.{name}"]
+http_endpoint = "http://{addr}/ilp"
+
+[signer]
+key_file = "{signer_key}"
+
+[operator]
+bearer_token = "operator-secret"
+write_keys = ["{write_key}"]
+{tables}
+"#,
+            state_dir = files.state_dir.path().display(),
+            signer_key = files.signer_key.path().display(),
+        ));
+        let runtime = connector_cli::build(&config).await.expect("build the node");
+        let router = connector_cli::router(&runtime, &config).expect("the node's router");
+        let served = router.clone();
+        tokio::spawn(async move {
+            let _ = axum::Server::from_tcp(listener)
+                .expect("serve the bound listener")
+                .serve(served.into_make_service())
+                .await;
+        });
+        PeerNode {
+            name,
+            addr,
+            operator,
+            _files: files,
+            _runtime: runtime,
+            router,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/ilp", self.addr)
+    }
+
+    /// A signed operator write, answered with its status and body.
+    async fn write(&self, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_vec(&body).expect("json");
+        let created = NEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        let (sig_input, sig, digest) = connector_operator::test_support::sign_request(
+            &self.operator,
+            "POST",
+            path,
+            &body,
+            created,
+            Some(9_999_999_999),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("signature-input", sig_input)
+            .header("signature", sig)
+            .header("content-digest", digest)
+            .body(Body::from(body))
+            .expect("a request");
+        answer(&self.router, request).await
+    }
+
+    async fn read(&self, path: &str) -> serde_json::Value {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", "Bearer operator-secret")
+            .body(Body::empty())
+            .expect("a request");
+        let (status, body) = answer(&self.router, request).await;
+        assert_eq!(status, StatusCode::OK, "{} GET {path}: {body}", self.name);
+        body
+    }
+
+    /// `POST /peers` naming `other`, with `filter` merged into the body.
+    async fn peer_with(
+        &self,
+        other: &PeerNode,
+        filter: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut body = serde_json::json!({
+            "id": other.name,
+            "url": other.url(),
+            "fee": 0,
+            "deposit": PEERING_DEPOSIT,
+        });
+        for (key, value) in filter.as_object().expect("an object") {
+            body[key] = value.clone();
+        }
+        self.write("/peers", body).await
+    }
+
+    /// This node's outbound channels, as `GET /channels` reports them.
+    async fn outbound(&self) -> Vec<serde_json::Value> {
+        self.read("/channels")
+            .await
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter(|view| view["direction"] == "outbound")
+            .cloned()
+            .collect()
+    }
+}
+
+async fn answer(app: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let response = app.clone().oneshot(request).await.expect("an answer");
+    let status = response.status();
+    let bytes = hyper::body::to_bytes(response.into_body())
+        .await
+        .expect("the body");
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, body)
+}
+
+/// ADR 0086 decision 12 and story 31: two nodes that share two networks
+/// have no honest default. `POST /peers` with no `network` is refused as
+/// `AmbiguousNetwork`, naming both, and with the retired `chain` filter by
+/// name -- and neither opens anything.
+#[tokio::test]
+async fn post_peers_between_two_network_nodes_needs_a_network() {
+    if !require_anvil() {
+        return;
+    }
+    let base = Net::spawn(31_337).await;
+    let other = Net::spawn(31_338).await;
+    let keys = [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY];
+    fund_nodes(&base, &keys).await;
+    fund_nodes(&other, &keys).await;
+    let a = PeerNode::boot("a", DEPLOYER_PRIVATE_KEY, &[&base, &other]).await;
+    let b = PeerNode::boot("b", COUNTERPARTY_PRIVATE_KEY, &[&base, &other]).await;
+
+    let (status, body) = a.peer_with(&b, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body.as_str().expect("a message");
+    assert!(message.contains("eip155:31337"), "{message}");
+    assert!(message.contains("eip155:31338"), "{message}");
+    assert!(message.contains("`network`"), "{message}");
+
+    let (status, body) = a.peer_with(&b, serde_json::json!({"chain": "evm"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.as_str().expect("a message").contains("`chain`"),
+        "{body}"
+    );
+
+    assert!(a.outbound().await.is_empty(), "nothing was opened");
+    assert_eq!(a.read("/peers").await, serde_json::json!([]));
+}
+
+/// ADR 0086 decisions 11 and 12, stories 30, 33, 34 and 35: `POST /peers`
+/// with `network` lands the peering there -- each node's own half on that
+/// network's chain and nowhere else -- channel reads report it, a fund lands
+/// on the channel's own network, and a repeat that would move the peering
+/// to the other network is refused before anything is opened.
+#[tokio::test]
+async fn post_peers_with_a_network_lands_both_halves_on_it() {
+    if !require_anvil() {
+        return;
+    }
+    let base = Net::spawn(31_337).await;
+    let other = Net::spawn(31_338).await;
+    let keys = [DEPLOYER_PRIVATE_KEY, COUNTERPARTY_PRIVATE_KEY];
+    fund_nodes(&base, &keys).await;
+    fund_nodes(&other, &keys).await;
+    let a = PeerNode::boot("a", DEPLOYER_PRIVATE_KEY, &[&base, &other]).await;
+    let b = PeerNode::boot("b", COUNTERPARTY_PRIVATE_KEY, &[&base, &other]).await;
+    let on = serde_json::json!({ "network": other.network() });
+
+    // The payee first, then the payer, as `local/keys.sh` does: each opens
+    // its own half, on the network the write names.
+    let mut halves = Vec::new();
+    for (from, to) in [(&b, &a), (&a, &b)] {
+        let (status, established) = from.peer_with(to, on.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{}: {established}", from.name);
+        assert_eq!(established["channel"]["status"], "created");
+        assert_eq!(established["channel"]["chain"], "evm");
+        assert_eq!(established["channel"]["network"], other.network());
+        halves.push(ChannelId(
+            established["channel"]["id"]
+                .as_str()
+                .expect("a channel id")
+                .to_string(),
+        ));
+    }
+
+    // Both halves are on 31338's chain, and neither is on 31337's.
+    for channel in &halves {
+        assert_eq!(other.x402.channel(channel).await.0, PEERING_DEPOSIT);
+        assert_eq!(base.x402.channel(channel).await, (0, 0));
+    }
+
+    // Each node reads its own half back with its network.
+    for (node, channel) in [(&b, &halves[0]), (&a, &halves[1])] {
+        let views = node.outbound().await;
+        assert_eq!(views.len(), 1, "{views:?}");
+        assert_eq!(views[0]["id"], channel.0);
+        assert_eq!(views[0]["network"], other.network());
+        assert_eq!(views[0]["collateral"], PEERING_DEPOSIT as u64);
+    }
+
+    // A fund lands on the channel's own network: 31338's chain moves, and
+    // the node's USDC on 31337 does not.
+    let a_address = wallet_of(DEPLOYER_PRIVATE_KEY).address();
+    let (status, funded) = a
+        .write(
+            &format!("/channels/{}/fund", halves[1].0),
+            serde_json::json!({ "amount": TOP_UP }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{funded}");
+    assert_eq!(funded["network"], other.network());
+    assert_eq!(
+        other.x402.channel(&halves[1]).await.0,
+        PEERING_DEPOSIT + TOP_UP
+    );
+    assert_eq!(
+        base.x402.balance_of(base.token, a_address).await,
+        NODE_FUNDS
+    );
+    assert_eq!(
+        other.x402.balance_of(other.token, a_address).await,
+        NODE_FUNDS - PEERING_DEPOSIT - TOP_UP
+    );
+
+    // Moving the peering to 31337 by writing it again is refused, and no
+    // channel is opened there.
+    let (status, refused) = a
+        .peer_with(&b, serde_json::json!({ "network": base.network() }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let message = refused.as_str().expect("a message");
+    assert!(message.contains(&other.network()), "{message}");
+    assert!(message.contains(&base.network()), "{message}");
+    assert_eq!(a.outbound().await.len(), 1);
+    assert_eq!(
+        base.x402.balance_of(base.token, a_address).await,
+        NODE_FUNDS
+    );
+
+    // The same write on the peering's own network is a repeat: found, not
+    // a second channel.
+    let (status, repeated) = a.peer_with(&b, on).await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["channel"]["status"], "found");
+    assert_eq!(repeated["channel"]["id"], halves[1].0);
 }
