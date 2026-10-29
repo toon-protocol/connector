@@ -326,6 +326,18 @@ node knows every outbound channel it journaled and signs on each only above the 
 journaled — never below what the chain shows landed — so its watermark never goes backwards. While a
 channel's open is unconfirmed it is listed `opening`, and funding or withdrawing it answers `409`.
 
+**Each journaled channel names its network**
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 10), and every
+top-up, withdrawal, voucher and challenge on it goes through that network's settlement table. A
+record an earlier build wrote names none: at boot its EVM channel id is recomputed under each
+configured `[settlement.eip155.<chainId>]` table's x402 domain, the one table that reproduces it is
+its network, and the record is journaled again naming it, under the same `evm:0x…` key (a Solana
+record is the one Solana table's). A channel no table reproduces — or, for a record that names its
+network, one whose table is gone — is value the node still holds on a network its operator removed,
+and the node refuses to start, naming the channel. One that several tables reproduce is refused too,
+rather than placed by guess. The upgrade writes only entries that are the same whenever they are
+written, so a restart after a crash part-way through ends on the same journal.
+
 **The `toon-channel` writes are gone.** `redeem`, `redeem-latest`, `settle`, `close` and
 `cooperative-close` are deleted (#1376). **This build no longer lands a `toon-channel` claim on chain
 at all**: nothing on it redeemed one but these writes (#1376 found no automatic path, though the issue

@@ -23,12 +23,15 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use connector_cli::RuntimeError;
+use connector_domain::JournalEntry;
 use connector_domain::{Fulfill, Network, Reject};
+use connector_runtime::{FileJournal, Journal};
 use connector_settlement::batch::contract::{
     assert_upholds_the_contract, BatchContractFixture, BoxFuture, ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
-    BatchChannelStatus, BatchSettlementBackend, ChannelPresentation, EvmChannelConfig, Voucher,
+    BatchChannelStatus, BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation,
+    EvmChannelConfig, EvmReceiverTerms, OutboundChannelRecord, ReceiverTerms, Voucher,
     VoucherSigner,
 };
 use connector_settlement::ChannelId;
@@ -1346,4 +1349,175 @@ async fn a_forward_between_networks_with_no_declared_rate_is_refused() {
         "C was paid nothing"
     );
     assert!(path.app.lock().unwrap().is_empty());
+}
+
+/// The outbound channel journal under `state_dir`, as the runtime names it.
+fn outbound_journal(files: &Files) -> FileJournal {
+    FileJournal::open(files.state_dir.path().join("outbound-channels.log")).expect("the journal")
+}
+
+/// An outbound channel the node opened on `net` under a build from before
+/// ADR 0086: opened on chain through the node's own backend for that
+/// network, then journaled as that build did, with a version-1 record that
+/// names no network.
+async fn open_as_before_adr_0086(
+    config: &connector_config::Config,
+    files: &Files,
+    net: &Net,
+) -> OutboundChannelRecord {
+    net.x402
+        .mint(net.token, Address::from(node_address()), 1_000_000)
+        .await;
+    let runtime = connector_cli::build(config).await.expect("build");
+    let payer = Arc::clone(
+        runtime
+            .batch_settlement_evm
+            .get(&network(&net.network()))
+            .expect("a backend for the network"),
+    );
+    let record = payer
+        .prepare_open(
+            ReceiverTerms::Evm(EvmReceiverTerms {
+                receiver: [0x55; 20],
+                token: net.token.to_fixed_bytes(),
+                min_withdraw_delay_secs: ONE_DAY,
+            }),
+            DEPOSIT,
+        )
+        .await
+        .expect("prepare");
+    payer.open_prepared(&record).await.expect("opened on chain");
+    drop(payer);
+    drop(runtime);
+    let key = format!("evm:{}", record.channel().0);
+    let journal = outbound_journal(files);
+    journal
+        .append(&JournalEntry::OutboundChannelOpening {
+            channel_id: key.clone(),
+            record: record.encode_version_1(),
+        })
+        .expect("journal");
+    journal
+        .append(&JournalEntry::OutboundChannelOpened { channel_id: key })
+        .expect("journal");
+    record
+}
+
+/// ADR 0086 decision 10, story 24: a node upgraded with a live outbound
+/// channel keeps it. The version-1 record is rewritten as version 2 on the
+/// network whose domain reproduces its id, under its unchanged key; a
+/// top-up and a voucher on it go through that network; a restart writes
+/// nothing more.
+#[tokio::test]
+async fn a_version_1_outbound_record_is_upgraded_to_the_network_that_reproduces_it() {
+    if !require_anvil() {
+        return;
+    }
+    let base = Net::spawn(31_337).await;
+    let other = Net::spawn(31_338).await;
+    let files = Files::new();
+    let config = files.config(&[(&base, ""), (&other, "")], "127.0.0.1:9");
+    let record = open_as_before_adr_0086(&config, &files, &other).await;
+    let channel = record.channel().clone();
+    let key = format!("evm:{}", channel.0);
+
+    let runtime = connector_cli::build(&config).await.expect("it boots");
+    let outbound = runtime.outbound_channels.clone().expect("x402");
+    assert_eq!(
+        outbound.network(&channel.0),
+        Some(network(&other.network()))
+    );
+
+    let journal = outbound_journal(&files).read_all().expect("read");
+    assert_eq!(
+        journal.last(),
+        Some(&JournalEntry::OutboundChannelOpening {
+            channel_id: key.clone(),
+            record: record.encode_on(&other.network()),
+        }),
+        "rewritten as version 2 on 31338"
+    );
+    for entry in &journal {
+        let (JournalEntry::OutboundChannelOpening { channel_id, .. }
+        | JournalEntry::OutboundChannelOpened { channel_id }) = entry
+        else {
+            panic!("an unexpected entry {entry:?}");
+        };
+        assert_eq!(channel_id, &key, "the journal key is unchanged");
+    }
+
+    // A top-up is sent on 31338, where the channel is; 31337 never sees it.
+    outbound.top_up(&channel.0, 7).await.expect("top-up");
+    assert_eq!(other.x402.channel(&channel).await, (DEPOSIT + 7, 0));
+    assert_eq!(base.x402.channel(&channel).await, (0, 0));
+
+    // A voucher is signed under 31338's domain, and not 31337's.
+    let voucher = outbound
+        .sign_voucher(&channel.0, 25)
+        .await
+        .expect("voucher");
+    let id: [u8; 32] = ethers::utils::hex::decode(&channel.0[2..])
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let signature: [u8; 65] = voucher.signature.try_into().expect("65 bytes");
+    let verifies_on = |chain_id| {
+        connector_signer::verify_evm_voucher(
+            &connector_signer::BatchSettlementDomain::x402(chain_id),
+            &id,
+            25,
+            &signature,
+            &node_address(),
+        )
+    };
+    assert!(verifies_on(31_338), "signed on the channel's own network");
+    assert!(!verifies_on(31_337));
+
+    // Idempotent: a restart replays version 2 and writes no upgrade again.
+    drop(outbound);
+    drop(runtime);
+    let before = outbound_journal(&files).read_all().expect("read");
+    let runtime = connector_cli::build(&config).await.expect("it reboots");
+    assert_eq!(
+        runtime
+            .outbound_channels
+            .as_ref()
+            .expect("x402")
+            .network(&channel.0),
+        Some(network(&other.network()))
+    );
+    assert_eq!(outbound_journal(&files).read_all().expect("read"), before);
+}
+
+/// ADR 0086 decision 10, story 25: the table of the network a version-1
+/// record's channel is on was removed. One EVM table left is not proof, so
+/// the node refuses to start, naming the channel it still holds value in.
+#[tokio::test]
+async fn a_version_1_outbound_record_no_table_reproduces_is_refused_at_boot_by_name() {
+    if !require_anvil() {
+        return;
+    }
+    let base = Net::spawn(31_337).await;
+    let other = Net::spawn(31_338).await;
+    let files = Files::new();
+    let both = files.config(&[(&base, ""), (&other, "")], "127.0.0.1:9");
+    let record = open_as_before_adr_0086(&both, &files, &other).await;
+    let before = outbound_journal(&files).read_all().expect("read");
+
+    let base_only = files.config(&[(&base, "")], "127.0.0.1:9");
+    let Err(error) = connector_cli::build(&base_only).await else {
+        panic!("booted holding a channel on a network it no longer settles on");
+    };
+    let key = format!("evm:{}", record.channel().0);
+    assert!(
+        matches!(&error, RuntimeError::OutboundChannelOnNoNetwork { channel_id, network: None }
+            if *channel_id == key),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&record.channel().0), "{error}");
+    assert_eq!(
+        outbound_journal(&files).read_all().expect("read"),
+        before,
+        "nothing rewritten"
+    );
 }

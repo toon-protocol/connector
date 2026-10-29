@@ -13,7 +13,11 @@
 //! beside the claim books', and writes to it in this order:
 //!
 //! 1. `OutboundChannelOpening`, carrying the settlement port's
-//!    [`OutboundChannelRecord`], **before** the opening transaction is sent;
+//!    [`OutboundChannelRecord`] as version 2, naming the network it is on
+//!    (ADR 0086 decision 10), **before** the opening transaction is sent;
+//!    a version-1 record an earlier build wrote is journaled again as
+//!    version 2 at boot, once [`OutboundChannels::restore`] proves its
+//!    network;
 //! 2. `OutboundChannelOpened` once the chain holds the channel, or
 //!    `OutboundChannelAbandoned` once it provably never will (a Solana
 //!    `open` whose blockhash expired);
@@ -194,6 +198,49 @@ pub enum BatchChannelError {
     DepositRefused(String),
 }
 
+/// Why [`OutboundChannels::restore`] refused to replay a journal. Each is a
+/// refusal to start: a channel this node cannot place is one holding its
+/// deposit that it would otherwise forget.
+#[derive(Debug, Error)]
+pub enum OutboundRestoreError {
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// ADR 0086 decision 10: the journal holds an outbound channel on no
+    /// network this node settles on -- a version-1 record no configured
+    /// table's domain reproduces (`network: None`), or a version-2 record
+    /// naming a network no table is for. The node still holds value there,
+    /// and its operator removed the network.
+    #[error(
+        "the outbound channel {channel_id} is on {}, and this node has no settlement table \
+         for it: the node still holds value in that channel. Restore the table for the \
+         network it was opened on, at least until the channel is withdrawn (ADR 0086 \
+         decision 10)",
+        match network {
+            Some(network) => format!("{network}"),
+            None => "no network this node settles on (no configured table's EIP-712 domain \
+                     reproduces its channel id)".to_string(),
+        }
+    )]
+    OnNoNetwork {
+        /// The journal key, `evm:0x…` or `solana:…`.
+        channel_id: String,
+        network: Option<Network>,
+    },
+    /// ADR 0086 decision 10: a version-1 record that more than one
+    /// configured table's domain reproduces. State is never assigned to a
+    /// network by guess.
+    #[error(
+        "the outbound channel {channel_id} is reproduced by more than one settlement table \
+         ({}), so which network it is on cannot be proved: state is never assigned to a \
+         network by guess (ADR 0086 decision 10)",
+        networks.iter().map(|network| network.to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    OnSeveralNetworks {
+        channel_id: String,
+        networks: Vec<Network>,
+    },
+}
+
 /// Where a deposit is counted against a controller's deposit limit (ADR 0078
 /// decision 4). Asked once per deposit that commits value: when an open is
 /// about to be journaled as a new channel -- never for a repeat that finds or
@@ -289,8 +336,33 @@ pub fn network_of_presentation<'a>(
     if let [only] = candidates.as_slice() {
         return Some((*only).clone());
     }
-    let ChannelPresentation::Evm { channel, config } = presentation else {
+    if family == AssetChain::Solana {
         return None;
+    }
+    match <[Network; 1]>::try_from(networks_proving(presentation, candidates)) {
+        Ok([network]) => Some(network),
+        Err(_) => None,
+    }
+}
+
+/// The networks among `networks` that prove the channel `presentation` is
+/// theirs: on EVM each whose `x402BatchSettlement` domain reproduces the
+/// channel id from its config, and on Solana each Solana network, of which
+/// a node has at most one. No shortcut for a single candidate: one network
+/// configured is not proof that a channel is on it.
+fn networks_proving<'a>(
+    presentation: &ChannelPresentation,
+    networks: impl IntoIterator<Item = &'a Network>,
+) -> Vec<Network> {
+    let candidates = networks.into_iter();
+    let (channel, config) = match presentation {
+        ChannelPresentation::Solana { .. } => {
+            return candidates
+                .filter(|network| network.chain() == AssetChain::Solana)
+                .cloned()
+                .collect()
+        }
+        ChannelPresentation::Evm { channel, config } => (channel, config),
     };
     let config = connector_signer::BatchChannelConfig {
         payer: config.payer,
@@ -301,19 +373,77 @@ pub fn network_of_presentation<'a>(
         withdraw_delay: config.withdraw_delay,
         salt: config.salt,
     };
-    let mut reproducing = candidates.into_iter().filter(|network| {
-        network.eip155_chain_id().is_some_and(|chain_id| {
-            let id = connector_signer::evm_batch_channel_id(
-                &connector_signer::BatchSettlementDomain::x402(chain_id),
-                &config,
-            );
-            canonical_id(&channel.0) == hex(&id)
+    candidates
+        .filter(|network| {
+            network.eip155_chain_id().is_some_and(|chain_id| {
+                let id = connector_signer::evm_batch_channel_id(
+                    &connector_signer::BatchSettlementDomain::x402(chain_id),
+                    &config,
+                );
+                canonical_id(&channel.0) == hex(&id)
+            })
         })
-    });
-    match (reproducing.next(), reproducing.next()) {
-        (Some(network), None) => Some(network.clone()),
-        _ => None,
+        .cloned()
+        .collect()
+}
+
+/// Place every replayed channel on one of `payers`' networks (ADR 0086
+/// decision 10), and answer the version-2 rewrite of each version-1 record
+/// placed by proof -- in key order, so the rewrite is the same entries
+/// however often it is done. Refuses, by name, a channel on no configured
+/// network or (version 1) proved on several. A version-2 Solana record is
+/// placed on the one Solana network whatever genesis it names: a local
+/// cluster is reset to a fresh genesis on every start.
+fn place_on_networks(
+    channels: &mut BTreeMap<String, Tracked>,
+    payers: &[(Network, Arc<dyn BatchSettlementPayer>)],
+) -> Result<Vec<JournalEntry>, OutboundRestoreError> {
+    let configured = || payers.iter().map(|(network, _)| network);
+    let mut upgrades = Vec::new();
+    for tracked in channels.values_mut() {
+        let channel_id = journal_key(tracked.chain, tracked.record.channel());
+        match tracked.network.clone() {
+            Some(journaled) => {
+                let placed = match journaled.chain() {
+                    AssetChain::Evm => configured().find(|network| **network == journaled),
+                    AssetChain::Solana => {
+                        configured().find(|network| network.chain() == AssetChain::Solana)
+                    }
+                };
+                let Some(placed) = placed else {
+                    return Err(OutboundRestoreError::OnNoNetwork {
+                        channel_id,
+                        network: Some(journaled),
+                    });
+                };
+                tracked.network = Some(placed.clone());
+            }
+            None => {
+                let proving = networks_proving(&tracked.record.presentation(), configured());
+                let network = match <[Network; 1]>::try_from(proving) {
+                    Ok([network]) => network,
+                    Err(proving) if proving.is_empty() => {
+                        return Err(OutboundRestoreError::OnNoNetwork {
+                            channel_id,
+                            network: None,
+                        })
+                    }
+                    Err(networks) => {
+                        return Err(OutboundRestoreError::OnSeveralNetworks {
+                            channel_id,
+                            networks,
+                        })
+                    }
+                };
+                upgrades.push(JournalEntry::OutboundChannelOpening {
+                    channel_id,
+                    record: tracked.record.encode_on(&network.to_string()),
+                });
+                tracked.network = Some(network);
+            }
+        }
     }
+    Ok(upgrades)
 }
 
 /// `bytes` as `0x` and lowercase hex.
@@ -357,33 +487,57 @@ pub struct OutboundChannels {
 }
 
 impl OutboundChannels {
-    /// Replay `journal` and restore every channel it names to its chain's
-    /// payer. A channel whose chain cannot be read now is kept, and
-    /// restored on first use; one journaled as opening that the chain holds
-    /// is journaled as opened. Fails only on a journal that cannot be read
-    /// or a record that cannot be decoded: a record this node cannot read
+    /// Replay `journal` and restore every channel it names to its
+    /// network's payer. A channel whose chain cannot be read now is kept,
+    /// and restored on first use; one journaled as opening that the chain
+    /// holds is journaled as opened. Fails on a journal that cannot be read
+    /// or a record that cannot be decoded -- a record this node cannot read
     /// is a channel it cannot find, and starting without it would strand
-    /// whatever is in it.
+    /// whatever is in it -- and on a channel it cannot place on one of
+    /// `payers`' networks, for the same reason.
+    ///
+    /// **Version-1 records are upgraded here, by proof** (ADR 0086 decision
+    /// 10). A record written before ADR 0086 names no network: its channel
+    /// id is recomputed under every configured EVM network's x402 domain,
+    /// and the one that reproduces it is its network (a Solana record's is
+    /// the one Solana network). The record is then journaled again, as
+    /// version 2 under its unchanged key, which a later replay reads in
+    /// place of the first. None reproducing it, or several, is refused by
+    /// name before anything is written. Every rewrite is the same entry
+    /// whenever it is written, and a record already rewritten is version 2,
+    /// so a restart after a crash part-way through ends on the same journal.
     pub async fn restore(
         journal: Arc<dyn Journal>,
         payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)>,
-    ) -> Result<OutboundChannels, JournalError> {
+    ) -> Result<OutboundChannels, OutboundRestoreError> {
         let mut channels: BTreeMap<String, Tracked> = BTreeMap::new();
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
         for entry in journal.read_all()? {
             match entry {
                 JournalEntry::OutboundChannelOpening { channel_id, record } => {
-                    let record = OutboundChannelRecord::decode(&record).ok_or_else(|| {
+                    let unreadable = || {
                         JournalError::Corrupt(format!(
                             "outbound channel '{channel_id}' has a record this build cannot read"
                         ))
-                    })?;
+                    };
+                    let journaled =
+                        OutboundChannelRecord::decode(&record).ok_or_else(unreadable)?;
+                    // Unassigned until proved, below, for a version-1 record.
+                    let network = journaled
+                        .network
+                        .map(|network| network.parse::<Network>())
+                        .transpose()
+                        .map_err(|_| unreadable())?;
+                    let record = journaled.record;
                     let id = record.channel().0.clone();
                     by_key.insert(channel_id, id.clone());
-                    let network = network_of_presentation(
-                        &record.presentation(),
-                        payers.iter().map(|(network, _)| network),
-                    );
+                    // The same channel journaled again is its record
+                    // upgraded: what replay has folded into it so far stays.
+                    if let Some(tracked) = channels.get_mut(&id) {
+                        tracked.network = network;
+                        tracked.record = record;
+                        continue;
+                    }
                     channels.insert(
                         id,
                         Tracked {
@@ -434,6 +588,8 @@ impl OutboundChannels {
                 _ => {}
             }
         }
+        let upgrades = place_on_networks(&mut channels, &payers)?;
+        journal.append_batch(&upgrades)?;
         let outbound = OutboundChannels {
             journal,
             payers,
@@ -690,7 +846,7 @@ impl OutboundChannels {
         let record = payer.prepare_open(terms, deposit).await?;
         self.append(JournalEntry::OutboundChannelOpening {
             channel_id: journal_key(chain, record.channel()),
-            record: record.encode(),
+            record: record.encode_on(&network.to_string()),
         })?;
         self.channels().insert(
             record.channel().0.clone(),
@@ -1455,6 +1611,7 @@ mod tests {
         assert_eq!(
             OutboundChannelRecord::decode(record)
                 .expect("a record")
+                .record
                 .channel(),
             &state.on_chain.id
         );
@@ -1562,7 +1719,7 @@ mod tests {
             journal
                 .append(&JournalEntry::OutboundChannelOpening {
                     channel_id: journal_key(chain_name(exit), record.channel()),
-                    record: record.encode(),
+                    record: record.encode_on(&exit_network(world.exit).to_string()),
                 })
                 .unwrap();
 
@@ -1619,7 +1776,7 @@ mod tests {
         journal
             .append(&JournalEntry::OutboundChannelOpening {
                 channel_id: journal_key(chain_name(PayerExit::Withdrawal), record.channel()),
-                record: record.encode(),
+                record: record.encode_on(&exit_network(world.exit).to_string()),
             })
             .unwrap();
         let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
@@ -1655,7 +1812,7 @@ mod tests {
         journal
             .append(&JournalEntry::OutboundChannelOpening {
                 channel_id: journal_key(SettlementChain::Evm, record.channel()),
-                record: record.encode(),
+                record: record.encode_on(&exit_network(world.exit).to_string()),
             })
             .unwrap();
         let outbound = world.boot(Arc::clone(&journal) as Arc<dyn Journal>).await;
@@ -1683,7 +1840,7 @@ mod tests {
         journal
             .append(&JournalEntry::OutboundChannelOpening {
                 channel_id: key.clone(),
-                record: record.encode(),
+                record: record.encode_on(&exit_network(world.exit).to_string()),
             })
             .unwrap();
         crashed.open_prepared(&record).await.expect("it landed");
@@ -1716,7 +1873,7 @@ mod tests {
         journal
             .append(&JournalEntry::OutboundChannelOpening {
                 channel_id: key.clone(),
-                record: record.encode(),
+                record: record.encode_on(&exit_network(world.exit).to_string()),
             })
             .unwrap();
         world.chain.advance_time(ONE_DAY);
@@ -1916,5 +2073,266 @@ mod tests {
             "{error:?}"
         );
         assert!(journal.read_all().unwrap().is_empty());
+    }
+
+    /// ADR 0086 decision 10: version-1 outbound records, as a build from
+    /// before it journaled them, upgraded at boot by proof.
+    mod record_upgrade {
+        use super::*;
+
+        const BASE: &str = "eip155:31337";
+        const OTHER: &str = "eip155:31338";
+        const SOLANA: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+        fn net(text: &str) -> Network {
+            text.parse().expect("a CAIP-2 network")
+        }
+
+        /// An EVM record whose channel id is the one x402's contract on
+        /// `chain_id` derives from its config: proof of its network.
+        fn evm_record_on(chain_id: u64, salt: u8) -> OutboundChannelRecord {
+            let config = connector_settlement::batch::EvmChannelConfig {
+                payer: [1; 20],
+                payer_authorizer: [1; 20],
+                receiver: [2; 20],
+                receiver_authorizer: [2; 20],
+                token: [3; 20],
+                withdraw_delay: ONE_DAY,
+                salt: [salt; 32],
+            };
+            let id = connector_signer::evm_batch_channel_id(
+                &connector_signer::BatchSettlementDomain::x402(chain_id),
+                &connector_signer::BatchChannelConfig {
+                    payer: config.payer,
+                    payer_authorizer: config.payer_authorizer,
+                    receiver: config.receiver,
+                    receiver_authorizer: config.receiver_authorizer,
+                    token: config.token,
+                    withdraw_delay: config.withdraw_delay,
+                    salt: config.salt,
+                },
+            );
+            OutboundChannelRecord::Evm {
+                channel: ChannelId(hex(&id)),
+                config,
+                deposit: 1_000,
+            }
+        }
+
+        fn solana_record() -> OutboundChannelRecord {
+            OutboundChannelRecord::Solana {
+                channel: ChannelId("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string()),
+                receiver: [5; 32],
+                sponsor_endpoint: "https://peer.example/open".to_string(),
+                deposit: 1_000,
+                transaction: vec![6; 64],
+                last_valid_block_height: 1,
+            }
+        }
+
+        fn key(record: &OutboundChannelRecord) -> String {
+            journal_key(chain_of(record.chain()), record.channel())
+        }
+
+        /// A journal as a pre-0086 build left it: each record opened, and
+        /// a voucher signed on it.
+        fn version_1_journal(records: &[&OutboundChannelRecord]) -> Arc<InMemoryJournal> {
+            let journal = Arc::new(InMemoryJournal::new());
+            for record in records {
+                for entry in [
+                    JournalEntry::OutboundChannelOpening {
+                        channel_id: key(record),
+                        record: record.encode_version_1(),
+                    },
+                    JournalEntry::OutboundChannelOpened {
+                        channel_id: key(record),
+                    },
+                    JournalEntry::OutboundVoucherSigned {
+                        channel_id: key(record),
+                        cumulative_amount: 40,
+                    },
+                ] {
+                    journal.append(&entry).unwrap();
+                }
+            }
+            journal
+        }
+
+        /// One payer per network named, each its chain's in-memory fake.
+        fn payers(networks: &[&str]) -> Vec<(Network, Arc<dyn BatchSettlementPayer>)> {
+            networks
+                .iter()
+                .map(|network| {
+                    let network = net(network);
+                    let exit = match network.chain() {
+                        AssetChain::Evm => PayerExit::Withdrawal,
+                        AssetChain::Solana => PayerExit::Close,
+                    };
+                    let payer =
+                        InMemoryBatchSettlement::on(InMemoryBatchChain::new(exit), 0x01, ONE_DAY);
+                    (network, Arc::new(payer) as Arc<dyn BatchSettlementPayer>)
+                })
+                .collect()
+        }
+
+        async fn boot(
+            journal: &Arc<InMemoryJournal>,
+            networks: &[&str],
+        ) -> Result<OutboundChannels, OutboundRestoreError> {
+            OutboundChannels::restore(Arc::clone(journal) as Arc<dyn Journal>, payers(networks))
+                .await
+        }
+
+        #[tokio::test]
+        async fn a_version_1_record_is_rewritten_as_version_2_on_the_network_that_reproduces_it() {
+            let record = evm_record_on(31_338, 9);
+            let journal = version_1_journal(&[&record]);
+            let before = journal.read_all().unwrap();
+
+            let outbound = boot(&journal, &[BASE, OTHER]).await.expect("it boots");
+            let id = &record.channel().0;
+            assert_eq!(outbound.network(id), Some(net(OTHER)));
+            assert_eq!(outbound.signed(id), Some(40), "its watermark kept");
+
+            let after = journal.read_all().unwrap();
+            assert_eq!(after[..before.len()], before[..], "appended, never edited");
+            assert_eq!(
+                after[before.len()..],
+                [JournalEntry::OutboundChannelOpening {
+                    channel_id: format!("evm:{id}"),
+                    record: record.encode_on(OTHER),
+                }],
+                "the record, under its unchanged key, as version 2 on 31338"
+            );
+        }
+
+        /// A table's removal never strands value silently: one EVM table
+        /// left is not proof, so the record is refused, naming the channel.
+        #[tokio::test]
+        async fn a_version_1_record_no_network_reproduces_is_refused_by_name() {
+            let record = evm_record_on(31_338, 9);
+            let journal = version_1_journal(&[&record]);
+            let before = journal.read_all().unwrap();
+
+            let Err(error) = boot(&journal, &[BASE]).await else {
+                panic!("booted holding a channel on no network it settles on");
+            };
+            let key = key(&record);
+            assert!(
+                matches!(&error, OutboundRestoreError::OnNoNetwork { channel_id, network: None }
+                    if *channel_id == key),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(&key), "{error}");
+            assert_eq!(journal.read_all().unwrap(), before, "nothing rewritten");
+        }
+
+        #[tokio::test]
+        async fn a_version_1_record_several_networks_reproduce_is_refused_by_name() {
+            let record = evm_record_on(31_338, 9);
+            let journal = version_1_journal(&[&record]);
+
+            let Err(error) = boot(&journal, &[BASE, OTHER, OTHER]).await else {
+                panic!("assigned a channel to one of several networks by guess");
+            };
+            let key = key(&record);
+            assert!(
+                matches!(&error, OutboundRestoreError::OnSeveralNetworks { channel_id, networks }
+                    if *channel_id == key && *networks == vec![net(OTHER), net(OTHER)]),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains(&key), "{error}");
+        }
+
+        /// A crash after the first rewrite and before the second: the
+        /// restart finishes the upgrade, and the journal ends exactly as an
+        /// uninterrupted one did. A further restart writes nothing.
+        #[tokio::test]
+        async fn the_upgrade_is_idempotent_across_a_crash_mid_upgrade() {
+            let on_base = evm_record_on(31_337, 1);
+            let on_other = evm_record_on(31_338, 2);
+            let records = [&on_base, &on_other];
+
+            let uninterrupted = version_1_journal(&records);
+            boot(&uninterrupted, &[BASE, OTHER]).await.expect("boots");
+            let finished = uninterrupted.read_all().unwrap();
+            let upgrades = &finished[records.len() * 3..];
+            assert_eq!(upgrades.len(), 2, "{finished:?}");
+
+            let crashed = version_1_journal(&records);
+            crashed.append(&upgrades[0]).unwrap();
+            boot(&crashed, &[BASE, OTHER]).await.expect("boots");
+            assert_eq!(crashed.read_all().unwrap(), finished);
+
+            let outbound = boot(&crashed, &[BASE, OTHER]).await.expect("boots");
+            assert_eq!(crashed.read_all().unwrap(), finished, "nothing more");
+            assert_eq!(outbound.network(&on_base.channel().0), Some(net(BASE)));
+            assert_eq!(outbound.network(&on_other.channel().0), Some(net(OTHER)));
+        }
+
+        #[tokio::test]
+        async fn a_solana_version_1_record_is_assigned_the_one_solana_network() {
+            let record = solana_record();
+            let journal = version_1_journal(&[&record]);
+
+            let outbound = boot(&journal, &[BASE, SOLANA]).await.expect("boots");
+            assert_eq!(outbound.network(&record.channel().0), Some(net(SOLANA)));
+            assert_eq!(
+                journal.read_all().unwrap().last(),
+                Some(&JournalEntry::OutboundChannelOpening {
+                    channel_id: key(&record),
+                    record: record.encode_on(SOLANA),
+                })
+            );
+        }
+
+        /// A record the journal abandoned holds nothing: it is neither
+        /// refused nor rewritten.
+        #[tokio::test]
+        async fn an_abandoned_version_1_record_is_neither_refused_nor_rewritten() {
+            let record = evm_record_on(31_338, 9);
+            let journal = Arc::new(InMemoryJournal::new());
+            for entry in [
+                JournalEntry::OutboundChannelOpening {
+                    channel_id: key(&record),
+                    record: record.encode_version_1(),
+                },
+                JournalEntry::OutboundChannelAbandoned {
+                    channel_id: key(&record),
+                },
+            ] {
+                journal.append(&entry).unwrap();
+            }
+            let before = journal.read_all().unwrap();
+            boot(&journal, &[BASE]).await.expect("boots");
+            assert_eq!(journal.read_all().unwrap(), before);
+        }
+
+        /// A version-2 record on a network whose table is gone holds value
+        /// there too: refused, naming the channel and its network.
+        #[tokio::test]
+        async fn a_version_2_record_on_a_network_with_no_table_is_refused_by_name() {
+            let record = evm_record_on(31_338, 9);
+            let journal = Arc::new(InMemoryJournal::new());
+            journal
+                .append(&JournalEntry::OutboundChannelOpening {
+                    channel_id: key(&record),
+                    record: record.encode_on(OTHER),
+                })
+                .unwrap();
+            let Err(error) = boot(&journal, &[BASE]).await else {
+                panic!("booted holding a channel on a network it no longer settles on");
+            };
+            assert!(
+                matches!(&error, OutboundRestoreError::OnNoNetwork { network: Some(network), .. }
+                    if *network == net(OTHER)),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&key(&record)) && message.contains(OTHER),
+                "{message}"
+            );
+        }
     }
 }
