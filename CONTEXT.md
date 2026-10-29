@@ -645,6 +645,15 @@ denomination boundaries
 single-segment path is the only kind that existed before 0071, which is why older prose may use
 "path" where it means this word.
 
+**Native-coin leg**:
+A peering leg whose channel holds only its chain's native coin, such as XRP on XRPL, whose
+`PayChannel` can hold nothing else. It is an ordinary denomination boundary
+([ADR 0071](docs/adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)): the rate is a static
+`[[rates]]` row plus a spread, and with no rate there is no forward. Its asset is CAIP-19, `xrpl:<id>/slip44:144`;
+`xrpl:native` and every other `<chain>:native` are refused by name
+([ADR 0087](docs/adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md) decisions 6–7).
+_Avoid_: native token, `<chain>:native` (the refused spelling)
+
 **Minimum delivery** _(retired term, [ADR 0057](docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md), issue #1143)_:
 The amount a packet declared must reach its destination, checked by every hop after its own fee
 and answered with `R01` when it could not be met. Retired: once a packet carries the claim that
