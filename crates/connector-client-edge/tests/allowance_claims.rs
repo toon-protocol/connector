@@ -1732,6 +1732,14 @@ async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
             "subsidy_period_not_current",
         ),
         ("a closed budget", base(64), "subsidy_budget_closed"),
+        (
+            "a reused per-period nullifier, while the budget is closed",
+            Payer {
+                period_nullifier: first.period_nullifier,
+                ..base(65)
+            },
+            "subsidy_budget_closed",
+        ),
     ];
     for (case, payer, name) in cases {
         let payer = payer.provable(&edge);

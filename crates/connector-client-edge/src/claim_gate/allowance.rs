@@ -369,7 +369,8 @@ pub(super) struct ZkLedger {
     /// The per-period nullifiers seen in each period. A finished period's are
     /// pruned: a proof for it can no longer be admitted.
     subsidy_nullifiers: HashMap<u64, HashSet<[u8; 32]>>,
-    /// How many subsidised allowances each period granted.
+    /// How many subsidised allowances each period granted. Pruned to the
+    /// current period and the last finished one.
     subsidy_grants: HashMap<u64, u64>,
 }
 
@@ -550,8 +551,9 @@ impl ZkLedger {
     }
 
     /// The refusal, if any, that `period`'s budget and nullifier make
-    /// (decision 14, refusals 3 and 4). Also forgets the nullifiers of
-    /// finished periods.
+    /// (decision 14, refusals 3 and 4). Also forgets what finished periods
+    /// left behind, keeping only the last one's grant count for the
+    /// self-description.
     fn subsidy_refusal(
         &mut self,
         budget: u64,
@@ -559,6 +561,9 @@ impl ZkLedger {
         period_nullifier: &[u8; 32],
     ) -> Option<AllowanceRefusal> {
         self.subsidy_nullifiers.retain(|p, _| *p >= period);
+        self.subsidy_used.retain(|p, _| *p >= period);
+        self.subsidy_grants
+            .retain(|p, _| p.saturating_add(1) >= period);
         if !self.subsidy_open(budget, period) {
             return Some(AllowanceRefusal::SubsidyBudgetClosed);
         }

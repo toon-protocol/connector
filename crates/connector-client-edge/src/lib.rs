@@ -4033,6 +4033,7 @@ mod tests {
     /// finished period's count instead, and never the open/closed word.
     #[tokio::test]
     async fn the_greeting_says_open_or_closed_and_the_description_counts_the_last_period() {
+        use connector_zk_note::note::policy::TIERS;
         let (app, gate, _dir) = zk_edge_node(5 * 10_000_000);
         let extra = zk_greeting_extra(app.clone()).await;
         assert_eq!(extra["subsidy"], "open");
@@ -4044,8 +4045,18 @@ mod tests {
         assert_eq!(document["zkNote"]["subsidisedLastPeriod"], 0);
         assert!(document["zkNote"].get("subsidy").is_none());
 
-        // The live gate decides: a closed budget reads closed.
         assert_eq!(gate.subsidy_open(), Some(true));
+
+        // A budget below the smallest tier is never open: served, it reads
+        // closed, and still never says how much remains.
+        let (app, gate, _dir) = zk_edge_node(TIERS[0] - 1);
+        let extra = zk_greeting_extra(app).await;
+        assert_eq!(extra["subsidy"], "closed");
+        assert!(
+            !extra.to_string().contains(&(TIERS[0] - 1).to_string()),
+            "the greeting never says how much remains: {extra}"
+        );
+        assert_eq!(gate.subsidy_open(), Some(false));
 
         let (app, _gate, _dir) = zk_edge_node(0);
         let extra = zk_greeting_extra(app.clone()).await;
