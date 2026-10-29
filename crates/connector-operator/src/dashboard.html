@@ -854,6 +854,9 @@
           tile('key id', el('span', { class: 'mono', title: identity?.key_id || '' }, short(identity?.key_id))),
           tile('address', el('span', { class: 'mono', title: identity?.address || '' }, short(identity?.address))),
           tile('peer carriages', (description?.peerCarriages || []).join(', ') || 'none'),
+          // One entry per settlement table: each EVM network separately
+          // (ADR 0086), then Solana's.
+          tile('settles on', (description?.batchSettlements || []).map((terms) => terms.network).join(', ') || 'none'),
         ];
         replace(document.getElementById('node-tiles'), tiles);
       }

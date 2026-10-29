@@ -167,9 +167,21 @@ connector cannot open is refused under its own reason, distinguishable both from
 and from a claim naming an unknown channel.
 
 Required fields on every claim, regardless of chain: `version` (`'1.0'`), `scheme`
-(`'batch-settlement'`), `blockchain`, `messageId` (idempotency), `timestamp` (ISO 8601),
+(`'batch-settlement'`), `blockchain`, `network`, `messageId` (idempotency), `timestamp` (ISO 8601),
 `senderId`. `senderId` is self-declared and carries no authority: it labels the sender for §1.2's
 anonymous identity and for the lookup budget below, and nothing is verified against it.
+
+`network` is the CAIP-2 network the voucher is on (`eip155:<chainId>`, or `solana:<genesis prefix>`
+as the greeting's `accepts[]` spells it; [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
+decision 1, `schema_version` 11), of the family `blockchain` names; `blockchain` still picks the
+parser. A claim with no `network` is refused **by name**, even by a node that settles on one
+network. One naming a network this node holds no settlement table for is refused by name before
+anything about it is looked up. On EVM the channel id is recomputed from `channelConfig` under the
+EIP-712 domain of the network named, so a voucher relabelled onto another network does not
+recompute and is refused, naming the network it claimed; on Solana the network must equal this
+node's one Solana network. The same field, under the same rules, rides every claim-state entry
+(§1.10) -- answered `"network-missing"` or `"network-not-settled"` by name, and echoed on every
+answer that read it -- every `channelChallenge` (§1.9) and every payout voucher.
 Chain-specific fields, named as x402's own voucher payloads name them:
 
 - **evm**: `channelId` (bytes32 hex), `maxClaimableAmount` (decimal string, cumulative, a `uint128`
@@ -926,25 +938,27 @@ is the one thing a sender's own envelope can never override.
 ([ADR 0040](../adr/0040-a-verified-payment-is-stated-to-the-app.md), superseding
 [ADR 0036](../adr/0036-a-paid-deliverys-attribution-stays-on-the-connector.md)'s conclusion). Beyond the
 opened envelope's own `method`, `target`, `headers` and `body`, the request made to the route's
-`handler_url` carries three connector-stated headers:
+`handler_url` carries four connector-stated headers (the fourth, `X-TOON-Network`, from
+[ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 14):
 
-| Header          | Value                                                                                                         |
-| --------------- | ------------------------------------------------------------------------------------------------------------- |
-| `X-TOON-Payer`  | the client channel key a covering claim was admitted under — `evm:0x<64 lower-case hex>` or `solana:<base58>` |
-| `X-TOON-Amount` | the route's flat `price` (ADR 0020), decimal, in the settlement asset's base units                            |
-| `X-TOON-Chain`  | that channel key's own namespace — `evm` or `solana`                                                          |
+| Header           | Value                                                                                                                                             |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-TOON-Payer`   | the client channel key a covering claim was admitted under — `evm:0x<64 lower-case hex>` or `solana:<base58>`                                     |
+| `X-TOON-Amount`  | the route's flat `price` (ADR 0020), decimal, in the settlement asset's base units                                                                |
+| `X-TOON-Chain`   | that channel key's own namespace — `evm` or `solana`                                                                                              |
+| `X-TOON-Network` | the CAIP-2 network that channel's claim was verified on — `eip155:<chainId>` or `solana:<genesis prefix>`; whose base units `X-TOON-Amount` is in |
 
 They are stated **only** for a delivery this connector was paid for at its own client edge: a
 packet no client claim admitted (a peer-role arrival, a forwarded packet, an unclaimed request) or
-a route priced at zero carries none of the three, absent rather than empty. `X-TOON-Payer` is
+a route priced at zero carries none of them, absent rather than empty. `X-TOON-Payer` is
 therefore never the previous hop — on a longer path there is no client channel to name, and
 nothing is named (ADR 0017's defect, made unreachable rather than merely avoided). `X-TOON-Chain`
 comes from the verified claim, never from the destination address; `X-TOON-Amount` is the price
 this connector charged, never the arriving packet's sender-declared `amount`.
 
-A sender's own spelling of those three names, inside the sealed envelope, is **removed on every
+A sender's own spelling of those four names, inside the sealed envelope, is **removed on every
 delivery** — including the deliveries that then state nothing. An app reading `X-TOON-Payer` is
-reading the connector or reading nothing, and MUST treat all three as optional rather than
+reading the connector or reading nothing, and MUST treat all four as optional rather than
 inferring "unpaid" from their absence: whatever reaches a handler was paid at that handler's one
 price (ADR 0020), whether or not this hop was the one that took the payment.
 

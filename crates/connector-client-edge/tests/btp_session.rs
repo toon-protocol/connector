@@ -210,6 +210,7 @@ fn evm_claim_json(amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{EVM_CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("msg-{amount}"),
         "timestamp": "2026-02-02T12:00:00.000Z",
@@ -241,16 +242,17 @@ struct OneChannel {
 
 #[async_trait]
 impl BatchSettlementChannels for OneChannel {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(domain())
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![domain()]
     }
 
-    fn accepts_solana(&self) -> bool {
-        false
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        None
     }
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         _presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {

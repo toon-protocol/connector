@@ -184,9 +184,10 @@ least the next hop's (ADR 0065).
 ## 6. What the app is told
 
 **PM-21** `[connector]` — A delivery whose covering client claim **this** connector verified itself
-states `X-TOON-Payer`, `X-TOON-Amount` and `X-TOON-Chain` to the app. A delivery this connector did
-not verify states **none of the three** — an unverified payment is stated by nobody.
-([ADR 0040](../adr/0040-a-verified-payment-is-stated-to-the-app.md))
+states `X-TOON-Payer`, `X-TOON-Amount`, `X-TOON-Chain` and `X-TOON-Network` to the app. A delivery
+this connector did not verify states **none of them** — an unverified payment is stated by nobody.
+([ADR 0040](../adr/0040-a-verified-payment-is-stated-to-the-app.md), and
+[ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) for `X-TOON-Network`)
 
 **PM-22** `[app]` — An app MUST NOT assume those headers are present. Their absence means _this
 connector cannot vouch for the payer_, not that the work was unpaid: whatever arrives at a handler was

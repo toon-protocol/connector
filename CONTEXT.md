@@ -24,8 +24,9 @@ _Avoid_: terminator, connector-as-terminator, gateway
 **App**:
 The payment-oblivious service a connector delivers to at the end of a route. It settles nothing,
 holds no channel and is never told which destination was addressed. It IS told who paid, how much
-and on what chain — `X-TOON-Payer`/`X-TOON-Amount`/`X-TOON-Chain`, from the client claim the
-delivering connector verified itself (ADR 0040) — and told none of the three when that connector
+and on what chain and network — `X-TOON-Payer`/`X-TOON-Amount`/`X-TOON-Chain`/`X-TOON-Network`,
+from the client claim the delivering connector verified itself (ADR 0040, ADR 0086) — and told none
+of them when that connector
 was not the one paid. Either way, whatever arrives at one of its handlers was paid for, under that
 handler's one price (ADR 0020) — `X-TOON-Amount` states what this packet was actually charged,
 which for a route priced by size is not a figure the app's own route table could have known
@@ -304,9 +305,10 @@ accepts.
 
 **Settlement circuit**:
 The circuit a settlement table's RPC rides when that table sets `rpc_via_socks_proxy = true`: the
-node's one `socks_proxy`, authenticated with a SOCKS username fixed per chain
-(`toon-settlement-evm`, `toon-settlement-solana`), so each chain stays on its own circuit and off the
-ILP wire's. Every client of the table's `rpc_url` rides it (the backend, and on EVM the rate
+node's one `socks_proxy`, authenticated with a SOCKS username fixed per network
+(`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-solana`), so each network
+stays on its own circuit and off the ILP wire's
+([ADR 0086](docs/adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 7). Every client of the table's `rpc_url` rides it (the backend, and on EVM the rate
 source), and none ever falls back to a direct dial. It hides the
 node's address from the RPC provider; it does not hide the node's keys, its transactions or its
 payments, which are on chain either way
@@ -460,7 +462,7 @@ _Avoid_: facilitator (x402's relayer, which on Solana would take these seats its
 
 **Facilitator**:
 x402's relayer: the service that sends a payer's signed EVM deposit into `x402BatchSettlement` and
-pays its gas. In TOON the **operator** names it (`[settlement.evm] facilitator_url`, published as
+pays its gas. In TOON the **operator** names it (`[settlement.eip155.<chainId>] facilitator_url`, published as
 `facilitator`) and pays for it as a cost of the sale; the payer calls it, and the connector never
 does ([ADR 0076](docs/adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md)). EVM only:
 on Solana the **sponsor** does this job. A node's own outbound deposits use none.

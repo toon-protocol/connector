@@ -325,6 +325,12 @@ struct TableNode {
 #[derive(Debug)]
 struct TablePeering {
     id: String,
+    /// The CAIP-2 network the peering is on (ADR 0086 decision 12), as
+    /// `POST /peers` is sent it -- except a Solana peering's reference,
+    /// which is [`LOCAL_SOLANA_GENESIS`] until the `channels` stage reads it
+    /// off the validator.
+    network: String,
+    /// The network's chain family.
     chain: SettlementChain,
     payer: String,
     payee: String,
@@ -421,20 +427,41 @@ fn topology(name: &str) -> Topology {
             let parts: Vec<&str> = entry.split(':').collect();
             assert_eq!(
                 parts.len(),
-                6,
-                "a PEERINGS entry is id:chain:payer:payee:fee:max_packet_amount, got {entry}"
+                7,
+                "a PEERINGS entry is id:<CAIP-2 network>:payer:payee:fee:max_packet_amount, got \
+                 {entry} -- a peering names its network, never just its chain (ADR 0086)"
             );
+            let network = format!("{}:{}", parts[1], parts[2]);
+            let chain = match parts[1] {
+                "eip155" => {
+                    network
+                        .parse::<connector_domain::Network>()
+                        .unwrap_or_else(|error| {
+                            panic!("local/keys.sh's {name} peering network `{network}`: {error}")
+                        });
+                    SettlementChain::Evm
+                }
+                "solana" => {
+                    assert_eq!(
+                        parts[2], LOCAL_SOLANA_GENESIS,
+                        "a local Solana peering's reference is `{LOCAL_SOLANA_GENESIS}`: the \
+                         validator starts from a fresh genesis, so the channels stage reads it"
+                    );
+                    SettlementChain::Solana
+                }
+                other => panic!(
+                    "local/keys.sh's {name} names `{other}` where a CAIP-2 namespace goes \
+                     (eip155 or solana)"
+                ),
+            };
             TablePeering {
                 id: parts[0].to_owned(),
-                chain: match parts[1] {
-                    "evm" => SettlementChain::Evm,
-                    "solana" => SettlementChain::Solana,
-                    other => panic!("local/keys.sh names an unknown chain `{other}`"),
-                },
-                payer: parts[2].to_owned(),
-                payee: parts[3].to_owned(),
-                fee: number(parts[4], "fee"),
-                max_packet_amount: number(parts[5], "max_packet_amount"),
+                network,
+                chain,
+                payer: parts[3].to_owned(),
+                payee: parts[4].to_owned(),
+                fee: number(parts[5], "fee"),
+                max_packet_amount: number(parts[6], "max_packet_amount"),
             }
         })
         .collect();
@@ -461,6 +488,92 @@ fn topology(name: &str) -> Topology {
         routes,
     }
 }
+
+/// One EVM network a topology settles on, from `local/keys.sh`'s
+/// `EVM_NETWORKS`: `<CAIP-2 network>:<compose anvil service>:<host port>`.
+/// `keys.sh` funds every node on each of them, and every committed EVM table
+/// of the topology's configs is on one of them (ADR 0086).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableEvmNetwork {
+    network: String,
+    chain_id: u64,
+    service: String,
+    host_port: u16,
+}
+
+/// The EVM networks `local/keys.sh` funds topology `name`'s nodes on: its
+/// arm's `EVM_NETWORKS`, or the script's own default when the arm writes none.
+fn evm_networks(name: &str) -> Vec<TableEvmNetwork> {
+    let head = format!("\n  {name})\n");
+    let arm = KEYS_SCRIPT
+        .split_once(&head)
+        .unwrap_or_else(|| panic!("local/keys.sh has no `{name})` arm in its topology table"))
+        .1
+        .split_once("\n    ;;")
+        .expect("a case arm ends in ;;")
+        .0;
+    let in_arm = arm
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("EVM_NETWORKS=\""));
+    let value = in_arm
+        .or_else(|| {
+            KEYS_SCRIPT
+                .lines()
+                .find_map(|line| line.strip_prefix("EVM_NETWORKS=\""))
+        })
+        .expect("local/keys.sh sets a default EVM_NETWORKS before its topology table")
+        .trim_end_matches('"');
+    value
+        .split_whitespace()
+        .map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            assert_eq!(
+                parts.len(),
+                4,
+                "an EVM_NETWORKS entry is eip155:<chainId>:<anvil service>:<host port>, got \
+                 {entry}"
+            );
+            assert_eq!(parts[0], "eip155", "{entry} is not an EVM network");
+            let network = format!("{}:{}", parts[0], parts[1]);
+            let parsed: connector_domain::Network = network
+                .parse()
+                .unwrap_or_else(|error| panic!("local/keys.sh's `{network}`: {error}"));
+            TableEvmNetwork {
+                chain_id: parsed.eip155_chain_id().expect("an eip155 network"),
+                network,
+                service: parts[2].to_owned(),
+                host_port: parts[3].parse().expect("a host port"),
+            }
+        })
+        .collect()
+}
+
+/// The one service block `compose` (named `file` in a failure) declares
+/// under `service`.
+fn compose_service(compose: &'static str, file: &str, service: &str) -> &'static str {
+    let head = format!("\n  {service}:\n");
+    let start = compose
+        .find(&head)
+        .unwrap_or_else(|| panic!("{file} declares no `{service}` service"))
+        + head.len();
+    let body = &compose[start..];
+    let mut end = body.len();
+    let mut offset = 0;
+    for line in body.lines() {
+        if !line.is_empty() && !line.starts_with("    ") {
+            end = offset;
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    &body[..end]
+}
+
+/// The reference a local Solana peering's network is written with in
+/// `local/keys.sh`'s table, resolved from the validator's genesis hash at the
+/// `channels` stage.
+const LOCAL_SOLANA_GENESIS: &str = "genesis";
 
 /// The value of a bare `NAME=value` assignment in a script, as an integer.
 fn script_constant(script: &str, file: &str, name: &str) -> u128 {
@@ -634,7 +747,6 @@ fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
         for table in config.settlements() {
             match table {
                 SettlementConfig::Evm(evm) => {
-                    assert_eq!(evm.rpc_url(), "http://anvil:8545", "{name}");
                     assert_eq!(
                         hex20(evm.token_address()),
                         usdc,
@@ -943,9 +1055,22 @@ fn every_peered_node_publishes_itself_and_can_be_written_to() {
                         "{file} reads a plaintext self-description in POST /peers (CF-18)"
                     );
                 }
-                // The peering's chain has a settlement table, which is its
-                // x402 terms (ADR 0075 decision 9).
-                let _ = settlement(&config, peering.chain);
+                // The peering's network has a settlement table on both
+                // nodes, which is its x402 terms (ADR 0075 decision 9, ADR
+                // 0086 decision 12): on EVM the table keyed by the table's
+                // CAIP-2 network itself.
+                let table = settlement(&config, peering.chain);
+                if let Some(network) = table.network() {
+                    assert_eq!(
+                        network.to_string(),
+                        peering.network,
+                        "{file}: '{}' is on {} in local/keys.sh's table, and this node's \
+                         settlement table is {}",
+                        peering.id,
+                        peering.network,
+                        table.table_name()
+                    );
+                }
             }
         }
     }
@@ -1006,6 +1131,32 @@ fn local_keys_sh_opens_channels_only_through_the_nodes_own_writes() {
         .find("establish \"$payer\"")
         .expect("the payer establishes its side");
     assert!(payee < payer, "the payee's POST /peers must come first");
+}
+
+/// **`POST /peers` names each peering's network** (ADR 0086 decision 12):
+/// the `channels` stage sends the table's CAIP-2 `network` -- never the
+/// retired `chain` filter, which is refused by name -- reads the local
+/// Solana genesis off the validator to complete a Solana one, and holds the
+/// answer to the network it asked for.
+#[test]
+fn local_keys_sh_peers_on_each_peerings_caip2_network() {
+    let stage = code(KEYS_SCRIPT);
+    assert!(
+        stage.contains(r#""network":"%s""#),
+        "local/keys.sh's POST /peers body must name the peering's `network`"
+    );
+    assert!(
+        !stage.contains(r#""chain":"%s""#),
+        "local/keys.sh still sends POST /peers the retired `chain` filter"
+    );
+    assert!(
+        stage.contains("solana genesis-hash"),
+        "local/keys.sh must read the local validator's genesis to name a Solana peering's network"
+    );
+    assert!(
+        stage.contains(r#"doc["channel"]["network"]"#),
+        "local/keys.sh must hold POST /peers' answer to the network it asked for"
+    );
 }
 
 /// **The rehearsal reads the chain and the payee's voucher journal** --
@@ -1146,10 +1297,19 @@ fn the_solo_topologys_committed_config_loads() {
         "solo terminates exactly one route"
     );
     assert_eq!(config.routes()[0].prefix(), "g.local.solo");
+    let networks: Vec<String> = config
+        .settlements()
+        .iter()
+        .map(|table| match table {
+            SettlementConfig::Evm(evm) => evm.network().to_string(),
+            SettlementConfig::Solana(_) => "solana".to_owned(),
+        })
+        .collect();
     assert_eq!(
-        config.settlements().len(),
-        2,
-        "the point of the solo topology is BOTH settlement backends attached at once"
+        networks,
+        ["eip155:31337", "eip155:31338", "solana"],
+        "the point of the solo topology is BOTH settlement backends attached at once, the EVM \
+         one on TWO networks (ADR 0086 decision 15)"
     );
     assert!(topology("solo").peerings.is_empty());
     assert_eq!(
@@ -1164,10 +1324,6 @@ fn the_solo_topologys_committed_config_loads() {
 fn the_solo_config_and_its_compose_file_agree() {
     for (value, why) in [
         (
-            "http://anvil:8545",
-            "the EVM rpc_url must name the compose `anvil` service",
-        ),
-        (
             "http://solana-validator:8899",
             "the Solana rpc_url must name the compose `solana-validator` service",
         ),
@@ -1178,10 +1334,275 @@ fn the_solo_config_and_its_compose_file_agree() {
     ] {
         assert!(SOLO_CONFIG.contains(value), "{why}");
     }
-    for service in ["stub-app:", "connector:", "sender:"] {
+    for service in ["stub-app:", "connector:", "sender:", "anvil-31338:"] {
         assert!(SOLO_COMPOSE.contains(service));
     }
+    let connector = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "connector");
+    for chain in ["anvil:", "anvil-31338:", "solana-validator:"] {
+        assert!(
+            connector.contains(&format!(
+                "      {chain}\n        condition: service_healthy"
+            )),
+            "solo's connector boots only once `{chain}` is healthy: a node refuses to start on \
+             a table whose chain has no x402 on it"
+        );
+    }
     assert!(SOLO_COMPOSE.contains("./local/solo/connector.toml:/app/config/connector.toml:ro"));
+}
+
+/// **Both of solo's EVM tables sign with one settlement key** (ADR 0086 user
+/// story 3): one address on every network, and nothing for `keys.sh` to
+/// derive twice.
+#[test]
+fn solos_two_evm_tables_share_one_settlement_key() {
+    let raw: toml::Value = toml::from_str(SOLO_CONFIG).expect("local/solo/connector.toml parses");
+    let tables = raw["settlement"]["eip155"]
+        .as_table()
+        .expect("solo holds [settlement.eip155.<chainId>] tables");
+    let keys: BTreeSet<&str> = tables
+        .values()
+        .map(|table| table["key"]["key_file"].as_str().expect("a key_file"))
+        .collect();
+    assert_eq!(tables.len(), 2);
+    assert_eq!(
+        keys.into_iter().collect::<Vec<_>>(),
+        ["/app/data/settlement.key"],
+        "both EVM tables name the one settlement key local/keys.sh derives and funds"
+    );
+}
+
+/// **Solo moves money on each of its EVM networks, and the rehearsal reads
+/// each back off its own anvil** (ADR 0086 decision 15).
+///
+/// Solo has no peer to pay, so `local/keys.sh`'s `channels` stage has the
+/// node open its own x402 channel on every network in its `EVM_NETWORKS`,
+/// with a signed `POST /channels`. The sender then requires the greeting to
+/// offer each network, each channel to hold its deposit on its own anvil, and
+/// each to be absent from the other -- before the packet.
+#[test]
+fn the_solo_rehearsal_reads_each_evm_network_back_off_its_own_anvil() {
+    let networks = evm_networks("solo");
+    let arm_channels: Vec<String> = KEYS_SCRIPT
+        .split_once("\n  solo)\n")
+        .expect("a solo arm")
+        .1
+        .split_once("\n    ;;")
+        .expect("a case arm ends in ;;")
+        .0
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("NETWORK_CHANNELS=\""))
+        .expect("solo's arm names NETWORK_CHANNELS")
+        .trim_end_matches('"')
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        arm_channels,
+        networks
+            .iter()
+            .map(|network| format!("connector:{}", network.network))
+            .collect::<Vec<_>>(),
+        "solo's node opens one channel of its own on each EVM network it settles on"
+    );
+    let stage = code(KEYS_SCRIPT);
+    assert!(
+        stage.contains("establish_peerings\nopen_network_channels\nexit 0"),
+        "the `channels` stage opens the NETWORK_CHANNELS channels"
+    );
+
+    let sender = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "sender");
+    assert!(sender.contains("- ./local/.keys/solo/networks:/app/networks:ro"));
+    assert!(sender.contains("- ./local/rehearsal.sh:/app/rehearsal.sh:ro"));
+    assert!(sender.contains(&format!(
+        "DEPOSIT={}",
+        keys_script_constant("CHANNEL_DEPOSIT")
+    )));
+    for network in &networks {
+        let anvil = format!("http://{}:8545", network.service);
+        assert!(
+            sender.contains(&format!("{} {anvil}", network.network)),
+            "the solo sender reads the {} channel off {anvil}",
+            network.network
+        );
+        for other in networks.iter().filter(|other| *other != network) {
+            assert!(
+                sender.contains(&format!(
+                    "http://{}:8545 {}",
+                    other.service, network.network
+                )),
+                "the solo sender requires the {} channel absent from {}",
+                network.network,
+                other.network
+            );
+        }
+    }
+    assert!(sender.contains("--expect-fulfill"));
+}
+
+// ─── the EVM networks ────────────────────────────────────────────────────────
+
+/// **Every EVM table names the anvil started on its own chain id, and
+/// `keys.sh` funds every node on each of them** (ADR 0086 decision 15).
+///
+/// A table keyed `31338` whose `rpc_url` reached the 31337 anvil is refused at
+/// boot (decision 4), so this is the same check made before an image is
+/// built: each table's `rpc_url` is `http://<service>:8545` for the service
+/// `local/keys.sh`'s `EVM_NETWORKS` puts on that chain id, that service is
+/// started with `ANVIL_CHAIN_ID` set to it, and its host port is the one
+/// `keys.sh` funds through. Only `solo` holds a second network; every other
+/// topology keeps one EVM network, on 31337.
+#[test]
+fn every_evm_table_names_the_anvil_started_on_its_own_chain_id() {
+    for (name, compose, configs) in TOPOLOGIES {
+        let networks = evm_networks(name);
+        let mut held = BTreeSet::new();
+        for (node, raw) in configs.iter() {
+            let config = load(&format!("local/{name}/{node}.toml"), raw);
+            for table in config.settlements() {
+                let SettlementConfig::Evm(evm) = table else {
+                    continue;
+                };
+                let funded = networks
+                    .iter()
+                    .find(|network| network.chain_id == evm.chain_id())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "local/{name}/{node}.toml settles on {} but local/keys.sh's \
+                             EVM_NETWORKS for {name} funds nobody there",
+                            evm.network()
+                        )
+                    });
+                assert_eq!(
+                    evm.rpc_url(),
+                    format!("http://{}:8545", funded.service),
+                    "local/{name}/{node}.toml's {} table must reach the anvil started on that \
+                     chain id",
+                    evm.network()
+                );
+                held.insert(funded.network.clone());
+            }
+        }
+        let listed: BTreeSet<String> = networks.iter().map(|n| n.network.clone()).collect();
+        assert_eq!(
+            held, listed,
+            "local/keys.sh funds {name} on exactly the EVM networks its configs settle on"
+        );
+        let expected: &[&str] = if *name == "solo" {
+            &["eip155:31337", "eip155:31338"]
+        } else {
+            &["eip155:31337"]
+        };
+        assert_eq!(
+            networks
+                .iter()
+                .map(|n| n.network.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{name}: only solo carries a second EVM network (ADR 0086 decision 15)"
+        );
+        for network in &networks {
+            let (file, service) = if network.service == "anvil" {
+                (
+                    "docker-compose.yml".to_owned(),
+                    compose_service(ROOT_COMPOSE, "docker-compose.yml", "anvil"),
+                )
+            } else {
+                let file = format!("local/{name}/compose.yml");
+                let service = compose_service(compose, &file, &network.service);
+                (file, service)
+            };
+            assert!(
+                service.contains(&format!("ANVIL_CHAIN_ID: '{}'", network.chain_id)),
+                "{file}'s `{}` must start anvil on {}",
+                network.service,
+                network.network
+            );
+            assert!(
+                service.contains(&format!("'{}:8545'", network.host_port)),
+                "{file}'s `{}` must publish 8545 on host port {}, where local/keys.sh funds it",
+                network.service,
+                network.host_port
+            );
+        }
+    }
+}
+
+/// **Every local anvil is the same seeded chain, on its own chain id.** The
+/// entrypoint takes the id from `ANVIL_CHAIN_ID` rather than hard-coding
+/// 31337, and solo's second anvil runs the same entrypoint and seed from the
+/// same read-only mounts behind the same healthcheck -- so USDC and x402 land
+/// at the same addresses on both, which is exactly the case ADR 0086's CAIP
+/// identifiers exist for.
+#[test]
+fn every_local_anvil_runs_the_one_seed_on_its_own_chain_id() {
+    let entrypoint = code(ANVIL_ENTRYPOINT);
+    assert!(
+        entrypoint.contains("--chain-id \"$ANVIL_CHAIN_ID\""),
+        "infra/anvil/entrypoint.sh starts anvil on the chain id its environment names"
+    );
+    assert!(
+        !entrypoint.contains("31337"),
+        "infra/anvil/entrypoint.sh must not hard-code a chain id"
+    );
+    let root = compose_service(ROOT_COMPOSE, "docker-compose.yml", "anvil");
+    let healthcheck = root
+        .split_once("healthcheck:")
+        .expect("the root anvil has a healthcheck")
+        .1;
+    let second = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "anvil-31338");
+    for shared in [
+        "image: ghcr.io/foundry-rs/foundry:latest",
+        "command: ['sh', '/anvil/entrypoint.sh']",
+        "./infra/anvil:/anvil:ro",
+        "./crates/connector-settlement-evm/contracts:/evm:ro",
+        healthcheck.trim_end(),
+    ] {
+        assert!(
+            second.contains(shared),
+            "solo's `anvil-31338` must share the root anvil's `{shared}`"
+        );
+    }
+    assert!(second.contains("profiles: [solo]"), "only solo starts it");
+}
+
+/// **The chains start before `keys.sh` funds them.** `make local-up` waits on
+/// every anvil a topology funds, solo's second included, before `keys.sh`
+/// mints on it -- a mint to a codeless address does not revert.
+#[test]
+fn local_up_waits_on_every_anvil_keys_sh_funds() {
+    assert!(
+        MAKEFILE.contains("up -d --wait anvil solana-validator $(LOCAL_CHAINS)"),
+        "local-up waits on the topology's own chains with the shared two"
+    );
+    for (name, _, _) in TOPOLOGIES {
+        let extra: Vec<String> = evm_networks(name)
+            .into_iter()
+            .map(|network| network.service)
+            .filter(|service| service != "anvil")
+            .collect();
+        let line = format!("LOCAL_CHAINS_{name} := {}", extra.join(" "));
+        if extra.is_empty() {
+            assert!(
+                !MAKEFILE.contains(&format!("LOCAL_CHAINS_{name} :=")),
+                "{name} starts no chain of its own"
+            );
+        } else {
+            assert!(
+                MAKEFILE.contains(&line),
+                "the Makefile must start {name}'s own anvils: `{line}`"
+            );
+        }
+    }
+    let funding = code(KEYS_SCRIPT);
+    assert!(
+        funding.contains("for evm in $EVM_NETWORKS; do"),
+        "local/keys.sh funds every node on each of the topology's EVM networks"
+    );
+    assert!(
+        funding.contains("cast chain-id --rpc-url \"$rpc\""),
+        "local/keys.sh checks each anvil answers on the chain id its table names before minting"
+    );
 }
 
 // ─── two-hop ─────────────────────────────────────────────────────────────────
@@ -1203,11 +1624,11 @@ fn the_two_hop_path_adds_up_across_the_table_and_the_configs() {
     let peering = table.peering("a-b");
     assert_eq!(
         (
-            peering.chain,
+            peering.network.as_str(),
             peering.payer.as_str(),
             peering.payee.as_str()
         ),
-        (SettlementChain::Evm, "connector-a", "connector-b")
+        ("eip155:31337", "connector-a", "connector-b")
     );
     let forward = table.route_on("connector-a");
     assert_eq!(forward.prefix, "g.local.two-hop.b");
@@ -1300,8 +1721,11 @@ fn the_mixed_chain_topology_puts_one_node_on_both_chains() {
     let mut chains: Vec<SettlementChain> = b.settlements().iter().map(|s| s.chain()).collect();
     chains.sort_by_key(|chain| format!("{chain:?}"));
     assert_eq!(chains, vec![SettlementChain::Evm, SettlementChain::Solana]);
-    assert_eq!(table.peering("a-b").chain, SettlementChain::Evm);
-    assert_eq!(table.peering("b-c").chain, SettlementChain::Solana);
+    assert_eq!(table.peering("a-b").network, "eip155:31337");
+    assert_eq!(
+        table.peering("b-c").network,
+        format!("solana:{LOCAL_SOLANA_GENESIS}")
+    );
     for (name, config) in [("A", &a), ("B", &b), ("C", &c)] {
         assert!(
             !config.denomination().declares_tokens(),
@@ -1487,9 +1911,22 @@ fn settlement_decimals(settlement: &SettlementConfig) -> u8 {
 fn dealing_boundary(b: &Config) -> (AssetId, AssetId) {
     let table = topology("dealing");
     (
-        settlement(b, table.peering("a-b").chain).asset(),
-        settlement(b, table.peering("b-c").chain).asset(),
+        held_token(b, settlement(b, table.peering("a-b").chain)),
+        held_token(b, settlement(b, table.peering("b-c").chain)),
     )
+}
+
+/// The declared CAIP-19 token `settlement` holds (ADR 0086 decision 2): the
+/// `[[tokens]]` row whose network and contract or mint are that table's.
+fn held_token(config: &Config, settlement: &SettlementConfig) -> AssetId {
+    config
+        .denomination()
+        .tokens()
+        .iter()
+        .map(|token| token.asset())
+        .find(|asset| settlement.holds(asset))
+        .cloned()
+        .unwrap_or_else(|| panic!("no [[tokens]] row declares {}", settlement.asset_spelling()))
 }
 
 /// What one crossing forwards across the boundary, computed the way the
@@ -1674,13 +2111,12 @@ fn the_dealing_solana_channel_is_funded_in_the_outgoing_leg_unit() {
 fn the_dealing_topology_owns_its_mint_and_commits_no_key_for_it() {
     let b = load("local/dealing/connector-b.toml", DEALING_B);
     let c = load("local/dealing/connector-c.toml", DEALING_C);
-    let mint = settlement(&b, SettlementChain::Solana).asset();
+    let mint = held_token(&b, settlement(&b, SettlementChain::Solana));
     assert!(!mint
         .to_string()
         .contains("H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"));
-    assert_eq!(
-        mint,
-        c.settlements()[0].asset(),
+    assert!(
+        c.settlements()[0].holds(&mint),
         "both ends of b-c hold the same mint"
     );
     assert!(code(KEYS_SCRIPT).contains("DEALING_MINT_INDEX="));
@@ -1716,22 +2152,7 @@ fn the_dealing_topology_is_on_the_ci_gate() {
 
 /// The one service block `local/onion/compose.yml` declares under `service`.
 fn onion_service(service: &str) -> &'static str {
-    let head = format!("\n  {service}:\n");
-    let start = ONION_COMPOSE
-        .find(&head)
-        .unwrap_or_else(|| panic!("local/onion/compose.yml declares no `{service}` service"))
-        + head.len();
-    let body = &ONION_COMPOSE[start..];
-    let mut end = body.len();
-    let mut offset = 0;
-    for line in body.lines() {
-        if !line.is_empty() && !line.starts_with("    ") {
-            end = offset;
-            break;
-        }
-        offset += line.len() + 1;
-    }
-    &body[..end]
+    compose_service(ONION_COMPOSE, "local/onion/compose.yml", service)
 }
 
 #[test]

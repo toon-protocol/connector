@@ -352,7 +352,12 @@ mod tests {
     use super::*;
 
     fn asset(token: &str) -> AssetId {
-        AssetId::solana(token)
+        AssetId::token_on(
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse::<connector_domain::Network>()
+                .expect("a network"),
+            token,
+        )
     }
 
     fn leg(base: &str, quote: &str) -> QuoteLeg {

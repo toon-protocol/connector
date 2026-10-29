@@ -23,11 +23,10 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
-    SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettledNetworks,
+    SettlementConfig, SettlementTables,
 };
 use crate::zk_note::{resolve_zk_note, RawZkNoteTable, ZkNoteConfig};
-use connector_domain::AssetId;
 
 /// The config file's shape exactly as written -- convenience forms
 /// (`children`) intact, nothing yet validated. `deny_unknown_fields`
@@ -375,7 +374,7 @@ impl Config {
         let settlements = resolve_settlement(raw.settlement)?;
         check_settlement_rpc_routes(&settlements, socks_proxy.as_ref())?;
         let settlement_tables = SettlementTables::of(&settlements);
-        let peer_channels = resolve_peer_channels(raw.peer_channels, settlement_tables)?;
+        let peer_channels = resolve_peer_channels(raw.peer_channels, &settlement_tables)?;
         for peer_route in &peer_routes {
             let Some(peer) = peers.iter().find(|peer| peer.id() == peer_route.peer_id()) else {
                 return Err(ConfigError::UnknownPeerId {
@@ -460,7 +459,7 @@ impl Config {
         let pay_channels = resolve_pay_channels(
             raw.pay_channels,
             peer_allow_plaintext_endpoints,
-            settlement_tables,
+            &settlement_tables,
         )?;
         for pay_channel in &pay_channels {
             // A row for a peering that does not exist pays nobody -- the
@@ -482,6 +481,24 @@ impl Config {
                 return Err(ConfigError::ChannelInBothDirections {
                     value: pay_channel.outbound_channel().to_string(),
                 });
+            }
+            // A peering is on one network, both of its channels (ADR 0086
+            // decision 11): this row and the peer's own row on the same
+            // chain must name one network.
+            if let Some(outbound) = pay_channel.network() {
+                let inbound = peer_channels.iter().find_map(|row| {
+                    row.network()
+                        .filter(|_| row.peer_id() == pay_channel.peer_id())
+                        .filter(|inbound| inbound.chain() == outbound.chain())
+                        .filter(|inbound| *inbound != outbound)
+                });
+                if let Some(inbound) = inbound {
+                    return Err(ConfigError::PeeringNetworksDiffer {
+                        peer_id: pay_channel.peer_id().to_string(),
+                        inbound: inbound.to_string(),
+                        outbound: outbound.to_string(),
+                    });
+                }
             }
         }
         // ADR 0042, and the load-time half of issue #1145: **a connector
@@ -517,13 +534,14 @@ impl Config {
         }
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.
-        // Resolved against `settlement_tables` because a token's quote is
-        // read over its own chain's RPC endpoint, so a quote on a chain
-        // with no `[settlement.<chain>]` table is a poller that could never
-        // take its first reading -- refused here rather than logged
-        // forever. All three keys absent is the default value and checks
-        // nothing, which is what "a node that declares none of it behaves
-        // exactly as it does today" means here.
+        // Resolved against the networks this node settles on (ADR 0086
+        // decision 2): every asset says which network it is on, and a token
+        // on a network with no settlement table is one no channel of this
+        // node can hold -- and, quoted, a poller that could never take its
+        // first reading. Refused here rather than logged forever. All three
+        // keys absent is the default value and checks nothing, which is
+        // what "a node that declares none of it behaves exactly as it does
+        // today" means here.
         let zk_note = raw
             .zk_note
             .map(|table| resolve_zk_note(table, socks_proxy.as_ref()))
@@ -532,23 +550,29 @@ impl Config {
             raw.tokens,
             raw.rates,
             raw.rate_guards,
-            settlement_tables,
-            zk_note.is_some(),
+            &SettledNetworks::of(&settlements),
+            zk_note.as_ref().map(ZkNoteConfig::asset).as_ref(),
         )?;
         // ADR 0080 decision 7, as amended: a zk edge prices in MINA, and a
         // forward out of it is paid in a settlement asset, so it crosses a
         // denomination at a rate the operator declared -- no TWAP source
         // quotes MINA. Every settlement table this node pays a next hop in
-        // therefore needs a `[[rates]]` row from `mina:native` to its token,
-        // refused here naming the missing pair rather than at the first
-        // forward. A zk edge with no settlement table forwards nothing.
-        if zk_note.is_some() {
+        // therefore needs a `[[rates]]` row from the vault's asset to the
+        // token that table holds, refused here naming the missing pair rather
+        // than at the first forward. A zk edge with no settlement table
+        // forwards nothing.
+        if let Some(zk_note) = &zk_note {
+            let from = zk_note.asset();
             for settlement in &settlements {
-                let to = settlement.asset();
-                if denomination.rate(&AssetId::mina_native(), &to).is_none() {
+                let declared = denomination.rates().iter().any(|row| {
+                    row.from() == &from
+                        && settlement.holds(row.to())
+                        && denomination.rate(row.from(), row.to()).is_some()
+                });
+                if !declared {
                     return Err(ConfigError::ZkNoteRateMissing {
-                        from: AssetId::mina_native(),
-                        to,
+                        from,
+                        to: settlement.asset_spelling(),
                     });
                 }
             }
@@ -581,8 +605,11 @@ impl Config {
         // packets are denominated in the vault's asset (ADR 0080 decision 7,
         // as amended), whose rate to every settlement token was required
         // above.
-        let client_channel_assets =
-            resolve_client_channel_assets(&settlements, &denomination, zk_note.is_some())?;
+        let client_channel_assets = resolve_client_channel_assets(
+            &settlements,
+            &denomination,
+            zk_note.as_ref().map(ZkNoteConfig::asset),
+        )?;
         let state_dir = raw.state_dir.map(PathBuf::from);
         // The unresolvable-lookup budget (issue #613). Every one of these
         // is refused at zero: each zero either switches the
@@ -1568,7 +1595,7 @@ handler_url = "http://localhost:5000"
     /// A `TokenNetwork` address: what a retired `toon-channel` row named.
     const PEER_TOKEN_NETWORK: &str = "0x3333333333333333333333333333333333333333";
 
-    /// An `[settlement.evm]` table and its key, in the shape a channel row
+    /// An `[settlement.eip155.<chainId>]` table and its key, in the shape a channel row
     /// on this chain now requires (issue #1138): that table is where this
     /// node's EVM address comes from, and a channel row names it as this
     /// node's on-chain participant. Written once here rather than inline
@@ -1577,14 +1604,14 @@ handler_url = "http://localhost:5000"
     fn evm_settlement(key_path: &Path) -> String {
         format!(
             r#"
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,
@@ -1597,7 +1624,7 @@ key_file = "{key_file}"
     /// spoils exactly one thing about it, so what each error is *about* is
     /// the diff between it and this.
     ///
-    /// It carries `[settlement.evm]` with its `batch_settlement` sub-table
+    /// It carries `[settlement.eip155.<chainId>]` with its `batch_settlement` sub-table
     /// because an x402 channel row on a chain this node takes no voucher on
     /// does not load (ADR 0075, issue #1380).
     ///
@@ -1663,6 +1690,159 @@ client_edge_url = "https://store.example/ilp"
             .expect("write key file");
         let text = edit(peering_config(key_file.path(), state_dir.path(), ""));
         Config::from_toml_str(&text, Path::new("test.toml"))
+    }
+
+    /// [`peering_config`] with a second EVM table, `[settlement.eip155.31338]`,
+    /// naming the **same** key file as the first (ADR 0086 decision 5), and
+    /// `edit` applied to the text.
+    fn load_two_network_peering(edit: impl Fn(String) -> String) -> Result<Config, ConfigError> {
+        load_peering(|text| {
+            let key_file = text
+                .split("key_file = \"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("the fixture names a key file")
+                .to_string();
+            let second = format!(
+                "\n[settlement.eip155.31338]\nrpc_url = \"http://127.0.0.1:8546\"\n\
+                 token_address = \"0x49beE1Bca5d15Fb0963117923403F9498119a9Ce\"\ndecimals = 6\n\
+                 asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n\n\
+                 [settlement.eip155.31338.key]\nkey_file = \"{key_file}\"\n\n[[peers]]"
+            );
+            edit(text.replacen("\n[[peers]]", &second, 1))
+        })
+    }
+
+    /// `network = "<caip-2>"` written onto both channel rows of the fixture.
+    fn rows_on(text: String, network: &str) -> String {
+        text.replace(
+            &format!("voucher_signer = \"{PEER_KEY}\""),
+            &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"{network}\""),
+        )
+        .replace(
+            "client_edge_url = \"https://store.example/ilp\"",
+            &format!("client_edge_url = \"https://store.example/ilp\"\nnetwork = \"{network}\""),
+        )
+    }
+
+    /// ADR 0086 decisions 5 and 8: two EVM tables may name one key file, and
+    /// a channel row names which of them it is on.
+    #[test]
+    fn two_evm_tables_sharing_one_key_file_load_with_each_row_on_its_network() {
+        let config = load_two_network_peering(|text| rows_on(text, "eip155:31338")).expect("load");
+
+        assert_eq!(config.settlements().len(), 2);
+        let on = "eip155:31338".parse::<connector_domain::Network>().unwrap();
+        assert_eq!(config.peer_channels()[0].network(), Some(&on));
+        assert_eq!(config.pay_channels()[0].network(), Some(&on));
+    }
+
+    /// ADR 0086 decision 11: both channels of a peering are on one network,
+    /// so a config peering whose `[[peer_channels]]` row is on one network
+    /// and whose `[[pay_channels]]` row is on another is refused by name.
+    #[test]
+    fn a_config_peering_whose_two_rows_are_on_two_networks_is_refused_by_name() {
+        let error = load_two_network_peering(|text| {
+            text.replace(
+                &format!("voucher_signer = \"{PEER_KEY}\""),
+                &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"eip155:31337\""),
+            )
+            .replace(
+                "client_edge_url = \"https://store.example/ilp\"",
+                "client_edge_url = \"https://store.example/ilp\"\nnetwork = \"eip155:31338\"",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::PeeringNetworksDiffer { peer_id, inbound, outbound }
+                    if peer_id == "store" && inbound == "eip155:31337" && outbound == "eip155:31338"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("store"), "{message}");
+        assert!(message.contains("one network"), "{message}");
+    }
+
+    /// ADR 0086 decision 8: with one EVM table a `0x` row's network is that
+    /// table's, inferred -- and checked when it is written.
+    #[test]
+    fn a_0x_row_on_a_one_table_node_is_on_that_tables_network() {
+        let config = load_peering(|text| text).expect("load");
+        let on = "eip155:31337".parse::<connector_domain::Network>().unwrap();
+        assert_eq!(config.peer_channels()[0].network(), Some(&on));
+        assert_eq!(config.pay_channels()[0].network(), Some(&on));
+
+        let written = load_peering(|text| rows_on(text, "eip155:31337")).expect("load");
+        assert_eq!(written.peer_channels()[0].network(), Some(&on));
+    }
+
+    /// ADR 0086 decision 8: a `0x` row is never guessed onto one of two
+    /// networks -- on either table.
+    #[test]
+    fn a_0x_row_with_no_network_on_a_two_table_node_is_refused_by_name() {
+        let error = load_two_network_peering(|text| text).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkAmbiguous { table: "peer_channels", peer_id, .. }
+                    if peer_id == "store"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("eip155:31337") && message.contains("eip155:31338"));
+        assert!(message.contains("network"), "{message}");
+
+        let error = load_two_network_peering(|text| {
+            text.replace(
+                &format!("voucher_signer = \"{PEER_KEY}\""),
+                &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"eip155:31337\""),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkAmbiguous {
+                    table: "pay_channels",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// ADR 0086 decision 8: a row's `network` must name a configured table.
+    #[test]
+    fn a_row_whose_network_names_no_table_is_refused_by_name() {
+        let error = load_peering(|text| rows_on(text, "eip155:8453")).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::ChannelRowNetworkUnsettled { table: "peer_channels", network, .. }
+                    if network == "eip155:8453"
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("eip155:8453"));
+
+        let error = load_peering(|text| rows_on(text, "eip155:base")).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            "{error:?}"
+        );
+
+        // A Solana network on an EVM signer's row names no table of that
+        // signer's chain.
+        let error = load_peering(|text| rows_on(text, "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"))
+            .unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            "{error:?}"
+        );
     }
 
     /// The whole surface round-trips from a real TOML file: the exposure
@@ -1946,7 +2126,7 @@ state_dir = "/tmp/connector-rpc-route-test"
 [signer]
 key_file = "{key}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{evm_rpc}"
 token_address = "0x00000000000000000000000000000000000000bb"
 decimals = 6
@@ -1954,7 +2134,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {evm_line}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key}"
 
 [settlement.solana]
@@ -2020,7 +2200,10 @@ key_file = "{key}"
     /// settlement call", and that is refused where the operator wrote it.
     #[test]
     fn a_table_that_opts_into_the_proxy_on_a_node_with_none_is_refused_by_name() {
-        for (evm, solana, table) in [(Some(true), None, "evm"), (None, Some(true), "solana")] {
+        for (evm, solana, table) in [
+            (Some(true), None, "eip155.31337"),
+            (None, Some(true), "solana"),
+        ] {
             let error = load_settlement_routes(
                 "",
                 "https://sepolia.base.org",
@@ -2031,7 +2214,7 @@ key_file = "{key}"
             .expect_err("no socks_proxy to ride");
             assert!(
                 matches!(
-                    error,
+                    &error,
                     ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table: named }
                         if named == table
                 ),
@@ -2055,7 +2238,7 @@ key_file = "{key}"
         assert!(
             matches!(
                 error,
-                ConfigError::SettlementRpcViaSocksProxyPlaintext { table: "evm", .. }
+                ConfigError::SettlementRpcViaSocksProxyPlaintext { ref table, .. } if table == "eip155.31337"
             ),
             "{error}"
         );
@@ -2425,10 +2608,13 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
     /// names one. Checksummed on purpose: a config file is where an
     /// explorer's spelling gets pasted, and an `AssetId` reads it and the
     /// lowercase one as a single token.
-    const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
-    /// USDC on Base -- some other ERC-20. Declared alone, it makes a node
-    /// that deals a token none of its peerings hold.
-    const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const SETTLEMENT_TOKEN: &str = "eip155:31337/erc20:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+    /// Some other ERC-20 on the node's own network. Declared alone, it
+    /// makes a node that deals a token none of its peerings hold.
+    const OTHER_TOKEN: &str = "eip155:31337/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    /// A Solana devnet genesis prefix: what a `solana:` asset's network
+    /// names. Config cannot check it -- boot does, against the cluster.
+    const SOLANA_GENESIS: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
     /// USDC on Solana, the mint `[settlement.solana]` names below.
     const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -2531,7 +2717,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         assert_eq!(
             resolved.asset("store").map(ToString::to_string),
             Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
-            "the peering holds what [settlement.evm] settles in, however the row spelled it"
+            "the peering holds what [settlement.eip155.<chainId>] settles in, however the row spelled it"
         );
         assert_eq!(
             resolved
@@ -2573,7 +2759,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
                 error,
                 ConfigError::PeeringTokenNotDeclared { peer_id, asset }
                     if peer_id == "store"
-                        && asset.to_string() == SETTLEMENT_TOKEN.to_ascii_lowercase()
+                        && asset == &SETTLEMENT_TOKEN.to_ascii_lowercase()
             )
         });
         assert!(
@@ -2595,7 +2781,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let config = load_text(&peerings_on_two_chains(
             key_file.path(),
             state_dir.path(),
@@ -2629,7 +2815,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let result = load_text(&one_peering_on_two_chains(
             key_file.path(),
             state_dir.path(),
@@ -2722,7 +2908,7 @@ key_file = "{key_file}"
                 .asset(UNDECLARED_EVM_CHANNEL_KEY)
                 .map(ToString::to_string),
             Some(SETTLEMENT_TOKEN.to_ascii_lowercase()),
-            "a channel on the EVM chain holds what [settlement.evm] settles in -- including a \
+            "a channel on the EVM chain holds what [settlement.eip155.<chainId>] settles in -- including a \
              channel this file never named, which is the one this rule exists for"
         );
         assert_eq!(
@@ -2773,7 +2959,7 @@ key_file = "{key_file}"
                 error,
                 ConfigError::ClientChannelTokenNotDeclared { chain, asset }
                     if *chain == SettlementChain::Solana
-                        && asset.to_string() == format!("solana:{SOLANA_MINT}")
+                        && asset == &format!("solana:<genesis prefix>/token:{SOLANA_MINT}")
             )
         });
         assert!(
@@ -2794,7 +2980,7 @@ key_file = "{key_file}"
         key_file
             .write_all(b"not a real key")
             .expect("write key file");
-        let solana_token = format!("solana:{SOLANA_MINT}");
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         let text = peering_config(
             key_file.path(),
             state_dir.path(),
@@ -2821,6 +3007,99 @@ key_file = "{key_file}"
         );
     }
 
+    // -- every asset id is CAIP-19 (ADR 0086 decision 2, issue #1598) --
+
+    /// The retired spellings, in every position a config names an asset,
+    /// each refused at load by name with its CAIP-19 rewrite in the message
+    /// -- and never read as some other token.
+    #[test]
+    fn a_legacy_asset_spelling_is_refused_at_load_with_its_rewrite() {
+        const LEGACY_EVM: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+        const REWRITE_EVM: &str =
+            "eip155:<chainId>/erc20:0x49bee1bca5d15fb0963117923403f9498119a9ce";
+        let legacy_solana = format!("solana:{SOLANA_MINT}");
+        let rewrite_solana = format!("solana:<genesis prefix>/token:{SOLANA_MINT}");
+        let guards = "\n[rate_guards]\nspread = { numerator = 0, denominator = 1 }\n\
+                      ttl_secs = 60\nmax_move = { numerator = 1, denominator = 10 }\n";
+        let pool = "0x1111111111111111111111111111111111111111";
+
+        let cases: Vec<(String, &str, String)> = vec![
+            (
+                declaring(&[LEGACY_EVM]),
+                LEGACY_EVM,
+                REWRITE_EVM.to_string(),
+            ),
+            (
+                declaring(&[&legacy_solana]),
+                legacy_solana.as_str(),
+                rewrite_solana.clone(),
+            ),
+            (
+                format!(
+                    "{}\n[[rates]]\nfrom = \"{LEGACY_EVM}\"\nto = \"{OTHER_TOKEN}\"\n\
+                     rate = {{ numerator = 1, denominator = 1 }}\n{guards}",
+                    declaring(&[SETTLEMENT_TOKEN, OTHER_TOKEN])
+                ),
+                LEGACY_EVM,
+                REWRITE_EVM.to_string(),
+            ),
+            (
+                format!(
+                    "\n[[tokens]]\nasset = \"{OTHER_TOKEN}\"\nnumeraire = true\n\
+                     \n[[tokens]]\nasset = \"{SETTLEMENT_TOKEN}\"\nquote = [{{ pool = \"{pool}\", \
+                     quote_token = \"evm:31337:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\", \
+                     twap_window_secs = 60 }}]\n{guards}"
+                ),
+                "evm:31337:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "eip155:31337/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string(),
+            ),
+            (
+                declaring(&["evm:native"]),
+                "evm:native",
+                "<caip2 network>/slip44:<coin type>".to_string(),
+            ),
+        ];
+        for (declaration, legacy, rewrite) in cases {
+            let message = expect_error(
+                load_peering(|text| format!("{text}{declaration}")),
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::TokenAssetInvalid { .. }
+                            | ConfigError::RateRowAssetInvalid { .. }
+                            | ConfigError::TokenQuoteTokenInvalid { .. }
+                    )
+                },
+            );
+            assert!(
+                message.contains(legacy) && message.contains(&rewrite),
+                "{legacy}: got: {message}"
+            );
+        }
+    }
+
+    /// An asset on a network this node has no settlement table for is
+    /// refused at load, naming the table it would need.
+    #[test]
+    fn an_asset_on_a_network_with_no_settlement_table_is_refused_at_load() {
+        let on_base = SETTLEMENT_TOKEN.replace("eip155:31337", "eip155:8453");
+        let message = expect_error(
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &on_base]))),
+            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
+        );
+        assert!(
+            message.contains("[settlement.eip155.8453]"),
+            "got: {message}"
+        );
+
+        // No [settlement.solana] on this node at all.
+        let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
+        expect_error(
+            load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &solana_token]))),
+            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
+        );
+    }
+
     // -- "the settlement table this channel needs is absent" (issue #1138)
     //
     // One rule for all four channel tables, stated in
@@ -2830,13 +3109,15 @@ key_file = "{key_file}"
     // refusals when one file trips more than one.
 
     /// The EVM half of #1134's rule, at the level an operator meets it: a
-    /// peering bound to an EVM channel on a node with no `[settlement.evm]`
+    /// peering bound to an EVM channel on a node with no `[settlement.eip155.<chainId>]`
     /// does not load. It used to load and verify the peer's inbound claims
     /// under a domain no address this node holds could ever redeem at.
     #[test]
     fn rejects_an_evm_peer_channel_on_a_node_that_does_not_settle_on_evm() {
         let result = load_peering(|text| {
-            let start = text.find("[settlement.evm]").expect("the fixture has one");
+            let start = text
+                .find("[settlement.eip155.31337]")
+                .expect("the fixture has one");
             let end = text.find("[[peers]]").expect("the fixture has one");
             let mut without = text.clone();
             without.replace_range(start..end, "");
@@ -2850,7 +3131,7 @@ key_file = "{key_file}"
             )
         });
         assert!(
-            message.contains("[settlement.evm]") && message.contains("no"),
+            message.contains("[settlement.eip155.<chainId>]") && message.contains("no"),
             "got: {message}"
         );
     }
@@ -2858,7 +3139,7 @@ key_file = "{key_file}"
     /// The rule is **per chain**: a row needs the table for its own chain
     /// and no other. This is the shape `local/mixed-chain/connector-c.toml`
     /// is committed in -- a Solana peering on a node with no
-    /// `[settlement.evm]` at all -- and it must keep loading.
+    /// `[settlement.eip155.<chainId>]` at all -- and it must keep loading.
     #[test]
     fn a_solana_only_node_needs_no_evm_settlement_table() {
         let config = load_solana_peering("").expect("load");
@@ -3055,7 +3336,10 @@ key_file = "{key_file}"
                 ConfigError::PayChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
             )
         });
-        assert!(message.contains("[settlement.evm]"), "got: {message}");
+        assert!(
+            message.contains("[settlement.eip155.<chainId>]"),
+            "got: {message}"
+        );
     }
 
     /// The Solana shapes: a Solana pay row names a channel account, and the
@@ -3915,14 +4199,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{}"
 "#,
                 key_path.display(),
@@ -3941,7 +4225,7 @@ key_file = "{}"
         assert_eq!(evm.decimals(), 6);
     }
 
-    /// The new keyed shape (issue #628): `[settlement.evm]` alone resolves
+    /// The new keyed shape (issue #628): `[settlement.eip155.<chainId>]` alone resolves
     /// the same facts the legacy flat shape does.
     #[test]
     fn a_keyed_evm_settlement_table_loads() {
@@ -3954,14 +4238,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{}"
 "#,
                 key_path.display(),
@@ -3989,7 +4273,7 @@ state_dir = "/tmp"
 [signer]
 key_file = "{key_path}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
@@ -3997,7 +4281,7 @@ asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 {delay}
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_path}"
 "#,
                     key_path = key_path.display()
@@ -4018,7 +4302,7 @@ key_file = "{key_path}"
         ));
     }
 
-    /// AC: "A config declaring both [settlement.evm] and [settlement.solana]
+    /// AC: "A config declaring both [settlement.eip155.<chainId>] and [settlement.solana]
     /// parses into typed per-chain settlement config".
     #[test]
     fn declaring_both_evm_and_solana_settlement_tables_loads_both() {
@@ -4031,14 +4315,14 @@ state_dir = "/tmp"
 [signer]
 key_file = "{key_path}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117893403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_path}"
 
 [settlement.solana]

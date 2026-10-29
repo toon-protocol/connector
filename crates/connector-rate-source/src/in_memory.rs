@@ -147,11 +147,11 @@ mod tests {
     use crate::port::QuotePath;
 
     fn usdc() -> AssetId {
-        AssetId::evm("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+        AssetId::erc20(8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
     }
 
     fn weth() -> AssetId {
-        AssetId::evm("0x4200000000000000000000000000000000000006")
+        AssetId::erc20(8453, "0x4200000000000000000000000000000000000006")
     }
 
     fn pool() -> PoolId {
@@ -217,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn a_pair_the_pool_does_not_hold_is_refused_rather_than_answered() {
         let source = source();
-        let dai = AssetId::evm("0x50c5725949a6f0c72e6c4a641f24049a917db0cb");
+        let dai = AssetId::erc20(8453, "0x50c5725949a6f0c72e6c4a641f24049a917db0cb");
         let err = source
             .observe(&QuoteLeg {
                 base: dai.clone(),

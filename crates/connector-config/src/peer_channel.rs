@@ -44,6 +44,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
+use connector_domain::Network;
+
 use crate::settlement::{SettlementChain, SettlementTables};
 use crate::x402_row::{parse_voucher_signer, parse_x402_channel, RemovedToonFields};
 
@@ -60,6 +62,9 @@ pub(crate) struct RawPeerChannel {
     voucher_signer: Option<String>,
     #[serde(default)]
     inbound_channel: Option<String>,
+    /// The CAIP-2 network the peer's channel is on (ADR 0086 decision 8).
+    #[serde(default)]
+    network: Option<String>,
     #[serde(default)]
     channel_id: Option<toml::Value>,
     #[serde(default)]
@@ -94,6 +99,7 @@ impl RawPeerChannel {
 pub struct PeerChannelConfig {
     peer_id: String,
     chain: SettlementChain,
+    network: Option<Network>,
     voucher_signer: String,
     inbound_channel: Option<String>,
 }
@@ -110,6 +116,14 @@ impl PeerChannelConfig {
     /// read off the signer's own spelling.
     pub fn chain(&self) -> SettlementChain {
         self.chain
+    }
+
+    /// The CAIP-2 network the peer's channel is on (ADR 0086 decision 8):
+    /// always `Some` on EVM -- written, or inferred from this node's one EVM
+    /// table -- and on Solana as written, since config cannot know a
+    /// cluster's genesis prefix.
+    pub fn network(&self) -> Option<&Network> {
+        self.network.as_ref()
     }
 
     /// The key whose vouchers prove this peering: an EVM address as
@@ -131,7 +145,7 @@ impl PeerChannelConfig {
 
 fn resolve_peer_channel(
     raw: RawPeerChannel,
-    tables: SettlementTables,
+    tables: &SettlementTables,
 ) -> Result<PeerChannelConfig, ConfigError> {
     // First, because "you wrote a key that no longer exists" explains the
     // file better than any other complaint when both are true, and because
@@ -173,9 +187,16 @@ fn resolve_peer_channel(
             chain: signer.chain.name(),
         });
     }
+    let network = tables.row_network(
+        "peer_channels",
+        &raw.peer_id,
+        signer.chain,
+        raw.network.as_deref(),
+    )?;
     Ok(PeerChannelConfig {
         peer_id: raw.peer_id,
         chain: signer.chain,
+        network,
         voucher_signer: signer.value,
         inbound_channel,
     })
@@ -183,7 +204,7 @@ fn resolve_peer_channel(
 
 pub(crate) fn resolve_peer_channels(
     raw: Vec<RawPeerChannel>,
-    tables: SettlementTables,
+    tables: &SettlementTables,
 ) -> Result<Vec<PeerChannelConfig>, ConfigError> {
     let mut seen_signers = HashSet::with_capacity(raw.len());
     let mut seen_channels = HashSet::with_capacity(raw.len());
@@ -230,7 +251,7 @@ mod tests {
     fn resolve(rows: &[&str]) -> Result<Vec<PeerChannelConfig>, ConfigError> {
         resolve_peer_channels(
             rows.iter().map(|text| parse(text)).collect(),
-            SettlementTables::for_tests(true, true),
+            &SettlementTables::for_tests(true, true),
         )
     }
 
@@ -366,13 +387,13 @@ mod tests {
     fn a_row_on_a_chain_without_x402_is_refused_per_chain() {
         let rows = || vec![parse(&row(EVM_SIGNER))];
         let error =
-            resolve_peer_channels(rows(), SettlementTables::for_tests(false, true)).unwrap_err();
+            resolve_peer_channels(rows(), &SettlementTables::for_tests(false, true)).unwrap_err();
         assert!(matches!(
             error,
             ConfigError::PeerChannelWithoutX402 { chain: "evm", .. }
         ));
         assert!(
-            resolve_peer_channels(rows(), SettlementTables::for_tests(true, false)).is_ok(),
+            resolve_peer_channels(rows(), &SettlementTables::for_tests(true, false)).is_ok(),
             "the rule is per chain"
         );
     }

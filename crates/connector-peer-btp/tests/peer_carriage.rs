@@ -182,6 +182,7 @@ fn voucher_on(channel: &BatchChannelConfig, signer: &SecretKey, amount: u64) -> 
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -215,6 +216,7 @@ fn challenge_on(channel: &BatchChannelConfig, signer: &SecretKey, expires: u64) 
     let channel_id = channel_id_of(channel);
     let digest = evm_voucher_claim_state_challenge_digest(&domain(), &channel_id, expires);
     challenge_json::encode(&PeerRoleChallenge::Evm {
+        network: connector_domain::Network::Eip155(CHAIN_ID),
         channel_id,
         expires,
         signature: sign_evm(signer, &digest),
@@ -361,6 +363,7 @@ impl VoucherEvidence for ChannelBook {
             expires,
             signature,
             channel_config,
+            ..
         } = challenge
         else {
             // This chain holds EVM channels only.
@@ -1472,7 +1475,11 @@ async fn the_named_regression_no_frame_becomes_a_peer_without_a_bound_verifying_
             "{case}: an asserted role is not refused on the wire (§1.6)"
         );
         assert!(
-            ack::from_protocol_data(&answer.protocol_data).is_none(),
+            ack::from_protocol_data(
+                &answer.protocol_data,
+                &connector_domain::Network::Eip155(CHAIN_ID)
+            )
+            .is_none(),
             "{case}: a client frame gets no claim-ack (§1.7)"
         );
         match decode_answer(&answer).map(|answer| answer.into_response()) {
@@ -1494,7 +1501,10 @@ async fn the_named_regression_no_frame_becomes_a_peer_without_a_bound_verifying_
     peer.send(voucher_frame(2, &payer_voucher(1))).await;
     let answer = peer.answer().await;
     assert_eq!(
-        ack::from_protocol_data(&answer.protocol_data),
+        ack::from_protocol_data(
+            &answer.protocol_data,
+            &connector_domain::Network::Eip155(CHAIN_ID)
+        ),
         Some(ClaimAckOutcome::Accepted),
         "no client frame had advanced this channel's watermark"
     );
@@ -1575,7 +1585,11 @@ async fn an_arriving_auth_entry_is_ignored_rather_than_refused() {
     // and a forged one is still a client frame.
     session.send(voucher_frame(2, &forged_voucher(500))).await;
     let answer = session.answer().await;
-    assert!(ack::from_protocol_data(&answer.protocol_data).is_none());
+    assert!(ack::from_protocol_data(
+        &answer.protocol_data,
+        &connector_domain::Network::Eip155(CHAIN_ID)
+    )
+    .is_none());
 }
 
 /// §1.5: more than one claim entry on one frame is **refused, not
@@ -1607,7 +1621,10 @@ async fn two_claim_entries_on_one_frame_are_refused_rather_than_resolved() {
     session.send(voucher_frame(2, &first)).await;
     let answer = session.answer().await;
     assert_eq!(
-        ack::from_protocol_data(&answer.protocol_data),
+        ack::from_protocol_data(
+            &answer.protocol_data,
+            &connector_domain::Network::Eip155(CHAIN_ID)
+        ),
         Some(ClaimAckOutcome::Accepted)
     );
 }
@@ -1624,7 +1641,11 @@ async fn a_frame_whose_voucher_does_not_verify_stays_a_client_frame() {
     session.send(voucher_frame(1, &forged_voucher(500))).await;
     let before = session.answer().await;
     assert!(
-        ack::from_protocol_data(&before.protocol_data).is_none(),
+        ack::from_protocol_data(
+            &before.protocol_data,
+            &connector_domain::Network::Eip155(CHAIN_ID)
+        )
+        .is_none(),
         "a frame whose voucher does not verify is a client frame"
     );
 
@@ -1633,7 +1654,10 @@ async fn a_frame_whose_voucher_does_not_verify_stays_a_client_frame() {
     session.send(voucher_frame(2, &payer_voucher(500))).await;
     let after = session.answer().await;
     assert_eq!(
-        ack::from_protocol_data(&after.protocol_data),
+        ack::from_protocol_data(
+            &after.protocol_data,
+            &connector_domain::Network::Eip155(CHAIN_ID)
+        ),
         Some(ClaimAckOutcome::Accepted)
     );
 
@@ -1643,7 +1667,11 @@ async fn a_frame_whose_voucher_does_not_verify_stays_a_client_frame() {
         .send(encode_message(3, &[], &prepare("g.nowhere").encode()))
         .await;
     let evidence_less = session.answer().await;
-    assert!(ack::from_protocol_data(&evidence_less.protocol_data).is_none());
+    assert!(ack::from_protocol_data(
+        &evidence_less.protocol_data,
+        &connector_domain::Network::Eip155(CHAIN_ID)
+    )
+    .is_none());
 }
 
 /// §1.10's bounded escape hatch: on a **dedicated peer listener with
@@ -2322,7 +2350,10 @@ async fn vouchers_sent_in_order_on_one_session_never_race_each_other() {
     for _ in 1..=16 {
         let answer = session.answer().await;
         assert_eq!(
-            ack::from_protocol_data(&answer.protocol_data),
+            ack::from_protocol_data(
+                &answer.protocol_data,
+                &connector_domain::Network::Eip155(CHAIN_ID)
+            ),
             Some(ClaimAckOutcome::Accepted)
         );
     }

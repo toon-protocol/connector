@@ -34,6 +34,7 @@ mod error;
 mod fee;
 pub mod identity;
 mod journal_entry;
+pub mod network;
 pub mod node;
 mod oer;
 mod packet;
@@ -45,7 +46,7 @@ mod route;
 pub mod x402;
 
 pub use address::is_valid_ilp_address;
-pub use asset::{AssetChain, AssetId, AssetIdError};
+pub use asset::{AssetChain, AssetId, AssetIdError, AssetNamespace};
 pub use claim::{
     advance_voucher_watermark, allowance_close_charge, payment_route_covers,
     validate_allowance_claim, validate_price, validate_voucher, ClaimError, VoucherAdmission,
@@ -62,6 +63,7 @@ pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
 pub use journal_entry::JournalEntry;
+pub use network::{MinaNetwork, Network, NetworkError, SolanaGenesisPrefix};
 pub use node::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
     NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,

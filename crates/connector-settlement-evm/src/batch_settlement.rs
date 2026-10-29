@@ -79,6 +79,7 @@ use crate::bindings::Erc20;
 use crate::channel_id::format_channel_id;
 use crate::send::{confirm, ConfirmPolicy, Sender};
 use crate::{build_client, EvmClient, RpcTransport};
+use connector_chain_rpc::evm::EvmRpc;
 use ethers::middleware::Middleware;
 
 /// Both halves of the batch-settlement port over `x402BatchSettlement`:
@@ -123,6 +124,20 @@ pub struct EvmBatchSettlementBackend {
 }
 
 impl EvmBatchSettlementBackend {
+    /// The chain id `transport`'s endpoint answers `eth_chainId` with,
+    /// retried like every boot read. What boot asserts a
+    /// `[settlement.eip155.<chainId>]` table's key against before
+    /// [`Self::connect`] (ADR 0086 decision 4): the key is declared and
+    /// checked, and never handed to the backend, which binds whatever this
+    /// answers.
+    pub async fn chain_id_at(transport: &RpcTransport) -> Result<u64, BatchSettlementError> {
+        let client = EvmRpc::provider(transport.clone());
+        connector_chain_rpc::retry_read(|| client.get_chainid())
+            .await
+            .map(|chain_id| chain_id.as_u64())
+            .map_err(rpc_error)
+    }
+
     /// This node's backend for x402 `batch-settlement` channels on EVM, both
     /// halves (ADR 0074, ADR 0075), over `x402BatchSettlement` at the one
     /// address the record fixes ([`X402_BATCH_SETTLEMENT_ADDRESS`]), signing
@@ -178,7 +193,7 @@ impl EvmBatchSettlementBackend {
         .map_err(rpc_error)?;
         if on_chain_decimals != expected_decimals {
             return Err(BatchSettlementError::Backend(format!(
-                "[settlement.evm] decimals is {expected_decimals}, but token {token:?} \
+                "[settlement.eip155.<chainId>] decimals is {expected_decimals}, but token {token:?} \
                  reports decimals() = {on_chain_decimals}"
             )));
         }

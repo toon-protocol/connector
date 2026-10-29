@@ -89,16 +89,18 @@ impl Timeouts {
 /// A circuit is pinned by the SOCKS username a client authenticates with:
 /// the `anon` daemon's `IsolateSOCKSAuth` (on by default) keeps streams
 /// with different credentials on different circuits and streams with the
-/// same credentials on one. So each chain gets a fixed username of its own.
-/// That keeps one exit from seeing both chains' RPCs, and it keeps
+/// same credentials on one. So each network gets a fixed username of its
+/// own (ADR 0086 decision 7, amending 0073 decision 3): one per EVM network,
+/// named for its chain id, and one for Solana. That keeps one exit from
+/// seeing two networks' RPCs, and it keeps
 /// settlement off the ILP wire's circuits, whose dials present no
 /// credentials at all. The daemon still rotates a circuit after
 /// `MaxCircuitDirtiness`, and that is left alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Circuit {
-    /// `[settlement.evm]`: the backend, the channel-index syncer and the
-    /// rate source.
-    EvmSettlement,
+    /// `[settlement.eip155.<chain_id>]`: the backend, the channel-index
+    /// syncer and the rate source of that one EVM network.
+    EvmSettlement { chain_id: u64 },
     /// `[settlement.solana]`: the backend.
     SolanaSettlement,
 }
@@ -107,10 +109,10 @@ impl Circuit {
     /// The SOCKS username this circuit authenticates with. Fixed rather
     /// than per-process, so the pinning survives a restart the same way it
     /// survives a reconnect.
-    pub fn socks_username(self) -> &'static str {
+    pub fn socks_username(self) -> String {
         match self {
-            Circuit::EvmSettlement => "toon-settlement-evm",
-            Circuit::SolanaSettlement => "toon-settlement-solana",
+            Circuit::EvmSettlement { chain_id } => format!("toon-settlement-eip155-{chain_id}"),
+            Circuit::SolanaSettlement => "toon-settlement-solana".to_string(),
         }
     }
 
@@ -252,7 +254,7 @@ impl RpcTransport {
                 let proxied = ProxiedClient::with_credentials(
                     proxy,
                     Some((
-                        circuit.socks_username().to_string(),
+                        circuit.socks_username(),
                         circuit.socks_password().to_string(),
                     )),
                     tune,
@@ -563,14 +565,22 @@ mod tests {
     #[test]
     fn a_circuit_takes_a_socks5h_proxy_and_no_other() {
         let proxy = Url::parse("socks5://127.0.0.1:9050").unwrap();
-        let refused = RpcTransport::through("https://rpc.example", &proxy, Circuit::EvmSettlement);
+        let refused = RpcTransport::through(
+            "https://rpc.example",
+            &proxy,
+            Circuit::EvmSettlement { chain_id: 31337 },
+        );
         assert!(matches!(
             refused,
             Err(TransportError::ProxyNotSocks5h { .. })
         ));
         let proxy = Url::parse("socks5h://127.0.0.1:9050").unwrap();
-        let built =
-            RpcTransport::through("https://rpc.example", &proxy, Circuit::EvmSettlement).unwrap();
+        let built = RpcTransport::through(
+            "https://rpc.example",
+            &proxy,
+            Circuit::EvmSettlement { chain_id: 31337 },
+        )
+        .unwrap();
         assert!(built.is_proxied());
     }
 
@@ -683,10 +693,19 @@ mod tests {
     }
 
     #[test]
-    fn each_chain_pins_its_own_circuit() {
+    fn each_network_pins_its_own_circuit() {
+        let base = Circuit::EvmSettlement { chain_id: 8453 };
+        let arbitrum = Circuit::EvmSettlement { chain_id: 42161 };
+        assert_eq!(base.socks_username(), "toon-settlement-eip155-8453");
+        assert_ne!(base.socks_username(), arbitrum.socks_username());
         assert_ne!(
-            Circuit::EvmSettlement.socks_username(),
+            base.socks_username(),
             Circuit::SolanaSettlement.socks_username()
+        );
+        // Solana's is the one it has always been.
+        assert_eq!(
+            Circuit::SolanaSettlement.socks_username(),
+            "toon-settlement-solana"
         );
     }
 }

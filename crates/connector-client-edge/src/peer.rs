@@ -334,14 +334,14 @@ endpoint = "wss://peer.example:443/ilp/btp"
 peer_id = "{PEER_ID}"
 voucher_signer = "0x7777777777777777777777777777777777777777"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,
@@ -478,16 +478,21 @@ key_file = "{key_file}"
 
         #[async_trait]
         impl BatchSettlementChannels for TwoChannelsEachChain {
-            fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-                Some(domain())
+            fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+                vec![domain()]
             }
 
-            fn accepts_solana(&self) -> bool {
-                true
+            fn solana_network(&self) -> Option<connector_domain::Network> {
+                Some(
+                    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                        .parse()
+                        .expect("a CAIP-2 network"),
+                )
             }
 
             async fn evm(
                 &self,
+                _network: &connector_domain::Network,
                 channel_id: &[u8; 32],
                 presented_config: Option<&BatchChannelConfig>,
             ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -542,6 +547,7 @@ key_file = "{key_file}"
             serde_json::json!({
                 "version": "1.0",
                 "blockchain": "evm",
+                "network": format!("eip155:{}", domain().chain_id),
                 "scheme": "batch-settlement",
                 "messageId": format!("voucher-{amount}"),
                 "timestamp": "2026-09-27T12:00:00.000Z",
@@ -564,6 +570,7 @@ key_file = "{key_file}"
             serde_json::json!({
                 "version": "1.0",
                 "blockchain": "solana",
+                "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
                 "scheme": "batch-settlement",
                 "messageId": format!("voucher-{amount}"),
                 "timestamp": "2026-09-27T12:00:00Z",
@@ -591,6 +598,7 @@ key_file = "{key_file}"
             let channel_id = evm_channel(owner);
             let digest = evm_voucher_claim_state_challenge_digest(&domain(), &channel_id, expires);
             challenge_json::encode(&PeerRoleChallenge::Evm {
+                network: connector_domain::Network::Eip155(domain().chain_id),
                 channel_id,
                 expires,
                 signature: sign_evm(signer, &digest),
@@ -614,6 +622,9 @@ key_file = "{key_file}"
         ) -> String {
             let message = solana_voucher_claim_state_challenge_message(&account, expires);
             challenge_json::encode(&PeerRoleChallenge::Solana {
+                network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                    .parse()
+                    .expect("a CAIP-2 network"),
                 channel_account: account,
                 expires,
                 signature: signer.sign(&message).to_bytes(),
@@ -945,6 +956,7 @@ key_file = "{key_file}"
                         connector_runtime::SettlementChain::Evm,
                         &format!("0x{}", hex::encode(address_of(&peer_key()))),
                         Some(&channel),
+                        None,
                     )
                     .expect("store is a configured peering"),
                 );
@@ -1122,6 +1134,7 @@ key_file = "{key_file}"
                 &evm_voucher_digest(&domain(), &channel_id, u128::from(expires)),
             );
             let voucher_as_challenge = challenge_json::encode(&PeerRoleChallenge::Evm {
+                network: connector_domain::Network::Eip155(domain().chain_id),
                 channel_id,
                 expires,
                 signature: voucher_signature,
@@ -1151,6 +1164,9 @@ key_file = "{key_file}"
                 .sign(&solana_voucher_message(&PEER_ACCOUNT, expires, 0))
                 .to_bytes();
             let solana_voucher_as_challenge = challenge_json::encode(&PeerRoleChallenge::Solana {
+                network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                    .parse()
+                    .expect("a CAIP-2 network"),
                 channel_account: PEER_ACCOUNT,
                 expires,
                 signature: solana_voucher_signature,

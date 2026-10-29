@@ -916,16 +916,21 @@ mod tests {
     /// one ratio, as `fee.rs` and `rate.rs` both use it.
     const USDC_TO_ANYONE: u64 = 4_000_000_000_000;
 
+    /// Base's chain id: every token here is on it unless a test says otherwise.
+    const BASE: u64 = 8453;
+    /// Arbitrum One's chain id.
+    const ARBITRUM: u64 = 42161;
+
     fn usdc() -> AssetId {
-        AssetId::evm("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+        AssetId::erc20(BASE, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
     }
 
     fn anyone() -> AssetId {
-        AssetId::evm("0x1111111111111111111111111111111111111111")
+        AssetId::erc20(BASE, "0x1111111111111111111111111111111111111111")
     }
 
     fn weth() -> AssetId {
-        AssetId::evm("0x2222222222222222222222222222222222222222")
+        AssetId::erc20(BASE, "0x2222222222222222222222222222222222222222")
     }
 
     fn rate(numerator: u64, denominator: u64) -> Rate {
@@ -961,6 +966,28 @@ mod tests {
         let mut table = RateTable::new(usdc(), defaults());
         table.refresh(anyone(), usdc(), mid, observed);
         table
+    }
+
+    #[test]
+    fn a_lookup_keys_on_the_network_as_well_as_the_token() {
+        // ADR 0086 decision 13: USDC at one address on two networks is two
+        // assets, so a rate declared on Base answers nothing on Arbitrum.
+        let usdc_on_arbitrum = AssetId::erc20(ARBITRUM, usdc().token());
+        let mut table = RateTable::new(usdc(), defaults());
+        table.declare(usdc(), usdc_on_arbitrum.clone(), rate(1, 1));
+
+        assert!(table.lookup(&usdc(), &usdc_on_arbitrum, at(0)).is_live());
+        let anyone_on_arbitrum = AssetId::erc20(ARBITRUM, anyone().token());
+        assert_eq!(
+            table.lookup(&anyone_on_arbitrum, &usdc_on_arbitrum, at(0)),
+            RateLookup::NotDeclared
+        );
+        let mut quoted_on_base = quoted(rate(3, 2), at(0));
+        quoted_on_base.declare(usdc(), anyone(), rate(2, 3));
+        assert_eq!(
+            quoted_on_base.lookup(&anyone_on_arbitrum, &usdc(), at(0)),
+            RateLookup::NotDeclared
+        );
     }
 
     #[test]

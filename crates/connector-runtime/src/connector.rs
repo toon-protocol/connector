@@ -417,6 +417,17 @@ pub struct ClientRoutePrice {
     pub payment: bool,
 }
 
+/// Which network an admitted x402 channel is on (ADR 0086 decision 14), as
+/// whatever verified its vouchers knows it: on EVM, the network whose
+/// EIP-712 domain reproduced the channel id. The journal key
+/// (`evm:0x…`) does not say, because an EVM channel id already binds its
+/// chain (decision 9).
+pub trait ChannelNetworks: Send + Sync {
+    /// The CAIP-2 network of the channel `channel_key` (`evm:0x…`,
+    /// `solana:…`), or `None` for a channel this source never admitted.
+    fn network_of(&self, channel_key: &str) -> Option<connector_domain::Network>;
+}
+
 /// The connector's packet plane: a fixed set of terminated routes and peer
 /// routes, an [`AppClient`] port for delivering to the apps behind
 /// terminated routes, a [`PeerTransport`] port for forwarding to the next
@@ -493,10 +504,16 @@ pub struct Connector {
     /// through. `None` on a node with no x402 backend, which then peers
     /// with nobody.
     outbound_channels: Option<Arc<OutboundChannels>>,
-    /// This node's own CAIP-2 network on each chain it pays x402 on, as its
-    /// greeting publishes it: a counterparty's terms must name the same one
-    /// before this node opens a channel on them.
+    /// This node's own CAIP-2 networks, with the chain each is on, as its
+    /// greeting publishes them -- one per EVM table and the one Solana
+    /// table (ADR 0086): a counterparty's terms must name one of them before
+    /// this node opens a channel on them.
     x402_networks: Vec<(SettlementChain, String)>,
+    /// Which network an admitted channel is on, for a chain on which this
+    /// node holds several (ADR 0086 decision 14): the claim gate, which
+    /// verified the channel under its network's domain. Set once the gate
+    /// exists, after this connector is shared.
+    channel_networks: RwLock<Option<Arc<dyn ChannelNetworks>>>,
     /// The node's one root-level `socks_proxy` (ADR 0070), if configured:
     /// what a runtime peering's claim-state ask leaves on when the peer's
     /// client edge is an onion host ([`Connector::register_voucher_hop`]).
@@ -694,6 +711,19 @@ pub enum ConfigPeeringError {
          the channel this node opened toward that peer (GET /channels lists them)"
     )]
     OutboundChannelPaysSomeoneElse { peer_id: String, channel: String },
+    /// A `[[pay_channels]]` row on one network naming an outbound channel
+    /// this node holds on another (ADR 0086 decision 11).
+    #[error(
+        "the [[pay_channels]] row for peer '{peer_id}' is on {row}, and outbound channel \
+         '{channel}' is held on {held_on}: a peering is on one network (ADR 0086), so name the \
+         channel this node opened on {row}, or put the row on {held_on}"
+    )]
+    OutboundChannelOnAnotherNetwork {
+        peer_id: Box<str>,
+        channel: Box<str>,
+        row: Box<str>,
+        held_on: Box<str>,
+    },
     /// A `[[peer_channels]]` row's voucher signer is not in its chain's
     /// spelling. `Config::load` refuses one first; the second lock.
     #[error(
@@ -855,6 +885,7 @@ impl Connector {
             outbound_voucher_hops: ArcSwap::from_pointee(HashMap::new()),
             outbound_channels: None,
             x402_networks: Vec::new(),
+            channel_networks: RwLock::new(None),
             socks_proxy: None,
             config_peer_ids: HashSet::new(),
             runtime_peers: ArcSwap::from_pointee(RuntimePeers::new()),
@@ -941,22 +972,26 @@ impl Connector {
     }
 
     /// Narrow a fetched self-description's published x402 terms to the one
-    /// chain this connector will open its outbound channel on.
+    /// network this connector will open its outbound channel on (ADR 0086
+    /// decision 12).
     pub(crate) fn shared_settlement(
         &self,
         document: &connector_domain::NodeSelfDescription,
-        wanted: Option<SettlementChain>,
+        wanted: Option<&connector_domain::Network>,
         url: &url::Url,
     ) -> Result<crate::peering::SharedSettlement, crate::peering::EstablishPeeringError> {
         // A peering is two x402 channels on either chain (ADR 0075 decision
         // 4, #1378 on EVM, #1379 on Solana): a node with no x402 channels to
-        // pay on a chain shares that chain with nobody.
-        crate::peering::shared_settlement_of(
-            document,
-            |chain| self.outbound_channels.is_some() && self.x402_network(chain).is_some(),
-            wanted,
-            url,
-        )
+        // pay on shares no network with anybody.
+        let ours: Vec<&str> = if self.outbound_channels.is_some() {
+            self.x402_networks
+                .iter()
+                .map(|(_, network)| network.as_str())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        crate::peering::shared_settlement_of(document, &ours, wanted, url)
     }
 
     /// Make a runtime peering dialable, if this node holds a registrar.
@@ -1120,7 +1155,13 @@ impl Connector {
         let incoming = match arrived? {
             Arrival::Operator => return None,
             Arrival::Peer(peer_id) => self.peer_asset(peer_id)?,
-            Arrival::ClientChannel(channel_key) => self.client_channel_assets.asset(channel_key)?,
+            Arrival::ClientChannel(channel_key) => {
+                let network = self
+                    .verified_network(channel_key)
+                    .and_then(|network| network.parse::<connector_domain::Network>().ok());
+                self.client_channel_assets
+                    .asset_on(channel_key, network.as_ref())?
+            }
         };
         let outgoing = self.peer_asset(outgoing_peer_id)?;
         // The compare itself is `PeeringAssets::crosses`: both legs are
@@ -1189,7 +1230,14 @@ impl Connector {
                 chain,
                 &ChannelId(binding.channel().to_string()),
             );
-            let Some(asset) = self.client_channel_assets.asset(&key) else {
+            let network = match binding {
+                RuntimePeerChannel::EvmVoucher { network, .. }
+                | RuntimePeerChannel::SolanaVoucher { network, .. } => {
+                    network.parse::<connector_domain::Network>().ok()
+                }
+                _ => None,
+            };
+            let Some(asset) = self.client_channel_assets.asset_on(&key, network.as_ref()) else {
                 continue;
             };
             match resolved {
@@ -1294,12 +1342,44 @@ impl Connector {
         self.outbound_channels.as_ref()
     }
 
-    /// This node's own CAIP-2 network on `chain`, if it pays x402 there.
-    pub(crate) fn x402_network(&self, chain: SettlementChain) -> Option<&str> {
+    /// This node's own CAIP-2 networks on `chain`, in table order.
+    pub(crate) fn x402_networks_on(&self, chain: SettlementChain) -> Vec<&str> {
         self.x402_networks
             .iter()
-            .find(|(configured, _)| *configured == chain)
+            .filter(|(configured, _)| *configured == chain)
             .map(|(_, network)| network.as_str())
+            .collect()
+    }
+
+    /// Tell this connector which network each admitted channel is on (ADR
+    /// 0086 decision 14): consulted for a chain on which it holds several
+    /// networks. Replaces any source set before.
+    pub fn set_channel_networks(&self, source: Arc<dyn ChannelNetworks>) {
+        *self
+            .channel_networks
+            .write()
+            .expect("channel networks lock poisoned") = Some(source);
+    }
+
+    /// The CAIP-2 network a payment on `channel_key` was verified on (ADR
+    /// 0086 decision 14). On a chain where this node holds one network, the
+    /// chain decides it; on one where it holds several, the claim gate that
+    /// verified the channel under its network's domain does. `None` for a
+    /// key on no chain this node settles on, or a channel no source knows.
+    fn verified_network(&self, channel_key: &str) -> Option<String> {
+        let (namespace, _) = channel_key.split_once(':')?;
+        let chain = namespace.parse::<SettlementChain>().ok()?;
+        match self.x402_networks_on(chain).as_slice() {
+            [] => None,
+            [only] => Some((*only).to_string()),
+            _ => self
+                .channel_networks
+                .read()
+                .expect("channel networks lock poisoned")
+                .as_ref()?
+                .network_of(channel_key)
+                .map(|network| network.to_string()),
+        }
     }
 
     /// Register an x402 peering's outbound channel as the hop `peer_id` is
@@ -1421,6 +1501,7 @@ impl Connector {
         outbound_channel: &str,
         client_edge_url: &url::Url,
         answer_timeout: std::time::Duration,
+        network: Option<&connector_domain::Network>,
     ) -> Result<Self, ConfigPeeringError> {
         let Some(outbound) = self.outbound_channels.as_ref() else {
             return Err(ConfigPeeringError::NoOutboundChannels {
@@ -1432,6 +1513,18 @@ impl Connector {
                 peer_id: peer_id.to_string(),
                 channel: outbound_channel.to_string(),
             });
+        }
+        // A config peering is on the network its rows name (ADR 0086
+        // decision 11): the channel the row pays on must be held there.
+        if let (Some(row), Some(held_on)) = (network, outbound.network(outbound_channel)) {
+            if *row != held_on {
+                return Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
+                    peer_id: peer_id.into(),
+                    channel: outbound_channel.into(),
+                    row: row.to_string().into(),
+                    held_on: held_on.to_string().into(),
+                });
+            }
         }
         // A peering's settlement key both signs its vouchers toward this node
         // and receives this node's (ADR 0075 decision 4), so where the config
@@ -1501,6 +1594,7 @@ impl Connector {
         chain: SettlementChain,
         voucher_signer: &str,
         inbound_channel: Option<&str>,
+        network: Option<&connector_domain::Network>,
     ) -> Result<Self, ConfigPeeringError> {
         let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
             return Err(ConfigPeeringError::VoucherSignerUnreadable {
@@ -1517,16 +1611,10 @@ impl Connector {
                 peer_id.to_string(),
             )));
         }
-        match inbound_channel {
-            None => self
-                .voucher_bindings
-                .bind(peer_id, signer)
-                .map_err(unbound)?,
-            Some(channel) => self
-                .voucher_bindings
-                .bind_on_channel(peer_id, signer, channel)
-                .map_err(unbound)?,
-        }
+        // ADR 0086 decision 11: the row's network is the peering's.
+        self.voucher_bindings
+            .bind_on_network(peer_id, signer, network, inbound_channel)
+            .map_err(unbound)?;
         Ok(self)
     }
 
@@ -1564,13 +1652,17 @@ impl Connector {
         peer_id: &str,
         binding: &RuntimePeerChannel,
     ) -> Result<(), VoucherBindingError> {
-        let (chain, voucher_signer) = match binding {
-            RuntimePeerChannel::EvmVoucher { voucher_signer, .. } => {
-                (SettlementChain::Evm, voucher_signer)
-            }
-            RuntimePeerChannel::SolanaVoucher { voucher_signer, .. } => {
-                (SettlementChain::Solana, voucher_signer)
-            }
+        let (chain, voucher_signer, network) = match binding {
+            RuntimePeerChannel::EvmVoucher {
+                voucher_signer,
+                network,
+                ..
+            } => (SettlementChain::Evm, voucher_signer, network),
+            RuntimePeerChannel::SolanaVoucher {
+                voucher_signer,
+                network,
+                ..
+            } => (SettlementChain::Solana, voucher_signer, network),
             RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return Ok(()),
         };
         let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
@@ -1582,7 +1674,12 @@ impl Connector {
             );
             return Ok(());
         };
-        self.voucher_bindings.bind(peer_id, signer)
+        // ADR 0086 decision 11: the peer's half is the peering's only on the
+        // peering's own network. A row whose network does not parse (none
+        // written since #1599 lacks one) binds on any, as before.
+        let network = network.parse::<connector_domain::Network>().ok();
+        self.voucher_bindings
+            .bind_on_network(peer_id, signer, network.as_ref(), None)
     }
 
     /// Configure this node's own identity key (issue #524), used to open a
@@ -1827,13 +1924,30 @@ impl Connector {
     }
 
     /// The peering `signer` proves on `channel` -- an EVM channel id as
-    /// lower-case `0x` hex, a Solana channel account in base58 -- if it is
-    /// bound to one: [`Self::voucher_signer_peer`], except that a signer a
-    /// `[[peer_channels]]` row pinned to one `inbound_channel` proves
-    /// nothing on any other.
+    /// lower-case `0x` hex, a Solana channel account in base58 -- on
+    /// `network`, if it is bound to one: [`Self::voucher_signer_peer`],
+    /// except that a signer a `[[peer_channels]]` row pinned to one
+    /// `inbound_channel` proves nothing on any other, and one bound on a
+    /// network proves nothing on another (ADR 0086 decision 11).
     #[must_use]
-    pub fn voucher_signer_peer_on(&self, signer: &VoucherSigner, channel: &str) -> Option<String> {
-        self.voucher_bindings.peer_for_channel(signer, channel)
+    pub fn voucher_signer_peer_on(
+        &self,
+        signer: &VoucherSigner,
+        channel: &str,
+        network: &connector_domain::Network,
+    ) -> Option<String> {
+        self.voucher_bindings
+            .peer_for_channel(signer, channel, network)
+    }
+
+    /// The network the peering `signer` proves is on, when it was bound on
+    /// one.
+    #[must_use]
+    pub fn voucher_signer_network(
+        &self,
+        signer: &VoucherSigner,
+    ) -> Option<connector_domain::Network> {
+        self.voucher_bindings.network_of(signer)
     }
 
     /// Whether any voucher signer is bound at all. `false` on every node
@@ -3310,6 +3424,16 @@ impl Connector {
                 hop.channel_id
             )));
         };
+        // ADR 0086 decision 1: every voucher and challenge names the network
+        // its channel is on -- the network whose payer it was opened, or
+        // restored, on.
+        let Some(network) = outbound.network(&hop.channel_id) else {
+            return Err(CoverError::Failed(format!(
+                "peer '{peer_id}' is paid over x402 channel {}, on a chain for which this node \
+                 publishes no CAIP-2 network to name on its vouchers",
+                hop.channel_id
+            )));
+        };
         // PF-26: every wait below ends at the packet's outgoing expiry, and
         // the expiry is read again after each one, so a packet that ran out
         // of time while this forward queued, asked, or both is refused
@@ -3337,7 +3461,7 @@ impl Connector {
                     match tokio::time::timeout(
                         budget,
                         hop.claim_state
-                            .watermark(&presentation, expires, &signature),
+                            .watermark(&presentation, &network, expires, &signature),
                     )
                     .await
                     {
@@ -3387,7 +3511,7 @@ impl Connector {
                 .map_err(|error| CoverError::Failed(error.to_string()))?;
             return Ok((
                 Covering::Challenge(
-                    challenge_entry(&presentation, expires, &signature).to_string(),
+                    challenge_entry(&presentation, &network, expires, &signature).to_string(),
                 ),
                 0,
             ));
@@ -3401,6 +3525,7 @@ impl Connector {
         Ok((
             Covering::Voucher(voucher_json(
                 &presentation,
+                &network,
                 &voucher,
                 &voucher_sender(&presentation),
                 &self
@@ -3648,15 +3773,20 @@ impl Connector {
         // route states the packet's whole `amount`, which the carriage's gate
         // has already made the voucher's own advance; at any other route a
         // peer arrival states nothing.
+        let network = client_channel_id
+            .or(peer_channel)
+            .and_then(|channel_key| self.verified_network(channel_key));
         let attribution = match (client_channel_id, peer_channel) {
             (Some(claim_key), _) => Some(PaymentAttribution {
                 claim_key,
                 charge,
+                network: network.as_deref(),
                 zk_note_network: self.zk_note_network.as_deref(),
             }),
             (None, Some(channel_key)) if route.payment() => Some(PaymentAttribution {
                 claim_key: channel_key,
                 charge: prepare.amount,
+                network: network.as_deref(),
                 zk_note_network: None,
             }),
             _ => None,
@@ -4411,8 +4541,13 @@ mod tests {
     /// that a header is *absent*.
     mod payment_attribution {
         use super::*;
-        use crate::attribution::{AMOUNT_HEADER, CHAIN_HEADER, PAYER_HEADER};
+        use crate::attribution::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER};
         use crate::Delivery;
+
+        /// The networks this node verifies payments on, as its greeting
+        /// publishes them: one per chain (ADR 0086 decision 14).
+        const EVM_NETWORK: &str = "eip155:31337";
+        const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 
         /// The channel key the client edge admits a covering EVM claim
         /// under -- `ClientClaim::channel_key`'s own spelling.
@@ -4448,7 +4583,11 @@ mod tests {
                 StaticRoute::new_priced("g.example.app", "http://localhost:4000", price).unwrap();
             let app_client = Arc::new(FakeAppClient::new());
             app_client.respond(route.handler_url(), answered(b"stored"));
-            let connector = connector_with(vec![route], app_client.clone(), test_clock());
+            let mut connector = connector_with(vec![route], app_client.clone(), test_clock());
+            connector.x402_networks = vec![
+                (SettlementChain::Evm, EVM_NETWORK.to_string()),
+                (SettlementChain::Solana, SOLANA_NETWORK.to_string()),
+            ];
             let prepare = Prepare {
                 data: sealed_data,
                 ..prepare("g.example.app", b"unused")
@@ -4477,6 +4616,27 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), Some(PAYING_CHANNEL));
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+        }
+
+        /// ADR 0086 decision 14: the app is told the CAIP-2 network the
+        /// paying channel was verified on, so it knows whose base units
+        /// `X-TOON-Amount` is in -- for an EVM channel and a Solana one.
+        #[tokio::test]
+        async fn a_paid_delivery_names_the_network_its_claim_was_verified_on() {
+            let (data, _secret) = sealed_envelope_request_data(b"an event");
+            let delivery = deliver(PRICE, Some(PAYING_CHANNEL), data).await;
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(EVM_NETWORK));
+            assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+
+            let (data, _secret) = sealed_envelope_request_data(b"an event");
+            let delivery = deliver(
+                PRICE,
+                Some("solana:9xQeWvG816bUx9EPjHmaT23yvVM2ZHbGrX"),
+                data,
+            )
+            .await;
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(SOLANA_NETWORK));
+            assert_eq!(header(&delivery, CHAIN_HEADER), Some("solana"));
         }
 
         /// ADR 0040 as amended by ADR 0080 decision 6: a packet a zk edge
@@ -4508,6 +4668,10 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("mina:devnet"));
+            // ADR 0086 decision 14: the network header carries the CAIP-2
+            // network the payment was verified on -- for an allowance, the
+            // vault's.
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some("mina:devnet"));
         }
 
         /// The chain is read off the admitted claim's own namespace, not
@@ -4542,6 +4706,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
         }
 
         /// A free route charged nothing, so there is no payment to
@@ -4555,6 +4720,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
         }
 
         /// The spoof defence: a sender who seals its own `X-TOON-Payer`
@@ -4571,6 +4737,7 @@ mod tests {
                     ),
                     ("x-toon-amount".to_string(), "1".to_string()),
                     ("X-Toon-Chain".to_string(), "solana".to_string()),
+                    ("x-toon-network".to_string(), SOLANA_NETWORK.to_string()),
                 ],
                 b"an event",
             );
@@ -4580,6 +4747,17 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), Some(PAYING_CHANNEL));
             assert_eq!(header(&delivery, AMOUNT_HEADER), Some("1000"));
             assert_eq!(header(&delivery, CHAIN_HEADER), Some("evm"));
+            assert_eq!(header(&delivery, NETWORK_HEADER), Some(EVM_NETWORK));
+            assert_eq!(
+                delivery
+                    .request
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case(NETWORK_HEADER))
+                    .count(),
+                1,
+                "the sender's network must be removed, not joined by ours"
+            );
             assert_eq!(
                 delivery
                     .request
@@ -4602,6 +4780,7 @@ mod tests {
                 ("X-TOON-Payer".to_string(), "evm:0xvictim".to_string()),
                 ("X-TOON-Amount".to_string(), "999999".to_string()),
                 ("X-TOON-Chain".to_string(), "evm".to_string()),
+                ("X-TOON-Network".to_string(), EVM_NETWORK.to_string()),
                 ("Content-Type".to_string(), "application/json".to_string()),
             ];
             let (data, _secret) =
@@ -4612,6 +4791,7 @@ mod tests {
             assert_eq!(header(&delivery, PAYER_HEADER), None);
             assert_eq!(header(&delivery, AMOUNT_HEADER), None);
             assert_eq!(header(&delivery, CHAIN_HEADER), None);
+            assert_eq!(header(&delivery, NETWORK_HEADER), None);
             // The sender's other headers are its own business and reach
             // the app untouched.
             assert_eq!(header(&delivery, "content-type"), Some("application/json"));
@@ -5441,14 +5621,14 @@ mod tests {
 
     /// USDC on Base: 6 decimals, and the numeraire throughout, as in ADR
     /// 0071's own examples.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     /// ANYONE on Base: 18 decimals against USDC's 6, which is where the
     /// `10^12` in ADR 0071's motivating error comes from.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// USDC on Solana: the SAME asset as [`USDC`] on another chain, which
     /// `AssetId` nevertheless distinguishes -- today's `mixed-chain`
     /// crossing, and the pair ADR 0071 decision 2 talks about.
-    const USDC_SOLANA: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC_SOLANA: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     /// One 6-decimals USDC base unit in 18-decimals ANYONE base units at
     /// four ANYONE to the USDC -- the decimals gap (`10^12`) and the market
@@ -6341,7 +6521,7 @@ mod tests {
             .with_client_channel_assets(
                 client_chains
                     .iter()
-                    .map(|(chain, token)| (*chain, asset(token)))
+                    .map(|(_, token)| asset(token))
                     .collect(),
             );
         (hop, peer, clock)
@@ -6459,22 +6639,23 @@ mod tests {
     /// ADR 0080 decision 7 (as amended) and ADR 0071, at a zk edge: a
     /// packet paid by an allowance claim arrives in nanomina, under the key
     /// `zk-note:<allowance id>`, and a forward out of it converts at the
-    /// operator's declared `mina:native` rate -- never leaves unconverted.
+    /// operator's declared rate out of native MINA -- never leaves
+    /// unconverted.
     #[tokio::test]
     async fn an_allowance_paid_arrival_converts_from_mina_at_the_declared_rate() {
         let peer = Arc::new(CarriesAndRemembers::quoting(0));
-        let assets: ClientChannelAssets =
-            [(SettlementChain::Evm, asset(USDC))].into_iter().collect();
+        const MINA: &str = "mina:devnet/slip44:12586";
+        let assets: ClientChannelAssets = [asset(USDC)].into_iter().collect();
         // Half a USDC to the MINA: 10^9 nanomina to 5 * 10^5 micro-USDC.
         let hop = dealing_hop_over(
             peer.clone(),
             &[("second-hop", USDC)],
             0,
             u64::MAX,
-            Some(declaring("mina:native", USDC, 1, 2_000)),
+            Some(declaring(MINA, USDC, 1, 2_000)),
             test_clock(),
         )
-        .with_client_channel_assets(assets.with_zk_edge());
+        .with_client_channel_assets(assets.with_zk_edge(asset(MINA)));
 
         // Two thousandths of a MINA, on an allowance.
         arrives_over_client_channel(&hop, "zk-note:00112233445566778899aabbccddeeff", 2_000_000)
@@ -6535,7 +6716,7 @@ mod tests {
             Some(table),
             clock.clone(),
         )
-        .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect());
+        .with_client_channel_assets([asset(USDC)].into_iter().collect());
 
         // Past the two-minute ttl `rate_guards` declares.
         clock.advance(Duration::seconds(121));
@@ -6650,7 +6831,7 @@ mod tests {
                     .into_iter()
                     .collect(),
             )
-            .with_client_channel_assets([(SettlementChain::Evm, asset(USDC))].into_iter().collect())
+            .with_client_channel_assets([asset(USDC)].into_iter().collect())
             .with_rate_table(declaring(USDC, ANYONE, USDC_TO_ANYONE, 1)),
             "second-hop",
         );
@@ -9612,6 +9793,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 signature: &[u8],
             ) -> Result<u128, String> {
@@ -9718,7 +9900,10 @@ mod tests {
         ) {
             let settles_on = match exit {
                 PayerExit::Withdrawal => (SettlementChain::Evm, "eip155:31337"),
-                PayerExit::Close => (SettlementChain::Solana, "solana:test"),
+                PayerExit::Close => (
+                    SettlementChain::Solana,
+                    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+                ),
             };
             let chain = InMemoryBatchChain::new(exit);
             let payer = Arc::new(InMemoryBatchSettlement::on(
@@ -9731,7 +9916,10 @@ mod tests {
             let outbound = Arc::new(
                 OutboundChannels::restore(
                     Arc::new(InMemoryJournal::new()),
-                    vec![(settles_on.0, payer as Arc<dyn BatchSettlementPayer>)],
+                    vec![(
+                        settles_on.1.parse().expect("a CAIP-2 network"),
+                        payer as Arc<dyn BatchSettlementPayer>,
+                    )],
                 )
                 .await
                 .expect("an empty journal"),
@@ -9787,9 +9975,15 @@ mod tests {
                 let (connector, _, _, _, channel) = peered().await;
                 let wired = connector
                     .with_config_peer_ids(["next-hop".to_string()])
-                    .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None)
+                    .with_config_voucher_signer(
+                        "next-hop",
+                        SettlementChain::Evm,
+                        &signer,
+                        None,
+                        None,
+                    )
                     .expect("bind the signer")
-                    .with_config_pay_channel("next-hop", &channel, &url, timeout);
+                    .with_config_pay_channel("next-hop", &channel, &url, timeout, None);
                 if pays_it {
                     assert!(wired.is_ok(), "the channel pays {signer}");
                 } else {
@@ -9800,6 +9994,42 @@ mod tests {
                     ));
                 }
             }
+        }
+
+        /// ADR 0086 decision 11: a config peering resolves its network from
+        /// its rows, so a `[[pay_channels]]` row on one network naming an
+        /// outbound channel this node holds on another is refused at boot by
+        /// name -- and one on the channel's own network is wired.
+        #[tokio::test]
+        async fn a_config_pay_channel_must_be_on_its_channels_own_network() {
+            let url = url::Url::parse("https://next-hop.example/ilp").unwrap();
+            let timeout = std::time::Duration::from_secs(1);
+            let (connector, _, _, _, channel) = peered().await;
+            let elsewhere: connector_domain::Network = "eip155:8453".parse().unwrap();
+            let refused = connector
+                .with_config_peer_ids(["next-hop".to_string()])
+                .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&elsewhere));
+            match refused {
+                Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
+                    peer_id,
+                    row,
+                    held_on,
+                    ..
+                }) => {
+                    assert_eq!(&*peer_id, "next-hop");
+                    assert_eq!(&*row, "eip155:8453");
+                    assert_eq!(&*held_on, "eip155:31337");
+                }
+                Err(other) => panic!("expected a network refusal, got {other:?}"),
+                Ok(_) => panic!("expected a network refusal, got a wired peering"),
+            }
+
+            let (connector, _, _, _, channel) = peered().await;
+            let own: connector_domain::Network = "eip155:31337".parse().unwrap();
+            assert!(connector
+                .with_config_peer_ids(["next-hop".to_string()])
+                .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&own))
+                .is_ok());
         }
 
         fn prepare(amount: u64) -> Prepare {
@@ -10239,7 +10469,12 @@ mod tests {
             let presentation = outbound.presentation(&channel).expect("the channel");
             let refused = hop
                 .claim_state
-                .watermark(&presentation, 0, &[1])
+                .watermark(
+                    &presentation,
+                    &connector_domain::Network::Eip155(84_532),
+                    0,
+                    &[1],
+                )
                 .await
                 .expect_err("no proxy, no dial");
             assert!(refused.contains("socks_proxy"), "{refused}");
@@ -10272,7 +10507,7 @@ mod tests {
                         channels: vec![RuntimePeerChannel::SolanaVoucher {
                             outbound_channel_id: channel.clone(),
                             voucher_signer: bs58::encode([0x02; 32]).into_string(),
-                            network: "solana:test".to_string(),
+                            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
                         }],
                         ..RuntimePeering::default()
                     },
@@ -10296,14 +10531,7 @@ mod tests {
                 )
                 .expect("the incoming peering's runtime row");
             let connector = connector
-                .with_client_channel_assets(
-                    [
-                        (SettlementChain::Evm, asset(USDC)),
-                        (SettlementChain::Solana, asset(USDC_SOLANA)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
+                .with_client_channel_assets([asset(USDC), asset(USDC_SOLANA)].into_iter().collect())
                 .with_rate_table(declaring(USDC, USDC_SOLANA, 1_000, 1));
 
             let response = connector
@@ -10362,7 +10590,7 @@ mod tests {
                             RuntimePeerChannel::SolanaVoucher {
                                 outbound_channel_id: bs58::encode([0x03; 32]).into_string(),
                                 voucher_signer: bs58::encode([0x04; 32]).into_string(),
-                                network: "solana:test".to_string(),
+                                network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
                             },
                         ],
                         ..RuntimePeering::default()
@@ -10370,12 +10598,7 @@ mod tests {
                 )
                 .expect("the ambiguous row");
             let connector = connector.with_client_channel_assets(
-                [
-                    (SettlementChain::Evm, asset(USDC)),
-                    (SettlementChain::Solana, asset(USDC_SOLANA)),
-                ]
-                .into_iter()
-                .collect(),
+                [asset(USDC), asset(USDC_SOLANA)].into_iter().collect(),
             );
 
             assert_eq!(connector.peer_asset("ambiguous"), None);
@@ -10415,6 +10638,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 _signature: &[u8],
             ) -> Result<u128, String> {
@@ -10431,6 +10655,7 @@ mod tests {
             async fn watermark(
                 &self,
                 _presentation: &ChannelPresentation,
+                _network: &connector_domain::Network,
                 _expires: u64,
                 _signature: &[u8],
             ) -> Result<u128, String> {

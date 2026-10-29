@@ -99,15 +99,23 @@ write_keys_file = "/app/data/operator-write-keys"
 # Neither row carries a `quote`: there is no AMM on either disposable chain
 # and no Solana-side `RateSource` exists, so this pair runs the STATIC ROW
 # below -- decision 3's arm for "a pair that cannot self-source".
+#
+# Every asset is CAIP-19 (ADR 0086 decision 2): it names its NETWORK, so USDC
+# on this anvil (`eip155:31337`) is a different asset from USDC at the same
+# address on any other EVM network. A Solana asset names its cluster by
+# genesis prefix, and the local validator starts from a fresh genesis on every
+# `--reset`, so no committed file can name it: the prefix below is a
+# placeholder that only has to be a well-formed CAIP-2 reference. Config
+# matches a `solana:` asset to the one `[settlement.solana]` table by mint.
 [[tokens]]
-asset = "evm:0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+asset = "eip155:31337/erc20:0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
 numeraire = true
 
 [[tokens]]
-asset = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+asset = "solana:LocaLSoLanaVaLidatorGenesis11111/token:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
 
 # ── The rate, and the whole of the arithmetic ────────────────────────────────
-# ORDERED, never sorted: this row prices `evm USDC -> solana mock` and says
+# ORDERED, never sorted: this row prices `anvil USDC -> solana mock` and says
 # nothing about the other direction.
 #
 # 4000/1 is a MID over BASE UNITS, and it folds two independent things into
@@ -122,8 +130,8 @@ asset = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
 # operator's declaration is not one -- which is why this topology rehearses
 # the same an hour after bring-up.
 [[rates]]
-from = "evm:0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-to = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
+from = "eip155:31337/erc20:0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+to = "solana:LocaLSoLanaVaLidatorGenesis11111/token:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX"
 rate = { numerator = 4000, denominator = 1 }
 
 # ── The three guards (ADR 0071 decision 5) ───────────────────────────────────
@@ -157,14 +165,14 @@ max_move = { numerator = 5, denominator = 100 }
 # public anvil mnemonic -- so the address is committable -- and asserted
 # against this line by that script. `decimals = 9` is checked against the
 # mint's own at boot.
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://anvil:8545"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"
 
 [settlement.solana]

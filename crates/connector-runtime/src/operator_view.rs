@@ -380,13 +380,13 @@ mod tests {
 
     /// USDC on Base, the numeraire -- ADR 0071's own example, and the one
     /// `connector-config`'s denomination tests and `rate_table`'s use.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     /// ANYONE on Base: 18 decimals against USDC's 6, and the token whose
     /// price comes off a pool rather than out of the file.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// A second dealt token, for the pairs that must not move when one
     /// does.
-    const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
+    const WETH: &str = "eip155:8453/erc20:0x4200000000000000000000000000000000000006";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("a declared asset")

@@ -1,4 +1,4 @@
-//! The x402 `batch-settlement` terms of `[settlement.evm]` and
+//! The x402 `batch-settlement` terms of `[settlement.eip155.<chainId>]` and
 //! `[settlement.solana]`: on what terms this node accepts, and opens, x402
 //! channels on that chain (ADR 0074 decisions 1 and 5, ADR 0075 decision 9).
 //!
@@ -43,7 +43,7 @@ pub const DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS: u64 = 86_400;
 /// published minimum above it would admit no channel at all.
 pub const EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS: u64 = 30 * 86_400;
 
-/// The EVM terms as `[settlement.evm]` wrote them. `asset_eip712_name` and
+/// The EVM terms as `[settlement.eip155.<chainId>]` wrote them. `asset_eip712_name` and
 /// `asset_eip712_version` are required (issue #1345, ADR 0075 decision 9);
 /// an omitted `min_withdraw_delay_secs` takes the default the record chose,
 /// an omitted `asset_transfer_method` is x402's own `eip3009`, and an
@@ -77,7 +77,7 @@ pub(crate) struct RawSolanaBatchSettlementTable {
 /// ADR 0075 decision 9).
 ///
 /// It names only the terms that are this node's to choose. `receiver` and
-/// `receiverAuthorizer` must both be the enclosing `[settlement.evm]` table's
+/// `receiverAuthorizer` must both be the enclosing `[settlement.eip155.<chainId>]` table's
 /// settlement address, and `token` its `token_address`; neither is declared
 /// here a second time (CF-26).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +99,7 @@ impl EvmBatchSettlementConfig {
     }
 
     /// The EIP-712 domain `name` of the asset this node accepts a deposit
-    /// in (`[settlement.evm] token_address`) -- `"USDC"` for the devnet's
+    /// in (`[settlement.eip155.<chainId>] token_address`) -- `"USDC"` for the devnet's
     /// Circle FiatToken v2.2, and the figure the greeting's
     /// `accepts[].extra.name` publishes (issue #1345). Configured, not read
     /// off the chain: see this table's own module doc for why.
@@ -161,22 +161,23 @@ impl SolanaBatchSettlementConfig {
     }
 }
 
-fn delay_at_or_above_floor(
-    table: &'static str,
-    key: &'static str,
-    value: u64,
-) -> Result<u64, ConfigError> {
+fn delay_at_or_above_floor(table: &str, key: &'static str, value: u64) -> Result<u64, ConfigError> {
     if value < BATCH_SETTLEMENT_DELAY_FLOOR_SECS {
-        return Err(ConfigError::BatchSettlementDelayBelowFloor { table, key, value });
+        return Err(ConfigError::BatchSettlementDelayBelowFloor {
+            table: table.to_string(),
+            key,
+            value,
+        });
     }
     Ok(value)
 }
 
 pub(crate) fn resolve_evm_batch_settlement(
+    table: &str,
     raw: RawEvmBatchSettlementTable,
 ) -> Result<EvmBatchSettlementConfig, ConfigError> {
     let min_withdraw_delay_secs = delay_at_or_above_floor(
-        "evm",
+        table,
         "min_withdraw_delay_secs",
         raw.min_withdraw_delay_secs
             .unwrap_or(DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS),
@@ -258,7 +259,7 @@ mod tests {
     /// fixture.
     fn evm(text: &str) -> Result<EvmBatchSettlementConfig, ConfigError> {
         let text = format!("asset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n{text}");
-        resolve_evm_batch_settlement(toml::from_str(&text).expect("valid TOML"))
+        resolve_evm_batch_settlement("eip155.31337", toml::from_str(&text).expect("valid TOML"))
     }
 
     fn solana(text: &str) -> Result<SolanaBatchSettlementConfig, ConfigError> {
@@ -294,10 +295,10 @@ mod tests {
         assert!(matches!(
             error,
             ConfigError::BatchSettlementDelayBelowFloor {
-                table: "evm",
+                ref table,
                 key: "min_withdraw_delay_secs",
                 value: 899,
-            }
+            } if table == "eip155.31337"
         ));
         let message = error.to_string();
         assert!(
@@ -325,6 +326,7 @@ mod tests {
     #[test]
     fn an_evm_table_with_an_empty_eip712_domain_field_is_refused_by_name() {
         let error = resolve_evm_batch_settlement(
+            "eip155.31337",
             toml::from_str("asset_eip712_name = \"\"\nasset_eip712_version = \"2\"")
                 .expect("valid TOML"),
         )
@@ -337,6 +339,7 @@ mod tests {
         ));
 
         let error = resolve_evm_batch_settlement(
+            "eip155.31337",
             toml::from_str("asset_eip712_name = \"USDC\"\nasset_eip712_version = \"\"")
                 .expect("valid TOML"),
         )
@@ -488,10 +491,10 @@ mod tests {
         assert!(matches!(
             error,
             ConfigError::BatchSettlementDelayBelowFloor {
-                table: "solana",
+                ref table,
                 key: "min_grace_period_secs",
                 value: 899,
-            }
+            } if table == "solana"
         ));
 
         let config = solana("min_sponsored_deposit = 1\nmin_grace_period_secs = 900")

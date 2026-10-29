@@ -204,8 +204,16 @@ and an open journaled but not yet confirmed is resumed rather than sent twice. T
 `"channel": { "id": "0x…", "status": "found" | "created" }` — so an unintended second channel shows
 up in your own output rather than on a block explorer later.
 
-**Two nodes that settle on more than one chain in common** must say which: add `"chain": "evm"` or
-`"chain": "solana"`. Without it the write is refused by name rather than resolved silently.
+**A peering is on one network** ([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
+decisions 11 and 12): both of its channels are. Two nodes that settle on **more than one network in
+common** — two EVM networks, or EVM and Solana — must say which with the CAIP-2 `"network"`, e.g.
+`"network": "eip155:8453"` or `"network": "solana:<genesis prefix>"`. Without it the write is refused
+as `AmbiguousNetwork` (`400`), naming every candidate, rather than resolved silently; with one network
+in common it is not needed. A counterparty on this node's chain but on none of its networks is a
+`502` naming both sides' networks. The `"chain"` filter this replaced is refused by name (`400`), so
+an old script fails loudly. A repeat that would put an existing peering on another network is a
+`409`: remove the peering and establish it again to move it. The answer's `channel` carries the
+`network` it is on.
 
 **A new peering starts at a conservative cap.** The cap is the most this connector is willing to lose
 in one theft, and nothing raises it automatically — a connector never earns its own cap
@@ -318,6 +326,18 @@ node knows every outbound channel it journaled and signs on each only above the 
 journaled — never below what the chain shows landed — so its watermark never goes backwards. While a
 channel's open is unconfirmed it is listed `opening`, and funding or withdrawing it answers `409`.
 
+**Each journaled channel names its network**
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 10), and every
+top-up, withdrawal, voucher and challenge on it goes through that network's settlement table. A
+record an earlier build wrote names none: at boot its EVM channel id is recomputed under each
+configured `[settlement.eip155.<chainId>]` table's x402 domain, the one table that reproduces it is
+its network, and the record is journaled again naming it, under the same `evm:0x…` key (a Solana
+record is the one Solana table's). A channel no table reproduces — or, for a record that names its
+network, one whose table is gone — is value the node still holds on a network its operator removed,
+and the node refuses to start, naming the channel. One that several tables reproduce is refused too,
+rather than placed by guess. The upgrade writes only entries that are the same whenever they are
+written, so a restart after a crash part-way through ends on the same journal.
+
 **The `toon-channel` writes are gone.** `redeem`, `redeem-latest`, `settle`, `close` and
 `cooperative-close` are deleted (#1376). **This build no longer lands a `toon-channel` claim on chain
 at all**: nothing on it redeemed one but these writes (#1376 found no automatic path, though the issue
@@ -334,8 +354,10 @@ Reads are gated by a bearer token — or, in this implementation, a write key's 
 (§4) — and nothing else: peers, routes (config, leased and runtime, each
 labelled by source), channels, claims, node identity, the write audit log, and metrics.
 
-`GET /channels` lists every x402 channel, inbound and outbound, each with its `direction`,
-`collateral` (what still backs a new voucher, read from the chain now), `landed`, `watermark` (the
+`GET /channels` lists every x402 channel, inbound and outbound, each with its `direction`, the
+CAIP-2 `network` it is on (ADR 0086 — where its collateral sits, and the network
+`POST /channels/:id/fund` deposits on; absent only for a channel none of this node's networks
+reproduces), `collateral` (what still backs a new voucher, read from the chain now), `landed`, `watermark` (the
 highest voucher signed, outbound, or accepted, inbound) and `status` (`opening`, `open`,
 `withdrawing`, `closing`, `sealed`, or `unreadable` with a `detail`), marked `scheme:
 "batch-settlement"`. Any `toon-channel` rows follow in their older shape. `GET /claims` shows vouchers

@@ -53,8 +53,8 @@ fn window() -> Duration {
 fn anyone_weth_leg(pool: &PoolId) -> QuoteLeg {
     QuoteLeg {
         pool: pool.clone(),
-        base: AssetId::evm(support::ANYONE),
-        quote: AssetId::evm(support::WETH),
+        base: AssetId::erc20(31337, support::ANYONE),
+        quote: AssetId::erc20(31337, support::WETH),
         window: window(),
     }
 }
@@ -62,8 +62,8 @@ fn anyone_weth_leg(pool: &PoolId) -> QuoteLeg {
 fn weth_usdc_leg(pool: &PoolId) -> QuoteLeg {
     QuoteLeg {
         pool: pool.clone(),
-        base: AssetId::evm(support::WETH),
-        quote: AssetId::evm(support::USDC),
+        base: AssetId::erc20(31337, support::WETH),
+        quote: AssetId::erc20(31337, support::USDC),
         window: window(),
     }
 }
@@ -150,8 +150,11 @@ async fn a_two_leg_quote_composes_to_a_known_good_rate() {
         compose_rates(first.rate, second.rate).expect("the legs compose"),
         "a path's rate is its legs' rates composed, and nothing else"
     );
-    assert_eq!(composed.path.base(), &AssetId::evm(support::ANYONE));
-    assert_eq!(composed.path.quote(), &AssetId::evm(support::USDC));
+    assert_eq!(
+        composed.path.base(),
+        &AssetId::erc20(31337, support::ANYONE)
+    );
+    assert_eq!(composed.path.quote(), &AssetId::erc20(31337, support::USDC));
 }
 
 /// Everything this reader refuses rather than guesses at, against the chain
@@ -212,7 +215,7 @@ async fn a_pool_that_cannot_answer_the_question_asked_says_so() {
     // for the wrong two tokens.
     let error = source
         .observe(&QuoteLeg {
-            base: AssetId::evm(support::USDC),
+            base: AssetId::erc20(31337, support::USDC),
             ..anyone_weth_leg(&venue.anyone_weth)
         })
         .await
@@ -244,8 +247,8 @@ async fn growing_observation_cardinality_is_what_makes_a_window_servable() {
     );
     let leg = QuoteLeg {
         pool: pool.pool.clone(),
-        base: AssetId::evm(support::ANYONE),
-        quote: AssetId::evm(support::WETH),
+        base: AssetId::erc20(31337, support::ANYONE),
+        quote: AssetId::erc20(31337, support::WETH),
         window: Duration::seconds(60),
     };
 

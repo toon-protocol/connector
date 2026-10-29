@@ -39,7 +39,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 use tower::ServiceExt;
 
-use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app};
+use support::{paid_prepare, post_ilp, solana_network, solana_voucher, spawn_recording_app};
 
 const ROUTE: &str = "g.toon.outbound";
 const PRICE: u64 = 300;
@@ -264,8 +264,9 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
 
     // -- A pays B; B lands it now, on an open channel --
     let receiver = b_runtime.signer.public_key().expect("B's wrap key");
+    let network = solana_network(&b_runtime);
     let pay = |outbound: std::sync::Arc<connector_runtime::OutboundChannels>, amount: u64| {
-        let (b_app, id, receiver) = (b_app.clone(), id.clone(), receiver);
+        let (b_app, id, receiver, network) = (b_app.clone(), id.clone(), receiver, network.clone());
         async move {
             let voucher = outbound
                 .sign_voucher(&id, u128::from(amount))
@@ -274,7 +275,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
             let signature: [u8; 64] = voucher.signature.try_into().expect("64 bytes");
             let response = post_ilp(
                 &b_app,
-                &solana_voucher(&id, amount, &signature),
+                &solana_voucher(&network, &id, amount, &signature),
                 paid_prepare(ROUTE, &receiver),
             )
             .await;

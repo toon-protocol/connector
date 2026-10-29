@@ -32,7 +32,7 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app};
+use support::{paid_prepare, post_ilp, solana_network, solana_voucher, spawn_recording_app};
 
 const ROUTE: &str = "g.toon.batch";
 const PRICE: u64 = 100;
@@ -124,7 +124,12 @@ price = {PRICE}
     for amount in [PRICE, 2 * PRICE] {
         let response = post_ilp(
             &app,
-            &solana_voucher(&channel.to_string(), amount, &payer.sign(&channel, amount)),
+            &solana_voucher(
+                &solana_network(&runtime),
+                &channel.to_string(),
+                amount,
+                &payer.sign(&channel, amount),
+            ),
             paid_prepare(ROUTE, &receiver),
         )
         .await;

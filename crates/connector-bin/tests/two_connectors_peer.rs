@@ -63,7 +63,7 @@ use connector_btp::{
     CONTENT_TYPE_TEXT,
 };
 use connector_domain::{Prepare, Reject};
-use connector_runtime::{FileJournal, InMemoryJournal, Journal, OutboundChannels, SettlementChain};
+use connector_runtime::{FileJournal, InMemoryJournal, Journal, OutboundChannels};
 use connector_settlement::batch::{
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms, Voucher,
 };
@@ -218,14 +218,14 @@ impl Chain {
     fn settlement_block(&self, key_file: &std::path::Path) -> String {
         format!(
             r#"
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,
@@ -259,7 +259,7 @@ key_file = "{key_file}"
         let outbound = OutboundChannels::restore(
             journal,
             vec![(
-                SettlementChain::Evm,
+                connector_domain::Network::Eip155(payer.domain().chain_id),
                 Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )
@@ -409,6 +409,7 @@ impl PeerFixture {
             .sign_voucher(&wallet, presentation.channel(), cumulative);
         connector_runtime::voucher_json(
             presentation,
+            &connector_domain::Network::Eip155(self.chain.x402.chain_id()),
             &Voucher {
                 cumulative_amount: cumulative,
                 signature,
@@ -1403,7 +1404,13 @@ async fn a_peer_voucher_is_acknowledged(carriage: Carriage) {
     let first = ack_of(b"first crossing", voucher.clone()).await;
     assert_eq!(
         first.as_deref(),
-        Some(r#"{"result":"accepted"}"#),
+        Some(
+            format!(
+                r#"{{"result":"accepted","network":"eip155:{}"}}"#,
+                fixture.chain.x402.chain_id()
+            )
+            .as_str()
+        ),
         "§6.1: the ack rides the response that already answers the voucher-bearing frame"
     );
     assert_eq!(
@@ -1417,7 +1424,13 @@ async fn a_peer_voucher_is_acknowledged(carriage: Carriage) {
     let resent = ack_of(b"retransmission", voucher).await;
     assert_eq!(
         resent.as_deref(),
-        Some(r#"{"result":"accepted"}"#),
+        Some(
+            format!(
+                r#"{{"result":"accepted","network":"eip155:{}"}}"#,
+                fixture.chain.x402.chain_id()
+            )
+            .as_str()
+        ),
         "§6.3: a voucher byte-identical to the one at the watermark MUST be re-acked \
          `accepted` -- a lost ack and a lost voucher are indistinguishable at the payer"
     );
@@ -1532,8 +1545,9 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives_over_http() 
 /// at default `forwarded_claim_enforcement`. A voucher covering only the
 /// charge buys nothing above it (`F03`, the app never called); one covering
 /// the amount reaches the app with `X-TOON-Amount` that amount, and
-/// `X-TOON-Payer` / `X-TOON-Chain` naming the inbound peering channel, over
-/// whatever the caller forged under those names.
+/// `X-TOON-Payer` / `X-TOON-Chain` naming the inbound peering channel, and
+/// `X-TOON-Network` its CAIP-2 network (ADR 0086 decision 14), over whatever
+/// the caller forged under those names.
 async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Carriage) {
     const CHARGE: u64 = 50;
     let Some(fixture) = PeerFixture::spawn().await else {
@@ -1549,6 +1563,7 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Ca
         ("X-TOON-Amount".to_string(), "999999".to_string()),
         ("x-toon-payer".to_string(), "evm:forged".to_string()),
         ("X-Toon-Chain".to_string(), "forged".to_string()),
+        ("x-toon-network".to_string(), "eip155:1".to_string()),
     ];
     let prepare_of = |amount: u64, body: &[u8]| {
         let (data, _shared) =
@@ -1586,6 +1601,7 @@ async fn a_peer_arrival_at_a_payment_route_is_paid_whatever_arrives(carriage: Ca
         vec![format!("evm:{}", fixture.payer_channel)]
     );
     assert_eq!(app.header(0, "x-toon-chain"), vec!["evm"]);
+    assert_eq!(app.header(0, "x-toon-network"), vec!["eip155:31337"]);
 
     // (2) The voucher advances by 400 and the packet declares 700: covers the
     // charge, not the amount. Refused F03; the wrap is never opened.

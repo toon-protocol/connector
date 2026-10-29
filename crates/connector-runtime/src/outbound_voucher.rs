@@ -30,6 +30,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 
 use crate::batch_channels::hex;
@@ -54,7 +55,9 @@ fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
     })
 }
 
-/// A voucher on `presentation`'s channel, as the claim slot carries it.
+/// A voucher on `presentation`'s channel, on `network` -- the CAIP-2 network
+/// the channel is on, which every voucher names (ADR 0086 decision 1) -- as
+/// the claim slot carries it.
 ///
 /// `sender_id` is this node's voucher signer in its chain's spelling -- a
 /// label, as a voucher's `senderId` always is: the receiver reads the
@@ -66,6 +69,7 @@ fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
 #[must_use]
 pub fn voucher_json(
     presentation: &ChannelPresentation,
+    network: &Network,
     voucher: &Voucher,
     sender_id: &str,
     timestamp: &str,
@@ -76,6 +80,7 @@ pub fn voucher_json(
         ChannelPresentation::Evm { channel, config } => serde_json::json!({
             "version": "1.0",
             "blockchain": "evm",
+            "network": network.to_string(),
             "scheme": "batch-settlement",
             "messageId": message_id,
             "timestamp": timestamp,
@@ -88,6 +93,7 @@ pub fn voucher_json(
         ChannelPresentation::Solana { channel } => serde_json::json!({
             "version": "1.0",
             "blockchain": "solana",
+            "network": network.to_string(),
             "scheme": "batch-settlement",
             "messageId": message_id,
             "timestamp": timestamp,
@@ -101,20 +107,23 @@ pub fn voucher_json(
     .to_string()
 }
 
-/// The voucher claim-state challenge for `presentation`'s channel, valid
-/// until `expires`, as a `POST /ilp/claim-state` entry: what the receiver
+/// The voucher claim-state challenge for `presentation`'s channel on
+/// `network`, valid until `expires`, as a `POST /ilp/claim-state` entry:
+/// what the receiver
 /// is asked with, and -- serialized -- what the peer-role challenge slot
 /// carries. An EVM entry carries the channel's config, so a receiver with
 /// no record of the channel yet can resolve it.
 #[must_use]
 pub fn challenge_entry(
     presentation: &ChannelPresentation,
+    network: &Network,
     expires: u64,
     signature: &[u8],
 ) -> serde_json::Value {
     match presentation {
         ChannelPresentation::Evm { channel, config } => serde_json::json!({
             "blockchain": "evm",
+            "network": network.to_string(),
             "scheme": "batch-settlement",
             "channelId": channel.0,
             "expires": expires,
@@ -123,6 +132,7 @@ pub fn challenge_entry(
         }),
         ChannelPresentation::Solana { channel } => serde_json::json!({
             "blockchain": "solana",
+            "network": network.to_string(),
             "scheme": "batch-settlement",
             "channelAccount": channel.0,
             "expires": expires,
@@ -137,11 +147,12 @@ pub fn challenge_entry(
 #[async_trait]
 pub trait VoucherStateSource: Send + Sync {
     /// The highest cumulative amount the receiver has accepted a voucher
-    /// for on `presentation`'s channel, proved by `signature` over the
-    /// challenge valid until `expires`.
+    /// for on `presentation`'s channel on `network`, proved by `signature`
+    /// over the challenge valid until `expires`.
     async fn watermark(
         &self,
         presentation: &ChannelPresentation,
+        network: &Network,
         expires: u64,
         signature: &[u8],
     ) -> Result<u128, String>;
@@ -169,12 +180,13 @@ impl VoucherStateSource for HttpVoucherState {
     async fn watermark(
         &self,
         presentation: &ChannelPresentation,
+        network: &Network,
         expires: u64,
         signature: &[u8],
     ) -> Result<u128, String> {
         let url = format!("{}/claim-state", self.edge_url.trim_end_matches('/'));
         let body = serde_json::json!({
-            "channels": [challenge_entry(presentation, expires, signature)],
+            "channels": [challenge_entry(presentation, network, expires, signature)],
         });
         let response = self
             .client
@@ -217,6 +229,7 @@ impl VoucherStateSource for UnreachableVoucherState {
     async fn watermark(
         &self,
         _presentation: &ChannelPresentation,
+        _network: &Network,
         _expires: u64,
         _signature: &[u8],
     ) -> Result<u128, String> {
@@ -228,6 +241,7 @@ impl VoucherStateSource for UnreachableVoucherState {
 mod tests {
     use super::*;
     use connector_domain::client_claim::{parse_client_claim, ClientClaim};
+    use connector_domain::Network;
     use connector_settlement::ChannelId;
 
     fn evm() -> ChannelPresentation {
@@ -251,6 +265,7 @@ mod tests {
     fn an_evm_voucher_is_the_client_edges_own_voucher_json() {
         let json = voucher_json(
             &evm(),
+            &Network::Eip155(84_532),
             &Voucher {
                 cumulative_amount: 1_234,
                 signature: vec![0x1b; 65],
@@ -262,6 +277,7 @@ mod tests {
             panic!("an EVM voucher");
         };
         assert_eq!(voucher.max_claimable_amount, 1_234);
+        assert_eq!(voucher.network, Network::Eip155(84_532));
         assert_eq!(voucher.channel_id, format!("0x{}", "ab".repeat(32)));
         let config = voucher
             .channel_config
@@ -277,6 +293,7 @@ mod tests {
             &ChannelPresentation::Solana {
                 channel: ChannelId(channel.clone()),
             },
+            &devnet(),
             &Voucher {
                 cumulative_amount: 7,
                 signature: vec![0x01; 64],
@@ -288,13 +305,21 @@ mod tests {
             panic!("a Solana voucher");
         };
         assert_eq!(voucher.channel_id, channel);
+        assert_eq!(voucher.network, devnet());
         assert_eq!(voucher.max_claimable_amount, 7);
+    }
+
+    fn devnet() -> Network {
+        "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+            .parse()
+            .expect("a CAIP-2 network")
     }
 
     #[test]
     fn a_challenge_entry_names_the_scheme_and_carries_the_config() {
-        let entry = challenge_entry(&evm(), 1_800_000_000, &[0x1c; 65]);
+        let entry = challenge_entry(&evm(), &Network::Eip155(84_532), 1_800_000_000, &[0x1c; 65]);
         assert_eq!(entry["scheme"], "batch-settlement");
+        assert_eq!(entry["network"], "eip155:84532");
         assert_eq!(entry["expires"], 1_800_000_000u64);
         assert_eq!(entry["channelConfig"]["withdrawDelay"], 86_400);
         assert_eq!(entry["signature"].as_str().expect("hex").len(), 2 + 2 * 65);

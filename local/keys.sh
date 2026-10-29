@@ -108,7 +108,9 @@ KEYS="$HERE/.keys/$TOPOLOGY"
 CONNECTOR="$ROOT/target/release/connector"
 SIGN_WRITE="$ROOT/docs/operators/sign-write.sh"
 
-ANVIL_RPC="${ANVIL_RPC:-http://127.0.0.1:8545}"
+# The host every local chain publishes its RPC on. Each anvil's port is its
+# EVM_NETWORKS entry's (below); 8545 is the shared one on 31337.
+CHAIN_HOST="${CHAIN_HOST:-127.0.0.1}"
 SOLANA_RPC="${SOLANA_RPC:-http://127.0.0.1:8899}"
 
 # anvil's own published accounts and the mnemonic they derive from -- "test
@@ -127,6 +129,11 @@ USDC_MINTER_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b7869
 # canonical `x402BatchSettlement` every EVM channel lives in.
 USDC=0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
 X402_BATCH_SETTLEMENT=0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003
+
+# The payee of every NETWORK_CHANNELS channel: anvil's genesis account 9, the
+# same address on every local anvil and no node's settlement address. Nothing
+# ever signs as it here; it only has to be somebody other than the payer.
+NETWORK_COUNTERPARTY=0xa0Ee7A142d267C1f36714E4a8F75612F20a79720
 
 # The deterministic mock mint (`infra/solana/create-usdc-mint.sh`) and the
 # program every Solana channel lives in: solana-foundation's `payment-channels`,
@@ -217,14 +224,33 @@ ONION_PLACEHOLDER_B=placeholderplaceholderplaceholderplaceholderplaceholderb.any
 #             `channels` stage sends its writes; `-` for a node with no host
 #             port at all (onion's B, whose only door is the circuit), which is
 #             written to from inside its own container instead.
-#   PEERINGS  `id:chain:payer:payee:fee:max_packet_amount` -- the PAYER is the
-#             side packets flow away from; `fee` is what it retains per packet
+#   PEERINGS  `id:network:payer:payee:fee:max_packet_amount` -- `network` is
+#             the CAIP-2 network the peering is on (ADR 0086 decision 12),
+#             both of its channels, and is what `POST /peers` is sent:
+#             `eip155:<chainId>`, or `solana:genesis` for the local validator,
+#             whose genesis is fresh on every start and so is read off it at
+#             the `channels` stage. The PAYER is the side packets flow away from; `fee` is what it retains per packet
 #             carried over this peering (ADR 0010, ADR 0061) and
 #             `max_packet_amount` its cap in the OUTGOING leg's unit (ADR
 #             0049; 0 keeps the default).
 #   ROUTES    `node:prefix:peer_id:price` -- a forwarding route written with
 #             `POST /routes/peers`, whose `price` is what that node's client
 #             edge charges for the prefix (ADR 0028).
+#   EVM_NETWORKS
+#             `eip155:<chainId>:<anvil service>:<host port>` -- every EVM
+#             network the topology's configs hold a table for, the compose
+#             anvil started on that chain id, and the host port its RPC is
+#             published on. Every node is funded on each. Only `solo` writes
+#             one (ADR 0086 decision 15: its second anvil, on 31338); every
+#             other topology keeps the default, the one shared anvil.
+#   NETWORK_CHANNELS
+#             `node:eip155:<chainId>` -- an outbound x402 channel `node` opens
+#             and funds on that network itself, with a signed `POST /channels`
+#             naming its own published terms for the network with the payee
+#             swapped for NETWORK_COUNTERPARTY. What solo uses to move money on
+#             each of its EVM networks with no peer to pay; the `channels`
+#             stage reads each back off its own anvil and requires it absent
+#             from every other.
 #
 # These figures are the peering half of each topology's arithmetic, the other
 # half being the committed `price` of the route that terminates it.
@@ -242,24 +268,28 @@ TOPOLOGY_MINT_INDEX=""
 TOPOLOGY_MINT_DECIMALS=6
 TOPOLOGY_MINT_TREASURY=""
 ROUTES=""
+EVM_NETWORKS="eip155:31337:anvil:8545"
+NETWORK_CHANNELS=""
 case "$TOPOLOGY" in
   solo)
     NODES="connector:4:14:3000"
     PEERINGS=""
+    EVM_NETWORKS="eip155:31337:anvil:8545 eip155:31338:anvil-31338:8546"
+    NETWORK_CHANNELS="connector:eip155:31337 connector:eip155:31338"
     ;;
   two-hop)
     NODES="connector-a:5:15:3001 connector-b:6:16:3002"
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0"
     ROUTES="connector-a:g.local.two-hop.b:a-b:1100"
     ;;
   mixed-chain)
     NODES="connector-a:7:17:3003 connector-b:8:18:3004 connector-c:9:19:3005"
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0 b-c:solana:connector-b:connector-c:50:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0 b-c:solana:genesis:connector-b:connector-c:50:0"
     ROUTES="connector-a:g.local.mixed.b:a-b:1200 connector-b:g.local.mixed.b.c:b-c:1100"
     ;;
   onion)
     NODES="connector-a:10:20:3006 connector-b:11:21:-"
-    PEERINGS="a-b:evm:connector-a:connector-b:200:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:200:0"
     ROUTES="connector-a:g.local.onion.b:a-b:1200"
     ;;
   dealing)
@@ -268,7 +298,7 @@ case "$TOPOLOGY" in
     # decision 1), and its cap is written out because the default -- one USDC
     # at six decimals -- is checked against the converted amount and would
     # refuse every crossing `T04`.
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0 b-c:solana:connector-b:connector-c:6000:1000000000"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0 b-c:solana:genesis:connector-b:connector-c:6000:1000000000"
     ROUTES="connector-a:g.local.dealing.b:a-b:1200 connector-b:g.local.dealing.b.c:b-c:1100"
     TOPOLOGY_MINT_INDEX="$DEALING_MINT_INDEX"
     TOPOLOGY_MINT_DECIMALS="$DEALING_MINT_DECIMALS"
@@ -629,6 +659,23 @@ render_onion_configs() {
 
 # ── Stage two: the peerings ──────────────────────────────────────────────────
 
+# The host-side RPC of EVM network `$1` (`eip155:<chainId>`): the published
+# port of the anvil EVM_NETWORKS starts on that chain id. A network the table
+# does not list is a failure, never the default anvil -- a read against the
+# wrong chain answers "no such channel", which looks like an unfunded one.
+evm_rpc() {
+  local evm namespace chain_id _service port
+  for evm in $EVM_NETWORKS; do
+    IFS=':' read -r namespace chain_id _service port <<<"$evm"
+    if [[ "$namespace:$chain_id" == "$1" ]]; then
+      echo "http://$CHAIN_HOST:$port"
+      return
+    fi
+  done
+  echo "ERROR: '$TOPOLOGY' starts no anvil on $1 (EVM_NETWORKS: $EVM_NETWORKS)." >&2
+  exit 1
+}
+
 # The channel `$2` of node `$1`, as its own `GET /channels` reports it: one
 # JSON object, or nothing.
 channel_view() {
@@ -646,9 +693,10 @@ for row in json.load(sys.stdin):
 # `$2` base units in it. The chain's own `channels(id)` -- never the node's
 # answer -- because the point is to catch a node that SAYS it funded a channel.
 assert_evm_channel() {
-  local id="$1" target="$2" label="$3" balance
+  local id="$1" target="$2" label="$3" network="$4" balance rpc
+  rpc="$(evm_rpc "$network")"
   balance="$(cast call "$X402_BATCH_SETTLEMENT" "channels(bytes32)(uint128,uint128)" "$id" \
-    --rpc-url "$ANVIL_RPC" | head -1 | cut -d' ' -f1)"
+    --rpc-url "$rpc" | head -1 | cut -d' ' -f1)"
   if [[ -z "$balance" || "$balance" -lt "$target" ]]; then
     echo "ERROR: '$label': x402BatchSettlement holds ${balance:-nothing} in channel $id, not the" >&2
     echo "       $target its payer was topped up to." >&2
@@ -707,13 +755,27 @@ print(f"{label}: payment-channels holds {deposit} in {channel} (at least {target
 ' "$PAYMENT_CHANNELS_PROGRAM" "$payer" "$payee" "$SOLANA_MINT" "$target" "'$label'" "$id"
 }
 
-# `POST /peers` from `$1` naming `$2`, on `$3`, at fee `$4` and cap `$5`,
-# opening with OPEN_DEPOSIT: the established channel's id on stdout.
+# The local validator's CAIP-2 reference: the first 32 base58 characters of its
+# genesis hash, as the connector names the cluster it settles on. Read, never
+# written down: the validator starts from a fresh genesis every time.
+local_solana_network() {
+  local genesis
+  genesis="$(solana genesis-hash --url "$SOLANA_RPC")"
+  if [[ ${#genesis} -lt 32 ]]; then
+    echo "ERROR: $SOLANA_RPC answered no genesis hash ('$genesis')." >&2
+    exit 1
+  fi
+  echo "solana:${genesis:0:32}"
+}
+
+# `POST /peers` from `$1` naming `$2`, on the CAIP-2 network `$3`, at fee `$4`
+# and cap `$5`, opening with OPEN_DEPOSIT: the established channel's id on
+# stdout.
 establish() {
-  local from="$1" to="$2" chain="$3" fee="$4" cap="$5" id="$6"
+  local from="$1" to="$2" network="$3" fee="$4" cap="$5" id="$6"
   local body answer channel status
-  body="$(printf '{"id":"%s","url":"%s","fee":%s,"max_packet_amount":%s,"chain":"%s","deposit":%s}' \
-    "$id" "$(node_url "$to")" "$fee" "$cap" "$chain" "$OPEN_DEPOSIT")"
+  body="$(printf '{"id":"%s","url":"%s","fee":%s,"max_packet_amount":%s,"network":"%s","deposit":%s}' \
+    "$id" "$(node_url "$to")" "$fee" "$cap" "$network" "$OPEN_DEPOSIT")"
   # On `onion` the other node's self-description is read over a circuit, and a
   # freshly published hidden service takes a while to become reachable -- the
   # rehearsal waits up to five minutes for its rendezvous for the same reason.
@@ -733,11 +795,11 @@ establish() {
   done
   channel="$(json_field 'doc["channel"]["id"]' <<<"$answer")"
   status="$(json_field 'doc["channel"]["status"]' <<<"$answer")"
-  if [[ -z "$channel" || "$(json_field 'doc["channel"]["chain"]' <<<"$answer")" != "$chain" ]]; then
-    echo "ERROR: $from's POST /peers for '$id' answered without a $chain channel: $answer" >&2
+  if [[ -z "$channel" || "$(json_field 'doc["channel"]["network"]' <<<"$answer")" != "$network" ]]; then
+    echo "ERROR: $from's POST /peers for '$id' answered without a channel on $network: $answer" >&2
     exit 1
   fi
-  echo "'$id': $from -> $to on $chain, channel $channel ($status)" >&2
+  echo "'$id': $from -> $to on $network, channel $channel ($status)" >&2
   echo "$channel"
 }
 
@@ -748,9 +810,21 @@ establish_peerings() {
   fi
   mkdir -p "$KEYS/peerings"
 
-  local peering id chain payer payee fee cap
+  local peering id namespace reference network chain payer payee fee cap
   for peering in $PEERINGS; do
-    IFS=':' read -r id chain payer payee fee cap <<<"$peering"
+    IFS=':' read -r id namespace reference payer payee fee cap <<<"$peering"
+    case "$namespace:$reference" in
+      solana:genesis) network="$(local_solana_network)" ;;
+      *) network="$namespace:$reference" ;;
+    esac
+    case "$namespace" in
+      eip155) chain=evm ;;
+      solana) chain=solana ;;
+      *)
+        echo "ERROR: '$id' names '$namespace' where a CAIP-2 namespace goes (eip155 or solana)" >&2
+        exit 1
+        ;;
+    esac
 
     # The PAYEE first: its write reads the payer's self-description and binds
     # the payer's voucher signer to the peering, so every voucher the payer
@@ -774,10 +848,10 @@ establish_peerings() {
       fi
       echo "'$id': $payee declares the peering in its config; no POST /peers on that end" >&2
     else
-      establish "$payee" "$payer" "$chain" 0 0 "$id" >/dev/null
+      establish "$payee" "$payer" "$network" 0 0 "$id" >/dev/null
     fi
     local channel
-    channel="$(establish "$payer" "$payee" "$chain" "$fee" "$cap" "$id")"
+    channel="$(establish "$payer" "$payee" "$network" "$fee" "$cap" "$id")"
 
     local target counterparty
     if [[ "$chain" == "evm" ]]; then
@@ -819,7 +893,7 @@ establish_peerings() {
     fi
 
     if [[ "$chain" == "evm" ]]; then
-      assert_evm_channel "$channel" "$target" "$id"
+      assert_evm_channel "$channel" "$target" "$id" "$network"
     else
       assert_solana_channel "$channel" "$(solana_settlement_address "$payer")" "$counterparty" \
         "$target" "$id"
@@ -841,6 +915,98 @@ establish_peerings() {
   chmod -R a+rX "$KEYS/peerings"
 }
 
+# The node's own channel on each NETWORK_CHANNELS network (ADR 0086 decision
+# 15). `solo` has no peer to pay, so this is how its image moves money on each
+# of its EVM networks: a signed `POST /channels` whose terms are the node's own
+# published `batchSettlements` entry for that network -- the asset, the
+# EIP-712 domain and the delay it publishes there -- with the payee swapped for
+# NETWORK_COUNTERPARTY. The node opens through THAT network's payer, so the
+# answer and its `GET /channels` must both name the network, and the chain must
+# agree: the channel holds its deposit in `x402BatchSettlement` on that anvil
+# and does not exist on any other. Each channel's key goes to
+# `$KEYS/networks/<chainId>`, where the rehearsal reads it back again.
+#
+# Idempotent: an outbound channel to the counterparty on that network that the
+# node already reports is reused rather than opened a second time.
+open_network_channels() {
+  [[ -z "$NETWORK_CHANNELS" ]] && return
+  mkdir -p "$KEYS/networks"
+
+  local entry node namespace chain_id network self terms channel view
+  for entry in $NETWORK_CHANNELS; do
+    IFS=':' read -r node namespace chain_id <<<"$entry"
+    network="$namespace:$chain_id"
+
+    channel="$(operator_request "$node" GET /channels | python3 -c '
+import json, sys
+network, counterparty = sys.argv[1], sys.argv[2].lower()
+for row in json.load(sys.stdin):
+    if (row.get("scheme") == "batch-settlement" and row.get("direction") == "outbound"
+            and row.get("network") == network
+            and str(row.get("counterparty", "")).lower() == counterparty):
+        print(row["id"])
+        break
+' "$network" "$NETWORK_COUNTERPARTY")"
+
+    if [[ -z "$channel" ]]; then
+      self="$(curl -sS "http://127.0.0.1:$(node_port "$node")/ilp")" || {
+        echo "ERROR: $node's self-description did not answer." >&2
+        exit 1
+      }
+      terms="$(python3 -c '
+import json, sys
+doc = json.loads(sys.argv[1])
+network, counterparty = sys.argv[2], sys.argv[3]
+mine = [t for t in doc.get("batchSettlements", []) if t.get("network") == network]
+if len(mine) != 1:
+    sys.exit("%d batchSettlements entries on %s: %s"
+             % (len(mine), network, doc.get("batchSettlements")))
+terms = mine[0]
+terms["payTo"] = counterparty
+terms["receiverAuthorizer"] = counterparty
+print(json.dumps(terms))
+' "$self" "$network" "$NETWORK_COUNTERPARTY")" || {
+        echo "ERROR: $node does not publish exactly one x402 entry on $network." >&2
+        exit 1
+      }
+      local answer
+      answer="$(operator_request "$node" POST /channels \
+        "{\"terms\":$terms,\"deposit\":$CHANNEL_DEPOSIT}")"
+      channel="$(json_field 'doc["id"]' <<<"$answer")"
+      if [[ -z "$channel" || "$(json_field 'doc["network"]' <<<"$answer")" != "$network" ]]; then
+        echo "ERROR: $node's POST /channels on $network answered without a channel there: $answer" >&2
+        exit 1
+      fi
+      echo "$node: opened $channel on $network"
+    else
+      echo "$node: already holds $channel on $network"
+    fi
+
+    view="$(channel_view "$node" "$channel")"
+    if [[ "$(json_field 'doc["network"]' <<<"$view")" != "$network" ]]; then
+      echo "ERROR: $node's GET /channels does not place $channel on $network: $view" >&2
+      exit 1
+    fi
+    assert_evm_channel "$channel" "$CHANNEL_DEPOSIT" "$node on $network" "$network"
+
+    local other other_id rpc held
+    for other in $EVM_NETWORKS; do
+      IFS=':' read -r _ other_id _ _ <<<"$other"
+      [[ "$other_id" == "$chain_id" ]] && continue
+      rpc="$(evm_rpc "eip155:$other_id")"
+      held="$(cast call "$X402_BATCH_SETTLEMENT" "channels(bytes32)(uint128,uint128)" \
+        "$channel" --rpc-url "$rpc" | head -1 | cut -d' ' -f1)"
+      if [[ "$held" != "0" ]]; then
+        echo "ERROR: $channel, opened on $network, also holds '$held' on eip155:$other_id." >&2
+        exit 1
+      fi
+    done
+
+    echo "evm:$channel" >"$KEYS/networks/$chain_id"
+  done
+  chmod -R a+rX "$KEYS/networks"
+}
+
 if [[ "$STAGE" == "channels" ]]; then
   if [[ ! -d "$KEYS" ]]; then
     echo "ERROR: $KEYS does not exist. Run 'local/keys.sh $TOPOLOGY' first -- this stage" >&2
@@ -850,6 +1016,7 @@ if [[ "$STAGE" == "channels" ]]; then
   need docker "The channels stage reaches a node with no host port through its own container."
   resolve_solana_mint
   establish_peerings
+  open_network_channels
   exit 0
 fi
 
@@ -857,7 +1024,7 @@ mkdir -p "$KEYS"
 chmod 700 "$KEYS"
 # A previous run's channel ids name channels on a chain that has since been
 # reset; the `channels` stage writes this run's.
-rm -rf "$KEYS/peerings"
+rm -rf "$KEYS/peerings" "$KEYS/networks"
 
 resolve_solana_mint
 
@@ -941,13 +1108,30 @@ chmod -R a+rX "$KEYS"
 # against the seed reports a funded account and leaves an empty one. The
 # compose anvil healthcheck gates on the same fact; this is the second half,
 # for anyone running the script against a chain they brought up themselves.
-if [[ ! "$(cast code "$USDC" --rpc-url "$ANVIL_RPC" 2>/dev/null)" =~ ^0x[0-9a-fA-F]+$ ]]; then
-  echo "ERROR: no contract at $USDC on $ANVIL_RPC." >&2
-  echo "       The local chain is not seeded yet -- infra/anvil/seed.sh runs as part of the" >&2
-  echo "       compose anvil service's startup. Wait for that container to report healthy" >&2
-  echo "       (it gates on exactly this) and re-run." >&2
-  exit 1
-fi
+#
+# And on EVERY network the topology settles on, at the chain id its table is
+# keyed by: each anvil is the same seeded chain, so USDC is at the same address
+# on all of them, and a port that reached the wrong anvil would fund the node
+# on a network its config never names while the right one stayed empty. The
+# node would refuse that at boot (ADR 0086 decision 4); this says so first.
+for evm in $EVM_NETWORKS; do
+  IFS=':' read -r _namespace chain_id service _port <<<"$evm"
+  rpc="$(evm_rpc "eip155:$chain_id")"
+  answered="$(cast chain-id --rpc-url "$rpc" 2>/dev/null || true)"
+  if [[ "$answered" != "$chain_id" ]]; then
+    echo "ERROR: $rpc answered chain id '${answered:-nothing}', and '$TOPOLOGY' funds" >&2
+    echo "       eip155:$chain_id there. Is the compose '$service' service up, started" >&2
+    echo "       with ANVIL_CHAIN_ID=$chain_id?" >&2
+    exit 1
+  fi
+  if [[ ! "$(cast code "$USDC" --rpc-url "$rpc" 2>/dev/null)" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    echo "ERROR: no contract at $USDC on $rpc (eip155:$chain_id)." >&2
+    echo "       The local chain is not seeded yet -- infra/anvil/seed.sh runs as part of the" >&2
+    echo "       compose '$service' service's startup. Wait for that container to report" >&2
+    echo "       healthy (it gates on exactly this) and re-run." >&2
+    exit 1
+  fi
+done
 
 # A throwaway `solana` config pointed at the mock mint's authority, so that
 # authority is the default signer AND fee payer of every `spl-token` call
@@ -996,16 +1180,24 @@ for entry in $NODES; do
   node="${entry%%:*}"
   dir="$(node_dir "$node")"
 
+  # One settlement address on every EVM network (every table names the one
+  # `settlement.key`), funded on each: gas for its own transactions there, and
+  # USDC to deposit there. Anvil's genesis accounts and the FiatToken's minter
+  # are the same on every local anvil, because each runs the same seed.
   evm_address="$(evm_settlement_address "$node")"
-  echo "$node: funding EVM settlement account $evm_address"
-  cast send --rpc-url "$ANVIL_RPC" --private-key "$ANVIL_ACCOUNT0_KEY" \
-    --value 100ether "$evm_address" >/dev/null
-  # FiatToken v2.2 is MINTABLE by its configured minter -- anvil's account 1,
-  # with an unlimited allowance (`infra/anvil/seed.sh`) -- so this is a mint
-  # rather than a transfer out of somebody's balance.
-  cast send --rpc-url "$ANVIL_RPC" --private-key "$USDC_MINTER_KEY" \
-    "$USDC" "mint(address,uint256)" "$evm_address" "$NODE_EVM_USDC" >/dev/null
-  echo "  100 ETH + $NODE_EVM_USDC USDC base units (6dp), minted"
+  for evm in $EVM_NETWORKS; do
+    IFS=':' read -r _namespace chain_id _service _port <<<"$evm"
+    rpc="$(evm_rpc "eip155:$chain_id")"
+    echo "$node: funding EVM settlement account $evm_address on eip155:$chain_id"
+    cast send --rpc-url "$rpc" --private-key "$ANVIL_ACCOUNT0_KEY" \
+      --value 100ether "$evm_address" >/dev/null
+    # FiatToken v2.2 is MINTABLE by its configured minter -- anvil's account 1,
+    # with an unlimited allowance (`infra/anvil/seed.sh`) -- so this is a mint
+    # rather than a transfer out of somebody's balance.
+    cast send --rpc-url "$rpc" --private-key "$USDC_MINTER_KEY" \
+      "$USDC" "mint(address,uint256)" "$evm_address" "$NODE_EVM_USDC" >/dev/null
+    echo "  100 ETH + $NODE_EVM_USDC USDC base units (6dp), minted"
+  done
 
   solana_address="$(solana address --keypair "$dir/settlement-solana-cli.json")"
   echo "$node: funding Solana settlement account $solana_address"

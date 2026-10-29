@@ -26,8 +26,9 @@ use connector_domain::client_claim::{
     self, ClientClaim, ClientClaimError, SCHEME_BATCH_SETTLEMENT,
 };
 use connector_domain::{
-    validate_voucher, ClaimError, EnvelopeError, EnvelopeRequest, EnvelopeResponse, Fulfill,
-    Prepare, Price, Reject, RejectCode, RejectReason, VoucherAdmission, VoucherWatermark,
+    validate_voucher, AssetId, AssetIdError, ClaimError, EnvelopeError, EnvelopeRequest,
+    EnvelopeResponse, Fulfill, Network, Prepare, Price, Reject, RejectCode, RejectReason,
+    VoucherAdmission, VoucherWatermark,
 };
 use connector_peer_btp::role_gate::{self, RefusedEvidence};
 use connector_peer_btp::{ack, challenge_json, claim_json, fields, ClaimDecodeError};
@@ -194,7 +195,26 @@ use serde::Serialize;
 /// own derived values stay in its `test-vectors/zk-note.json`, and no asset
 /// or decimals key appears (ADR 0071). Nothing existing changes; a replaying
 /// SDK that ignores the section is unaffected.
-pub const SCHEMA_VERSION: u32 = 10;
+/// **11** (issue #1599 / ADR 0086): **every claim names its network.** Every
+/// voucher -- client, peer and payout -- every claim-state entry, every
+/// peer-role challenge and every `claim-ack` carries a required CAIP-2
+/// `network` (`eip155:<chainId>`, `solana:<genesis prefix>`); `blockchain`
+/// stays and still picks the parser. So every section carrying one of them
+/// changed bytes: `claim_voucher`, `peer_carriage` (its vouchers, its
+/// challenge and every ack), `payout_voucher`,
+/// `voucher_claim_state_challenge` and `client_auth_channel_challenge`. New:
+/// `claim_voucher.evm_second_network` (one key on a second EVM network: a
+/// different channel id and digest), `claim_voucher.invalid` gains a voucher
+/// with no `network` on each chain (refused by name), a top-level
+/// `claim_network` section pinning a node's refusal of a voucher on a network
+/// it settles on no table for and of one whose `network` and channel domain
+/// disagree, `peer_carriage.ack_other_network` (an ack naming another network
+/// is not acknowledged), and -- in a file of its own, `vectors/asset-ids.json`
+/// ([`AssetIdVectorFile`]) -- CAIP-19 asset ids on both chains and the refusal
+/// of every legacy spelling. A
+/// replaying SDK that omits `network` is sending a claim every connector on
+/// this schema refuses -- which is what this number exists to announce.
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub mod zk_note;
 
@@ -236,7 +256,40 @@ pub struct WireVectors {
     pub client_auth_channel_challenge: ClientAuthChannelChallengeVectors,
     pub claim_state_toon_channel_refused: ClaimStateToonChannelRefusedVectors,
     pub client_edge: ClientEdgeVectors,
+    /// Schema 11: a node's verdict on a claim's `network`.
+    pub claim_network: ClaimNetworkVectors,
+    /// Schema 10: the zk edge's own wire (ADR 0080 decision 12).
     pub zk_note: zk_note::ZkNoteVectors,
+}
+
+/// `vectors/asset-ids.json` (schema 11, ADR 0086 decision 2): CAIP-19 asset
+/// ids on both chains, and every legacy spelling refused by name.
+///
+/// **A file of its own, not a section of `wire-vectors.json`.** No asset id
+/// rides a packet: ADR 0071 decision 7 keeps the packet wire unit-silent, and
+/// its falsifier fires on any asset or token field in `wire-vectors.json`. An
+/// asset id is the spelling every config, rate table and operator surface
+/// shares -- a contract for `toon-client`, `rig` and `swap` all the same, so
+/// it is pinned beside the wire vectors, at the same `schema_version`.
+#[derive(Debug, Serialize)]
+pub struct AssetIdVectorFile {
+    pub schema_version: u32,
+    pub asset_ids: AssetIdVectors,
+}
+
+/// Build `vectors/asset-ids.json`.
+pub fn generate_asset_id_file() -> AssetIdVectorFile {
+    AssetIdVectorFile {
+        schema_version: SCHEMA_VERSION,
+        asset_ids: generate_asset_id_vectors(),
+    }
+}
+
+/// [`to_json`], for [`AssetIdVectorFile`].
+pub fn asset_ids_to_json(file: &AssetIdVectorFile) -> String {
+    let mut json = serde_json::to_string_pretty(file).expect("the asset ids always serialize");
+    json.push('\n');
+    json
 }
 
 /// Schema 9 (issue #1532): the client edge's own responses, as opposed to
@@ -955,6 +1008,9 @@ pub struct PeerZeroValueCase {
 pub struct AckFields {
     pub result: &'static str,
     pub reason: Option<&'static str>,
+    /// The CAIP-2 network of the voucher the ack judged (schema 11, ADR
+    /// 0086): a payer reads the verdict only for the network it sent on.
+    pub network: String,
 }
 
 /// A RESPONSE answering a voucher-bearing frame: the packet it answers, and
@@ -1012,6 +1068,9 @@ pub struct PeerCarriageVectors {
     pub reject_with_cost: PeerAnswerCase,
     pub ack_absent: PeerAnswerCase,
     pub ack_malformed: PeerMalformedAckCase,
+    /// Schema 11: an ack naming a network other than the one its voucher
+    /// was sent on -- not acknowledged, like a malformed one (ADR 0086).
+    pub ack_other_network: PeerMalformedAckCase,
     pub forwarded_data_unchanged: PeerForwardedDataCase,
 }
 
@@ -1066,6 +1125,7 @@ fn generate_peer_voucher_evm_case() -> (PeerVoucherEvmCase, EvmPresentation) {
     let (facts, presentation) = sign_evm_voucher(&signer, &config, 250_000);
     let json = voucher_json(
         &presentation.presentation,
+        &vector_evm_network(),
         &Voucher {
             cumulative_amount: 250_000,
             signature: presentation.signature.to_vec(),
@@ -1120,6 +1180,7 @@ fn generate_peer_voucher_solana_case() -> PeerVoucherSolanaCase {
         &ChannelPresentation::Solana {
             channel: SettlementChannelId(channel_account_base58.clone()),
         },
+        &vector_solana_network(),
         &Voucher {
             cumulative_amount: u128::from(amount),
             signature: signature.to_vec(),
@@ -1244,7 +1305,13 @@ fn generate_zero_value_case(voucher: &EvmPresentation) -> PeerZeroValueCase {
         &signature,
         &signer_address,
     ));
-    let json = challenge_entry(&voucher.presentation, expires, &signature).to_string();
+    let json = challenge_entry(
+        &voucher.presentation,
+        &vector_evm_network(),
+        expires,
+        &signature,
+    )
+    .to_string();
     let parsed = challenge_json::parse(json.as_bytes()).expect("the challenge parses");
     assert_eq!(parsed.expires(), expires);
     assert_eq!(
@@ -1324,10 +1391,13 @@ fn answer_case(spec: AnswerCaseSpec) -> PeerAnswerCase {
         ),
     });
     assert_eq!(
-        ack::from_protocol_data(&decoded.protocol_data),
+        ack::from_protocol_data(&decoded.protocol_data, &vector_evm_network()),
         expected_ack
     );
-    assert_eq!(http_claim_ack(&headers), expected_ack);
+    assert_eq!(
+        http_claim_ack(&headers, &vector_evm_network()),
+        expected_ack
+    );
     if let Some(cost) = spec.accumulated_cost {
         assert_eq!(fields::accumulated_cost(&decoded.protocol_data), cost);
         assert_eq!(http_accumulated_cost(&headers), cost);
@@ -1360,8 +1430,10 @@ fn generate_answer_cases() -> AnswerCases {
     let fulfill_bytes = fixture_fulfill().encode();
 
     // Item 7: a FULFILL, its voucher acknowledged accepted.
-    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged voucher");
-    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged voucher");
+    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted, Some(&vector_evm_network()))
+        .expect("a judged voucher");
+    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted, Some(&vector_evm_network()))
+        .expect("a judged voucher");
     let fulfill_ack_accepted = answer_case(AnswerCaseSpec {
         name: "peer_fulfill_ack_accepted".to_string(),
         request_id: 9_101,
@@ -1372,6 +1444,7 @@ fn generate_answer_cases() -> AnswerCases {
         ack: Some(AckFields {
             result: "accepted",
             reason: None,
+            network: vector_evm_network().to_string(),
         }),
         accumulated_cost: None,
     });
@@ -1380,8 +1453,11 @@ fn generate_answer_cases() -> AnswerCases {
     // a FULFILL answer carrying a *rejected* claim-ack on the same
     // response, pinning §6.2's independence of the two verdicts.
     let rejected_signature_invalid = ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid);
-    let ack_entry = ack::protocol_data(rejected_signature_invalid).expect("a judged voucher");
-    let ack_header = claim_ack_header_value(rejected_signature_invalid).expect("a judged voucher");
+    let ack_entry = ack::protocol_data(rejected_signature_invalid, Some(&vector_evm_network()))
+        .expect("a judged voucher");
+    let ack_header =
+        claim_ack_header_value(rejected_signature_invalid, Some(&vector_evm_network()))
+            .expect("a judged voucher");
     let fulfill_ack_rejected = answer_case(AnswerCaseSpec {
         name: "peer_fulfill_ack_rejected".to_string(),
         request_id: 9_102,
@@ -1392,6 +1468,7 @@ fn generate_answer_cases() -> AnswerCases {
         ack: Some(AckFields {
             result: "rejected",
             reason: Some("signature_invalid"),
+            network: vector_evm_network().to_string(),
         }),
         accumulated_cost: None,
     });
@@ -1414,8 +1491,10 @@ fn generate_answer_cases() -> AnswerCases {
     {
         let outcome = ClaimAckOutcome::Rejected(reason);
         let reason_name = ack::reason_name(reason);
-        let ack_entry = ack::protocol_data(outcome).expect("a judged voucher");
-        let ack_header = claim_ack_header_value(outcome).expect("a judged voucher");
+        let ack_entry =
+            ack::protocol_data(outcome, Some(&vector_evm_network())).expect("a judged voucher");
+        let ack_header =
+            claim_ack_header_value(outcome, Some(&vector_evm_network())).expect("a judged voucher");
         ack_rejected_reasons.push(answer_case(AnswerCaseSpec {
             name: format!("peer_ack_rejected_{reason_name}"),
             request_id: 9_110 + index as u32,
@@ -1426,6 +1505,7 @@ fn generate_answer_cases() -> AnswerCases {
             ack: Some(AckFields {
                 result: "rejected",
                 reason: Some(reason_name),
+                network: vector_evm_network().to_string(),
             }),
             accumulated_cost: None,
         }));
@@ -1437,8 +1517,10 @@ fn generate_answer_cases() -> AnswerCases {
     let accumulated_cost = 4_200u64;
     let cost_entry = fields::accumulated_cost_protocol_data(accumulated_cost);
     let cost_header = accumulated_cost.to_string();
-    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted).expect("a judged voucher");
-    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted).expect("a judged voucher");
+    let ack_entry = ack::protocol_data(ClaimAckOutcome::Accepted, Some(&vector_evm_network()))
+        .expect("a judged voucher");
+    let ack_header = claim_ack_header_value(ClaimAckOutcome::Accepted, Some(&vector_evm_network()))
+        .expect("a judged voucher");
     let reject_with_cost = answer_case(AnswerCaseSpec {
         name: "peer_reject_with_cost".to_string(),
         request_id: 9_120,
@@ -1452,6 +1534,7 @@ fn generate_answer_cases() -> AnswerCases {
         ack: Some(AckFields {
             result: "accepted",
             reason: None,
+            network: vector_evm_network().to_string(),
         }),
         accumulated_cost: Some(accumulated_cost),
     });
@@ -1481,7 +1564,7 @@ fn generate_answer_cases() -> AnswerCases {
 fn generate_ack_malformed_case() -> PeerMalformedAckCase {
     let malformed = r#"{"result":"maybe"}"#.to_string();
     assert_eq!(
-        ack::decode(malformed.as_bytes()),
+        ack::decode(malformed.as_bytes(), &vector_evm_network()),
         None,
         "§6.3: an unknown result is not acknowledged, never a verdict"
     );
@@ -1490,17 +1573,43 @@ fn generate_ack_malformed_case() -> PeerMalformedAckCase {
         content_type: CONTENT_TYPE_TEXT,
         data: malformed.as_bytes().to_vec(),
     };
-    assert_eq!(ack::from_protocol_data(&[entry]), None);
+    assert_eq!(
+        ack::from_protocol_data(&[entry], &vector_evm_network()),
+        None
+    );
 
     let http_value = BASE64.encode(&malformed);
     let mut headers = Headers::new();
     headers.push(CLAIM_ACK_HEADER, &http_value);
-    assert_eq!(http_claim_ack(&headers), None);
+    assert_eq!(http_claim_ack(&headers, &vector_evm_network()), None);
 
     PeerMalformedAckCase {
         name: "peer_ack_malformed",
         malformed_json: malformed.clone(),
         btp_raw_hex: hex_of(malformed.as_bytes()),
+        http_base64: http_value,
+    }
+}
+
+/// An ack that is a verdict -- for another network. A payer that sent its
+/// voucher on `vector_evm_network()` reads it as not acknowledged.
+fn generate_ack_other_network_case() -> PeerMalformedAckCase {
+    let other = Network::Eip155(SECOND_EVM_CHAIN_ID);
+    let bytes = ack::encode(ClaimAckOutcome::Accepted, Some(&other)).expect("a judged voucher");
+    let json = String::from_utf8(bytes).expect("an ack is UTF-8 JSON");
+    assert_eq!(
+        ack::decode(json.as_bytes(), &other),
+        Some(ClaimAckOutcome::Accepted)
+    );
+    assert_eq!(ack::decode(json.as_bytes(), &vector_evm_network()), None);
+    let http_value = BASE64.encode(&json);
+    let mut headers = Headers::new();
+    headers.push(CLAIM_ACK_HEADER, &http_value);
+    assert_eq!(http_claim_ack(&headers, &vector_evm_network()), None);
+    PeerMalformedAckCase {
+        name: "peer_ack_other_network",
+        malformed_json: json.clone(),
+        btp_raw_hex: hex_of(json.as_bytes()),
         http_base64: http_value,
     }
 }
@@ -1561,6 +1670,7 @@ fn generate_peer_carriage_vectors(giftwrap: &GiftwrapVectors) -> PeerCarriageVec
         ack_absent,
     } = generate_answer_cases();
     let ack_malformed = generate_ack_malformed_case();
+    let ack_other_network = generate_ack_other_network_case();
     let forwarded_data_unchanged = generate_forwarded_data_case(giftwrap);
 
     PeerCarriageVectors {
@@ -1575,6 +1685,7 @@ fn generate_peer_carriage_vectors(giftwrap: &GiftwrapVectors) -> PeerCarriageVec
         reject_with_cost,
         ack_absent,
         ack_malformed,
+        ack_other_network,
         forwarded_data_unchanged,
     }
 }
@@ -1824,6 +1935,7 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
     let (facts, presentation) = sign_evm_voucher(&signer, &config, u128::from(amount));
     let address = |bytes: &[u8; 20]| format!("0x{}", hex_of(bytes));
     let mut evm_json = serde_json::json!({
+        "network": vector_evm_network().to_string(),
         "scheme": "batch-settlement",
         "channelId": format!("0x{}", hex_of(&presentation.channel_id)),
         "maxClaimableAmount": amount.to_string(),
@@ -1869,6 +1981,7 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
     ));
     let channel_account_base58 = bs58::encode(channel_account).into_string();
     let mut solana_json = serde_json::json!({
+        "network": VECTOR_SOLANA_NETWORK,
         "scheme": "batch-settlement",
         "channelId": channel_account_base58,
         "maxClaimableAmount": solana_amount.to_string(),
@@ -2095,6 +2208,20 @@ fn generate_charge_vectors() -> ChargeVectors {
 
 const VOUCHER_EVM_CHAIN_ID: u64 = 84_532;
 
+/// The CAIP-2 network every EVM fixture here is on (schema 11, ADR 0086):
+/// [`VOUCHER_EVM_CHAIN_ID`]'s.
+fn vector_evm_network() -> Network {
+    Network::Eip155(VOUCHER_EVM_CHAIN_ID)
+}
+
+/// The CAIP-2 network every Solana fixture here is on: devnet's genesis
+/// prefix, as a devnet node's greeting spells it.
+const VECTOR_SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+fn vector_solana_network() -> Network {
+    VECTOR_SOLANA_NETWORK.parse().expect("a CAIP-2 network")
+}
+
 fn voucher_evm_fixture_config() -> BatchChannelConfig {
     BatchChannelConfig {
         payer: [0x11; 20],
@@ -2127,6 +2254,10 @@ pub struct VoucherEvmChannelConfigFields {
 #[derive(Debug, Serialize)]
 pub struct VoucherEvmCase {
     pub name: &'static str,
+    /// The CAIP-2 network the voucher names (schema 11, ADR 0086): always
+    /// `eip155:<chain_id>`, the chain whose domain `channel_id_hex` and
+    /// `digest_hex` are computed under.
+    pub network: String,
     /// The EIP-712 domain's `chainId` -- Base Sepolia's real id, the same
     /// domain the live cross-check above queried, not a made-up one.
     pub chain_id: u64,
@@ -2181,6 +2312,7 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
     let json = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": vector_evm_network().to_string(),
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "messageId": "vector-fixture:voucher:evm:1",
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -2208,6 +2340,7 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
         panic!("expected an EVM voucher, got {parsed:?}");
     };
     assert_eq!(voucher.channel_id, channel_id_hex_0x);
+    assert_eq!(voucher.network, vector_evm_network());
     assert_eq!(
         voucher.max_claimable_amount,
         u128::from(max_claimable_amount)
@@ -2220,6 +2353,7 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
 
     VoucherEvmCase {
         name: "claim_voucher_evm",
+        network: vector_evm_network().to_string(),
         chain_id: VOUCHER_EVM_CHAIN_ID,
         verifying_contract_hex: hex_of(&X402_BATCH_SETTLEMENT_ADDRESS),
         channel_config: VoucherEvmChannelConfigFields {
@@ -2246,6 +2380,9 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
 #[derive(Debug, Serialize)]
 pub struct VoucherSolanaCase {
     pub name: &'static str,
+    /// The CAIP-2 network the voucher names (schema 11, ADR 0086):
+    /// `solana:<genesis prefix>`.
+    pub network: String,
     pub channel_account_hex: String,
     pub channel_account_base58: String,
     /// The channel account's `authorized_signer` -- the key a voucher on
@@ -2298,6 +2435,7 @@ fn generate_voucher_solana_case() -> VoucherSolanaCase {
     let json = serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": VECTOR_SOLANA_NETWORK,
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "messageId": "vector-fixture:voucher:solana:1",
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -2314,10 +2452,12 @@ fn generate_voucher_solana_case() -> VoucherSolanaCase {
         panic!("expected a Solana voucher, got {parsed:?}");
     };
     assert_eq!(voucher.channel_id, channel_account_base58);
+    assert_eq!(voucher.network, vector_solana_network());
     assert_eq!(voucher.max_claimable_amount, max_claimable_amount);
 
     VoucherSolanaCase {
         name: "claim_voucher_solana",
+        network: VECTOR_SOLANA_NETWORK.to_string(),
         channel_account_hex: hex_of(&channel_account),
         channel_account_base58,
         signer_public_key_hex: hex_of(&signer_public_key),
@@ -2483,6 +2623,7 @@ fn generate_voucher_invalid_cases(solana: &VoucherSolanaCase) -> Vec<VoucherInva
     let claim_json = serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": VECTOR_SOLANA_NETWORK,
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "messageId": "vector-fixture:voucher:solana:expires",
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -2522,6 +2663,7 @@ fn generate_voucher_evm_above_u64_max_case() -> VoucherEvmCase {
     let json = serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": vector_evm_network().to_string(),
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "messageId": "vector-fixture:voucher:evm:above-u64-max",
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -2553,6 +2695,7 @@ fn generate_voucher_evm_above_u64_max_case() -> VoucherEvmCase {
 
     VoucherEvmCase {
         name: "claim_voucher_evm_above_u64_max",
+        network: vector_evm_network().to_string(),
         chain_id: facts.chain_id,
         verifying_contract_hex: facts.verifying_contract_hex,
         channel_config: facts.channel_config,
@@ -2574,6 +2717,9 @@ pub struct ClaimVoucherVectors {
     /// Schema 8 (#1429): a `uint128` amount above `u64::MAX`, admitted
     /// exactly. See [`generate_voucher_evm_above_u64_max_case`].
     pub evm_above_u64_max: VoucherEvmCase,
+    /// Schema 11 (ADR 0086): `evm`'s channel config and key on a second
+    /// EVM network. See [`generate_voucher_evm_second_network_case`].
+    pub evm_second_network: VoucherEvmCase,
     pub solana: VoucherSolanaCase,
     pub amount_only_watermark: Vec<VoucherWatermarkCase>,
     pub invalid: Vec<VoucherInvalidClaimCase>,
@@ -2582,16 +2728,425 @@ pub struct ClaimVoucherVectors {
 fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
     let evm = generate_voucher_evm_case();
     let evm_above_u64_max = generate_voucher_evm_above_u64_max_case();
+    let evm_second_network = generate_voucher_evm_second_network_case(&evm);
     let solana = generate_voucher_solana_case();
     let amount_only_watermark = generate_voucher_watermark_cases();
-    let invalid = generate_voucher_invalid_cases(&solana);
+    let mut invalid = generate_voucher_invalid_cases(&solana);
+    invalid.extend(generate_voucher_network_missing_cases(&evm, &solana));
 
     ClaimVoucherVectors {
         evm,
         evm_above_u64_max,
+        evm_second_network,
         solana,
         amount_only_watermark,
         invalid,
+    }
+}
+
+/// Base's chain id: the second EVM network of the two-network case.
+const SECOND_EVM_CHAIN_ID: u64 = 8_453;
+
+/// `claim_voucher.evm_second_network` (schema 11, ADR 0086): `claim_voucher.
+/// evm`'s own `ChannelConfig` and signing key, on a second EVM network. The
+/// channel id and the voucher digest both bind the chain through the
+/// EIP-712 domain, so the same config is a different channel there, and a
+/// voucher on one network is no voucher on the other.
+fn generate_voucher_evm_second_network_case(first: &VoucherEvmCase) -> VoucherEvmCase {
+    let network = Network::Eip155(SECOND_EVM_CHAIN_ID);
+    let domain = BatchSettlementDomain::x402(SECOND_EVM_CHAIN_ID);
+    let config = voucher_evm_fixture_config();
+    let channel_id = evm_batch_channel_id(&domain, &config);
+    assert_ne!(
+        hex_of(&channel_id),
+        first.channel_id_hex,
+        "one config is a different channel on another network"
+    );
+    let amount: u128 = 5_000;
+    let digest = evm_voucher_digest(&domain, &channel_id, amount);
+    let signer = LocalSigner::from_secret_bytes(
+        "vector-fixture-second-network",
+        hex_bytes::<32>(VOUCHER_EVM_AUTHORIZER_SECRET),
+    )
+    .expect("fixture secret is a valid secp256k1 scalar");
+    let mut signature = signer
+        .sign(&digest)
+        .expect("fixture signer signs its own digest")
+        .to_bytes();
+    signature[64] += 27;
+    let voucher_signer = evm_voucher_signer(&config);
+    assert!(verify_evm_voucher(
+        &domain,
+        &channel_id,
+        amount,
+        &signature,
+        &voucher_signer
+    ));
+    assert!(
+        !verify_evm_voucher(
+            &BatchSettlementDomain::x402(VOUCHER_EVM_CHAIN_ID),
+            &channel_id,
+            amount,
+            &signature,
+            &voucher_signer
+        ),
+        "a voucher signed on one network does not verify on another"
+    );
+    let channel_id_hex_0x = format!("0x{}", hex_of(&channel_id));
+    let json = serde_json::json!({
+        "version": "1.0",
+        "blockchain": "evm",
+        "network": network.to_string(),
+        "scheme": SCHEME_BATCH_SETTLEMENT,
+        "messageId": "vector-fixture:voucher:evm:second-network",
+        "timestamp": "2030-01-01T00:00:00.000Z",
+        "senderId": format!("0x{}", hex_of(&voucher_signer)),
+        "channelId": channel_id_hex_0x,
+        "maxClaimableAmount": amount.to_string(),
+        "signature": format!("0x{}", hex_of(&signature)),
+        "channelConfig": {
+            "payer": format!("0x{}", hex_of(&config.payer)),
+            "payerAuthorizer": format!("0x{}", hex_of(&config.payer_authorizer)),
+            "receiver": format!("0x{}", hex_of(&config.receiver)),
+            "receiverAuthorizer": format!("0x{}", hex_of(&config.receiver_authorizer)),
+            "token": format!("0x{}", hex_of(&config.token)),
+            "withdrawDelay": config.withdraw_delay,
+            "salt": format!("0x{}", hex_of(&config.salt)),
+        },
+    })
+    .to_string();
+    let parsed = client_claim::parse_client_claim(&json).expect("the emitted voucher parses");
+    assert_eq!(parsed.network(), &network);
+
+    VoucherEvmCase {
+        name: "claim_voucher_evm_second_network",
+        network: network.to_string(),
+        chain_id: SECOND_EVM_CHAIN_ID,
+        verifying_contract_hex: hex_of(&X402_BATCH_SETTLEMENT_ADDRESS),
+        channel_config: channel_config_fields(&config),
+        channel_id_hex: hex_of(&channel_id),
+        max_claimable_amount: amount.to_string(),
+        digest_hex: hex_of(&digest),
+        signer_address_hex: hex_of(&voucher_signer),
+        signature_hex: hex_of(&signature),
+        json,
+    }
+}
+
+/// ADR 0086 decision 1: a voucher with no `network` is refused by name, on
+/// either chain -- `claim_voucher.evm` and `claim_voucher.solana` with the
+/// field removed and nothing else changed.
+fn generate_voucher_network_missing_cases(
+    evm: &VoucherEvmCase,
+    solana: &VoucherSolanaCase,
+) -> Vec<VoucherInvalidClaimCase> {
+    [
+        ("claim_voucher_evm_network_missing", &evm.json),
+        ("claim_voucher_solana_network_missing", &solana.json),
+    ]
+    .into_iter()
+    .map(|(name, json)| {
+        let mut claim: serde_json::Value = serde_json::from_str(json).expect("the case is JSON");
+        claim
+            .as_object_mut()
+            .expect("an object")
+            .remove("network")
+            .expect("the case names its network");
+        let claim_json = claim.to_string();
+        assert_eq!(
+            client_claim::parse_client_claim(&claim_json),
+            Err(ClientClaimError::NetworkMissing),
+            "{name}"
+        );
+        VoucherInvalidClaimCase {
+            name,
+            claim_json,
+            expected_error: "network_missing",
+        }
+    })
+    .collect()
+}
+
+// ---------------------------------------------------------------------
+// A node's verdict on a claim's network (schema 11, ADR 0086 decision 1)
+// ---------------------------------------------------------------------
+//
+// Structural refusals live in `claim_voucher.invalid`. These need a node:
+// which networks it holds a settlement table for. A voucher naming any other
+// network is refused by name, before anything about it is looked up; an EVM
+// voucher whose channel id does not recompute from its `channelConfig` under
+// the EIP-712 domain of the network it names is refused too, which is how a
+// claim relabelled onto another network fails safe. Each case is judged here
+// by [`judge_claim_network`], the same order a connector's claim gate takes.
+
+/// One node's verdict on one claim's `network`.
+#[derive(Debug, Serialize)]
+pub struct ClaimNetworkCase {
+    pub name: &'static str,
+    /// The CAIP-2 networks the judging node holds a settlement table for.
+    pub node_networks: Vec<String>,
+    pub claim_json: String,
+    /// `"accepted"`, `"network_not_settled"` or `"network_domain_mismatch"`.
+    pub outcome: &'static str,
+    /// On EVM, `getChannelId(channelConfig)` under the domain of the network
+    /// the claim names -- equal to its `channelId` exactly when that network
+    /// is the one the channel was opened on. `None` for Solana, and for a
+    /// claim refused before any recomputation.
+    pub recomputed_channel_id_hex: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClaimNetworkVectors {
+    pub cases: Vec<ClaimNetworkCase>,
+}
+
+/// The verdict a node holding `node` reaches on `claim_json`'s network, and
+/// the channel id it recomputed, in the claim gate's order: the network
+/// first, then the EVM recomputation, then the signature, which every
+/// accepted case here must pass.
+fn judge_claim_network(node: &[Network], claim_json: &str) -> (&'static str, Option<String>) {
+    let claim = client_claim::parse_client_claim(claim_json).expect("a well-formed voucher");
+    if !node.contains(claim.network()) {
+        return ("network_not_settled", None);
+    }
+    match &claim {
+        ClientClaim::EvmVoucher(voucher) => {
+            let chain_id = claim
+                .network()
+                .eip155_chain_id()
+                .expect("an EVM voucher is on an eip155 network");
+            let domain = BatchSettlementDomain::x402(chain_id);
+            let config = voucher
+                .channel_config
+                .as_ref()
+                .expect("every case presents its channelConfig");
+            let address = |text: &str| hex_bytes::<20>(text.trim_start_matches("0x"));
+            let config = BatchChannelConfig {
+                payer: address(&config.payer),
+                payer_authorizer: address(&config.payer_authorizer),
+                receiver: address(&config.receiver),
+                receiver_authorizer: address(&config.receiver_authorizer),
+                token: address(&config.token),
+                withdraw_delay: config.withdraw_delay,
+                salt: hex_bytes::<32>(config.salt.trim_start_matches("0x")),
+            };
+            let recomputed = evm_batch_channel_id(&domain, &config);
+            let channel_id = hex_bytes::<32>(voucher.channel_id.trim_start_matches("0x"));
+            if recomputed != channel_id {
+                return ("network_domain_mismatch", Some(hex_of(&recomputed)));
+            }
+            let signature = hex_bytes::<65>(voucher.signature.trim_start_matches("0x"));
+            assert!(
+                verify_evm_voucher(
+                    &domain,
+                    &channel_id,
+                    voucher.max_claimable_amount,
+                    &signature,
+                    &evm_voucher_signer(&config),
+                ),
+                "an accepted case's signature verifies under its network's domain"
+            );
+            ("accepted", Some(hex_of(&recomputed)))
+        }
+        ClientClaim::SolanaVoucher(_) => ("accepted", None),
+    }
+}
+
+fn claim_network_case(
+    name: &'static str,
+    node: &[Network],
+    claim_json: String,
+    expected: &'static str,
+) -> ClaimNetworkCase {
+    let (outcome, recomputed_channel_id_hex) = judge_claim_network(node, &claim_json);
+    assert_eq!(outcome, expected, "vector {name}");
+    ClaimNetworkCase {
+        name,
+        node_networks: node.iter().map(Network::to_string).collect(),
+        claim_json,
+        outcome,
+        recomputed_channel_id_hex,
+    }
+}
+
+/// `json` with its `network` replaced by `network`, and nothing else
+/// changed.
+fn renetworked(json: &str, network: &str) -> String {
+    let mut claim: serde_json::Value = serde_json::from_str(json).expect("the case is JSON");
+    claim["network"] = network.into();
+    claim.to_string()
+}
+
+fn generate_claim_network_vectors(vouchers: &ClaimVoucherVectors) -> ClaimNetworkVectors {
+    let first = vector_evm_network();
+    let second = Network::Eip155(SECOND_EVM_CHAIN_ID);
+    let solana = vector_solana_network();
+    let one_evm_network = [first.clone(), solana.clone()];
+    let two_evm_networks = [first.clone(), second.clone(), solana];
+    ClaimNetworkVectors {
+        cases: vec![
+            // The two-network EVM case: one node, a voucher on each network,
+            // each accepted under its own network's domain.
+            claim_network_case(
+                "two_evm_networks_accept_a_voucher_on_the_first",
+                &two_evm_networks,
+                vouchers.evm.json.clone(),
+                "accepted",
+            ),
+            claim_network_case(
+                "two_evm_networks_accept_a_voucher_on_the_second",
+                &two_evm_networks,
+                vouchers.evm_second_network.json.clone(),
+                "accepted",
+            ),
+            claim_network_case(
+                "solana_voucher_on_the_nodes_solana_network_is_accepted",
+                &two_evm_networks,
+                vouchers.solana.json.clone(),
+                "accepted",
+            ),
+            // A network the node holds no table for, on either chain.
+            claim_network_case(
+                "evm_voucher_on_a_network_with_no_table_is_refused",
+                &one_evm_network,
+                vouchers.evm_second_network.json.clone(),
+                "network_not_settled",
+            ),
+            claim_network_case(
+                "solana_voucher_on_another_cluster_is_refused",
+                &one_evm_network,
+                renetworked(
+                    &vouchers.solana.json,
+                    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                ),
+                "network_not_settled",
+            ),
+            // The second network's voucher relabelled onto the first: the
+            // node holds the first, but its channel id does not recompute
+            // under the first network's domain.
+            claim_network_case(
+                "evm_voucher_whose_network_and_domain_disagree_is_refused",
+                &two_evm_networks,
+                renetworked(&vouchers.evm_second_network.json, &first.to_string()),
+                "network_domain_mismatch",
+            ),
+        ],
+    }
+}
+
+// ---------------------------------------------------------------------
+// CAIP-19 asset ids (schema 11, ADR 0086 decision 2)
+// ---------------------------------------------------------------------
+
+/// One asset id, built from its parts and spelled in CAIP-19.
+#[derive(Debug, Serialize)]
+pub struct AssetIdCase {
+    pub name: &'static str,
+    pub network: String,
+    pub namespace: String,
+    /// The reference as written -- an ERC-20 contract in any case.
+    pub reference_as_written: String,
+    /// The one CAIP-19 spelling: an ERC-20 contract in lower-case hex.
+    pub caip19: String,
+}
+
+/// A legacy asset spelling, refused by name rather than read as anything.
+#[derive(Debug, Serialize)]
+pub struct LegacyAssetCase {
+    pub name: &'static str,
+    pub spelling: String,
+    /// `"legacy_evm"`, `"legacy_evm_with_chain_id"`, `"legacy_solana"` or
+    /// `"legacy_native"`.
+    pub expected_error: &'static str,
+    /// The refusal's own text: it carries the CAIP-19 rewrite.
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssetIdVectors {
+    pub valid: Vec<AssetIdCase>,
+    pub legacy_refused: Vec<LegacyAssetCase>,
+}
+
+fn asset_id_case(
+    name: &'static str,
+    network: Network,
+    reference: &str,
+    caip19: &str,
+) -> AssetIdCase {
+    let built = AssetId::token_on(network.clone(), reference);
+    assert_eq!(built.to_string(), caip19, "vector {name}");
+    let parsed: AssetId = caip19.parse().expect("a CAIP-19 asset id parses");
+    assert_eq!(parsed, built, "vector {name} round-trips");
+    assert_eq!(parsed.network(), &network);
+    AssetIdCase {
+        name,
+        network: network.to_string(),
+        namespace: built.namespace().to_string(),
+        reference_as_written: reference.to_string(),
+        caip19: caip19.to_string(),
+    }
+}
+
+fn legacy_asset_case(name: &'static str, spelling: &str) -> LegacyAssetCase {
+    let error = spelling
+        .parse::<AssetId>()
+        .expect_err("a legacy spelling is refused");
+    let expected_error = match error {
+        AssetIdError::LegacyEvm { .. } => "legacy_evm",
+        AssetIdError::LegacyEvmWithChainId { .. } => "legacy_evm_with_chain_id",
+        AssetIdError::LegacySolana { .. } => "legacy_solana",
+        AssetIdError::LegacyNative { .. } => "legacy_native",
+        other => panic!("vector {name}: {spelling} was refused as {other:?}, not by name"),
+    };
+    LegacyAssetCase {
+        name,
+        spelling: spelling.to_string(),
+        expected_error,
+        message: error.to_string(),
+    }
+}
+
+/// Base Sepolia's Circle USDC, checksummed as Circle publishes it.
+const BASE_SEPOLIA_USDC: &str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+
+/// Solana devnet's Circle USDC mint.
+const SOLANA_DEVNET_USDC: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+
+fn generate_asset_id_vectors() -> AssetIdVectors {
+    let lower = BASE_SEPOLIA_USDC.to_ascii_lowercase();
+    AssetIdVectors {
+        valid: vec![
+            asset_id_case(
+                "erc20_on_base_sepolia",
+                vector_evm_network(),
+                BASE_SEPOLIA_USDC,
+                &format!("eip155:{VOUCHER_EVM_CHAIN_ID}/erc20:{lower}"),
+            ),
+            // The same contract address on another network is another asset:
+            // what every anvil `seed.sh` seeds makes true locally.
+            asset_id_case(
+                "same_contract_on_a_second_network_is_another_asset",
+                Network::Eip155(SECOND_EVM_CHAIN_ID),
+                BASE_SEPOLIA_USDC,
+                &format!("eip155:{SECOND_EVM_CHAIN_ID}/erc20:{lower}"),
+            ),
+            asset_id_case(
+                "spl_token_on_solana_devnet",
+                vector_solana_network(),
+                SOLANA_DEVNET_USDC,
+                &format!("{VECTOR_SOLANA_NETWORK}/token:{SOLANA_DEVNET_USDC}"),
+            ),
+        ],
+        legacy_refused: vec![
+            legacy_asset_case("legacy_evm", &format!("evm:{BASE_SEPOLIA_USDC}")),
+            legacy_asset_case(
+                "legacy_evm_with_chain_id",
+                &format!("evm:{VOUCHER_EVM_CHAIN_ID}:{BASE_SEPOLIA_USDC}"),
+            ),
+            legacy_asset_case("legacy_solana", &format!("solana:{SOLANA_DEVNET_USDC}")),
+            legacy_asset_case("legacy_native", "evm:native"),
+        ],
     }
 }
 
@@ -2713,6 +3268,7 @@ fn voucher_claim_state_evm_case(
     let signature_hex = format!("0x{}", hex_of(&signature));
     let entry_json = serde_json::json!({
         "blockchain": "evm",
+        "network": vector_evm_network().to_string(),
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "channelId": format!("0x{}", hex_of(&channel_id)),
         "expires": expires,
@@ -2773,6 +3329,7 @@ fn voucher_claim_state_solana_case(
     let signature_base64 = BASE64.encode(signature);
     let entry_json = serde_json::json!({
         "blockchain": "solana",
+        "network": VECTOR_SOLANA_NETWORK,
         "scheme": SCHEME_BATCH_SETTLEMENT,
         "channelAccount": channel_account_base58,
         "expires": expires,
@@ -2945,7 +3502,7 @@ fn client_auth_channel_challenge_evm_case(
         channel: SettlementChannelId(format!("0x{}", hex_of(&channel_id))),
         config: to_settlement_config(&config),
     };
-    let challenge = challenge_entry(&presentation, expires, &signature);
+    let challenge = challenge_entry(&presentation, &vector_evm_network(), expires, &signature);
     let parsed = challenge_json::parse(challenge.to_string().as_bytes())
         .expect("the channelChallenge parses through the real peer-carriage reader");
     assert_eq!(parsed.expires(), expires);
@@ -3004,7 +3561,7 @@ fn client_auth_channel_challenge_solana_case(
     let presentation = ChannelPresentation::Solana {
         channel: SettlementChannelId(bs58::encode(channel_account).into_string()),
     };
-    let challenge = challenge_entry(&presentation, expires, &signature);
+    let challenge = challenge_entry(&presentation, &vector_solana_network(), expires, &signature);
     let parsed = challenge_json::parse(challenge.to_string().as_bytes())
         .expect("the channelChallenge parses through the real peer-carriage reader");
     assert_eq!(parsed.expires(), expires);
@@ -3215,6 +3772,7 @@ pub fn generate() -> WireVectors {
     let client_auth_channel_challenge = generate_client_auth_channel_challenge_vectors();
     let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
     let client_edge = generate_client_edge_vectors();
+    let claim_network = generate_claim_network_vectors(&claim_voucher);
     let zk_note = zk_note::generate_zk_note_vectors();
 
     WireVectors {
@@ -3231,6 +3789,7 @@ pub fn generate() -> WireVectors {
         client_auth_channel_challenge,
         claim_state_toon_channel_refused,
         client_edge,
+        claim_network,
         zk_note,
     }
 }

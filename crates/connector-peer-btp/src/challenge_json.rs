@@ -50,8 +50,10 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_btp::{ProtocolData, PEER_CHALLENGE_PROTOCOL};
 use connector_domain::client_claim::{
-    parse_evm_channel_config, EvmVoucherChannelConfig, SCHEME_BATCH_SETTLEMENT,
+    parse_evm_channel_config, required_network, ClientClaimError, EvmVoucherChannelConfig,
+    SCHEME_BATCH_SETTLEMENT,
 };
+use connector_domain::{AssetChain, Network};
 use serde_json::Value;
 
 use crate::claim_json::AmbiguousClaim;
@@ -63,6 +65,8 @@ use crate::claim_json::AmbiguousClaim;
 pub enum PeerRoleChallenge {
     /// An `x402BatchSettlement` channel.
     Evm {
+        /// The CAIP-2 network the channel is on (ADR 0086 decision 1).
+        network: Network,
         channel_id: [u8; 32],
         expires: u64,
         /// 65 bytes, `r ‖ s ‖ v`.
@@ -74,6 +78,8 @@ pub enum PeerRoleChallenge {
     },
     /// A `payment-channels` channel account.
     Solana {
+        /// The CAIP-2 network the channel is on (ADR 0086 decision 1).
+        network: Network,
         channel_account: [u8; 32],
         expires: u64,
         signature: [u8; 64],
@@ -100,6 +106,16 @@ impl PeerRoleChallenge {
         }
     }
 
+    /// The CAIP-2 network the challenged channel is on.
+    #[must_use]
+    pub fn network(&self) -> &Network {
+        match self {
+            PeerRoleChallenge::Evm { network, .. } | PeerRoleChallenge::Solana { network, .. } => {
+                network
+            }
+        }
+    }
+
     /// The unix second after which this challenge proves nothing.
     #[must_use]
     pub fn expires(&self) -> u64 {
@@ -121,6 +137,8 @@ pub enum ChallengeDecodeError {
     NotBatchSettlement,
     /// A field is missing or not its shape.
     Malformed(String),
+    /// No `network` (ADR 0086 decision 1): refused by name, never guessed.
+    NetworkMissing,
 }
 
 impl std::fmt::Display for ChallengeDecodeError {
@@ -134,6 +152,13 @@ impl std::fmt::Display for ChallengeDecodeError {
                  channel's voucher signer proves the peer role (ADR 0075)",
             ),
             ChallengeDecodeError::Malformed(reason) => write!(f, "peer-role challenge: {reason}"),
+            ChallengeDecodeError::NetworkMissing => {
+                write!(
+                    f,
+                    "peer-role challenge: {}",
+                    ClientClaimError::NetworkMissing
+                )
+            }
         }
     }
 }
@@ -185,8 +210,15 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
         .ok_or_else(|| {
             ChallengeDecodeError::Malformed("'expires' must be a unix second".to_string())
         })?;
+    let network = |chain: AssetChain| {
+        required_network(object, chain).map_err(|error| match error {
+            ClientClaimError::NetworkMissing => ChallengeDecodeError::NetworkMissing,
+            other => ChallengeDecodeError::Malformed(other.to_string()),
+        })
+    };
     match object.get("blockchain").and_then(Value::as_str) {
         Some("evm") => {
+            let network = network(AssetChain::Evm)?;
             let channel_id = hex_bytes::<32>(text("channelId")?).ok_or_else(|| {
                 ChallengeDecodeError::Malformed("'channelId' must be 32 bytes of hex".to_string())
             })?;
@@ -201,6 +233,7 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
                 ),
             };
             Ok(PeerRoleChallenge::Evm {
+                network,
                 channel_id,
                 expires,
                 signature,
@@ -208,6 +241,7 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
             })
         }
         Some("solana") => {
+            let network = network(AssetChain::Solana)?;
             let channel_account = bs58::decode(text("channelAccount")?)
                 .into_vec()
                 .ok()
@@ -227,6 +261,7 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
                     )
                 })?;
             Ok(PeerRoleChallenge::Solana {
+                network,
                 channel_account,
                 expires,
                 signature,
@@ -244,6 +279,7 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
 pub fn encode(challenge: &PeerRoleChallenge) -> String {
     match challenge {
         PeerRoleChallenge::Evm {
+            network,
             channel_id,
             expires,
             signature,
@@ -251,6 +287,7 @@ pub fn encode(challenge: &PeerRoleChallenge) -> String {
         } => {
             let mut json = serde_json::json!({
                 "blockchain": "evm",
+                "network": network.to_string(),
                 "scheme": SCHEME_BATCH_SETTLEMENT,
                 "channelId": format!("0x{}", hex::encode(channel_id)),
                 "expires": expires,
@@ -270,11 +307,13 @@ pub fn encode(challenge: &PeerRoleChallenge) -> String {
             json.to_string()
         }
         PeerRoleChallenge::Solana {
+            network,
             channel_account,
             expires,
             signature,
         } => serde_json::json!({
             "blockchain": "solana",
+            "network": network.to_string(),
             "scheme": SCHEME_BATCH_SETTLEMENT,
             "channelAccount": bs58::encode(channel_account).into_string(),
             "expires": expires,
@@ -298,6 +337,7 @@ mod tests {
 
     fn evm() -> PeerRoleChallenge {
         PeerRoleChallenge::Evm {
+            network: Network::Eip155(84_532),
             channel_id: [0xab; 32],
             expires: 1_800_000_000,
             signature: [0x11; 65],
@@ -315,6 +355,9 @@ mod tests {
 
     fn solana() -> PeerRoleChallenge {
         PeerRoleChallenge::Solana {
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
             channel_account: [0xc3; 32],
             expires: 1_800_000_000,
             signature: [0x22; 64],
@@ -331,6 +374,7 @@ mod tests {
     #[test]
     fn an_evm_challenge_needs_no_channel_config() {
         let PeerRoleChallenge::Evm {
+            network,
             channel_id,
             expires,
             signature,
@@ -340,6 +384,7 @@ mod tests {
             unreachable!()
         };
         let bare = PeerRoleChallenge::Evm {
+            network,
             channel_id,
             expires,
             signature,
@@ -367,6 +412,30 @@ mod tests {
         }
     }
 
+    /// ADR 0086 decision 1: a challenge names its network as a voucher does,
+    /// and one with none is refused by name on either chain.
+    #[test]
+    fn a_challenge_with_no_network_is_refused_by_name() {
+        for challenge in [evm(), solana()] {
+            let mut json: Value = serde_json::from_str(&encode(&challenge)).unwrap();
+            assert!(json.as_object_mut().unwrap().remove("network").is_some());
+            assert_eq!(
+                parse(json.to_string().as_bytes()),
+                Err(ChallengeDecodeError::NetworkMissing)
+            );
+        }
+        assert!(ChallengeDecodeError::NetworkMissing
+            .to_string()
+            .contains("'network'"));
+    }
+
+    #[test]
+    fn a_challenge_reads_its_network() {
+        assert_eq!(evm().network(), &Network::Eip155(84_532));
+        let json: Value = serde_json::from_str(&encode(&solana())).unwrap();
+        assert_eq!(json["network"], "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
+    }
+
     #[test]
     fn a_malformed_challenge_is_refused_not_guessed() {
         for (field, value) in [
@@ -374,6 +443,11 @@ mod tests {
             ("signature", Value::from("0x1234")),
             ("channelId", Value::from("0xnothex")),
             ("blockchain", Value::from("mina")),
+            ("network", Value::from("evm:84532")),
+            (
+                "network",
+                Value::from("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
+            ),
         ] {
             let mut json: Value = serde_json::from_str(&encode(&evm())).unwrap();
             json[field] = value;

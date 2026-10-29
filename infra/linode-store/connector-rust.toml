@@ -280,14 +280,14 @@ price = 1000
 # (`name()` "USDC", `version()` "2", read on chain, ADR 0075 Prerequisites);
 # `min_sponsored_deposit` is one USDC in base units.
 
-[settlement.evm]
+[settlement.eip155.84532]
 rpc_url = "https://base-sepolia-rpc.publicnode.com"
 token_address = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.84532.key]
 key_file = "/app/data/settlement.key"
 
 [settlement.solana]

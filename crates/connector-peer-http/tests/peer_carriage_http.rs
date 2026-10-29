@@ -171,6 +171,7 @@ fn evm_voucher(owner: &SecretKey, amount: u64, signature: &[u8; 65]) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2030-01-01T00:00:00.000Z",
@@ -206,6 +207,7 @@ fn evm_challenge(owner: &SecretKey, signer: &SecretKey, expires: u64) -> String 
     let channel_id = channel_of(owner);
     let digest = evm_voucher_claim_state_challenge_digest(&domain(), &channel_id, expires);
     challenge_json::encode(&PeerRoleChallenge::Evm {
+        network: connector_domain::Network::Eip155(CHAIN_ID),
         channel_id,
         expires,
         signature: sign_evm(signer, &digest),
@@ -375,6 +377,7 @@ impl VoucherEvidence for VoucherBook {
             expires,
             signature,
             channel_config,
+            ..
         } = challenge
         else {
             return VoucherCheck::Unresolved;
@@ -807,7 +810,10 @@ fn challenged(challenge_json: &str, body: Vec<u8>) -> PeerRequest {
 }
 
 fn ack_on(response: &PeerResponse) -> Option<ClaimAckOutcome> {
-    connector_peer_http::headers::claim_ack(&response.headers)
+    connector_peer_http::headers::claim_ack(
+        &response.headers,
+        &connector_domain::Network::Eip155(CHAIN_ID),
+    )
 }
 
 fn reject_code(response: &PeerResponse) -> String {
@@ -1028,14 +1034,14 @@ endpoint = "https://configured.example:8443/ilp"
 peer_id = "{PEER_ID}"
 voucher_signer = "{signer}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 "#,

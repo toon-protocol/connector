@@ -86,7 +86,8 @@ async fn the_evm_backend_submits_and_confirms_over_a_real_circuit() {
         return;
     };
     let transport =
-        RpcTransport::through(EVM_RPC, &proxy, Circuit::EvmSettlement).expect("transport");
+        RpcTransport::through(EVM_RPC, &proxy, Circuit::EvmSettlement { chain_id: 31337 })
+            .expect("transport");
     let key = match env("SETTLEMENT_CIRCUIT_EVM_KEY_FILE") {
         Some(path) => std::fs::read_to_string(path)
             .expect("read SETTLEMENT_CIRCUIT_EVM_KEY_FILE")

@@ -205,6 +205,10 @@ pub enum RefusedEvidence {
     /// `toon-channel` claim. Refused rather than read as absent, so a
     /// straggling peer is told why rather than silently downgraded.
     ToonChannelClaim,
+    /// A voucher with no `network` (ADR 0086 decision 1): refused by name
+    /// for the same reason, so a peer that predates `schema_version` 11
+    /// learns it must upgrade.
+    NetworkMissingClaim,
 }
 
 impl RefusedEvidence {
@@ -239,6 +243,11 @@ impl RefusedEvidence {
             }
             RefusedEvidence::ToonChannelClaim => {
                 connector_domain::client_claim::ClientClaimError::ToonChannel
+                    .to_string()
+                    .into_bytes()
+            }
+            RefusedEvidence::NetworkMissingClaim => {
+                connector_domain::client_claim::ClientClaimError::NetworkMissing
                     .to_string()
                     .into_bytes()
             }
@@ -296,6 +305,10 @@ pub fn decode_claim(raw: &[u8]) -> Result<Option<ClientClaim>, RefusedEvidence> 
             tracing::warn!("refusing a toon-channel claim: ADR 0075 retired the scheme");
             Err(RefusedEvidence::ToonChannelClaim)
         }
+        Err(ClaimDecodeError::NetworkMissing) => {
+            tracing::warn!("refusing a voucher with no 'network': ADR 0086 requires one");
+            Err(RefusedEvidence::NetworkMissingClaim)
+        }
         Err(error) => {
             // No peer id to name: the claim *is* what would have named one,
             // and it did not decode.
@@ -331,9 +344,15 @@ pub async fn decide_frame(
             };
             let check = vouchers.check_voucher(voucher).await;
             decide_voucher_role(
-                presented(connector, check, &voucher_channel(voucher), true)
-                    .as_ref()
-                    .map(as_presented),
+                presented(
+                    connector,
+                    check,
+                    &voucher_channel(voucher),
+                    voucher.network(),
+                    true,
+                )
+                .as_ref()
+                .map(as_presented),
             )
         }
         None => match (&evidence.challenge, vouchers) {
@@ -341,9 +360,15 @@ pub async fn decide_frame(
                 let check = vouchers.check_challenge(challenge).await;
                 let in_window = challenge_in_window(challenge.expires(), connector.now_unix());
                 decide_voucher_role(
-                    presented(connector, check, &challenge.channel(), in_window)
-                        .as_ref()
-                        .map(as_presented),
+                    presented(
+                        connector,
+                        check,
+                        &challenge.channel(),
+                        challenge.network(),
+                        in_window,
+                    )
+                    .as_ref()
+                    .map(as_presented),
                 )
             }
             _ => decide_voucher_role(None),
@@ -391,12 +416,15 @@ pub fn challenge_in_window(expires: u64, now: u64) -> bool {
     expires > now && expires - now <= MAX_PEER_CHALLENGE_LIFETIME_SECS
 }
 
-/// A check, as the peering its signer is bound to on `channel` and a
-/// verdict. `None` for a channel the receiving half could not resolve.
+/// A check, as the peering its signer is bound to on `channel` and
+/// `network` and a verdict. `None` for a channel the receiving half could
+/// not resolve. A signer bound on another network proves nothing here: a
+/// peering's two halves are on one network (ADR 0086 decision 11).
 fn presented(
     connector: &Connector,
     check: VoucherCheck,
     channel: &str,
+    network: &connector_domain::Network,
     in_window: bool,
 ) -> Option<(Option<String>, VoucherVerification)> {
     let (signer, verification) = match check {
@@ -406,7 +434,7 @@ fn presented(
         VoucherCheck::Unresolved => return None,
     };
     Some((
-        connector.voucher_signer_peer_on(&signer, channel),
+        connector.voucher_signer_peer_on(&signer, channel, network),
         verification,
     ))
 }

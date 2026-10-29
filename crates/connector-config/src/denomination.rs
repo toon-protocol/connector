@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::encoding::{is_base58_32_bytes, parse_evm_address, to_hex};
 use crate::error::ConfigError;
-use crate::settlement::{SettlementChain, SettlementTables};
+use crate::settlement::SettledNetworks;
 
 /// The most pools one token's quote path may name (ADR 0071 decision 3):
 /// one for a numeraire-quoted token, two for a token whose only real venue
@@ -23,7 +23,7 @@ const MAX_QUOTE_LEGS: usize = 2;
 /// [`crate::settlement::RawKeyedSettlementConfig`], and for the reason that
 /// one is keyed: a settlement table is keyed by chain because there is
 /// exactly one per chain and the chain's own name is the natural key. A
-/// token has no such key -- `evm:0x833589...` is the value, not a heading --
+/// token has no such key -- `eip155:8453/erc20:0x833589...` is the value, not a heading --
 /// and a TOML table keyed by a contract address would put a 42-character
 /// literal in a section header where a typo is hardest to see.
 /// `deny_unknown_fields` for ADR 0009's standing reason.
@@ -345,15 +345,6 @@ impl DenominationConfig {
     }
 }
 
-/// Which chains this node has a `[settlement.<chain>]` table -- and
-/// therefore an RPC endpoint -- for. ADR 0071 decision 3 puts a token's
-/// quote on its own settlement chain precisely because that is the one
-/// chain a peering already guarantees RPC for, so a quote on a chain with
-/// no table is a poller that could never take its first reading.
-fn settles_on(tables: SettlementTables, chain: AssetChain) -> bool {
-    SettlementChain::try_from(chain).is_ok_and(|chain| tables.x402(chain))
-}
-
 /// A pool address in the one spelling its chain has: lowercase `0x` hex for
 /// an EVM contract, base58 for a Solana account. `None` for text that is
 /// neither, which is refused by name -- a pool this node cannot address is
@@ -426,7 +417,7 @@ fn resolve_guard_override(row: &str, raw: &mut RawRateRow) -> Result<GuardOverri
 /// two numeraires has no right one at all.
 fn resolve_tokens(
     raw: Vec<RawToken>,
-    tables: SettlementTables,
+    networks: &SettledNetworks,
 ) -> Result<(Vec<DeclaredToken>, Option<AssetId>), ConfigError> {
     let mut assets = Vec::with_capacity(raw.len());
     let mut seen = HashSet::with_capacity(raw.len());
@@ -440,13 +431,20 @@ fn resolve_tokens(
                     source,
                 })?;
         // ADR 0080 decision 7, as amended: native MINA is the zk-note
-        // table's asset and no other table's. It parses now, so it is
-        // refused here by its own name; any other `mina:` token is refused
-        // by the parser above as an unknown chain, as it always was.
+        // table's asset and no other table's. It parses, so it is refused
+        // here by its own name; any other Mina asset is refused by the parser
+        // above.
         if asset.chain() == AssetChain::Mina {
             return Err(ConfigError::TokenMinaNative {
                 value: token.asset.clone(),
             });
+        }
+        // ADR 0086 decision 2: an asset says which network it is on, and a
+        // node deals only on networks it settles on. Before the quote path
+        // is walked, because a pool on a network with no table is one this
+        // node could never read either.
+        if !networks.settles(asset.network()) {
+            return Err(ConfigError::TokenWithoutSettlement { asset });
         }
         if !seen.insert(asset.clone()) {
             return Err(ConfigError::DuplicateToken { asset });
@@ -479,7 +477,7 @@ fn resolve_tokens(
         }
         let quote = match token.quote {
             None => None,
-            Some(legs) => Some(resolve_quote(&asset, legs, numeraire.as_ref(), tables)?),
+            Some(legs) => Some(resolve_quote(&asset, legs, numeraire.as_ref())?),
         };
         tokens.push(DeclaredToken {
             asset,
@@ -497,7 +495,6 @@ fn resolve_quote(
     asset: &AssetId,
     legs: Vec<RawQuoteLeg>,
     numeraire: Option<&AssetId>,
-    tables: SettlementTables,
 ) -> Result<QuotePath, ConfigError> {
     if legs.is_empty() {
         return Err(ConfigError::TokenQuoteEmpty {
@@ -510,17 +507,6 @@ fn resolve_quote(
             legs: legs.len(),
         });
     }
-    // Before every per-leg check, because it is the one refusal that is
-    // about the node rather than about the row: an operator whose pools are
-    // all fine but whose node has no RPC for their chain needs to read that
-    // sentence, not a complaint about the first pool address.
-    if !settles_on(tables, asset.chain()) {
-        return Err(ConfigError::TokenQuoteWithoutSettlement {
-            asset: asset.clone(),
-            chain: asset.chain(),
-        });
-    }
-
     let mut resolved = Vec::with_capacity(legs.len());
     for leg in legs {
         let quote_token = leg.quote_token.parse::<AssetId>().map_err(|source| {
@@ -530,7 +516,7 @@ fn resolve_quote(
                 source,
             }
         })?;
-        if quote_token.chain() != asset.chain() {
+        if quote_token.network() != asset.network() {
             return Err(ConfigError::TokenQuoteOffChain {
                 asset: asset.clone(),
                 quote_token,
@@ -579,12 +565,11 @@ fn resolve_quote(
 fn resolve_rate_rows(
     raw: Vec<RawRateRow>,
     tokens: &[DeclaredToken],
-    zk_note: bool,
+    zk_vault_asset: Option<&AssetId>,
 ) -> Result<Vec<RateRow>, ConfigError> {
     let declared = |asset: &AssetId| tokens.iter().any(|token| &token.asset == asset);
     // A zk edge's vault asset may be a rate's `from` (ADR 0080 decision 7,
     // as amended) without being a `[[tokens]]` row, which it may never be.
-    let mina_native = AssetId::mina_native();
     let mut seen = HashSet::with_capacity(raw.len());
     let mut rows = Vec::with_capacity(raw.len());
 
@@ -611,7 +596,7 @@ fn resolve_rate_rows(
         // Both sides, `from` first, so a row with two typos names the one
         // an operator reads first.
         for unknown in [&from, &to] {
-            let vault_asset = zk_note && unknown == &from && from == mina_native;
+            let vault_asset = unknown == &from && zk_vault_asset == Some(&from);
             if !declared(unknown) && !vault_asset {
                 return Err(ConfigError::RateRowUnknownToken {
                     from: from.clone(),
@@ -650,6 +635,46 @@ fn resolve_rate_rows(
     Ok(rows)
 }
 
+/// Refuse a declared token on a network other than the numeraire's that no
+/// `[[rates]]` row gives a static rate (ADR 0086 decision 13).
+///
+/// A quote path cannot leave its token's network
+/// ([`ConfigError::TokenQuoteOffChain`]), and every path ends at the
+/// numeraire, so only a token on the numeraire's own network can quote
+/// itself. Any other is priced by a static row or by nothing -- and nothing
+/// is a token every forward across would refuse, so it is refused here,
+/// by name, instead. A row with a `rate` on either side satisfies it; a
+/// rate-less row only tightens guards and prices nothing.
+///
+/// A node with no numeraire composes nothing and quotes nothing, so every
+/// pair it deals is already a static row or a refused forward; this rule
+/// is about the numeraire's network, and such a node has none.
+fn refuse_unpriced_off_numeraire_network(
+    tokens: &[DeclaredToken],
+    numeraire: Option<&AssetId>,
+    rates: &[RateRow],
+) -> Result<(), ConfigError> {
+    let Some(numeraire) = numeraire else {
+        return Ok(());
+    };
+    let priced = |asset: &AssetId| {
+        rates
+            .iter()
+            .any(|row| row.rate.is_some() && (&row.from == asset || &row.to == asset))
+    };
+    match tokens
+        .iter()
+        .map(DeclaredToken::asset)
+        .find(|asset| asset.network() != numeraire.network() && !priced(asset))
+    {
+        Some(asset) => Err(ConfigError::TokenOffNumeraireNetworkWithoutRate {
+            asset: asset.clone(),
+            numeraire: numeraire.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Validate everything ADR 0071 decisions 3 and 5 let an operator declare:
 /// `[[tokens]]`, `[[rates]]` and `[rate_guards]`.
 ///
@@ -661,15 +686,16 @@ pub(crate) fn resolve_denomination(
     raw_tokens: Vec<RawToken>,
     raw_rates: Vec<RawRateRow>,
     raw_guards: Option<RawRateGuards>,
-    tables: SettlementTables,
-    zk_note: bool,
+    networks: &SettledNetworks,
+    zk_vault_asset: Option<&AssetId>,
 ) -> Result<DenominationConfig, ConfigError> {
     if raw_tokens.is_empty() && raw_rates.is_empty() && raw_guards.is_none() {
         return Ok(DenominationConfig::default());
     }
 
-    let (tokens, numeraire) = resolve_tokens(raw_tokens, tables)?;
-    let rates = resolve_rate_rows(raw_rates, &tokens, zk_note)?;
+    let (tokens, numeraire) = resolve_tokens(raw_tokens, networks)?;
+    let rates = resolve_rate_rows(raw_rates, &tokens, zk_vault_asset)?;
+    refuse_unpriced_off_numeraire_network(&tokens, numeraire.as_ref(), &rates)?;
 
     let guards = match raw_guards {
         None => None,
@@ -706,20 +732,20 @@ mod tests {
     use super::*;
 
     /// USDC on Base, the numeraire throughout: 6 decimals.
-    const USDC: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const USDC: &str = "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
     /// ANYONE on Base, the dealt token: 18 decimals, WETH-quoted.
-    const ANYONE: &str = "evm:0x9ff58f4fFB29fA2266Ab25e75e2A8b3503311656";
+    const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4fFB29fA2266Ab25e75e2A8b3503311656";
     /// WETH on Base -- an intermediate, never a token this node deals.
-    const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
+    const WETH: &str = "eip155:8453/erc20:0x4200000000000000000000000000000000000006";
     /// USDC on Solana, for the same-asset cross-chain pair.
-    const USDC_SOLANA: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const USDC_SOLANA: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     const POOL_ANYONE_WETH: &str = "0x1111111111111111111111111111111111111111";
     const POOL_WETH_USDC: &str = "0x2222222222222222222222222222222222222222";
 
     /// A node with both settlement tables, which is what `local/solo`
     /// runs; the per-chain refusals below narrow it.
-    fn both_chains() -> SettlementTables {
-        SettlementTables::for_tests(true, true)
+    fn both_chains() -> SettledNetworks {
+        SettledNetworks::for_tests(&[8453], true)
     }
 
     fn asset(text: &str) -> AssetId {
@@ -799,7 +825,7 @@ spread = {{ numerator = 75, denominator = 10000 }}
     #[test]
     fn a_node_that_declares_nothing_resolves_to_the_empty_declaration() {
         let resolved =
-            resolve_denomination(vec![], vec![], None, both_chains(), false).expect("resolve");
+            resolve_denomination(vec![], vec![], None, &both_chains(), None).expect("resolve");
         assert_eq!(resolved, DenominationConfig::default());
         assert!(!resolved.declares_tokens());
         assert_eq!(resolved.numeraire(), None);
@@ -811,7 +837,7 @@ spread = {{ numerator = 75, denominator = 10000 }}
     fn a_full_declaration_is_reachable_through_typed_accessors() {
         let (tokens, rates) = full_declaration();
         let resolved =
-            resolve_denomination(tokens, rates, guards(), both_chains(), false).expect("resolve");
+            resolve_denomination(tokens, rates, guards(), &both_chains(), None).expect("resolve");
 
         assert!(resolved.declares_tokens());
         assert_eq!(resolved.numeraire(), Some(&asset(USDC)));
@@ -844,7 +870,7 @@ spread = {{ numerator = 75, denominator = 10000 }}
     fn a_per_pair_guard_overrides_the_node_default() {
         let (tokens, rates) = full_declaration();
         let resolved =
-            resolve_denomination(tokens, rates, guards(), both_chains(), false).expect("resolve");
+            resolve_denomination(tokens, rates, guards(), &both_chains(), None).expect("resolve");
 
         let overridden = resolved
             .guards_for(&asset(USDC_SOLANA), &asset(ANYONE))
@@ -886,7 +912,7 @@ asset = "{ANYONE}"
 numeraire = true
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a node has one numeraire");
         assert!(
             matches!(&error, ConfigError::MixedNumeraire { first, second }
@@ -906,7 +932,7 @@ rate = {{ numerator = 3, denominator = 0 }}
 "#
         ));
         let (tokens, _) = full_declaration();
-        let error = resolve_denomination(tokens, rates, guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("there is no rational over zero");
         assert!(
             matches!(&error, ConfigError::RateRowInvalid { from, to, .. }
@@ -929,7 +955,7 @@ rate = {{ numerator = 1, denominator = 2 }}
 "#
         ));
         let (tokens, _) = full_declaration();
-        let error = resolve_denomination(tokens, rates, guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("a pair is between two tokens this node deals");
         assert!(
             matches!(&error, ConfigError::RateRowUnknownToken { unknown, .. }
@@ -953,7 +979,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path ends at the numeraire");
         assert!(
             matches!(&error, ConfigError::TokenQuoteDoesNotEndAtNumeraire { asset: a, ends_at, numeraire }
@@ -963,28 +989,51 @@ quote = [
     }
 
     #[test]
-    fn a_quote_on_a_chain_with_no_settlement_table_is_refused_by_name() {
-        let tokens = tokens_from(&format!(
-            r#"
+    fn a_token_on_a_network_with_no_settlement_table_is_refused_by_name() {
+        // ADR 0086 decision 2: USDC at Base's address, but on Arbitrum,
+        // which this node has no table for. Quoted or not, it is a token no
+        // channel of this node can hold.
+        let on_arbitrum = USDC.replace("eip155:8453", "eip155:42161");
+        for quote in [
+            String::new(),
+            format!(
+                "quote = [{{ pool = \"{POOL_WETH_USDC}\", quote_token = \"{USDC}\", \
+                 twap_window_secs = 1800 }}]"
+            ),
+        ] {
+            let tokens = tokens_from(&format!(
+                r#"
 [[tokens]]
 asset = "{USDC}"
 numeraire = true
 
 [[tokens]]
-asset = "{ANYONE}"
-quote = [
-  {{ pool = "{POOL_WETH_USDC}", quote_token = "{USDC}", twap_window_secs = 1800 }},
-]
+asset = "{on_arbitrum}"
+{quote}
 "#
+            ));
+            let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
+                .expect_err("a token on a network this node does not settle on");
+            assert!(
+                matches!(&error, ConfigError::TokenWithoutSettlement { asset: a }
+                    if a == &asset(&on_arbitrum)),
+                "got: {error}"
+            );
+            assert!(
+                error.to_string().contains("[settlement.eip155.42161]"),
+                "got: {error}"
+            );
+        }
+
+        // A Solana-only node settles on no EVM network at all.
+        let tokens = tokens_from(&format!(
+            "[[tokens]]\nasset = \"{USDC}\"\nnumeraire = true\n"
         ));
-        // A Solana-only node: it has RPC for no EVM chain, so it can never
-        // take this reading.
-        let solana_only = SettlementTables::for_tests(false, true);
-        let error = resolve_denomination(tokens, vec![], guards(), solana_only, false)
-            .expect_err("a quote needs RPC for its own chain");
+        let solana_only = SettledNetworks::for_tests(&[], true);
+        let error = resolve_denomination(tokens, vec![], None, &solana_only, None)
+            .expect_err("no EVM table");
         assert!(
-            matches!(&error, ConfigError::TokenQuoteWithoutSettlement { asset: a, chain }
-                if a == &asset(ANYONE) && *chain == AssetChain::Evm),
+            matches!(&error, ConfigError::TokenWithoutSettlement { .. }),
             "got: {error}"
         );
     }
@@ -1000,7 +1049,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path has nowhere to end");
         assert!(
             matches!(&error, ConfigError::QuoteWithoutNumeraire { asset: a } if a == &asset(ANYONE)),
@@ -1025,7 +1074,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("one or two pools, never three");
         assert!(
             matches!(&error, ConfigError::TokenQuoteTooLong { legs, .. } if *legs == 3),
@@ -1048,7 +1097,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path stays on the token's own chain");
         assert!(
             matches!(&error, ConfigError::TokenQuoteOffChain { .. }),
@@ -1071,7 +1120,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a window of nothing is a spot read");
         assert!(
             matches!(&error, ConfigError::TokenQuoteZeroWindow { .. }),
@@ -1094,7 +1143,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a pool this node cannot address is a rate it cannot read");
         assert!(
             matches!(&error, ConfigError::TokenQuotePoolInvalid { value, .. }
@@ -1115,7 +1164,7 @@ quote = [
 ]
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("the numeraire is what everything else is quoted in");
         assert!(
             matches!(&error, ConfigError::NumeraireQuoted { .. }),
@@ -1135,7 +1184,7 @@ asset = "{USDC}"
 asset = "{lowercase}"
 "#
         ));
-        let error = resolve_denomination(tokens, vec![], None, both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], None, &both_chains(), None)
             .expect_err("one token, one row");
         // The checksummed spelling and the lowercase one are one token --
         // which is the whole reason `AssetId` canonicalizes.
@@ -1156,7 +1205,7 @@ rate = {{ numerator = 1, denominator = 1 }}
 "#
         ));
         let (tokens, _) = full_declaration();
-        let error = resolve_denomination(tokens, rates, guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("a token is not a denomination boundary with itself");
         assert!(
             matches!(&error, ConfigError::RateRowSelfPair { .. }),
@@ -1180,7 +1229,7 @@ rate = {{ numerator = 5000000000000, denominator = 1 }}
 "#
         ));
         let (tokens, _) = full_declaration();
-        let error = resolve_denomination(tokens, rates, guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("one ordered pair, one row");
         assert!(
             matches!(&error, ConfigError::DuplicateRateRow { .. }),
@@ -1201,11 +1250,18 @@ rate = {{ numerator = 4000000000000, denominator = 1 }}
 from = "{ANYONE}"
 to = "{USDC}"
 rate = {{ numerator = 1, denominator = 4200000000000 }}
+
+# The declaration's Solana USDC is off the numeraire's network, so it
+# keeps its static row (ADR 0086 decision 13).
+[[rates]]
+from = "{USDC_SOLANA}"
+to = "{ANYONE}"
+rate = {{ numerator = 4000000000000, denominator = 1 }}
 "#
         ));
         let (tokens, _) = full_declaration();
         let resolved =
-            resolve_denomination(tokens, rates, guards(), both_chains(), false).expect("resolve");
+            resolve_denomination(tokens, rates, guards(), &both_chains(), None).expect("resolve");
         assert_ne!(
             resolved.rate(&asset(USDC), &asset(ANYONE)),
             resolved
@@ -1224,8 +1280,8 @@ rate = {{ numerator = 1, denominator = 4200000000000 }}
                 ttl_secs: 300,
                 max_move: fraction(5, 100),
             }),
-            both_chains(),
-            false,
+            &both_chains(),
+            None,
         )
         .expect_err("a pair dealt at its own mid forwards nothing");
         assert!(
@@ -1245,8 +1301,8 @@ rate = {{ numerator = 1, denominator = 4200000000000 }}
                 ttl_secs: 0,
                 max_move: fraction(5, 100),
             }),
-            both_chains(),
-            false,
+            &both_chains(),
+            None,
         )
         .expect_err("a rate that is dead on arrival is not a rate");
         assert!(
@@ -1271,8 +1327,8 @@ rate = {{ numerator = 1, denominator = 4200000000000 }}
                 ttl_secs: 300,
                 max_move: fraction(0, 1),
             }),
-            both_chains(),
-            false,
+            &both_chains(),
+            None,
         )
         .expect("a pinned pair dealt at mid is a policy, not a typo");
         let guards = resolved.guards().expect("declared");
@@ -1291,7 +1347,7 @@ ttl_secs = 0
 "#
         ));
         let (tokens, _) = full_declaration();
-        let error = resolve_denomination(tokens, rates, guards(), both_chains(), false)
+        let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("an override is a guard too");
         assert!(
             matches!(&error, ConfigError::RateGuardInvalid { row, .. } if row.contains("->")),
@@ -1302,7 +1358,7 @@ ttl_secs = 0
     #[test]
     fn a_declared_rate_without_node_guards_is_refused() {
         let (tokens, rates) = full_declaration();
-        let error = resolve_denomination(tokens, rates, None, both_chains(), false)
+        let error = resolve_denomination(tokens, rates, None, &both_chains(), None)
             .expect_err("a rate with no ttl is one this node deals on forever");
         assert!(
             matches!(&error, ConfigError::RateGuardsMissing),
@@ -1326,7 +1382,7 @@ asset = "{USDC_SOLANA}"
 "#
         ));
         let resolved =
-            resolve_denomination(tokens, vec![], None, both_chains(), false).expect("resolve");
+            resolve_denomination(tokens, vec![], None, &both_chains(), None).expect("resolve");
         assert!(resolved.declares_tokens());
         assert_eq!(resolved.guards(), None);
         assert_eq!(resolved.guards_for(&asset(USDC), &asset(USDC_SOLANA)), None);
@@ -1394,10 +1450,27 @@ window_secs = 60
 asset = "mina:B62qFoo"
 "#,
         );
-        let error = resolve_denomination(tokens, vec![], None, both_chains(), false)
+        let error = resolve_denomination(tokens, vec![], None, &both_chains(), None)
             .expect_err("mina is gone from this repository");
         assert!(
             matches!(&error, ConfigError::TokenAssetInvalid { .. }),
+            "got: {error}"
+        );
+    }
+    /// ADR 0080 decision 7, as amended: native MINA parses, and is refused
+    /// by its own name as a token -- it is the zk-note vault's asset only.
+    #[test]
+    fn native_mina_is_refused_as_a_token_by_name() {
+        let tokens = tokens_from(
+            r#"
+[[tokens]]
+asset = "mina:devnet/slip44:12586"
+"#,
+        );
+        let error = resolve_denomination(tokens, vec![], None, &both_chains(), None)
+            .expect_err("MINA is the vault's asset, not a token");
+        assert!(
+            matches!(&error, ConfigError::TokenMinaNative { .. }),
             "got: {error}"
         );
     }

@@ -510,11 +510,15 @@ domain; Solana Ed25519 over `"toon-voucher-claim-state-challenge-v1" ‖ channel
 LE)`.
 
 ```json
-{"blockchain": "evm", "scheme": "batch-settlement", "channelId": "0x…", "expires": 1800000000,
- "signature": "0x…(65 bytes)", "channelConfig": {…}}
-{"blockchain": "solana", "scheme": "batch-settlement", "channelAccount": "<base58>",
- "expires": 1800000000, "signature": "<base64 of 64 bytes>"}
+{"blockchain": "evm", "network": "eip155:8453", "scheme": "batch-settlement", "channelId": "0x…",
+ "expires": 1800000000, "signature": "0x…(65 bytes)", "channelConfig": {…}}
+{"blockchain": "solana", "network": "solana:<genesis prefix>", "scheme": "batch-settlement",
+ "channelAccount": "<base58>", "expires": 1800000000, "signature": "<base64 of 64 bytes>"}
 ```
+
+`network` is **required** (ADR 0086 decision 1, `schema_version` 11): a challenge with none is
+refused by name, and one on a network the receiver holds no table for proves nothing. A peer's
+voucher with no `network` is refused by name on both carriages, as a `toon-channel` claim is (§1.5).
 
 One narrowing: `scheme` is **required** and MUST be `"batch-settlement"`. A claim-state entry
 without it asks about a `toon-channel` channel, and a `toon-channel` challenge never proves the peer
@@ -1331,9 +1335,14 @@ frame — never a frame of its own:
 The body in both cases is the same JSON, raw UTF-8 on BTP and `base64(JSON)` in the HTTP header:
 
 ```json
-{ "result": "accepted" }
-{ "result": "rejected", "reason": "signature_invalid" }
+{ "result": "accepted", "network": "eip155:8453" }
+{ "result": "rejected", "reason": "signature_invalid", "network": "eip155:8453" }
 ```
+
+`network` is the CAIP-2 network of the voucher judged
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 1,
+`schema_version` 11). A payer reads an ack as a verdict only when it names the network the payer's
+voucher named; one naming another network, or none, is **not acknowledged** (§6.3).
 
 `reason` is exactly one of `peer-semantics-pre-868.md` §3.4's four, unchanged and not extensible without a
 spec change: `signature_invalid`, `nonce_not_advancing`, `amount_not_advancing`, `unknown_channel`.

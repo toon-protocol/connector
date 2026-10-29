@@ -339,15 +339,15 @@ mod tests {
     use crate::in_memory::{InMemoryRateSource, PoolContents};
 
     fn anyone() -> AssetId {
-        AssetId::evm("0x0000000000000000000000000000000000009876")
+        AssetId::erc20(8453, "0x0000000000000000000000000000000000009876")
     }
 
     fn weth() -> AssetId {
-        AssetId::evm("0x4200000000000000000000000000000000000006")
+        AssetId::erc20(8453, "0x4200000000000000000000000000000000000006")
     }
 
     fn usdc() -> AssetId {
-        AssetId::evm("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+        AssetId::erc20(8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
     }
 
     fn at(seconds: i64) -> DateTime<Utc> {

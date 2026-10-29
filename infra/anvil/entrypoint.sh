@@ -9,10 +9,18 @@
 # =============================================================================
 set -eu
 
+# The chain id comes from the service's environment, never from this file: the
+# root `anvil` service runs on 31337, and `local/solo`'s second anvil runs the
+# SAME entrypoint and seed on 31338 (ADR 0086 decision 15), so USDC and x402
+# land at the same addresses on two networks that differ only in their id.
+# Unset is a refusal rather than a default -- an anvil silently started on the
+# wrong id is exactly what a node's `eth_chainId` check refuses at boot.
+: "${ANVIL_CHAIN_ID:?ANVIL_CHAIN_ID must name this anvil's chain id}"
+
 RPC=http://localhost:8545
 
-echo "Starting anvil..."
-anvil --host 0.0.0.0 --port 8545 --chain-id 31337 --accounts 10 --balance 10000 &
+echo "Starting anvil on chain id $ANVIL_CHAIN_ID..."
+anvil --host 0.0.0.0 --port 8545 --chain-id "$ANVIL_CHAIN_ID" --accounts 10 --balance 10000 &
 ANVIL_PID=$!
 
 cleanup() {

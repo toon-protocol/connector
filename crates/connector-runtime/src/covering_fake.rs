@@ -55,6 +55,7 @@ impl VoucherStateSource for NothingAcceptedYet {
     async fn watermark(
         &self,
         _presentation: &ChannelPresentation,
+        _network: &connector_domain::Network,
         _expires: u64,
         _signature: &[u8],
     ) -> Result<u128, String> {
@@ -97,7 +98,10 @@ pub fn covering(connector: Connector, peer_id: &str) -> Connector {
     let outbound = Arc::new(
         complete(OutboundChannels::restore(
             Arc::new(InMemoryJournal::new()),
-            vec![(SettlementChain::Evm, payer as Arc<dyn BatchSettlementPayer>)],
+            vec![(
+                "eip155:31337".parse().expect("a CAIP-2 network"),
+                payer as Arc<dyn BatchSettlementPayer>,
+            )],
         ))
         .expect("an empty journal"),
     );

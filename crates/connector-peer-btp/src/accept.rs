@@ -61,7 +61,7 @@ use connector_btp::{
     BTP_TRANSFER,
 };
 use connector_domain::client_claim::ClientClaim;
-use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
+use connector_domain::{Fulfill, Network, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{claim_ack_to_emit, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole};
 use connector_runtime::{ClaimAckOutcome, Connector};
 use tokio::sync::mpsc;
@@ -393,9 +393,14 @@ impl PeerSession {
             Some(judged) => (judged.ack, judged.claimed, judged.prior),
             None => (ClaimAckOutcome::NotSent, None, None),
         };
+        // The ack names the network of the voucher it judged (ADR 0086).
+        let ack_network = voucher.map(|voucher| voucher.network().clone());
 
         if ilp_packet.is_empty() {
-            let entries: Vec<ProtocolData> = self.claim_ack_entry(role, ack).into_iter().collect();
+            let entries: Vec<ProtocolData> = self
+                .claim_ack_entry(role, ack, ack_network.as_ref())
+                .into_iter()
+                .collect();
             return self.send(encode_response(request_id, &entries, &[])).await;
         }
 
@@ -453,7 +458,13 @@ impl PeerSession {
             self.state.enforcement.mode(&peer_id),
         ) {
             return self
-                .send(self.payment_required_response(role, request_id, refusal, ack))
+                .send(self.payment_required_response(
+                    role,
+                    request_id,
+                    refusal,
+                    ack,
+                    ack_network.as_ref(),
+                ))
                 .await;
         }
 
@@ -476,7 +487,8 @@ impl PeerSession {
                 .connector
                 .handle_peer_prepare_over(Some(&peer_id), prepare, inbound_channel.as_deref())
                 .await;
-            let frame = encode_packet_response(&role, request_id, response, ack);
+            let frame =
+                encode_packet_response(&role, request_id, response, ack, ack_network.as_ref());
             let _ = reply(&replies, frame).await;
         });
         Ok(())
@@ -485,8 +497,13 @@ impl PeerSession {
     /// §1.7: a connector MUST NOT emit a `claim-ack` on a client
     /// interaction, and §6.2 forbids one on a response answering a frame
     /// that carried no voucher. Both are one call.
-    fn claim_ack_entry(&self, role: &SessionRole, ack: ClaimAckOutcome) -> Option<ProtocolData> {
-        claim_ack_to_emit(role, ack::protocol_data(ack))
+    fn claim_ack_entry(
+        &self,
+        role: &SessionRole,
+        ack: ClaimAckOutcome,
+        network: Option<&Network>,
+    ) -> Option<ProtocolData> {
+        claim_ack_to_emit(role, ack::protocol_data(ack, network))
     }
 
     fn reject_response(
@@ -496,7 +513,7 @@ impl PeerSession {
         reject: Reject,
         ack: ClaimAckOutcome,
     ) -> Vec<u8> {
-        encode_packet_response(role, request_id, PacketResponse::Reject(reject), ack)
+        encode_packet_response(role, request_id, PacketResponse::Reject(reject), ack, None)
     }
 
     /// [`price_gate::payment_required`]'s refusal, BTP-shaped: `F06` plus
@@ -511,12 +528,13 @@ impl PeerSession {
         request_id: u32,
         refusal: PaymentRequired,
         ack: ClaimAckOutcome,
+        network: Option<&Network>,
     ) -> Vec<u8> {
         let mut entries = vec![
             fields::accumulated_cost_protocol_data(refusal.reject.accumulated_cost),
             fields::payment_required_protocol_data(refusal.terms),
         ];
-        entries.extend(self.claim_ack_entry(role, ack));
+        entries.extend(self.claim_ack_entry(role, ack, network));
         encode_response(request_id, &entries, &refusal.reject.encode())
     }
 }
@@ -532,8 +550,9 @@ fn encode_packet_response(
     request_id: u32,
     response: PacketResponse,
     ack: ClaimAckOutcome,
+    network: Option<&Network>,
 ) -> Vec<u8> {
-    let ack_entry = claim_ack_to_emit(role, ack::protocol_data(ack));
+    let ack_entry = claim_ack_to_emit(role, ack::protocol_data(ack, network));
     match response {
         PacketResponse::Fulfill(fulfill) => {
             // §5.2: `toon-accumulated-cost` rides **only** a REJECT. It is

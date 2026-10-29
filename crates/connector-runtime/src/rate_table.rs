@@ -189,9 +189,9 @@ mod tests {
 
     /// USDC on Base -- the numeraire throughout, as in ADR 0071's own
     /// examples and in `connector-config`'s denomination tests.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     /// ANYONE on Base: the dealt token, 18 decimals against USDC's 6.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
 
     fn asset(text: &str) -> AssetId {
         text.parse::<AssetId>().expect("a declared asset")

@@ -73,7 +73,7 @@ use connector_btp::{
     ACCUMULATED_COST_HEADER, CLAIM_ACK_HEADER, CLAIM_HEADER, PAYMENT_REQUIRED_HEADER,
     PEER_CHALLENGE_HEADER,
 };
-use connector_domain::{Fulfill, PacketResponse, Prepare, Reject, RejectCode};
+use connector_domain::{Fulfill, Network, PacketResponse, Prepare, Reject, RejectCode};
 use connector_peer_auth::{claim_ack_to_emit, PeerAuthRefusal, PeerAuthRefusalLog, SessionRole};
 use connector_peer_btp::price_gate::{self, ClaimEnforcementPolicy, PaymentRequired};
 use connector_peer_btp::role_gate::{self, FrameEvidence, RefusedEvidence, VoucherEvidence};
@@ -166,7 +166,10 @@ impl PeerHttpState {
         // in the body rather than silently read as presenting nothing.
         let evidence = match evidence_on(&request) {
             Ok(evidence) => evidence,
-            Err(refused @ RefusedEvidence::ToonChannelClaim) => {
+            Err(
+                refused
+                @ (RefusedEvidence::ToonChannelClaim | RefusedEvidence::NetworkMissingClaim),
+            ) => {
                 return PeerResponse::refused_naming(400, &refused.message());
             }
             Err(_) => return PeerResponse::refused(400),
@@ -202,6 +205,11 @@ impl PeerHttpState {
                 Some(judged) => (judged.ack, judged.claimed, judged.prior),
                 None => (ClaimAckOutcome::NotSent, None, None),
             };
+        // The ack names the network of the voucher it judged (ADR 0086).
+        let ack = (
+            ack,
+            voucher.as_ref().map(|voucher| voucher.network().clone()),
+        );
 
         // A POST with an **empty ILP body**: once the `toon-channel` FLUSH
         // (§3). A voucher standing alone is still answered, its ack riding
@@ -224,7 +232,7 @@ impl PeerHttpState {
                     accumulated_cost: 0,
                     reason: None,
                 })),
-                ClaimAckOutcome::NotSent,
+                (ClaimAckOutcome::NotSent, None),
             );
         };
 
@@ -251,7 +259,7 @@ impl PeerHttpState {
             &self.connector,
             &peer_id,
             &prepare,
-            ack,
+            ack.0,
             claimed,
             prior_watermark,
             self.enforcement.mode(&peer_id),
@@ -272,7 +280,7 @@ impl PeerHttpState {
             .handle_peer_prepare_over(
                 Some(&peer_id),
                 prepare,
-                price_gate::accepted_channel(ack, voucher.as_ref()).as_deref(),
+                price_gate::accepted_channel(ack.0, voucher.as_ref()).as_deref(),
             )
             .await;
         self.finish(&role, packet_response(response), ack)
@@ -311,12 +319,14 @@ impl PeerHttpState {
         &self,
         role: &SessionRole,
         mut response: PeerResponse,
-        ack: ClaimAckOutcome,
+        (ack, network): (ClaimAckOutcome, Option<Network>),
     ) -> PeerResponse {
         // §1.7: a connector MUST NOT emit a `Toon-Claim-Ack` on a client
         // interaction, and §6.2 forbids one on a response answering a
         // request that carried no voucher. Both are this one call.
-        if let Some(value) = claim_ack_to_emit(role, headers::claim_ack_header_value(ack)) {
+        if let Some(value) =
+            claim_ack_to_emit(role, headers::claim_ack_header_value(ack, network.as_ref()))
+        {
             response.headers.push(CLAIM_ACK_HEADER, value);
         }
         response

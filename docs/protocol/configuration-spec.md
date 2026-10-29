@@ -339,26 +339,26 @@ spell it however it likes.
 
 ### 2.1 Top level
 
-| key                                        | type                                  | required | expresses                                            |
-| ------------------------------------------ | ------------------------------------- | -------- | ---------------------------------------------------- |
-| `client_edge_addr`                         | socket address                        | yes      | where the client edge binds — **not** its public URL |
-| `[signer]`                                 | table                                 | yes      | CF-06, the one identity key                          |
-| `[[routes]]`                               | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
-| `[[peers]]`                                | array of tables                       | —        | CF-16 – CF-20                                        |
-| `[[peer_channels]]`                        | array of tables                       | —        | CF-21, the peer book                                 |
-| `[[pay_channels]]`                         | array of tables                       | —        | CF-21, channels this node pays from                  |
-| `[[client_identities]]`                    | array of tables                       | —        | CF-29                                                |
-| `[settlement.evm]` / `[settlement.solana]` | tables                                | —        | CF-24, CF-25                                         |
-| `[operator]`                               | table                                 | no       | CF-30, CF-31                                         |
-| `[node]`                                   | table                                 | —        | CF-08, the facts a node cannot introspect            |
-| `peer_expose`                              | `"neither"`/`"btp"`/`"http"`/`"both"` | no       | CF-17                                                |
-| `peer_allow_plaintext_endpoints`           | bool                                  | no       | CF-18's node-wide opt-in                             |
-| `socks_proxy`                              | `socks5h://` URL                      | no       | ADR 0070, the one onion dial path                    |
-| `[[tokens]]`                               | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
-| `[[rates]]`                                | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
-| `[rate_guards]`                            | table                                 | —        | ADR 0071, this node's dealing policy                 |
-| `[zk_note]`                                | table                                 | —        | ADR 0080, makes this node a zk edge                  |
-| `state_dir`                                | path                                  | CF-39    | where durable state lives                            |
+| key                                                     | type                                  | required | expresses                                            |
+| ------------------------------------------------------- | ------------------------------------- | -------- | ---------------------------------------------------- |
+| `client_edge_addr`                                      | socket address                        | yes      | where the client edge binds — **not** its public URL |
+| `[signer]`                                              | table                                 | yes      | CF-06, the one identity key                          |
+| `[[routes]]`                                            | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
+| `[[peers]]`                                             | array of tables                       | —        | CF-16 – CF-20                                        |
+| `[[peer_channels]]`                                     | array of tables                       | —        | CF-21, the peer book                                 |
+| `[[pay_channels]]`                                      | array of tables                       | —        | CF-21, channels this node pays from                  |
+| `[[client_identities]]`                                 | array of tables                       | —        | CF-29                                                |
+| `[settlement.eip155.<chainId>]` / `[settlement.solana]` | tables                                | —        | CF-24, CF-25                                         |
+| `[operator]`                                            | table                                 | no       | CF-30, CF-31                                         |
+| `[node]`                                                | table                                 | —        | CF-08, the facts a node cannot introspect            |
+| `peer_expose`                                           | `"neither"`/`"btp"`/`"http"`/`"both"` | no       | CF-17                                                |
+| `peer_allow_plaintext_endpoints`                        | bool                                  | no       | CF-18's node-wide opt-in                             |
+| `socks_proxy`                                           | `socks5h://` URL                      | no       | ADR 0070, the one onion dial path                    |
+| `[[tokens]]`                                            | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
+| `[[rates]]`                                             | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
+| `[rate_guards]`                                         | table                                 | —        | ADR 0071, this node's dealing policy                 |
+| `[zk_note]`                                             | table                                 | —        | ADR 0080, makes this node a zk edge                  |
+| `state_dir`                                             | path                                  | CF-39    | where durable state lives                            |
 
 **How the file is read.** Every table in it is `deny_unknown_fields`, so an unrecognised key — a typo,
 or one from a shape this build does not implement — is a load failure that names it rather than a line
@@ -425,15 +425,23 @@ would fail its onion peerings at dial time instead of at the line an operator wr
 **The channel books** (CF-21) — `[[peer_channels]]` and `[[pay_channels]]` — are §2.4.
 `[[client_channels]]` was the third, and is a tombstone since issue #1384 (§2.3).
 
-**Settlement is one table per chain** (issue #628): `[settlement.evm]` and `[settlement.solana]`,
-each with an `rpc_url`, a `token_address` (an ERC-20 address, or an SPL mint), its `decimals` and a
+**Settlement is one table per network** (issue #628,
+[ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)):
+`[settlement.eip155.<chainId>]` for an EVM network and `[settlement.solana]`, each with an `rpc_url`, a `token_address` (an ERC-20 address, or an SPL mint), its `decimals` and a
 key table, plus the chain's x402 terms below. Every channel is an x402 channel
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)), so there is
 no contract or program to name: the record fixes `x402BatchSettlement` at `0x4020074e…0003` and
 `payment-channels` at `CHNLx…yGsX`, the one address and program id each is deployed under on test and
 main networks alike (ADR 0074, _Sources_ and decision 4), so each is a constant of the connector and
 never a setting — and never read from a voucher. Boot reads each configured chain for it and refuses,
-by name, a chain it is not deployed to (CF-25). The flat `[settlement]` shape (`chain = "evm"`),
+by name, a chain it is not deployed to (CF-25). An EVM table's key is the network's EIP-155 chain id
+in decimal (`[settlement.eip155.8453]` for Base, `[settlement.eip155.84532]` for Base Sepolia). It
+is **declared and asserted**, like `decimals`: never an input to the backend, and checked against the
+RPC's `eth_chainId` at boot, where a table whose RPC answers with another id is refused by name with
+both ids. A key that is not a decimal chain id (`[settlement.eip155.base]`), and an
+`[settlement.eip155]` heading holding no network, are refused at load by name; `[settlement.evm]`,
+which named no network, is a tombstone (§2.3). Several EVM tables load, but until multi-network
+settlement lands a node runs one, and refuses two or more at boot by name. The flat `[settlement]` shape (`chain = "evm"`),
 `contract_address`, `program_id` and the `batch_settlement` sub-table are tombstones (§2.3). Mina is
 not a settlement chain ([ADR 0002](../adr/0002-drop-mina-from-the-rust-connector.md)), and is no
 longer in this repository at all ([ADR 0065](../adr/0065-mina-leaves-the-repository.md)). An absent
@@ -473,7 +481,7 @@ unchanged. Because the binary and a node's TOML are a matched pair
 a node repository bumping its pin past #1385 moves them in the same change.
 
 **`asset_eip712_name` and `asset_eip712_version`** are the EIP-712 domain `name` and `version` of
-`[settlement.evm] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and
+`[settlement.eip155.<chainId>] token_address` -- `"USDC"` and `"2"` for the devnet's Circle FiatToken v2.2 -- and
 are published on the greeting's `batch-settlement` `accepts[].extra` (ADR 0074 decision 8) so a stock
 client can sign its deposit's ERC-3009/permit2 authorization under the asset's real domain. Configured
 rather than read off the chain: an arbitrary ERC-20 need not expose an EIP-712 `version()` the way
@@ -483,7 +491,7 @@ Circle's FiatToken does, and this connector never itself signs or verifies under
 `DOMAIN_SEPARATOR()` on its chain (issue #1422), since every payer's ERC-3009 authorization is signed
 under them. A token with no `DOMAIN_SEPARATOR()` is not judged, and neither is any token under
 `"permit2"`, whose deposit is signed under Permit2's domain rather than the asset's. Both are
-required wherever `[settlement.evm]` exists -- there is no safe default for an
+required wherever an EVM table exists -- there is no safe default for an
 arbitrary settlement token, and publishing the wrong domain would build a deposit signature that
 never verifies. Solana carries no equivalent key: the x402 SVM scheme's asset transfer has no EIP-712
 domain of its own to publish.
@@ -524,14 +532,29 @@ and `[rate_guards]` are how an operator says which tokens their node **deals**, 
 against one **numeraire**, and under what guards
 ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) decisions 3 and 5). A
 node that writes none of the three loads, serves and forwards exactly as it did before they existed.
-A `[[tokens]]` row names its token as `evm:<contract>` or `solana:<mint>`, may set `numeraire = true`
+Every asset id in the file — a `[[tokens]]` row's `asset`, a `[[rates]]` row's `from` and `to`, a
+quote leg's `quote_token` — is **CAIP-19** and so names its network
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 2):
+`eip155:<chainId>/erc20:0x<contract>` (the hex read in any case and printed lowercase),
+`solana:<genesis prefix>/token:<mint>`, or `<network>/slip44:<coin type>` for a native coin. USDC on
+Base and USDC at the same address on Arbitrum are two assets. The retired spellings `evm:<contract>`,
+`evm:<chainId>:<contract>`, `solana:<mint>` and `<chain>:native` are refused at load by name, with the
+CAIP-19 rewrite in the message, and never read as some other token. An asset on a network this node
+has no settlement table for is refused at load too: an `eip155` asset needs the
+`[settlement.eip155.<chainId>]` table its chain id names, and a `solana` asset the `[settlement.solana]`
+table, which it is matched to by mint — config cannot know a cluster's genesis prefix.
+A `[[tokens]]` row may set `numeraire = true`
 — exactly one row may, and two is refused by name — and may carry a `quote`: one or two pools on that
-token's **own settlement chain**, each with its own `twap_window_secs`, the last ending at the
-numeraire. A quote is read over its chain's `[settlement.<chain>]` RPC endpoint, so a quote on a chain
-with no such table is refused at load rather than becoming a poller that can never take a reading; and
+token's **own settlement network**, each with its own `twap_window_secs`, the last ending at the
+numeraire. A quote is read over its network's settlement table's RPC endpoint, and a leg quoting into a
+token on another network is refused; and
 a path that ends anywhere but the numeraire is refused too, because a cross rate is composed as
 `(X/numeraire) ÷ (Y/numeraire)` and a leg answering in another unit would be composed as though it had
-not. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because
+not. So only a token on the numeraire's own network can quote itself: a `[[tokens]]` row on any other
+network — USDC on 31338 when the numeraire is USDC on 31337 — needs a `[[rates]]` row with a `rate`,
+from it or to it, and without one is refused at load by name (ADR 0086 decision 13). A rate-less row
+only tightens guards, so it does not count. A node that declares no numeraire quotes nothing and is
+not held to this. A `[[rates]]` row is keyed by an **ordered** pair — `from` and `to`, never sorted, because
 direction is the trade — and carries a `rate = { numerator, denominator }` over base units, guard
 overrides, or both; a row naming a token no `[[tokens]]` row declares is refused, and a rate with a
 zero half is refused in the domain's own words with the row named. `[rate_guards]` states `spread`,
@@ -558,11 +581,11 @@ base58, `EK…`, as Mina's tooling exports it),
 `policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
 quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest
 tier). The vault's asset is native MINA, 9 decimals; the table declares it by existing, as the
-`AssetId` `mina:native`, which a `[[rates]]` row may name as its `from` and which the settlement
-tables still refuse; `[[tokens]]` refuses it by name (`TokenMinaNative`). A zk edge that also settles
-pays its next hops in a settlement asset, so it needs a `[[rates]]` row from `mina:native` to each
-`[settlement.<chain>]` table's token, and is refused naming the missing pair without one; a packet paid
-by an allowance claim is denominated in `mina:native`, so a forward out of it converts at that rate
+CAIP-19 `AssetId` `mina:<network>/slip44:12586` on the table's `network` (ADR 0086), which a
+`[[rates]]` row may name as its `from` and which the settlement tables still refuse; `[[tokens]]` refuses it by name (`TokenMinaNative`). A zk edge that also settles
+pays its next hops in a settlement asset, so it needs a `[[rates]]` row from that asset to each
+settlement table's token, and is refused naming the missing pair without one; a packet paid
+by an allowance claim is denominated in it, so a forward out of it converts at that rate
 (ADR 0071). It requires `state_dir`, where its spent nullifiers are
 journaled and its evidence file, `zk-note-evidence.bin`, is kept. This build parses and validates the
 table but refuses to boot with it: the Mina vault adapter that reads the vault and verifies proofs is
@@ -598,14 +621,15 @@ use and belong in an operator's guide rather than a protocol specification.
 
 **`rpc_via_socks_proxy` sends one settlement table's RPC through `socks_proxy`**
 ([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)). It
-is a boolean on `[settlement.evm]` and on `[settlement.solana]`, `false` when omitted. When a table
+is a boolean on each `[settlement.eip155.<chainId>]` table and on `[settlement.solana]`, `false` when omitted. When a table
 sets it:
 
 - every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
   settlement backend, and on EVM the rate source too. None is left
   direct, and a proxy that is down is a failed call, never a direct dial;
-- each chain rides its own circuit, pinned by a fixed SOCKS username (`toon-settlement-evm`,
-  `toon-settlement-solana`), which relies on the daemon's `IsolateSOCKSAuth` (on by default);
+- each network rides its own circuit, pinned by a fixed SOCKS username naming it
+  (`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-solana`), which relies on
+  the daemon's `IsolateSOCKSAuth` (on by default) (ADR 0086 decision 7);
 - a node with no `socks_proxy` is refused at load (`SettlementRpcViaSocksProxyWithoutProxy`), since
   the key selects the node's one proxy and never names a second;
 - a plain `http://` `rpc_url` is refused at load (`SettlementRpcViaSocksProxyPlaintext`) unless its
@@ -644,10 +668,11 @@ finding a tombstone, not a live mechanism.
 | a route's `fee`                                                                                                                                           | [ADR 0061](../adr/0061-a-fee-attaches-to-a-peering-not-to-a-route.md) (#1159) — it moved to the `[[peers]]` row the route's `peer_id` names                                                                                                                                   |
 | `[[client_channels]]`                                                                                                                                     | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — it declared the channels a `toon-channel` claim was paid on; a client's x402 channel is resolved from the chain when its voucher presents it (`ClientChannelsRemoved`)         |
 | `channel_liveness_ttl_secs`, `channel_serve_stale_secs`, `channel_reattempt_interval_ms`                                                                  | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384) — they tuned the client-edge `toon-channel` channel registry's liveness memo, deleted with it (`ChannelLivenessKeyRemoved`)                                                      |
-| `[settlement.evm]` `channel_index_from_block`, `channel_index_confirmations`                                                                              | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384, ahead of #1385) — they tuned the `TokenNetwork` channel index, deleted with its last caller (`SettlementChannelIndexKeyRemoved`)                                                 |
-| `[settlement.evm]` `contract_address`, `[settlement.solana]` `program_id`                                                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — they named TOON's `TokenNetworkRegistry` and payment-channel program; every channel is an x402 channel on a contract and program the binary fixes (`SettlementToonKeyRemoved`) |
-| the flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`, ... directly under `[settlement]`)                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — it named a `TokenNetworkRegistry`; write `[settlement.evm]` (`SettlementLegacyShapeRemoved`)                                                                                   |
-| `[settlement.evm.batch_settlement]`, `[settlement.solana.batch_settlement]`                                                                               | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — x402 terms are no longer an opt-in; its keys move up into `[settlement.<chain>]` unchanged (`SettlementBatchSubTableRemoved`)                                                  |
+| `[settlement.eip155.<chainId>]` `channel_index_from_block`, `channel_index_confirmations`                                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1384, ahead of #1385) — they tuned the `TokenNetwork` channel index, deleted with its last caller (`SettlementChannelIndexKeyRemoved`)                                                 |
+| `[settlement.eip155.<chainId>]` `contract_address`, `[settlement.solana]` `program_id`                                                                    | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — they named TOON's `TokenNetworkRegistry` and payment-channel program; every channel is an x402 channel on a contract and program the binary fixes (`SettlementToonKeyRemoved`) |
+| the flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`, ... directly under `[settlement]`)                                                 | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — it named a `TokenNetworkRegistry`; write `[settlement.eip155.<chainId>]` (`SettlementLegacyShapeRemoved`)                                                                      |
+| `[settlement.eip155.<chainId>.batch_settlement]`, `[settlement.solana.batch_settlement]`                                                                  | [ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) (#1385) — x402 terms are no longer an opt-in; its keys move up into `[settlement.<chain>]` unchanged (`SettlementBatchSubTableRemoved`)                                                  |
+| `[settlement.evm]`                                                                                                                                        | [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) (#1597) — it named no network; rename it `[settlement.eip155.<chainId>]` with every key unchanged (`SettlementEvmTableRemoved`)                                                                        |
 | `[announce]` and its announce-only keys                                                                                                                   | [ADR 0046](../adr/0046-the-kind-10032-announce-is-removed-a-connector-needs-no-relay.md) (#1074); the section's three surviving fields are `[node]`, per [ADR 0050](../adr/0050-a-connectors-url-resolves-to-its-self-description.md)                                         |
 
 ### 2.4 The channel books
@@ -658,11 +683,12 @@ finding a tombstone, not a live mechanism.
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decisions 5
 and 9, [issue #1380](https://github.com/toon-protocol/connector/issues/1380)):
 
-| key               | required | expresses                                                                                                                                                                                                                              |
-| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_id`         | yes      | the `[[peers]]` row this binds                                                                                                                                                                                                         |
-| `voucher_signer`  | yes      | the key that signs the peer's vouchers on the channel it pays this node on: an EVM address (`0x` and 40 hex, the channel's `payerAuthorizer` — the peer's settlement address) or a Solana public key (base58, its `authorized_signer`) |
-| `inbound_channel` | no       | pins the peering to that one x402 channel: an EVM `x402BatchSettlement` channel id (`0x` and 64 hex) or a Solana `payment-channels` channel account (base58). Absent, a voucher by the signer proves the peering on any channel        |
+| key               | required  | expresses                                                                                                                                                                                                                              |
+| ----------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_id`         | yes       | the `[[peers]]` row this binds                                                                                                                                                                                                         |
+| `voucher_signer`  | yes       | the key that signs the peer's vouchers on the channel it pays this node on: an EVM address (`0x` and 40 hex, the channel's `payerAuthorizer` — the peer's settlement address) or a Solana public key (base58, its `authorized_signer`) |
+| `inbound_channel` | no        | pins the peering to that one x402 channel: an EVM `x402BatchSettlement` channel id (`0x` and 64 hex) or a Solana `payment-channels` channel account (base58). Absent, a voucher by the signer proves the peering on any channel        |
+| `network`         | see below | the CAIP-2 network the peer's channel is on, such as `eip155:8453` ([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 8)                                                                                 |
 
 An arrival takes the peer role when it carries a voucher — or answers a zero-value claim-state
 challenge — signed by that key, on either carriage; a `toon-channel` claim never decides it. The
@@ -676,11 +702,12 @@ is an x402 channel, resolved from the chain when its voucher presents it.
 `[[pay_channels]]` names the channel this node **pays** a hop from — every PREPARE forwarded to that
 peer carries a covering voucher on it ([ADR 0042](../adr/0042-a-packet-carries-its-claim.md)):
 
-| key                | required | expresses                                                                                                                                     |
-| ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `peer_id`          | yes      | the `[[peers]]` row this covers forwards to                                                                                                   |
-| `outbound_channel` | yes      | an x402 channel **this node opened** toward the peer (`POST /channels`), by channel id (EVM) or channel account (Solana)                      |
-| `client_edge_url`  | yes      | the peer's own `POST /ilp`, where this node arrives as a buyer and where `POST /ilp/claim-state` says where its vouchers on the channel stand |
+| key                | required  | expresses                                                                                                                                     |
+| ------------------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peer_id`          | yes       | the `[[peers]]` row this covers forwards to                                                                                                   |
+| `outbound_channel` | yes       | an x402 channel **this node opened** toward the peer (`POST /channels`), by channel id (EVM) or channel account (Solana)                      |
+| `client_edge_url`  | yes       | the peer's own `POST /ilp`, where this node arrives as a buyer and where `POST /ilp/claim-state` says where its vouchers on the channel stand |
+| `network`          | see below | the CAIP-2 network the outbound channel is on, such as `eip155:8453` (ADR 0086 decision 8)                                                    |
 
 The outbound channel MUST be one this node's outbound-channel journal holds, or the node refuses to
 start: a channel it did not open is one it holds no terms for and can sign nothing on. So a
@@ -691,9 +718,21 @@ signing vouchers the hop can never redeem.
 
 Both rows REQUIRE the chain's `[settlement.<chain>]` table, which is what makes this node take part
 in x402 channels on that chain at all, and are refused by name without it (CF-36).
-The signing key is that chain's settlement key, `[settlement.evm]`'s or `[settlement.solana]`'s, and
+The signing key is that chain's settlement key, the EVM table's or `[settlement.solana]`'s, and
 there is no second key to configure (CF-24,
 [ADR 0030](../adr/0030-an-operator-announces-a-node-the-node-still-does-not.md)).
+
+**A row's `network`** names which settlement table its channel is on. On a `0x` row it is REQUIRED
+when the node has more than one `[settlement.eip155.<chainId>]` table, and refused by name when
+absent there; with one EVM table it may be left out, and is that table's. It MUST name a configured
+table, or the row is refused by name. A Solana row may write `solana:<genesis prefix>`. The retired
+`chain_id` key stays refused: it named a `toon-channel` domain, not a network.
+
+**A peering is on one network** (ADR 0086 decision 11): its two rows on one chain MUST name the same
+network, or the config is refused by name (`PeeringNetworksDiffer`). The `[[peer_channels]]` row's
+network is the only one its voucher signer proves the peering on: the same key's voucher on another
+of this node's networks is a client's. A `[[pay_channels]]` row whose channel this node holds on
+another network than the row's is refused at boot by name.
 
 **A pay-from row's `client_edge_url`** is where this node asks `POST /ilp/claim-state` where its
 vouchers on the channel stand. The receiver is the authority on its own watermark: a node that lost

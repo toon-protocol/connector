@@ -502,6 +502,7 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
 /// session's own PREPARE genuinely fulfills, and on a session's (re)auth.
 pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolData {
     let mut json = serde_json::json!({
+        "network": payout.network.to_string(),
         "scheme": "batch-settlement",
         "channelId": payout.channel_id(),
         "maxClaimableAmount": payout.cumulative_amount().to_string(),
@@ -1060,6 +1061,7 @@ mod tests {
         let channel = format!("0x{}", "ab".repeat(32));
         let payout = PayoutVoucher {
             payee: VoucherSigner::Evm([0x02; 20]),
+            network: connector_domain::Network::Eip155(84_532),
             presentation: ChannelPresentation::Evm {
                 channel: ChannelId(channel.clone()),
                 config,
@@ -1076,6 +1078,7 @@ mod tests {
         assert_eq!(pd.content_type, CONTENT_TYPE_TEXT);
         let json: serde_json::Value = serde_json::from_slice(&pd.data).expect("valid JSON");
         assert_eq!(json["blockchain"], "evm");
+        assert_eq!(json["network"], "eip155:84532");
         assert_eq!(json["scheme"], "batch-settlement");
         assert_eq!(json["channelId"], channel);
         assert_eq!(json["maxClaimableAmount"], "750");
@@ -1089,6 +1092,9 @@ mod tests {
 
         let solana = PayoutVoucher {
             payee: VoucherSigner::Solana([0x02; 32]),
+            network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
             presentation: ChannelPresentation::Solana {
                 channel: ChannelId(bs58::encode([0xc3; 32]).into_string()),
             },
@@ -1101,6 +1107,7 @@ mod tests {
             serde_json::from_slice(&payout_voucher_protocol_data(&solana).data).expect("JSON");
         assert_eq!(json["blockchain"], "solana");
         assert_eq!(json["expiresAt"], 0);
+        assert_eq!(json["network"], "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
         assert_eq!(
             json["signature"],
             bs58::encode([0x22; 64]).into_string(),

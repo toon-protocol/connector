@@ -41,6 +41,10 @@ pub enum ClaimDecodeError {
     /// than as [`ClaimDecodeError::Structural`], so a straggling peer learns
     /// why.
     ToonChannel,
+    /// A voucher with no `network` (ADR 0086 decision 1): refused by name,
+    /// as [`ClaimDecodeError::ToonChannel`] is, rather than as merely
+    /// structural.
+    NetworkMissing,
 }
 
 impl std::fmt::Display for ClaimDecodeError {
@@ -55,6 +59,7 @@ impl std::fmt::Display for ClaimDecodeError {
                 )
             }
             ClaimDecodeError::ToonChannel => write!(f, "{}", ClientClaimError::ToonChannel),
+            ClaimDecodeError::NetworkMissing => write!(f, "{}", ClientClaimError::NetworkMissing),
         }
     }
 }
@@ -140,8 +145,19 @@ pub fn parse(raw: &[u8]) -> Result<ClientClaim, ClaimDecodeError> {
     parse_client_claim(json).map_err(|error| match error {
         ClientClaimError::Mina => ClaimDecodeError::UnsupportedChain("mina"),
         ClientClaimError::ToonChannel => ClaimDecodeError::ToonChannel,
+        ClientClaimError::NetworkMissing => ClaimDecodeError::NetworkMissing,
         other => ClaimDecodeError::Structural(other.to_string()),
     })
+}
+
+/// The CAIP-2 network a rendered voucher names (ADR 0086 decision 1), or
+/// `None` for one this build could not parse -- whose ack, then, is never
+/// read as a verdict.
+#[must_use]
+pub fn network_of(json: &str) -> Option<connector_domain::Network> {
+    parse(json.as_bytes())
+        .ok()
+        .map(|voucher| voucher.network().clone())
 }
 
 #[cfg(test)]
@@ -155,6 +171,7 @@ mod tests {
         serde_json::json!({
             "version": "1.0",
             "blockchain": "evm",
+            "network": "eip155:84532",
             "scheme": "batch-settlement",
             "messageId": "m",
             "timestamp": "2030-01-01T00:00:00Z",
@@ -172,6 +189,7 @@ mod tests {
         let solana = serde_json::json!({
             "version": "1.0",
             "blockchain": "solana",
+            "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
             "scheme": "batch-settlement",
             "messageId": "m",
             "timestamp": "2030-01-01T00:00:00Z",
@@ -222,6 +240,21 @@ mod tests {
         let message = ClaimDecodeError::ToonChannel.to_string();
         assert!(message.contains("toon-channel"), "{message}");
         assert!(message.contains("ADR 0075"), "{message}");
+    }
+
+    /// ADR 0086 decision 1: a peer's voucher names its network as a
+    /// client's does, and one with none is refused by name -- never read as
+    /// merely undecodable, so a straggling peer learns why.
+    #[test]
+    fn a_voucher_with_no_network_is_refused_by_name() {
+        let mut voucher = evm_voucher();
+        voucher.as_object_mut().unwrap().remove("network");
+        assert_eq!(
+            parse(voucher.to_string().as_bytes()),
+            Err(ClaimDecodeError::NetworkMissing)
+        );
+        let message = ClaimDecodeError::NetworkMissing.to_string();
+        assert!(message.contains("'network'"), "{message}");
     }
 
     /// §4: the entry is raw UTF-8 JSON, not base64.

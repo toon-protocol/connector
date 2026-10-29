@@ -8,7 +8,7 @@ circuit per network), [0075](0075-every-channel-is-an-x402-channel-a-peering-is-
 decision 3 (one settlement key per network) and
 [0076](0076-the-operator-names-the-facilitator-and-pays-its-gas.md) (the facilitator is named per
 network). It **extends** [0040](0040-a-verified-payment-is-stated-to-the-app.md) with one header and
-moves [0021](0021-vectors-are-normative-prose-is-not.md)'s `schema_version` from 9 to 10.
+moves [0021](0021-vectors-are-normative-prose-is-not.md)'s `schema_version` from 10 to 11.
 
 **Scope:** protocol law — binds every implementation, because a claim, an asset id and the vectors
 change. See the [ADR index](README.md).
@@ -61,28 +61,25 @@ and gets a table of its own if it returns.
 2. **An asset id is CAIP-19**: `eip155:<chainId>/erc20:0x…` and `solana:<genesis prefix>/token:<mint>`.
    `evm:0x…` and `solana:<mint>` are refused by name. `evm:<chainId>:0x…` was refused because today's
    parser would read it as a different token rather than refuse it.
-3. **The vectors move to `schema_version` 10** in one bump that covers both chains, and `toon-client`,
+3. **The vectors move to `schema_version` 11** in one bump that covers both chains, and `toon-client`,
    `rig` and `swap` ship before any node does. That order is safe: a node on the current release
    ignores an unknown `network`, and a claim for another network still fails safe there, because its
    channel id does not recompute under that node's domain.
 
 ### Configuration and keys
 
-4. **One table per network: `[settlement.eip155.<chainId>]`.** `[settlement.evm]` is refused by name
-   (0009). At boot each table's chain id is checked against `eth_chainId`, and two tables that
-   report the same id are refused. Each is checked for x402's code on its own, as 0075 decision 1
-   requires of every table.
-5. **Each table names its own `key`.** Several tables may name the same file: nonces are per chain
-   and each backend has its own sender, so a key shared across networks is safe. 0075 decision 3's
-   "one settlement key per chain" reads "per network".
-6. **`facilitator_url`, `asset_transfer_method` and the token's EIP-712 name and version are per
-   table.** USDC's EIP-712 name differs by network ("USD Coin" on Base, "USDC" on Base Sepolia). The
-   greeting already gives one `accepts[]` entry per table, so 0076 holds network by network.
-7. **Each table's RPC circuit is its own.** Under `rpc_via_socks_proxy`, each EVM table
-   authenticates to the SOCKS port with a username naming its network, so two EVM networks never
-   share a circuit (amending 0073 decision 3's "one pinned circuit per chain").
-8. **Channel rows in config name their network** with a new `network` key. `chain_id` is not reused:
-   it is already parsed on those rows only to be refused.
+_Amended 2026-10-28 (merge of #1607):_ this record was written as a move from 9 to 10. ADR 0080's
+`zk_note` section reached `main` first as schema 10 (#1608), so this bump is 11. 4. **One table per network: `[settlement.eip155.<chainId>]`.** `[settlement.evm]` is refused by name
+(0009). At boot each table's chain id is checked against `eth_chainId`, and two tables that
+report the same id are refused. Each is checked for x402's code on its own, as 0075 decision 1
+requires of every table. 5. **Each table names its own `key`.** Several tables may name the same file: nonces are per chain
+and each backend has its own sender, so a key shared across networks is safe. 0075 decision 3's
+"one settlement key per chain" reads "per network". 6. **`facilitator_url`, `asset_transfer_method` and the token's EIP-712 name and version are per
+table.** USDC's EIP-712 name differs by network ("USD Coin" on Base, "USDC" on Base Sepolia). The
+greeting already gives one `accepts[]` entry per table, so 0076 holds network by network. 7. **Each table's RPC circuit is its own.** Under `rpc_via_socks_proxy`, each EVM table
+authenticates to the SOCKS port with a username naming its network, so two EVM networks never
+share a circuit (amending 0073 decision 3's "one pinned circuit per chain"). 8. **Channel rows in config name their network** with a new `network` key. `chain_id` is not reused:
+it is already parsed on those rows only to be refused.
 
 ### State
 

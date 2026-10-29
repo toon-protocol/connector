@@ -1,4 +1,4 @@
-use connector_domain::AssetId;
+use connector_domain::{AssetId, Network};
 
 use crate::denomination::DenominationConfig;
 use crate::error::ConfigError;
@@ -146,33 +146,60 @@ impl FromIterator<(String, AssetId)> for PeeringAssets {
     }
 }
 
-/// The token a channel on `chain` settles in, read off the
-/// `[settlement.<chain>]` table that already states it
-/// ([`SettlementConfig::asset`], issue #1290).
+/// The token a channel on `chain` -- on `network`, when the row names one
+/// -- settles in, read off the `[settlement.<table>]` table that already
+/// states it ([`SettlementConfig::holds`], issues #1290 and #1604).
 ///
 /// Derived from that table and never declared a second time, which is the
 /// point: the settlement port admits and opens x402 channels only in the
-/// token its chain's table names (ADR 0075, issue #1382), so a channel's
-/// chain already determines its token, and the one place a node's answer
-/// can come from without asking a chain is that table.
+/// token its table names (ADR 0075, issue #1382), so a channel's network
+/// already determines its token, and the one place a node's answer can come
+/// from without asking a chain is that table.
 ///
-/// `None` is a channel on a chain with no settlement table, which no file
+/// The table is picked by the row's network (ADR 0086 decision 8): on a
+/// node with several EVM tables, a row on `eip155:31338` holds 31338's
+/// token, never the first EVM table's. An EVM row always carries a network
+/// once loaded -- written, or inferred from the one EVM table -- so `None`
+/// there is only a caller with no row. A Solana row is matched to the one
+/// Solana table, whatever genesis prefix it spells, since config cannot
+/// know the cluster's.
+///
+/// `None` is a channel on a network with no settlement table, which no file
 /// that reached this point has: `resolve_peer_channels` and
 /// `resolve_pay_channels` already refuse such a row by name and more
-/// precisely (issue #1138).
-///
-/// Shared with `resolve_client_channel_assets` (issue #1301), which asks
-/// the identical question of the client edge's channels -- one rule, one
-/// implementation, so the two sides of a hop can never disagree about what
-/// a chain's token is.
+/// precisely (issues #1138, #1601).
 pub(crate) fn settlement_asset(
     settlements: &[SettlementConfig],
     chain: SettlementChain,
-) -> Option<AssetId> {
-    settlements
+    network: Option<&Network>,
+    denomination: &DenominationConfig,
+) -> Option<Result<AssetId, String>> {
+    let mut on_chain = settlements
         .iter()
-        .find(|settlement| settlement.chain() == chain)
-        .map(SettlementConfig::asset)
+        .filter(|settlement| settlement.chain() == chain);
+    let settlement = match (chain, network) {
+        (SettlementChain::Evm, Some(network)) => {
+            on_chain.find(|settlement| settlement.network().as_ref() == Some(network))?
+        }
+        _ => {
+            let only = on_chain.next()?;
+            // Several tables on the chain and no network to pick by: refuse
+            // to guess, which `row_network` has already done at load.
+            if on_chain.next().is_some() {
+                return None;
+            }
+            only
+        }
+    };
+    Some(
+        denomination
+            .tokens()
+            .iter()
+            .map(|token| token.asset())
+            .find(|asset| settlement.holds(asset))
+            .cloned()
+            .ok_or_else(|| settlement.asset_spelling()),
+    )
 }
 
 /// Resolve every peering to the one declared token its channels hold (ADR
@@ -202,24 +229,31 @@ pub(crate) fn resolve_peering_assets(
 
     let mut peerings = Vec::with_capacity(peers.len());
     for peer in peers {
-        let chains = peer_channels
+        let rows = peer_channels
             .iter()
             .filter(|channel| channel.peer_id() == peer.id())
-            .map(PeerChannelConfig::chain)
+            .map(|channel| (channel.chain(), channel.network()))
             .chain(
                 pay_channels
                     .iter()
                     .filter(|channel| channel.peer_id() == peer.id())
-                    .map(PayChannelConfig::chain),
+                    .map(|channel| (channel.chain(), channel.network())),
             );
 
         let mut resolved: Option<AssetId> = None;
-        for chain in chains {
-            let Some(asset) = settlement_asset(settlements, chain) else {
+        for (chain, network) in rows {
+            let asset = match settlement_asset(settlements, chain, network, denomination) {
                 // Unreachable from a file that got this far -- a channel
                 // row whose chain has no settlement table is refused by
                 // name, earlier and more precisely (issue #1138).
-                continue;
+                None => continue,
+                Some(Ok(asset)) => asset,
+                Some(Err(asset)) => {
+                    return Err(ConfigError::PeeringTokenNotDeclared {
+                        peer_id: peer.id().to_string(),
+                        asset,
+                    })
+                }
             };
             match &resolved {
                 None => resolved = Some(asset),
@@ -240,12 +274,6 @@ pub(crate) fn resolve_peering_assets(
             // way to arrive here with nothing resolved.
             continue;
         };
-        if denomination.token(&asset).is_none() {
-            return Err(ConfigError::PeeringTokenNotDeclared {
-                peer_id: peer.id().to_string(),
-                asset,
-            });
-        }
         peerings.push((peer.id().to_string(), asset));
     }
 
@@ -269,8 +297,8 @@ mod tests {
         }
     }
 
-    const USDC_BASE: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-    const ANYONE_BASE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const USDC_BASE: &str = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const ANYONE_BASE: &str = "eip155:8453/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
 
     /// The question issue #1295 asks on the forwarding path, both ways
     /// round: direction is the trade, so the pair comes back ordered as it

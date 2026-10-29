@@ -279,7 +279,7 @@ async fn each_chain_dials_through_the_proxy_as_a_name_on_its_own_pinned_circuit(
     let evm = RpcTransport::through(
         &format!("http://{evm_host}/"),
         &proxy.proxy_url(),
-        Circuit::EvmSettlement,
+        Circuit::EvmSettlement { chain_id: 31337 },
     )
     .expect("evm transport");
     let solana = RpcTransport::through(
@@ -315,14 +315,14 @@ async fn each_chain_dials_through_the_proxy_as_a_name_on_its_own_pinned_circuit(
     assert!(!connects.is_empty());
     for connect in &connects {
         let expected = if connect.target.starts_with(evm_host) {
-            Circuit::EvmSettlement.socks_username()
+            Circuit::EvmSettlement { chain_id: 31337 }.socks_username()
         } else {
             Circuit::SolanaSettlement.socks_username()
         };
         assert_eq!(
             connect,
             &SocksConnect {
-                username: Some(expected.to_string()),
+                username: Some(expected),
                 target: connect.target.clone(),
             },
             "every dial is pinned to its own chain's circuit"
@@ -348,7 +348,7 @@ async fn a_proxy_that_is_down_fails_the_request_and_nothing_is_dialed_direct() {
         &rpc.url(),
         Route::Circuit {
             proxy,
-            circuit: Circuit::EvmSettlement,
+            circuit: Circuit::EvmSettlement { chain_id: 31337 },
         },
         SHORT,
     )
@@ -403,7 +403,7 @@ async fn a_circuit_whose_proxy_went_away_recovers_when_one_listens_again() {
             &format!("http://{host}/"),
             Route::Circuit {
                 proxy: first.proxy_url(),
-                circuit: Circuit::EvmSettlement,
+                circuit: Circuit::EvmSettlement { chain_id: 31337 },
             },
             SHORT,
         )
@@ -442,10 +442,12 @@ async fn a_circuit_whose_proxy_went_away_recovers_when_one_listens_again() {
     );
     let connects = second.connects();
     assert!(
-        connects
-            .iter()
-            .all(|connect| connect.username.as_deref()
-                == Some(Circuit::EvmSettlement.socks_username())),
+        connects.iter().all(|connect| connect.username.as_deref()
+            == Some(
+                Circuit::EvmSettlement { chain_id: 31337 }
+                    .socks_username()
+                    .as_str()
+            )),
         "the rebuilt client keeps the circuit's username: {connects:?}"
     );
     assert!(!connects.is_empty());

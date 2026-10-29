@@ -46,6 +46,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use connector_domain::Network;
 use connector_runtime::{BatchChannelError, OutboundChannels};
 use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, Voucher, VoucherSigner,
@@ -59,6 +60,9 @@ use connector_settlement::batch::{
 pub struct PayoutVoucher {
     /// The client this voucher pays: the receiver of its channel.
     pub payee: VoucherSigner,
+    /// The CAIP-2 network the channel is on, which a payout voucher names
+    /// as every voucher does (ADR 0086 decision 1).
+    pub network: Network,
     /// The channel, as its receiver is shown it.
     pub presentation: ChannelPresentation,
     /// The signed cumulative amount.
@@ -102,7 +106,8 @@ pub struct ClientPayoutLedger {
 }
 
 impl ClientPayoutLedger {
-    /// A ledger that signs on `outbound`'s channels.
+    /// A ledger that signs on `outbound`'s channels, each voucher naming
+    /// the network its channel is on (ADR 0086 decision 1).
     pub fn new(outbound: Arc<OutboundChannels>) -> ClientPayoutLedger {
         ClientPayoutLedger {
             outbound,
@@ -180,6 +185,14 @@ impl ClientPayoutLedger {
             else {
                 continue;
             };
+            let Some(network) = self.outbound.network(&id) else {
+                tracing::warn!(
+                    channel = %id,
+                    "a payout channel is on no network this node pays on; trying the next one \
+                     toward the same client"
+                );
+                continue;
+            };
             let voucher = match self.outbound.sign_voucher(&id, signed + amount).await {
                 // The journaled mark lagged the one the payer restored from
                 // the chain: sign above that instead.
@@ -193,6 +206,7 @@ impl ClientPayoutLedger {
                 Ok(voucher) => {
                     let payout = PayoutVoucher {
                         payee,
+                        network,
                         presentation,
                         voucher,
                     };
@@ -275,7 +289,7 @@ impl ClientPayoutLedger {
 /// payout channel an operator's `POST /channels` would have opened.
 #[cfg(test)]
 pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedger> {
-    use connector_runtime::{InMemoryJournal, SettlementChain};
+    use connector_runtime::InMemoryJournal;
     use connector_settlement::batch::{
         BatchSettlementPayer, EvmReceiverTerms, InMemoryBatchChain, InMemoryBatchSettlement,
         PayerExit, ReceiverTerms,
@@ -287,7 +301,7 @@ pub(crate) async fn test_ledger_paying(payee: [u8; 20]) -> Arc<ClientPayoutLedge
     let outbound = OutboundChannels::restore(
         Arc::new(InMemoryJournal::new()),
         vec![(
-            SettlementChain::Evm,
+            Network::Eip155(84_532),
             Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
         )],
     )
@@ -313,7 +327,8 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use super::*;
-    use connector_runtime::{InMemoryJournal, Journal, SettlementChain};
+
+    use connector_runtime::{InMemoryJournal, Journal};
     use connector_settlement::batch::{
         BatchSettlementBackend, BatchSettlementPayer, EvmReceiverTerms, InMemoryBatchChain,
         InMemoryBatchSettlement, PayerExit, ReceiverTerms,
@@ -353,7 +368,7 @@ mod tests {
         let outbound = OutboundChannels::restore(
             journal,
             vec![(
-                SettlementChain::Evm,
+                Network::Eip155(84_532),
                 Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
             )],
         )
@@ -506,7 +521,7 @@ mod tests {
             let outbound = Arc::new(
                 OutboundChannels::restore(
                     Arc::clone(&journal),
-                    vec![(SettlementChain::Evm, payer())],
+                    vec![(Network::Eip155(84_532), payer())],
                 )
                 .await
                 .expect("replays"),
@@ -519,7 +534,7 @@ mod tests {
         }
 
         let restarted = Arc::new(
-            OutboundChannels::restore(journal, vec![(SettlementChain::Evm, payer())])
+            OutboundChannels::restore(journal, vec![(Network::Eip155(84_532), payer())])
                 .await
                 .expect("replays"),
         );

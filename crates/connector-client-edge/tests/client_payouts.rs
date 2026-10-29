@@ -26,7 +26,7 @@ use connector_client_edge::{
 use connector_domain::{Fulfill, Prepare};
 use connector_runtime::{
     Connector, FakeAppClient, FileJournal, InProcessPeerTransport, Journal, OutboundChannels,
-    SettlementChain, TestClock,
+    TestClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
@@ -124,6 +124,7 @@ fn evm_voucher_by(secret: &SecretKey, amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": format!("eip155:{CHAIN_ID}"),
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-27T12:00:00.000Z",
@@ -151,6 +152,7 @@ fn client_solana_voucher(amount: u64) -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "solana",
+        "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
         "scheme": "batch-settlement",
         "messageId": format!("voucher-{amount}"),
         "timestamp": "2026-09-27T12:00:00Z",
@@ -170,16 +172,21 @@ struct ClientChannels;
 
 #[async_trait]
 impl BatchSettlementChannels for ClientChannels {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(domain())
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![domain()]
     }
 
-    fn accepts_solana(&self) -> bool {
-        true
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        Some(
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
+        )
     }
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         _presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -269,10 +276,12 @@ impl PayoutChain {
         }
     }
 
-    fn settlement_chain(&self) -> SettlementChain {
+    fn settlement_network(&self) -> connector_domain::Network {
         match self.exit {
-            PayerExit::Withdrawal => SettlementChain::Evm,
-            PayerExit::Close => SettlementChain::Solana,
+            PayerExit::Withdrawal => connector_domain::Network::Eip155(CHAIN_ID),
+            PayerExit::Close => "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                .parse()
+                .expect("a CAIP-2 network"),
         }
     }
 
@@ -284,7 +293,7 @@ impl PayoutChain {
             OutboundChannels::restore(
                 journal,
                 vec![(
-                    self.settlement_chain(),
+                    self.settlement_network(),
                     Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
                 )],
             )
@@ -544,6 +553,8 @@ fn payout_of(transfer: &Frame) -> (serde_json::Value, ChannelPresentation, Vouch
         .unwrap();
     let (presentation, signature) = match json["blockchain"].as_str().unwrap() {
         "evm" => {
+            // ADR 0086 decision 1: a payout voucher names its network.
+            assert_eq!(json["network"], format!("eip155:{CHAIN_ID}"));
             let config = &json["channelConfig"];
             let address = |field: &str| -> [u8; 20] {
                 hex::decode(config[field].as_str().unwrap().trim_start_matches("0x"))
@@ -572,6 +583,7 @@ fn payout_of(transfer: &Frame) -> (serde_json::Value, ChannelPresentation, Vouch
         }
         "solana" => {
             assert_eq!(json["expiresAt"], 0);
+            assert_eq!(json["network"], "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
             let signature = bs58::decode(json["signature"].as_str().unwrap())
                 .into_vec()
                 .unwrap();

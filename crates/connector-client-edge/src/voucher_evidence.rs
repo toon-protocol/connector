@@ -37,6 +37,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_domain::client_claim::ClientClaim;
+use connector_domain::Network;
 use connector_peer_btp::challenge_json::PeerRoleChallenge;
 use connector_peer_btp::role_gate::{PeerVoucherVerdict, VoucherCheck, VoucherEvidence};
 use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, VoucherSigner};
@@ -78,7 +79,9 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         | ClaimIngestRejection::WrapUnsupported
         | ClaimIngestRejection::WrapFailed(_)
         | ClaimIngestRejection::BatchSettlementNotAccepted
-        | ClaimIngestRejection::VoucherChannelConfigMismatch
+        | ClaimIngestRejection::VoucherChannelConfigMismatch { .. }
+        | ClaimIngestRejection::NetworkMissing
+        | ClaimIngestRejection::NetworkNotSettled { .. }
         | ClaimIngestRejection::UnknownAllowance
         | ClaimIngestRejection::AllowanceExpired
         | ClaimIngestRejection::AllowanceClosed
@@ -115,6 +118,7 @@ impl ClientClaimGate {
     /// against its chain-recorded voucher signer.
     async fn check_evm(
         &self,
+        network: &Network,
         channel_id: [u8; 32],
         presented: Option<BatchChannelConfig>,
         message: EvmMessage,
@@ -122,7 +126,7 @@ impl ClientClaimGate {
         requester: &str,
     ) -> VoucherCheck {
         let Ok(Some((domain, channel))) = self
-            .evm_voucher_channel(&channel_id, presented, requester)
+            .evm_voucher_channel(network, &channel_id, presented, requester)
             .await
         else {
             return VoucherCheck::Unresolved;
@@ -195,6 +199,11 @@ impl ClientClaimGate {
 #[async_trait]
 impl VoucherEvidence for ClientClaimGate {
     async fn check_voucher(&self, voucher: &ClientClaim) -> VoucherCheck {
+        // ADR 0086 decision 1: a voucher on a network this node has no
+        // table for names no channel it could resolve.
+        if !self.settles_on(voucher.network()) {
+            return VoucherCheck::Unresolved;
+        }
         match voucher {
             ClientClaim::EvmVoucher(voucher) => {
                 let (Some(channel_id), Some(signature)) = (
@@ -213,6 +222,7 @@ impl VoucherEvidence for ClientClaimGate {
                     Err(_) => return VoucherCheck::Unresolved,
                 };
                 self.check_evm(
+                    &voucher.network,
                     channel_id,
                     presented,
                     EvmMessage::Voucher {
@@ -268,8 +278,12 @@ impl VoucherEvidence for ClientClaimGate {
     }
 
     async fn check_challenge(&self, challenge: &PeerRoleChallenge) -> VoucherCheck {
+        if !self.settles_on(challenge.network()) {
+            return VoucherCheck::Unresolved;
+        }
         match challenge {
             PeerRoleChallenge::Evm {
+                network,
                 channel_id,
                 expires,
                 signature,
@@ -284,6 +298,7 @@ impl VoucherEvidence for ClientClaimGate {
                     Err(_) => return VoucherCheck::Unresolved,
                 };
                 self.check_evm(
+                    network,
                     *channel_id,
                     presented,
                     EvmMessage::Challenge { expires: *expires },
@@ -293,6 +308,7 @@ impl VoucherEvidence for ClientClaimGate {
                 .await
             }
             PeerRoleChallenge::Solana {
+                network: _,
                 channel_account,
                 expires,
                 signature,

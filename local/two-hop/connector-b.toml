@@ -39,7 +39,7 @@ peer_allow_plaintext_endpoints = true
 key_file = "/app/data/signer.key"
 
 # What B publishes at `GET /ilp` (ADR 0050): the URL A's `POST /peers` dials,
-# and -- off the `[settlement.evm]` table below -- the x402 terms A opens its
+# and -- off the `[settlement.eip155.31337]` table below -- the x402 terms A opens its
 # channel on and the voucher signer A binds B's by. An http endpoint only, so
 # A peers over ILP-over-HTTP: `POST /peers` prefers BTP wherever a node
 # publishes both, and this topology is the HTTP one.
@@ -91,12 +91,12 @@ write_keys_file = "/app/data/operator-write-keys"
 # refused unless both nodes' x402 terms name the same network (`POST /peers`'
 # `NetworkMismatch`), and a voucher is verified against the channel's own
 # config on this chain.
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://anvil:8545"
 token_address = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"

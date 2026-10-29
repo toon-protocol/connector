@@ -42,10 +42,10 @@ use connector_config::Config;
 /// names one. Checksummed on purpose: a config file is where an explorer's
 /// spelling gets pasted, and an `AssetId` reads it and the lowercase one as
 /// one token.
-const SETTLEMENT_TOKEN: &str = "evm:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+const SETTLEMENT_TOKEN: &str = "eip155:31337/erc20:0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
 /// USDC on Base -- some other ERC-20, declared by a node whose peerings do
 /// not hold it.
-const OTHER_TOKEN: &str = "evm:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const OTHER_TOKEN: &str = "eip155:31337/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 /// USDC on Solana: the mint `[settlement.solana]` names below, and the
 /// other side of a two-chain node's boundary.
 const SOLANA_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -106,14 +106,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [[peers]]
@@ -159,14 +159,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
 decimals = 6
 asset_eip712_name = "USD Coin"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [settlement.solana]
@@ -233,7 +233,7 @@ fn a_declaring_node_resolves_its_peering_to_one_declared_token() {
 fn two_peerings_on_two_chains_answer_with_the_ordered_pair_they_hold() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
-    let solana_token = format!("solana:{SOLANA_MINT}");
+    let solana_token = format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOLANA_MINT}");
     let config_file = write_config(&peerings_on_two_chains(
         key_file.path(),
         state_dir.path(),
@@ -258,6 +258,86 @@ fn two_peerings_on_two_chains_answer_with_the_ordered_pair_they_hold() {
     assert_eq!(
         (back.0.to_string(), back.1.to_string()),
         (solana_token, SETTLEMENT_TOKEN.to_ascii_lowercase())
+    );
+}
+
+/// ADR 0086 decision 13, issue #1604: two peerings on two EVM networks
+/// whose tables name the SAME token address hold two different tokens --
+/// each peering's token is read off the table its rows' `network` names,
+/// never off the first EVM table. Both peerings are declared with their
+/// network written, as a node with two EVM tables must.
+#[test]
+fn two_peerings_on_two_evm_networks_hold_each_networks_token() {
+    let key_file = write_raw_key_file();
+    let state_dir = tempfile::tempdir().expect("temp state dir");
+    let first = SETTLEMENT_TOKEN.to_ascii_lowercase();
+    let second = first.replace("eip155:31337/", "eip155:31338/");
+    let config_file = write_config(&format!(
+        r#"
+client_edge_addr = "127.0.0.1:0"
+peer_expose = "btp"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+
+[settlement.eip155.31337]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+asset_eip712_name = "USD Coin"
+asset_eip712_version = "2"
+
+[settlement.eip155.31337.key]
+key_file = "{key_file}"
+
+[settlement.eip155.31338]
+rpc_url = "http://127.0.0.1:8546"
+token_address = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce"
+decimals = 6
+asset_eip712_name = "USD Coin"
+asset_eip712_version = "2"
+
+[settlement.eip155.31338.key]
+key_file = "{key_file}"
+
+[[peers]]
+id = "on-first"
+endpoint = "wss://first.example:443/btp"
+
+[[peers]]
+id = "on-second"
+endpoint = "wss://second.example:443/btp"
+
+[[peer_channels]]
+peer_id = "on-first"
+network = "eip155:31337"
+voucher_signer = "{PEER_VOUCHER_SIGNER}"
+
+[[peer_channels]]
+peer_id = "on-second"
+network = "eip155:31338"
+voucher_signer = "0x3333333333333333333333333333333333333333"
+{declaration}"#,
+        state_dir = state_dir.path().display(),
+        key_file = key_file.path().display(),
+        declaration = declaring(&[&first, &second]),
+    ));
+
+    let config = Config::load(config_file.path()).expect("a declaring config must load");
+    let resolved = config.peering_assets();
+
+    assert_eq!(
+        resolved.asset("on-second").map(ToString::to_string),
+        Some(second.clone()),
+        "the peering on 31338 holds 31338's token, not the first EVM table's"
+    );
+    let forward = resolved
+        .boundary_between("on-first", "on-second")
+        .expect("one token address on two networks is two tokens");
+    assert_eq!(
+        (forward.0.to_string(), forward.1.to_string()),
+        (first, second)
     );
 }
 
@@ -336,7 +416,7 @@ fn exits_non_zero_on_a_peering_holding_an_undeclared_token() {
 fn exits_non_zero_on_a_peering_whose_channels_sit_on_two_chains() {
     let key_file = write_raw_key_file();
     let state_dir = tempfile::tempdir().expect("temp state dir");
-    let solana_token = format!("solana:{SOLANA_MINT}");
+    let solana_token = format!("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:{SOLANA_MINT}");
     let config_file = write_config(&peerings_on_two_chains(
         key_file.path(),
         state_dir.path(),

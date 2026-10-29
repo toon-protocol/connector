@@ -12,6 +12,23 @@
 use std::path::PathBuf;
 
 #[test]
+fn committed_asset_ids_match_what_the_implementation_generates_today() {
+    let regenerated: serde_json::Value = serde_json::from_str(
+        &connector_vectors::asset_ids_to_json(&connector_vectors::generate_asset_id_file()),
+    )
+    .expect("valid JSON");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/asset-ids.json");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the asset ids"))
+            .expect("valid JSON");
+    assert_eq!(
+        regenerated, committed,
+        "vectors/asset-ids.json is stale -- run `cargo run -p connector-vectors --bin \
+         generate-vectors` from the repo root and commit the result"
+    );
+}
+
+#[test]
 fn committed_vectors_match_what_the_implementation_generates_today() {
     let regenerated: serde_json::Value =
         serde_json::from_str(&connector_vectors::to_json(&connector_vectors::generate()))
@@ -272,8 +289,144 @@ fn the_committed_voucher_vectors_replay_against_the_real_implementation() {
                 matches!(err, ClientClaimError::VoucherExpires { .. }),
                 "case {name}: {err:?}"
             ),
+            "network_missing" => {
+                assert_eq!(err, ClientClaimError::NetworkMissing, "case {name}")
+            }
             other => panic!("case {name}: unknown expected_error tag {other:?}"),
         }
+    }
+
+    // -- Schema 11: every voucher names its network, and the two-network
+    // case's one config is a different channel, under a different digest, on
+    // each network.
+    for (case, chain) in [
+        ("evm", "evm"),
+        ("evm_second_network", "evm"),
+        ("solana", "solana"),
+    ] {
+        let case = &voucher[case];
+        let parsed = parse_client_claim(case["json"].as_str().expect("json")).expect("parses");
+        assert_eq!(
+            parsed.network().to_string(),
+            case["network"].as_str().expect("network"),
+        );
+        assert_eq!(parsed.network().chain().to_string(), chain);
+    }
+    let second = &voucher["evm_second_network"];
+    assert_ne!(second["channel_id_hex"], voucher["evm"]["channel_id_hex"]);
+    let second_domain = BatchSettlementDomain::x402(second["chain_id"].as_u64().expect("chain_id"));
+    let second_channel: [u8; 32] =
+        hex_bytes(second["channel_id_hex"].as_str().expect("channel_id_hex"));
+    assert!(verify_evm_voucher(
+        &second_domain,
+        &second_channel,
+        second["max_claimable_amount"]
+            .as_str()
+            .expect("amount")
+            .parse()
+            .expect("amount"),
+        &hex_bytes::<65>(second["signature_hex"].as_str().expect("signature_hex")),
+        &hex_bytes::<20>(second["signer_address_hex"].as_str().expect("signer")),
+    ));
+}
+
+/// Schema 11 (ADR 0086 decision 1): each committed `claim_network` case's
+/// verdict, recomputed from the committed claim -- the network first, then,
+/// on EVM, the channel id under the domain of the network the claim names.
+#[test]
+fn the_committed_claim_network_verdicts_replay() {
+    use connector_domain::client_claim::{parse_client_claim, ClientClaim};
+    use connector_domain::Network;
+    use connector_signer::{evm_batch_channel_id, BatchChannelConfig, BatchSettlementDomain};
+
+    let cases = committed()["claim_network"]["cases"].clone();
+    let cases = cases.as_array().expect("cases");
+    assert!(cases.len() >= 6);
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let node: Vec<Network> = case["node_networks"]
+            .as_array()
+            .expect("node_networks")
+            .iter()
+            .map(|network| network.as_str().expect("a string").parse().expect("CAIP-2"))
+            .collect();
+        let claim = parse_client_claim(case["claim_json"].as_str().expect("claim_json"))
+            .expect("every case is a well-formed voucher");
+        let outcome = if !node.contains(claim.network()) {
+            "network_not_settled"
+        } else {
+            match &claim {
+                ClientClaim::EvmVoucher(voucher) => {
+                    let config = voucher.channel_config.as_ref().expect("a channelConfig");
+                    let address = |text: &str| hex_array::<20>(&serde_json::json!(text));
+                    let config = BatchChannelConfig {
+                        payer: address(&config.payer),
+                        payer_authorizer: address(&config.payer_authorizer),
+                        receiver: address(&config.receiver),
+                        receiver_authorizer: address(&config.receiver_authorizer),
+                        token: address(&config.token),
+                        withdraw_delay: config.withdraw_delay,
+                        salt: hex_array::<32>(&serde_json::json!(config.salt)),
+                    };
+                    let domain = BatchSettlementDomain::x402(
+                        claim.network().eip155_chain_id().expect("eip155"),
+                    );
+                    let recomputed = hex::encode(evm_batch_channel_id(&domain, &config));
+                    assert_eq!(case["recomputed_channel_id_hex"], recomputed, "case {name}");
+                    if format!("0x{recomputed}") == voucher.channel_id.to_ascii_lowercase() {
+                        "accepted"
+                    } else {
+                        "network_domain_mismatch"
+                    }
+                }
+                ClientClaim::SolanaVoucher(_) => "accepted",
+            }
+        };
+        assert_eq!(case["outcome"], outcome, "case {name}");
+    }
+}
+
+/// Schema 11 (ADR 0086 decision 2): every committed CAIP-19 asset id parses
+/// to its parts and prints back as itself, and every legacy spelling is
+/// refused by name.
+#[test]
+fn the_committed_asset_ids_replay() {
+    use connector_domain::{AssetId, AssetIdError};
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/asset-ids.json");
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the asset ids"))
+            .expect("the asset ids are valid JSON");
+    assert_eq!(file["schema_version"], committed()["schema_version"]);
+    let assets = file["asset_ids"].clone();
+    for case in assets["valid"].as_array().expect("valid") {
+        let caip19 = case["caip19"].as_str().expect("caip19");
+        let parsed: AssetId = caip19.parse().expect("a CAIP-19 asset id");
+        assert_eq!(parsed.to_string(), caip19);
+        assert_eq!(parsed.network().to_string(), case["network"]);
+        assert_eq!(parsed.namespace().to_string(), case["namespace"]);
+        let written: AssetId = format!(
+            "{}/{}:{}",
+            case["network"].as_str().expect("network"),
+            case["namespace"].as_str().expect("namespace"),
+            case["reference_as_written"].as_str().expect("reference")
+        )
+        .parse()
+        .expect("the reference as written parses too");
+        assert_eq!(written, parsed);
+    }
+    for case in assets["legacy_refused"].as_array().expect("legacy_refused") {
+        let spelling = case["spelling"].as_str().expect("spelling");
+        let error = spelling.parse::<AssetId>().expect_err("refused");
+        let tag = match &error {
+            AssetIdError::LegacyEvm { .. } => "legacy_evm",
+            AssetIdError::LegacyEvmWithChainId { .. } => "legacy_evm_with_chain_id",
+            AssetIdError::LegacySolana { .. } => "legacy_solana",
+            AssetIdError::LegacyNative { .. } => "legacy_native",
+            other => panic!("{spelling} refused as {other:?}, not by name"),
+        };
+        assert_eq!(case["expected_error"], tag);
+        assert_eq!(case["message"], error.to_string());
     }
 }
 

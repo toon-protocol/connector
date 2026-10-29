@@ -34,7 +34,7 @@ use solana_sdk::signature::Signer;
 use url::Url;
 
 use payout_client::{client_session, earn, payout_of};
-use support::solana_voucher;
+use support::{solana_network, solana_voucher};
 
 const CLIENT_ADDRESS: &str = "g.toon.earner";
 const FUNDED: u64 = 1_000_000;
@@ -147,9 +147,10 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
         .await
         .expect("the client opens its channel toward A");
     let client_channel = client_channel.on_chain.id;
+    let network = solana_network(&a_runtime);
     let voucher_for = |signature: Vec<u8>, amount: u64| {
         let signature: [u8; 64] = signature.try_into().expect("64 bytes");
-        solana_voucher(&client_channel.0, amount, &signature)
+        solana_voucher(&network, &client_channel.0, amount, &signature)
     };
     let signed = client_outbound
         .sign_voucher(&client_channel.0, 100)

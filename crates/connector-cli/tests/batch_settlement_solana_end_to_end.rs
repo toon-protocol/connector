@@ -28,7 +28,10 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
 
-use support::{paid_prepare, post_ilp, solana_voucher, spawn_recording_app, CLIENT_EDGE_JOURNAL};
+use support::{
+    paid_prepare, post_ilp, solana_network, solana_voucher, spawn_recording_app,
+    CLIENT_EDGE_JOURNAL,
+};
 
 const ROUTE: &str = "g.toon.batch";
 const PRICE: u64 = 100;
@@ -41,6 +44,7 @@ fn unaccepted_evm_voucher() -> String {
     serde_json::json!({
         "version": "1.0",
         "blockchain": "evm",
+        "network": "eip155:31337",
         "scheme": "batch-settlement",
         "messageId": "voucher-evm",
         "timestamp": "2026-09-25T12:00:00.000Z",
@@ -114,7 +118,7 @@ price = {PRICE}
         runtime.batch_settlement_solana.is_some(),
         "opted in on Solana"
     );
-    assert!(runtime.batch_settlement_evm.is_none(), "and not on EVM");
+    assert!(runtime.batch_settlement_evm.is_empty(), "and not on EVM");
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
 
@@ -130,7 +134,12 @@ price = {PRICE}
 
     let response = post_ilp(
         &app,
-        &solana_voucher(&channel.to_string(), PRICE, &payer.sign(&channel, PRICE)),
+        &solana_voucher(
+            &solana_network(&runtime),
+            &channel.to_string(),
+            PRICE,
+            &payer.sign(&channel, PRICE),
+        ),
         paid_prepare(ROUTE, &receiver),
     )
     .await;
@@ -149,6 +158,10 @@ price = {PRICE}
     // retired toon-channel paid-write test): the app is told which channel
     // paid for each write, how much, and on what chain -- the channel the
     // voucher was verified against, not anything the sender wrote.
+    // ADR 0086 decision 14: and on which network, in CAIP-2 -- the
+    // validator's own genesis hash, cut to its first 32 characters.
+    let genesis = rpc.get_genesis_hash().await.expect("genesis hash");
+    let network = format!("solana:{}", &genesis.to_string()[..32]);
     for write in recorded.lock().unwrap().iter() {
         assert_eq!(write.header("x-toon-payer"), Some(key.as_str()));
         assert_eq!(
@@ -156,6 +169,7 @@ price = {PRICE}
             Some(PRICE.to_string().as_str())
         );
         assert_eq!(write.header("x-toon-chain"), Some("solana"));
+        assert_eq!(write.header("x-toon-network"), Some(network.as_str()));
     }
 
     let entries = FileJournal::open(state_dir.path().join(CLIENT_EDGE_JOURNAL))
@@ -194,6 +208,38 @@ price = {PRICE}
     assert!(
         refused.message.contains("batch-settlement"),
         "refused by name: {refused:?}"
+    );
+
+    // ADR 0086 decision 1 (#1599): a Solana voucher's network must be this
+    // node's one Solana network. Each refusal is by name, and none advances
+    // the watermark -- the journaled voucher above is still the latest.
+    let next = solana_voucher(
+        &network,
+        &channel.to_string(),
+        2 * PRICE,
+        &payer.sign(&channel, 2 * PRICE),
+    );
+    let refusal_of = |json: String| {
+        let app = app.clone();
+        async move {
+            Reject::decode(&post_ilp(&app, &json, paid_prepare(ROUTE, &receiver)).await)
+                .expect("the voucher is refused")
+                .message
+        }
+    };
+    let mut unnamed: serde_json::Value = serde_json::from_str(&next).expect("JSON");
+    unnamed
+        .as_object_mut()
+        .expect("an object")
+        .remove("network");
+    let message = refusal_of(unnamed.to_string()).await;
+    assert!(message.contains("'network'"), "refused by name: {message}");
+    // Mainnet-beta's genesis prefix: never a test validator's.
+    let mainnet_beta = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+    let message = refusal_of(next.replace(&network, mainnet_beta)).await;
+    assert!(
+        message.contains(mainnet_beta) && message.contains("settles"),
+        "refused naming the network: {message}"
     );
 
     // Restart, and land the journaled voucher through the port.

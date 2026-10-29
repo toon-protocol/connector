@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use connector_config::DenominationConfig;
-use connector_domain::{AssetChain, AssetId, Refresh, Ttl};
+use connector_domain::{AssetChain, AssetId, Network, Refresh, Ttl};
 use connector_rate_source::{PoolId, QuoteLeg, QuotePath, QuotePathError, RateSource};
 use thiserror::Error;
 
@@ -124,7 +124,7 @@ pub fn poll_interval(ttl: Ttl) -> Duration {
 pub enum QuotePathUnusable {
     /// A quote path on a chain this node has no [`RateSource`] for (issue
     /// #1302). Distinct from `Config::load`'s
-    /// `TokenQuoteWithoutSettlement`, which is the same token failing an
+    /// `TokenWithoutSettlement`, which is the same token failing an
     /// earlier and different test: that one is "this node has no
     /// `[settlement.<chain>]` table, so it has no endpoint to read the
     /// pools over", while this one is "the endpoint is there and nothing
@@ -134,11 +134,12 @@ pub enum QuotePathUnusable {
     /// until someone writes a source for the chain against the port, and
     /// the row is what the message asks for.
     #[error(
-        "the quote path for {token} reads pools on the {chain} chain, which no rate source \
-         linked into this node can read (ADR 0071 decision 6 leaves that source unwritten): \
-         drop the quote and price this token's pairs with [[rates]] rows"
+        "the quote path for {token} reads pools on {network}, which no rate source linked \
+         into this node reads (ADR 0071 decision 6 leaves the Solana source unwritten, and an \
+         EVM source reads only its own table's network, ADR 0086 decision 13): drop the quote \
+         and price this token's pairs with [[rates]] rows"
     )]
-    NoSourceForChain { token: AssetId, chain: AssetChain },
+    NoSourceForChain { token: AssetId, network: Network },
 
     /// A path with no leg at all -- nothing to read, and no rate that could
     /// come of reading it.
@@ -221,7 +222,9 @@ pub enum QuotePathUnusable {
 /// change.
 #[derive(Clone)]
 pub struct RateSources {
-    by_chain: BTreeMap<AssetChain, Arc<dyn RateSource>>,
+    /// One source per network it reads (ADR 0086 decision 13): each EVM
+    /// table's reader over that table's own transport.
+    by_network: BTreeMap<Network, Arc<dyn RateSource>>,
 }
 
 impl RateSources {
@@ -230,40 +233,52 @@ impl RateSources {
     /// that declares no quote path never asks.
     pub fn none() -> RateSources {
         RateSources {
-            by_chain: BTreeMap::new(),
+            by_network: BTreeMap::new(),
         }
     }
 
-    /// The one-chain map, which is every map this binary builds today.
-    pub fn reading(chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
-        RateSources::none().with(chain, source)
+    /// The one-network map.
+    pub fn reading(network: Network, source: Arc<dyn RateSource>) -> RateSources {
+        RateSources::none().with(network, source)
     }
 
-    /// Add the source that reads `chain`, replacing any already registered
-    /// for it. Taken by value and returned so that wiring reads as one
-    /// expression at the call site.
+    /// Add the source that reads `network`, replacing any already
+    /// registered for it. Taken by value and returned so that wiring reads
+    /// as one expression at the call site.
     #[must_use]
-    pub fn with(mut self, chain: AssetChain, source: Arc<dyn RateSource>) -> RateSources {
-        self.by_chain.insert(chain, source);
+    pub fn with(mut self, network: Network, source: Arc<dyn RateSource>) -> RateSources {
+        self.by_network.insert(network, source);
         self
     }
 
-    /// The source that reads `chain`, or `None` when nothing linked into
-    /// this node does.
-    pub fn get(&self, chain: AssetChain) -> Option<&Arc<dyn RateSource>> {
-        self.by_chain.get(&chain)
+    /// The source that reads `network`, or `None` when nothing linked into
+    /// this node does. A quote path never leaves its token's network (ADR
+    /// 0086 decision 13), so an EVM token is read only by its own network's
+    /// source. A Solana token is read by the node's one Solana source,
+    /// whatever genesis prefix its asset id spells: config cannot know the
+    /// cluster's, and a node holds one Solana table.
+    pub fn get(&self, network: &Network) -> Option<&Arc<dyn RateSource>> {
+        self.by_network.get(network).or_else(|| match network {
+            Network::Solana(_) => self
+                .by_network
+                .iter()
+                .find(|(held, _)| held.chain() == AssetChain::Solana)
+                .map(|(_, source)| source),
+            // No TWAP source quotes MINA (ADR 0080 decision 7).
+            Network::Eip155(_) | Network::Mina(_) => None,
+        })
     }
 
-    /// Every chain this node can read pools on, in a stable order -- for
+    /// Every network this node can read pools on, in a stable order -- for
     /// the log line that says so at boot.
-    pub fn chains(&self) -> impl Iterator<Item = AssetChain> + '_ {
-        self.by_chain.keys().copied()
+    pub fn networks(&self) -> impl Iterator<Item = &Network> + '_ {
+        self.by_network.keys()
     }
 }
 
 impl std::fmt::Debug for RateSources {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set().entries(self.chains()).finish()
+        f.debug_set().entries(self.networks()).finish()
     }
 }
 
@@ -308,11 +323,10 @@ impl RatePoller {
                 // and not a complaint about its pools, the same way
                 // `resolve_quote` states the node-shaped refusal before
                 // every per-leg one.
-                let chain = declared.chain();
-                let source = sources.get(chain).cloned().ok_or_else(|| {
+                let source = sources.get(token.network()).cloned().ok_or_else(|| {
                     QuotePathUnusable::NoSourceForChain {
                         token: token.clone(),
-                        chain,
+                        network: token.network().clone(),
                     }
                 })?;
                 let path = port_quote_path(token, declared)?;
@@ -526,11 +540,16 @@ mod tests {
     use std::io::Write;
 
     /// USDC on Base: the numeraire, 6 decimals.
-    const USDC: &str = "evm:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    const USDC: &str = "eip155:31337/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+    /// The network every EVM token of these fixtures is on.
+    fn evm_network() -> Network {
+        "eip155:31337".parse().expect("a CAIP-2 network")
+    }
     /// ANYONE on Base: the dealt token, 18 decimals, WETH-quoted.
-    const ANYONE: &str = "evm:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
+    const ANYONE: &str = "eip155:31337/erc20:0x9ff58f4ffb29fa2266ab25e75e2a8b3503311656";
     /// WETH on Base: an intermediate, never a token this node deals.
-    const WETH: &str = "evm:0x4200000000000000000000000000000000000006";
+    const WETH: &str = "eip155:31337/erc20:0x4200000000000000000000000000000000000006";
     const POOL_ANYONE_WETH: &str = "0x1111111111111111111111111111111111111111";
     const POOL_WETH_USDC: &str = "0x2222222222222222222222222222222222222222";
 
@@ -546,9 +565,9 @@ mod tests {
 
     /// The mock SPL mint `local/dealing` already uses, here standing as a
     /// Solana-side node's own numeraire.
-    const SOL_NUMERAIRE: &str = "solana:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
+    const SOL_NUMERAIRE: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:5i3gfxLCbMdWppYxEsa55MNLkxwAZHsm3SqoJWyKFckX";
     /// The token that node deals, quoted through one Solana pool.
-    const SOL_DEALT: &str = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const SOL_DEALT: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     /// A real Raydium account address: a base58 32-byte pool name, which is
     /// all `canonical_pool` asks of a Solana pool.
     const POOL_SOL_DEALT_NUMERAIRE: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
@@ -810,38 +829,47 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{usdc}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+decimals = 6
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
 key_file = "{key_file}"
 
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 numeraire = true
 
 [[tokens]]
-asset = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+asset = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 [[tokens]]
-asset = "evm:{anyone}"
+asset = "eip155:31337/erc20:{anyone}"
 quote = [
-  {{ pool = "{pool_anyone_weth}", quote_token = "evm:{weth}", twap_window_secs = 1800 }},
-  {{ pool = "{pool_weth_usdc}", quote_token = "evm:{usdc}", twap_window_secs = 900 }},
+  {{ pool = "{pool_anyone_weth}", quote_token = "eip155:31337/erc20:{weth}", twap_window_secs = 1800 }},
+  {{ pool = "{pool_weth_usdc}", quote_token = "eip155:31337/erc20:{usdc}", twap_window_secs = 900 }},
 ]
 
 [[rates]]
-from = "solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-to = "evm:{anyone}"
+from = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+to = "eip155:31337/erc20:{anyone}"
 rate = {{ numerator = 4000000000000, denominator = 1 }}
 
 [[rates]]
-from = "evm:{anyone}"
-to = "evm:{usdc}"
+from = "eip155:31337/erc20:{anyone}"
+to = "eip155:31337/erc20:{usdc}"
 ttl_secs = 60
 
 [rate_guards]
@@ -851,9 +879,9 @@ max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             state_dir = state_dir.display(),
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
-            anyone = ANYONE.trim_start_matches("evm:"),
-            weth = WETH.trim_start_matches("evm:"),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+            anyone = ANYONE.trim_start_matches("eip155:31337/erc20:"),
+            weth = WETH.trim_start_matches("eip155:31337/erc20:"),
             pool_anyone_weth = POOL_ANYONE_WETH,
             pool_weth_usdc = POOL_WETH_USDC,
         )
@@ -893,14 +921,14 @@ state_dir = "{state_dir}"
 [signer]
 key_file = "{key_file}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "http://127.0.0.1:8545"
 token_address = "{usdc}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{key_file}"
 
 [settlement.solana]
@@ -923,10 +951,10 @@ quote = [
 ]
 
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 
 [[rates]]
-from = "evm:{usdc}"
+from = "eip155:31337/erc20:{usdc}"
 to = "{sol_numeraire_asset}"
 rate = {{ numerator = 1000, denominator = 1 }}
 
@@ -937,8 +965,9 @@ max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             state_dir = state_dir.display(),
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
-            sol_numeraire = SOL_NUMERAIRE.trim_start_matches("solana:"),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+            sol_numeraire =
+                SOL_NUMERAIRE.trim_start_matches("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:"),
             sol_numeraire_asset = SOL_NUMERAIRE,
             sol_dealt = SOL_DEALT,
             pool = POOL_SOL_DEALT_NUMERAIRE,
@@ -1009,7 +1038,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         assert_eq!(held.numeraire(), &asset(USDC));
         assert_eq!(
             held.lookup(
-                &asset("solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+                &asset("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
                 &asset(ANYONE),
                 at(0)
             )
@@ -1037,7 +1066,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
         let pollers = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         )
         .expect("usable quote paths");
@@ -1076,8 +1105,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
     #[tokio::test]
     async fn each_quoted_token_is_polled_through_its_own_chains_source() {
         let sources = RateSources::none()
-            .with(AssetChain::Evm, two_leg_source())
-            .with(AssetChain::Solana, solana_source());
+            .with(evm_network(), two_leg_source())
+            .with(asset(SOL_NUMERAIRE).network().clone(), solana_source());
 
         let (evm_config, _evm_dir) = dealing_node();
         let evm_table =
@@ -1133,7 +1162,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
     /// later.
     ///
     /// It names the token and the chain, and it is a different sentence
-    /// from `Config::load`'s `TokenQuoteWithoutSettlement`: this node has
+    /// from `Config::load`'s `TokenWithoutSettlement`: this node has
     /// the `[settlement.solana]` table, which is exactly why the config
     /// loaded.
     #[test]
@@ -1143,7 +1172,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
 
         let refused = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         );
 
@@ -1151,8 +1180,133 @@ max_move = {{ numerator = 5, denominator = 100 }}
             refused.err(),
             Some(QuotePathUnusable::NoSourceForChain {
                 token: asset(SOL_DEALT),
-                chain: AssetChain::Solana,
+                network: asset(SOL_DEALT).network().clone(),
             })
+        );
+    }
+
+    /// ADR 0086 decision 13, issue #1604: on a node with two EVM tables,
+    /// each with its own rate source, a quoted token is read only by its
+    /// own network's source -- and the other network's USDC, which cannot
+    /// quote itself, is priced by its static row and asked of no source.
+    ///
+    /// The 31338 source holds the very pools the 31337 path names, at a
+    /// different price: a poller that asked it would write that price, so
+    /// the figure in the table is which source was asked.
+    #[tokio::test]
+    async fn no_rate_source_is_asked_about_a_token_on_another_network() {
+        const USDC_SECOND: &str = "eip155:31338/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let key_file = dir.path().join("signer.key");
+        std::fs::write(&key_file, [13u8; 32]).expect("write a raw 32-byte key");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create a state dir");
+        let config_file = dir.path().join("connector.toml");
+        let mut file = std::fs::File::create(&config_file).expect("create the config file");
+        let table = |chain_id: u64, port: u16| {
+            format!(
+                r#"
+[settlement.eip155.{chain_id}]
+rpc_url = "http://127.0.0.1:{port}"
+token_address = "{usdc}"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.{chain_id}.key]
+key_file = "{key_file}"
+"#,
+                usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+                key_file = key_file.display(),
+            )
+        };
+        write!(
+            file,
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+{first}
+{second}
+[[tokens]]
+asset = "{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "{USDC_SECOND}"
+
+[[tokens]]
+asset = "{ANYONE}"
+quote = [
+  {{ pool = "{POOL_ANYONE_WETH}", quote_token = "{WETH}", twap_window_secs = 1800 }},
+  {{ pool = "{POOL_WETH_USDC}", quote_token = "{USDC}", twap_window_secs = 900 }},
+]
+
+[[rates]]
+from = "{USDC}"
+to = "{USDC_SECOND}"
+rate = {{ numerator = 1, denominator = 1 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+            state_dir = state_dir.display(),
+            key_file = key_file.display(),
+            first = table(31337, 8545),
+            second = table(31338, 8546),
+        )
+        .expect("write the config file");
+        let config = Config::load(&config_file).expect("load the config");
+
+        // 31338's source: the same pool addresses, a price ten times off.
+        let elsewhere = Arc::new(InMemoryRateSource::new());
+        for (pool, base, quote, figure) in [
+            (POOL_ANYONE_WETH, ANYONE, WETH, rate(1, 400)),
+            (POOL_WETH_USDC, WETH, USDC, rate(3, 1_000_000_000)),
+        ] {
+            elsewhere.insert_pool(
+                PoolId(pool.to_string()),
+                PoolContents {
+                    base: asset(base),
+                    quote: asset(quote),
+                    rate: figure,
+                    observed_at: at(0),
+                    shortest_window: TimeDelta::seconds(60),
+                    longest_window: TimeDelta::seconds(3600),
+                },
+            );
+        }
+        let sources = RateSources::none()
+            .with(evm_network(), two_leg_source())
+            .with("eip155:31338".parse().expect("a CAIP-2 network"), elsewhere);
+
+        let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
+        let pollers = RatePoller::for_config(&table, &sources, config.denomination())
+            .expect("usable quote paths");
+        assert_eq!(
+            pollers.iter().map(RatePoller::token).collect::<Vec<_>>(),
+            vec![&asset(ANYONE)],
+            "only the token on the numeraire's network is polled; 31338's USDC is not"
+        );
+        pollers[0].refresh_once().await;
+
+        let held = table.read();
+        assert_eq!(
+            held.lookup(&asset(ANYONE), &asset(USDC), at(30)).rate(),
+            // 31337's pools: 1/4000 composed with 3/10^12, less the spread.
+            // 31338's would have been ten times that.
+            Some(rate(2991, 4_000_000_000_000_000)),
+            "ANYONE was quoted by its own network's source"
+        );
+        assert_eq!(
+            held.lookup(&asset(USDC), &asset(USDC_SECOND), at(30))
+                .rate(),
+            Some(rate(997, 1000)),
+            "and the pair across networks is the declared static row, less the spread"
         );
     }
 
@@ -1165,18 +1319,40 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let dir = tempfile::tempdir().expect("temp config dir");
         let key_file = dir.path().join("signer.key");
         std::fs::write(&key_file, [11u8; 32]).expect("write a raw 32-byte key");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create a state dir");
         let config_file = dir.path().join("connector.toml");
         let mut file = std::fs::File::create(&config_file).expect("create the config file");
         write!(
             file,
             r#"
 client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
 
 [signer]
 key_file = "{key_file}"
 
+[settlement.eip155.31337]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "{usdc}"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.31337.key]
+key_file = "{key_file}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "{sol_mint}"
+decimals = 9
+min_sponsored_deposit = 1
+
+[settlement.solana.key]
+key_file = "{key_file}"
+
 [[tokens]]
-asset = "evm:{usdc}"
+asset = "eip155:31337/erc20:{usdc}"
 numeraire = true
 
 [[tokens]]
@@ -1184,7 +1360,7 @@ asset = "{sol_numeraire}"
 
 [[rates]]
 from = "{sol_numeraire}"
-to = "evm:{usdc}"
+to = "eip155:31337/erc20:{usdc}"
 rate = {{ numerator = 1, denominator = 1000 }}
 
 [rate_guards]
@@ -1193,8 +1369,11 @@ ttl_secs = 300
 max_move = {{ numerator = 5, denominator = 100 }}
 "#,
             key_file = key_file.display(),
-            usdc = USDC.trim_start_matches("evm:"),
+            state_dir = state_dir.display(),
+            usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
             sol_numeraire = SOL_NUMERAIRE,
+            sol_mint =
+                SOL_NUMERAIRE.trim_start_matches("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:"),
         )
         .expect("write the config file");
         let config = Config::load(&config_file).expect("load the config");
@@ -1249,7 +1428,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
         let pollers = RatePoller::for_config(
             &table,
-            &RateSources::reading(AssetChain::Evm, two_leg_source()),
+            &RateSources::reading(evm_network(), two_leg_source()),
             config.denomination(),
         )
         .expect("usable quote paths");

@@ -1,0 +1,54 @@
+{
+  "schema_version": 11,
+  "asset_ids": {
+    "valid": [
+      {
+        "name": "erc20_on_base_sepolia",
+        "network": "eip155:84532",
+        "namespace": "erc20",
+        "reference_as_written": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "caip19": "eip155:84532/erc20:0x036cbd53842c5426634e7929541ec2318f3dcf7e"
+      },
+      {
+        "name": "same_contract_on_a_second_network_is_another_asset",
+        "network": "eip155:8453",
+        "namespace": "erc20",
+        "reference_as_written": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "caip19": "eip155:8453/erc20:0x036cbd53842c5426634e7929541ec2318f3dcf7e"
+      },
+      {
+        "name": "spl_token_on_solana_devnet",
+        "network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        "namespace": "token",
+        "reference_as_written": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+        "caip19": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1/token:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+      }
+    ],
+    "legacy_refused": [
+      {
+        "name": "legacy_evm",
+        "spelling": "evm:0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "expected_error": "legacy_evm",
+        "message": "'evm:0x036CbD53842c5426634e7929541eC2318f3dCF7e' is the retired 'evm:' asset spelling, which does not say which EVM network the token is on: write it in CAIP-19, eip155:<chainId>/erc20:0x036cbd53842c5426634e7929541ec2318f3dcf7e (ADR 0086)"
+      },
+      {
+        "name": "legacy_evm_with_chain_id",
+        "spelling": "evm:84532:0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+        "expected_error": "legacy_evm_with_chain_id",
+        "message": "'evm:84532:0x036CbD53842c5426634e7929541eC2318f3dCF7e' is not an asset spelling this connector reads: write it in CAIP-19, eip155:84532/erc20:0x036cbd53842c5426634e7929541ec2318f3dcf7e (ADR 0086)"
+      },
+      {
+        "name": "legacy_solana",
+        "spelling": "solana:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+        "expected_error": "legacy_solana",
+        "message": "'solana:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU' is the retired 'solana:<mint>' asset spelling, which does not say which cluster the mint is on: write it in CAIP-19, solana:<genesis prefix>/token:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU (ADR 0086)"
+      },
+      {
+        "name": "legacy_native",
+        "spelling": "evm:native",
+        "expected_error": "legacy_native",
+        "message": "'evm:native' is not an asset spelling this connector reads: a native coin is CAIP-19 too, <caip2 network>/slip44:<coin type> (e.g. eip155:1/slip44:60) (ADR 0086)"
+      }
+    ]
+  }
+}

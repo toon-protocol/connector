@@ -49,6 +49,8 @@ use url::Url;
 
 use crate::error::ConfigError;
 use crate::peer::plaintext_permitted;
+use connector_domain::Network;
+
 use crate::settlement::{SettlementChain, SettlementTables};
 use crate::x402_row::{parse_x402_channel, RemovedToonFields};
 
@@ -64,6 +66,9 @@ pub(crate) struct RawPayChannel {
     #[serde(default)]
     outbound_channel: Option<String>,
     client_edge_url: String,
+    /// The CAIP-2 network the outbound channel is on (ADR 0086 decision 8).
+    #[serde(default)]
+    network: Option<String>,
     #[serde(default)]
     channel_id: Option<toml::Value>,
     #[serde(default)]
@@ -102,6 +107,7 @@ impl RawPayChannel {
 pub struct PayChannelConfig {
     peer_id: String,
     chain: SettlementChain,
+    network: Option<Network>,
     outbound_channel: String,
     client_edge_url: Url,
 }
@@ -117,6 +123,13 @@ impl PayChannelConfig {
     /// The chain the channel is on, read off its own spelling.
     pub fn chain(&self) -> SettlementChain {
         self.chain
+    }
+
+    /// The CAIP-2 network the outbound channel is on (ADR 0086 decision
+    /// 8): always `Some` on EVM -- written, or inferred from this node's one
+    /// EVM table -- and on Solana as written.
+    pub fn network(&self) -> Option<&Network> {
+        self.network.as_ref()
     }
 
     /// This node's own outbound x402 channel toward the hop: an EVM
@@ -186,7 +199,7 @@ fn resolve_client_edge_url(
 
 fn resolve_pay_channel(
     raw: RawPayChannel,
-    tables: SettlementTables,
+    tables: &SettlementTables,
     allow_plaintext: bool,
 ) -> Result<PayChannelConfig, ConfigError> {
     // First, for the reason `resolve_peer_channel` gives: a removed key is
@@ -215,11 +228,18 @@ fn resolve_pay_channel(
             chain: channel.chain.name(),
         });
     }
+    let network = tables.row_network(
+        "pay_channels",
+        &raw.peer_id,
+        channel.chain,
+        raw.network.as_deref(),
+    )?;
     let client_edge_url =
         resolve_client_edge_url(&raw.peer_id, raw.client_edge_url, allow_plaintext)?;
     Ok(PayChannelConfig {
         peer_id: raw.peer_id,
         chain: channel.chain,
+        network,
         outbound_channel: channel.value,
         client_edge_url,
     })
@@ -236,7 +256,7 @@ fn resolve_pay_channel(
 pub(crate) fn resolve_pay_channels(
     raw: Vec<RawPayChannel>,
     allow_plaintext: bool,
-    tables: SettlementTables,
+    tables: &SettlementTables,
 ) -> Result<Vec<PayChannelConfig>, ConfigError> {
     let mut seen_peers = HashSet::with_capacity(raw.len());
     let mut seen_channels = HashSet::with_capacity(raw.len());
@@ -296,7 +316,7 @@ mod tests {
         resolve_pay_channels(
             rows.iter().map(|text| parse(text)).collect(),
             allow_plaintext,
-            SettlementTables::for_tests(true, true),
+            &SettlementTables::for_tests(true, true),
         )
     }
 
@@ -407,7 +427,7 @@ mod tests {
         let error = resolve_pay_channels(
             vec![parse(&row("relay", CHANNEL))],
             false,
-            SettlementTables::for_tests(false, true),
+            &SettlementTables::for_tests(false, true),
         )
         .unwrap_err();
         assert!(matches!(
@@ -417,7 +437,7 @@ mod tests {
         assert!(resolve_pay_channels(
             vec![parse(&row("store", ACCOUNT))],
             false,
-            SettlementTables::for_tests(false, true),
+            &SettlementTables::for_tests(false, true),
         )
         .is_ok());
     }

@@ -291,12 +291,22 @@ def crosscheck(fetch_doc, fetch_config, fetch_info, config_age):
         offered = {}
         for entry in doc.get("batchSettlements", []):
             offered.setdefault(chain_of(entry.get("network", "")), []).append(entry)
-        for chain in sorted(settlement):
-            want = settlement[chain].get("token_address")
+        # ADR 0086: EVM settlement is one `[settlement.eip155.<chainId>]`
+        # table per network; `[settlement.evm]` is still read here so the
+        # check spans a relay pin that predates it.
+        tables = []
+        for key in sorted(settlement):
+            if key == "eip155":
+                for chain_id in sorted(settlement[key]):
+                    tables.append(("evm", f"eip155:{chain_id}", settlement[key][chain_id]))
+            else:
+                tables.append((key, key, settlement[key]))
+        for chain, label, table in tables:
+            want = table.get("token_address")
             have = [e.get("asset") for e in offered.get(chain, [])]
             judge(
                 "one connector",
-                f"settles in the committed `{chain}` token",
+                f"settles in the committed `{label}` token",
                 any(same_asset(chain, want, a) for a in have),
                 f"{want}",
                 f"committed {want!r}, offered {have or 'nothing'}: a client "
@@ -427,7 +437,7 @@ prefix = "g.toon.echo"
 handler_url = "http://echo-app:3000"
 price = { base = 1, per_kib = 1 }
 
-[settlement.evm]
+[settlement.eip155.84532]
 token_address = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 
 [settlement.solana]

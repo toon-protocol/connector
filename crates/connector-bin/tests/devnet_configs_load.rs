@@ -50,7 +50,7 @@
 //! is in one token and a node settling in another cannot take it.
 //!
 //! Since #645 both files carry issue #628's KEYED per-chain shape --
-//! `[settlement.evm]` + `[settlement.evm.key]` and `[settlement.solana]` +
+//! `[settlement.eip155.84532]` + `[settlement.eip155.84532.key]` and `[settlement.solana]` +
 //! `[settlement.solana.key]` -- in place of the single flat `[settlement]`
 //! (`chain = "evm"`) table. They are keyed off the section HEADERS
 //! ([`LIVE_SETTLEMENT_SECTIONS`]) rather than one literal marker, and
@@ -67,7 +67,7 @@
 //! here, this fails again if any file ever silently returns to zero.
 //!
 //! **Section** (`*_devnet_settlement_section_boots_against_a_deployed_contract`)
-//! points each file's live `[settlement.evm]`, as committed, at a freshly
+//! points each file's live `[settlement.eip155.84532]`, as committed, at a freshly
 //! deployed contract on a disposable local `anvil`, and boots that. Both are
 //! on issue #628's keyed shape, and both cases assert it rather than
 //! trusting a reader's eye, because the legacy flat table they left behind
@@ -209,8 +209,8 @@ const ANVIL_BASE_PORT: u16 = 18_500;
 /// pass silently -- which is exactly what #645's migration off the flat
 /// `[settlement]` did to the string-literal marker this replaced.
 const LIVE_SETTLEMENT_SECTIONS: &[&str] = &[
-    "[settlement.evm]",
-    "[settlement.evm.key]",
+    "[settlement.eip155.84532]",
+    "[settlement.eip155.84532.key]",
     "[settlement.solana]",
     "[settlement.solana.key]",
 ];
@@ -523,7 +523,7 @@ fn without_live_settlement(raw: &str) -> String {
     stripped
 }
 
-/// Point an uncommented `[settlement.evm]` block at a real, disposable local
+/// Point an uncommented `[settlement.eip155.84532]` block at a real, disposable local
 /// chain with x402 placed. `decimals`, the EIP-712 domain and the key
 /// location stay the literal committed content.
 ///
@@ -1173,8 +1173,13 @@ async fn the_relay_route_is_btp_only_and_the_store_routes_accept_both() {
 /// Place x402 and deploy a FiatToken USDC on a disposable local chain: what
 /// a node settling on EVM needs to boot (ADR 0075 decision 1). The returned
 /// [`Anvil`] must stay alive for as long as the address beside it is used.
+///
+/// The chain runs under Base Sepolia's chain id, 84532: every fleet file
+/// keys its table `[settlement.eip155.84532]`, and boot asserts that key
+/// against `eth_chainId` (ADR 0086 decision 4), so a chain answering
+/// anvil's default 31337 is one these files rightly refuse.
 async fn deploy_settlement_on_anvil() -> (Anvil, ethers::types::Address) {
-    let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
+    let anvil = Anvil::spawn_with_chain_id(ANVIL_BASE_PORT, 84_532).await;
     let mut x402 =
         connector_settlement_evm::test_support::x402::X402Chain::place(&anvil.rpc_url).await;
     let token = x402.deploy_fiat_token().await;
@@ -1217,7 +1222,7 @@ const FLEET_SOLANA_USDC_MINT: &str = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6Ttxf
 /// would be a box that cannot boot.
 const EXPECTED_SETTLEMENT_DECIMALS: u8 = 6;
 
-/// The devnet USDC every fleet config's `[settlement.evm]` leg settles in:
+/// The devnet USDC every fleet config's `[settlement.eip155.84532]` leg settles in:
 /// Circle's FiatToken v2.2 on Base Sepolia, which replaced the ungated mock
 /// ERC-20 `0x49beE1…a9Ce` on 2026-09-25 so a client can deposit without gas
 /// through ERC-3009 (#1337, `docs/evm-deployment.md`). The registry did not
@@ -1234,7 +1239,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Every fleet config's `[settlement.evm]` leg -- store and relay alike --
+/// Every fleet config's `[settlement.eip155.84532]` leg -- store and relay alike --
 /// must name the identical asset and precision: a channel a buyer opened in
 /// one token is no use to a box settling in a different one. The boot tests below
 /// assert the same property for store/relay with a substring `.contains`
@@ -1269,20 +1274,27 @@ fn every_fleet_configs_settlement_evm_leg_matches_the_live_identity() {
                 SettlementConfig::Evm(evm) => Some(evm),
                 SettlementConfig::Solana(_) => None,
             })
-            .unwrap_or_else(|| panic!("the {label} config must carry a live [settlement.evm] leg"));
+            .unwrap_or_else(|| {
+                panic!("the {label} config must carry a live [settlement.eip155.84532] leg")
+            });
+        assert_eq!(
+            evm.network(),
+            &connector_domain::Network::Eip155(84_532),
+            "the {label} config's EVM leg must be Base Sepolia, eip155:84532"
+        );
 
         let token_address = format!("0x{}", hex_lower(evm.token_address().as_slice()));
         assert_eq!(
             token_address.to_lowercase(),
             EXPECTED_SETTLEMENT_TOKEN_ADDRESS.to_lowercase(),
-            "the {label} config's [settlement.evm] token_address must be \
+            "the {label} config's [settlement.eip155.84532] token_address must be \
              {EXPECTED_SETTLEMENT_TOKEN_ADDRESS} (expected), found {token_address}"
         );
 
         assert_eq!(
             evm.decimals(),
             EXPECTED_SETTLEMENT_DECIMALS,
-            "the {label} config's [settlement.evm] decimals must be \
+            "the {label} config's [settlement.eip155.84532] decimals must be \
              {EXPECTED_SETTLEMENT_DECIMALS} (expected), found {}",
             evm.decimals()
         );
@@ -1310,8 +1322,8 @@ async fn the_store_devnet_settlement_section_boots_against_a_deployed_contract()
     // go on writing a shape the fleet no longer uses, and one that cannot
     // grow a second chain. Asserted here rather than left to a reader's eye.
     assert!(
-        STORE_CONFIG.contains("[settlement.evm]")
-            && STORE_CONFIG.contains("[settlement.evm.key]")
+        STORE_CONFIG.contains("[settlement.eip155.84532]")
+            && STORE_CONFIG.contains("[settlement.eip155.84532.key]")
             && STORE_CONFIG.contains("[settlement.solana]")
             && STORE_CONFIG.contains("[settlement.solana.key]"),
         "the store config must carry both legs on the keyed \
@@ -1350,7 +1362,7 @@ async fn the_store_devnet_settlement_section_boots_against_a_deployed_contract()
     drop(boot(&text));
 }
 
-/// The relay box's own live `[settlement.evm]` leg (issue #816/#817), boots
+/// The relay box's own live `[settlement.eip155.84532]` leg (issue #816/#817), boots
 /// against a freshly deployed local chain exactly like the store's case
 /// above. It names the SAME registry the store file names: its client edge
 /// already accepts an unaffiliated buyer's own on-chain channel (the relay
@@ -1369,8 +1381,8 @@ async fn the_relay_devnet_settlement_section_boots_against_a_deployed_contract()
     let state_dir = tempfile::tempdir().expect("temp state dir");
 
     assert!(
-        RELAY_CONFIG.contains("[settlement.evm]")
-            && RELAY_CONFIG.contains("[settlement.evm.key]")
+        RELAY_CONFIG.contains("[settlement.eip155.84532]")
+            && RELAY_CONFIG.contains("[settlement.eip155.84532.key]")
             && RELAY_CONFIG.contains("[settlement.solana]")
             && RELAY_CONFIG.contains("[settlement.solana.key]"),
         "the relay config must carry both legs on the keyed \
@@ -1755,7 +1767,7 @@ const FLEET_LIVE_TOKEN_NETWORK: &str = "0x1B4606218ceE5Bf02B546e416905F4D3FC8a02
 ///   ordinary payment-channel contract a taker already holds a funded channel
 ///   on, and the one the maker VERIFIES an incoming claim against before it
 ///   quotes. It must be the fleet's one deployment, for the same reason every
-///   `[settlement.evm]` section on this fleet must be: a claim resolves
+///   `[settlement.eip155.84532]` section on this fleet must be: a claim resolves
 ///   against one deployment or it does not resolve.
 /// * `channelAddress` -- the LEG-B `RollingSwapChannel` (issues #973/#974).
 ///   Money going OUT: a different contract with a different ABI, the one the

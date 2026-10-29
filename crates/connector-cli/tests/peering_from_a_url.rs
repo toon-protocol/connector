@@ -349,14 +349,14 @@ handler_url = "http://{app}/pinned"
 price = 0
 transport = "{pinned}"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "{settlement_key}"
 
 "#,
@@ -774,6 +774,7 @@ async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node
     let as_json = |voucher: &Voucher| {
         connector_runtime::voucher_json(
             &presentation,
+            &connector_domain::Network::Eip155(chain.x402.chain_id()),
             voucher,
             &spelled(b.settlement_address()),
             "2026-09-28T00:00:00.000Z",

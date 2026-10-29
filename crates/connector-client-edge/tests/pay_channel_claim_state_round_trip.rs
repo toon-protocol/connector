@@ -112,16 +112,17 @@ struct PaysThisNode {
 
 #[async_trait]
 impl BatchSettlementChannels for PaysThisNode {
-    fn evm_domain(&self) -> Option<BatchSettlementDomain> {
-        Some(self.domain)
+    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
+        vec![self.domain]
     }
 
-    fn accepts_solana(&self) -> bool {
-        false
+    fn solana_network(&self) -> Option<connector_domain::Network> {
+        None
     }
 
     async fn evm(
         &self,
+        _network: &connector_domain::Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
     ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
@@ -255,7 +256,7 @@ impl Chain {
             OutboundChannels::restore(
                 journal,
                 vec![(
-                    SettlementChain::Evm,
+                    connector_domain::Network::Eip155(payer.domain().chain_id),
                     Arc::new(payer) as Arc<dyn BatchSettlementPayer>,
                 )],
             )
@@ -304,6 +305,7 @@ fn payer(
         channel,
         &Url::parse(&format!("http://{payee}/ilp")).expect("url"),
         std::time::Duration::from_secs(10),
+        None,
     )
     .expect("the pay channel is this node's own journaled outbound channel")
 }
@@ -327,6 +329,7 @@ async fn crossing(payer: &Connector, payee_identity: &PublicKeyBytes, body: &[u8
 /// answer the payer restores from, asked exactly as the payer asks it.
 async fn claim_state(
     outbound: &OutboundChannels,
+    network: &str,
     channel: &str,
     payee: std::net::SocketAddr,
 ) -> u128 {
@@ -338,6 +341,7 @@ async fn claim_state(
     HttpVoucherState::new(reqwest::Client::new(), format!("http://{payee}/ilp"))
         .watermark(
             &outbound.presentation(channel).expect("a journaled channel"),
+            &network.parse().expect("a CAIP-2 network"),
             expires,
             &signature,
         )
@@ -375,7 +379,7 @@ async fn successive_covered_packets_each_advance_the_payees_watermark() {
         );
     }
     assert_eq!(
-        claim_state(&outbound, &channel, payee).await,
+        claim_state(&outbound, &network, &channel, payee).await,
         u128::from(2 * ROUTE_PRICE),
         "and the payee's claim-state agrees with the payer's journal"
     );
@@ -429,7 +433,7 @@ async fn a_lost_journal_is_recovered_from_the_next_hops_claim_state() {
         "the next voucher is the payee's watermark plus exactly what this packet forwards"
     );
     assert_eq!(
-        claim_state(&outbound, &channel, payee).await,
+        claim_state(&outbound, &network, &channel, payee).await,
         u128::from(3 * ROUTE_PRICE)
     );
 }

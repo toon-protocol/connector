@@ -64,8 +64,8 @@
 //! let observation = source
 //!     .observe(&QuoteLeg {
 //!         pool: PoolId("0xd0b53d9277642d899df5c87a3966a349a798f224".to_string()),
-//!         base: AssetId::evm("0x4200000000000000000000000000000000000006"),
-//!         quote: AssetId::evm("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+//!         base: AssetId::erc20(8453, "0x4200000000000000000000000000000000000006"),
+//!         quote: AssetId::erc20(8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
 //!         window: Duration::seconds(1_800),
 //!     })
 //!     .await?;
@@ -517,8 +517,8 @@ mod tests {
     fn leg(window: Duration) -> QuoteLeg {
         QuoteLeg {
             pool: PoolId("0x1111111111111111111111111111111111111111".to_string()),
-            base: AssetId::evm("0x2222222222222222222222222222222222222222"),
-            quote: AssetId::evm("0x3333333333333333333333333333333333333333"),
+            base: AssetId::erc20(8453, "0x2222222222222222222222222222222222222222"),
+            quote: AssetId::erc20(8453, "0x3333333333333333333333333333333333333333"),
             window,
         }
     }
@@ -593,7 +593,12 @@ mod tests {
     #[test]
     fn a_token_on_another_chain_is_not_in_an_evm_pool() {
         let leg = QuoteLeg {
-            base: AssetId::solana("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            base: AssetId::token_on(
+                "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                    .parse::<connector_domain::Network>()
+                    .expect("a network"),
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            ),
             ..leg(Duration::seconds(600))
         };
         let token0: Address = "0x2222222222222222222222222222222222222222"

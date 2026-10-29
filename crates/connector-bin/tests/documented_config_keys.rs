@@ -64,7 +64,7 @@ fn top_level_key_section(spec: &str) -> &str {
 ///
 /// **Every** backticked token in the cell is taken, not just the first,
 /// because a row may legitimately name two spellings of one thing:
-/// `[settlement.evm]` / `[settlement.solana]` is one row and two keys, and
+/// `[settlement.eip155.<chainId>]` / `[settlement.solana]` is one row and two keys, and
 /// reading only the first would quietly stop checking the second.
 fn table_keys(section: &str) -> Vec<String> {
     section
@@ -97,6 +97,14 @@ enum Shape {
     Scalar,
     Table,
     Array,
+}
+
+/// A table whose header carries a placeholder segment -- `<chainId>` in
+/// `[settlement.eip155.<chainId>]` (ADR 0086) -- is probed with a real chain
+/// id in its place: the placeholder is not a TOML key, so leaving it in would
+/// fail every probe on syntax and check nothing.
+fn concrete(field: &str) -> String {
+    field.replace("<chainId>", "8453")
 }
 
 fn parse_key(raw: &str) -> (&str, Shape) {
@@ -183,7 +191,7 @@ fn every_documented_config_key_is_known_to_the_parser() {
 
     for raw_key in &keys {
         let (field, shape) = parse_key(raw_key);
-        let (text, outcome) = load_probe(field, shape);
+        let (text, outcome) = load_probe(&concrete(field), shape);
 
         if let Err(error) = outcome {
             let message = error.to_string();

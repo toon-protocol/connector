@@ -10,7 +10,7 @@
 //!
 //! The vault's asset is native MINA, 9 decimals (decision 7, as amended), and
 //! the table declares it by existing: inside the connector it is the
-//! `AssetId` `mina:native` ([`ZkNoteConfig::asset`]). It is the only place a
+//! `AssetId` `mina:<network>/slip44:12586` ([`ZkNoteConfig::asset`]). It is the only place a
 //! Mina asset is accepted -- `mina:` stays refused in `[[tokens]]` and in every
 //! settlement table -- and a `[[rates]]` row may name it as its `from`.
 
@@ -54,25 +54,9 @@ pub(crate) struct RawZkNoteTable {
     open_budget_cap: u64,
 }
 
-/// The Mina network a vault lives on, as its CAIP-2 id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MinaNetwork {
-    /// `mina:mainnet`.
-    Mainnet,
-    /// `mina:devnet`.
-    Devnet,
-}
-
-impl MinaNetwork {
-    /// The CAIP-2 network id: what the greeting's `network` and the app's
-    /// `X-TOON-Chain` name.
-    pub const fn caip2(self) -> &'static str {
-        match self {
-            MinaNetwork::Mainnet => "mina:mainnet",
-            MinaNetwork::Devnet => "mina:devnet",
-        }
-    }
-}
+/// The Mina network a vault lives on, as its CAIP-2 id: the domain's, since
+/// it is also the network half of the vault's [`AssetId`].
+pub use connector_domain::MinaNetwork;
 
 /// A validated `[zk_note]` table.
 #[derive(Debug, Clone)]
@@ -136,9 +120,10 @@ impl ZkNoteConfig {
         self.open_budget_cap
     }
 
-    /// The vault's asset inside the connector: `mina:native`.
+    /// The vault's asset inside the connector: native MINA on the vault's
+    /// network, `mina:<network>/slip44:12586`.
     pub fn asset(&self) -> AssetId {
-        AssetId::mina_native()
+        AssetId::mina(self.network)
     }
 }
 
@@ -294,7 +279,7 @@ key_file = "{signer}"
         let zk = config.zk_note().expect("the table");
         assert_eq!(zk.vault(), address());
         assert_eq!(zk.network().caip2(), "mina:devnet");
-        assert_eq!(zk.asset().to_string(), "mina:native");
+        assert_eq!(zk.asset().to_string(), "mina:devnet/slip44:12586");
         assert_eq!(zk.verification_key_hash(), VK_HASH);
         assert_eq!(zk.allowance_lifetime(), Duration::from_secs(3600));
         assert_eq!(zk.open_budget_cap(), 10 * TIERS[1]);
@@ -440,9 +425,15 @@ key_file = "{signer}"
     }
 
     const USDC: &str = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
+    /// The vault's asset on the fixture's `mina:devnet`.
+    const MINA: &str = "mina:devnet/slip44:12586";
+
+    fn usdc() -> AssetId {
+        AssetId::erc20(84532, USDC)
+    }
 
     /// A zk edge that also settles on EVM: its forwards are paid in the
-    /// settlement token, so they cross from `mina:native` at a declared rate.
+    /// settlement token, so they cross from native MINA at a declared rate.
     fn with_evm(text: String, rates: &str) -> String {
         let key = text
             .lines()
@@ -451,18 +442,18 @@ key_file = "{signer}"
             .to_string();
         format!(
             r#"{text}
-[settlement.evm]
+[settlement.eip155.84532]
 rpc_url = "https://base-sepolia.example"
 token_address = "{USDC}"
 decimals = 6
 asset_eip712_name = "USDC"
 asset_eip712_version = "2"
 
-[settlement.evm.key]
+[settlement.eip155.84532.key]
 key_file = {key}
 
 [[tokens]]
-asset = "evm:{USDC}"
+asset = "eip155:84532/erc20:{USDC}"
 numeraire = true
 
 [rate_guards]
@@ -480,21 +471,21 @@ max_move = {{ numerator = 1, denominator = 10 }}
         let ConfigError::ZkNoteRateMissing { from, to } = &error else {
             panic!("{error}");
         };
-        assert_eq!(from.to_string(), "mina:native");
-        assert_eq!(to.to_string(), format!("evm:{}", USDC.to_lowercase()));
+        assert_eq!(from.to_string(), MINA);
+        assert_eq!(to, &usdc().to_string());
 
         let config = load(|text| {
             with_evm(
                 text,
                 &format!(
-                    "[[rates]]\nfrom = \"mina:native\"\nto = \"evm:{USDC}\"\nrate = {{ numerator = 1, denominator = 1000 }}\n"
+                    "[[rates]]\nfrom = \"{MINA}\"\nto = \"eip155:84532/erc20:{USDC}\"\nrate = {{ numerator = 1, denominator = 1000 }}\n"
                 ),
             )
         })
         .expect("a declared rate out of MINA");
         assert!(config
             .denomination()
-            .rate(&AssetId::mina_native(), &AssetId::evm(USDC))
+            .rate(&AssetId::mina(MinaNetwork::Devnet), &usdc())
             .is_some());
         // ADR 0071 at a zk edge: an allowance-paid packet is denominated in
         // the vault's asset, so a forward out of it converts at that rate.
@@ -502,7 +493,7 @@ max_move = {{ numerator = 1, denominator = 10 }}
             config
                 .client_channel_assets()
                 .asset("zk-note:00112233445566778899aabbccddeeff"),
-            Some(&AssetId::mina_native())
+            Some(&AssetId::mina(MinaNetwork::Devnet))
         );
     }
 
@@ -512,7 +503,7 @@ max_move = {{ numerator = 1, denominator = 10 }}
         let error = load(|text| {
             with_evm(text, "").replace(
                 "[rate_guards]",
-                "[[tokens]]\nasset = \"mina:native\"\n\n[rate_guards]",
+                &format!("[[tokens]]\nasset = \"{MINA}\"\n\n[rate_guards]"),
             )
         })
         .unwrap_err();
@@ -520,17 +511,17 @@ max_move = {{ numerator = 1, denominator = 10 }}
             matches!(error, ConfigError::TokenMinaNative { .. }),
             "{error}"
         );
-        assert!(error.to_string().contains("mina:native"), "{error}");
+        assert!(error.to_string().contains(MINA), "{error}");
         // As a rate's `from`, on a node with no zk-note table.
         let error = load(|text| {
             let text = with_evm(
                 text,
                 &format!(
-                    "[[rates]]\nfrom = \"mina:native\"\nto = \"evm:{USDC}\"\nrate = {{ numerator = 1, denominator = 1000 }}\n"
+                    "[[rates]]\nfrom = \"{MINA}\"\nto = \"eip155:84532/erc20:{USDC}\"\nrate = {{ numerator = 1, denominator = 1000 }}\n"
                 ),
             );
             let start = text.find("[zk_note]").unwrap();
-            let end = text.find("[settlement.evm]").unwrap();
+            let end = text.find("[settlement.eip155.84532]").unwrap();
             format!("{}{}", &text[..start], &text[end..])
         })
         .unwrap_err();
