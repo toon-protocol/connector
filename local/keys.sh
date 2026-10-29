@@ -217,8 +217,12 @@ ONION_PLACEHOLDER_B=placeholderplaceholderplaceholderplaceholderplaceholderb.any
 #             `channels` stage sends its writes; `-` for a node with no host
 #             port at all (onion's B, whose only door is the circuit), which is
 #             written to from inside its own container instead.
-#   PEERINGS  `id:chain:payer:payee:fee:max_packet_amount` -- the PAYER is the
-#             side packets flow away from; `fee` is what it retains per packet
+#   PEERINGS  `id:network:payer:payee:fee:max_packet_amount` -- `network` is
+#             the CAIP-2 network the peering is on (ADR 0086 decision 12),
+#             both of its channels, and is what `POST /peers` is sent:
+#             `eip155:<chainId>`, or `solana:genesis` for the local validator,
+#             whose genesis is fresh on every start and so is read off it at
+#             the `channels` stage. The PAYER is the side packets flow away from; `fee` is what it retains per packet
 #             carried over this peering (ADR 0010, ADR 0061) and
 #             `max_packet_amount` its cap in the OUTGOING leg's unit (ADR
 #             0049; 0 keeps the default).
@@ -249,17 +253,17 @@ case "$TOPOLOGY" in
     ;;
   two-hop)
     NODES="connector-a:5:15:3001 connector-b:6:16:3002"
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0"
     ROUTES="connector-a:g.local.two-hop.b:a-b:1100"
     ;;
   mixed-chain)
     NODES="connector-a:7:17:3003 connector-b:8:18:3004 connector-c:9:19:3005"
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0 b-c:solana:connector-b:connector-c:50:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0 b-c:solana:genesis:connector-b:connector-c:50:0"
     ROUTES="connector-a:g.local.mixed.b:a-b:1200 connector-b:g.local.mixed.b.c:b-c:1100"
     ;;
   onion)
     NODES="connector-a:10:20:3006 connector-b:11:21:-"
-    PEERINGS="a-b:evm:connector-a:connector-b:200:0"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:200:0"
     ROUTES="connector-a:g.local.onion.b:a-b:1200"
     ;;
   dealing)
@@ -268,7 +272,7 @@ case "$TOPOLOGY" in
     # decision 1), and its cap is written out because the default -- one USDC
     # at six decimals -- is checked against the converted amount and would
     # refuse every crossing `T04`.
-    PEERINGS="a-b:evm:connector-a:connector-b:100:0 b-c:solana:connector-b:connector-c:6000:1000000000"
+    PEERINGS="a-b:eip155:31337:connector-a:connector-b:100:0 b-c:solana:genesis:connector-b:connector-c:6000:1000000000"
     ROUTES="connector-a:g.local.dealing.b:a-b:1200 connector-b:g.local.dealing.b.c:b-c:1100"
     TOPOLOGY_MINT_INDEX="$DEALING_MINT_INDEX"
     TOPOLOGY_MINT_DECIMALS="$DEALING_MINT_DECIMALS"
@@ -707,13 +711,27 @@ print(f"{label}: payment-channels holds {deposit} in {channel} (at least {target
 ' "$PAYMENT_CHANNELS_PROGRAM" "$payer" "$payee" "$SOLANA_MINT" "$target" "'$label'" "$id"
 }
 
-# `POST /peers` from `$1` naming `$2`, on `$3`, at fee `$4` and cap `$5`,
-# opening with OPEN_DEPOSIT: the established channel's id on stdout.
+# The local validator's CAIP-2 reference: the first 32 base58 characters of its
+# genesis hash, as the connector names the cluster it settles on. Read, never
+# written down: the validator starts from a fresh genesis every time.
+local_solana_network() {
+  local genesis
+  genesis="$(solana genesis-hash --url "$SOLANA_RPC")"
+  if [[ ${#genesis} -lt 32 ]]; then
+    echo "ERROR: $SOLANA_RPC answered no genesis hash ('$genesis')." >&2
+    exit 1
+  fi
+  echo "solana:${genesis:0:32}"
+}
+
+# `POST /peers` from `$1` naming `$2`, on the CAIP-2 network `$3`, at fee `$4`
+# and cap `$5`, opening with OPEN_DEPOSIT: the established channel's id on
+# stdout.
 establish() {
-  local from="$1" to="$2" chain="$3" fee="$4" cap="$5" id="$6"
+  local from="$1" to="$2" network="$3" fee="$4" cap="$5" id="$6"
   local body answer channel status
-  body="$(printf '{"id":"%s","url":"%s","fee":%s,"max_packet_amount":%s,"chain":"%s","deposit":%s}' \
-    "$id" "$(node_url "$to")" "$fee" "$cap" "$chain" "$OPEN_DEPOSIT")"
+  body="$(printf '{"id":"%s","url":"%s","fee":%s,"max_packet_amount":%s,"network":"%s","deposit":%s}' \
+    "$id" "$(node_url "$to")" "$fee" "$cap" "$network" "$OPEN_DEPOSIT")"
   # On `onion` the other node's self-description is read over a circuit, and a
   # freshly published hidden service takes a while to become reachable -- the
   # rehearsal waits up to five minutes for its rendezvous for the same reason.
@@ -733,11 +751,11 @@ establish() {
   done
   channel="$(json_field 'doc["channel"]["id"]' <<<"$answer")"
   status="$(json_field 'doc["channel"]["status"]' <<<"$answer")"
-  if [[ -z "$channel" || "$(json_field 'doc["channel"]["chain"]' <<<"$answer")" != "$chain" ]]; then
-    echo "ERROR: $from's POST /peers for '$id' answered without a $chain channel: $answer" >&2
+  if [[ -z "$channel" || "$(json_field 'doc["channel"]["network"]' <<<"$answer")" != "$network" ]]; then
+    echo "ERROR: $from's POST /peers for '$id' answered without a channel on $network: $answer" >&2
     exit 1
   fi
-  echo "'$id': $from -> $to on $chain, channel $channel ($status)" >&2
+  echo "'$id': $from -> $to on $network, channel $channel ($status)" >&2
   echo "$channel"
 }
 
@@ -748,9 +766,21 @@ establish_peerings() {
   fi
   mkdir -p "$KEYS/peerings"
 
-  local peering id chain payer payee fee cap
+  local peering id namespace reference network chain payer payee fee cap
   for peering in $PEERINGS; do
-    IFS=':' read -r id chain payer payee fee cap <<<"$peering"
+    IFS=':' read -r id namespace reference payer payee fee cap <<<"$peering"
+    case "$namespace:$reference" in
+      solana:genesis) network="$(local_solana_network)" ;;
+      *) network="$namespace:$reference" ;;
+    esac
+    case "$namespace" in
+      eip155) chain=evm ;;
+      solana) chain=solana ;;
+      *)
+        echo "ERROR: '$id' names '$namespace' where a CAIP-2 namespace goes (eip155 or solana)" >&2
+        exit 1
+        ;;
+    esac
 
     # The PAYEE first: its write reads the payer's self-description and binds
     # the payer's voucher signer to the peering, so every voucher the payer
@@ -774,10 +804,10 @@ establish_peerings() {
       fi
       echo "'$id': $payee declares the peering in its config; no POST /peers on that end" >&2
     else
-      establish "$payee" "$payer" "$chain" 0 0 "$id" >/dev/null
+      establish "$payee" "$payer" "$network" 0 0 "$id" >/dev/null
     fi
     local channel
-    channel="$(establish "$payer" "$payee" "$chain" "$fee" "$cap" "$id")"
+    channel="$(establish "$payer" "$payee" "$network" "$fee" "$cap" "$id")"
 
     local target counterparty
     if [[ "$chain" == "evm" ]]; then
