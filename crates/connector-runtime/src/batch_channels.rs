@@ -409,6 +409,9 @@ fn place_on_networks(
                     AssetChain::Solana => {
                         configured().find(|network| network.chain() == AssetChain::Solana)
                     }
+                    // No payer settles on Mina: a zk edge's vault is not a
+                    // channel this node pays from.
+                    AssetChain::Mina => None,
                 };
                 let Some(placed) = placed else {
                     return Err(OutboundRestoreError::OnNoNetwork {
@@ -2167,6 +2170,7 @@ mod tests {
                     let exit = match network.chain() {
                         AssetChain::Evm => PayerExit::Withdrawal,
                         AssetChain::Solana => PayerExit::Close,
+                        AssetChain::Mina => unreachable!("no payer settles on Mina"),
                     };
                     let payer =
                         InMemoryBatchSettlement::on(InMemoryBatchChain::new(exit), 0x01, ONE_DAY);

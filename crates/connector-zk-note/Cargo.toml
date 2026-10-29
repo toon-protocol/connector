@@ -3,24 +3,27 @@ name = "connector-zk-note"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Zk-note primitives (ADR 0080): Poseidon, tags, derivations, the balance commitment and the Mina Schnorr state signature, byte-identical to the reference implementation."
+description = "The connector's zk-note boundary (ADR 0080 decision 12): re-exports toon-protocol/zk_toon's zk-note crate, and holds the allowance claim's signature check, tier validation, the request proof's public inputs and the evidence file's bytes."
 
-# Pure: no I/O, no clock, no dependency on any connector crate, so the wallet and the
-# challenger outside this repository can depend on it too. Every proof-systems crate is
-# pinned by git `rev` to ab84160f, the commit the live Mina daemon 4.0.0-mainnet-mesa
-# pins (tag 0.7.0 less two commits). It is not a tag. One build serves one Mina era; a
-# repin comes with a regenerated fixtures/parity.json. No JavaScript prover dependency may appear here (ADR 0080's
-# falsifiers).
+# Pure: no I/O, no clock, no dependency on any connector crate. Every zk-note derivation
+# is zk_toon's, pinned here by git commit; a pin bump is a reviewed change that replays
+# zk_toon's test-vectors/zk-note.json (tests/zk_toon_parity.rs) and a bump that changes a
+# derivation breaks every note in a vault.
+#
+# Every proof-systems crate is spelled exactly as zk_toon spells it (git URL, tag 0.7.0,
+# default-features off), so Cargo resolves one source and there is one Fp type, not two.
+# Tag 0.7.0 is what the live Mina daemon pins for Mesa. No JavaScript prover dependency
+# may appear here (ADR 0080's falsifiers).
 [dependencies]
+zk-note = { git = "https://github.com/toon-protocol/zk_toon", rev = "7b399412ffd70966c5e5d35a139928a697460ca7" }
 ark-ec = { version = "0.5", default-features = false }
 ark-ff = { version = "0.5", default-features = false }
-mina-curves = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
-mina-hasher = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
-mina-poseidon = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
-mina-signer = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
-o1-utils = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386" }
+mina-curves = { git = "https://github.com/o1-labs/proof-systems", tag = "0.7.0", default-features = false }
+mina-hasher = { git = "https://github.com/o1-labs/proof-systems", tag = "0.7.0", default-features = false }
+mina-signer = { git = "https://github.com/o1-labs/proof-systems", tag = "0.7.0", default-features = false }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
 
 [dev-dependencies]
 proptest = "1"
-serde_json = "1"
-sha2 = "0.10"

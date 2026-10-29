@@ -12,7 +12,7 @@
 //! ```
 //!
 //! **`network` names the network of the voucher judged** (ADR 0086
-//! decision 1, `schema_version` 10), so a payer on several networks reads a
+//! decision 1, `schema_version` 11), so a payer on several networks reads a
 //! verdict only for the voucher it sent: [`decode`] takes the network that
 //! voucher named and reads an ack naming any other -- or none -- as not
 //! acknowledged.
@@ -158,7 +158,7 @@ mod tests {
 
     /// ADR 0086: an ack names the network of the voucher it judged, and is
     /// read as a verdict only for that network. One naming another, or
-    /// none -- an ack from a node that predates `schema_version` 10 -- is
+    /// none -- an ack from a node that predates `schema_version` 11 -- is
     /// not acknowledged.
     #[test]
     fn an_ack_is_a_verdict_only_on_the_network_its_voucher_was_sent_on() {

@@ -1,3 +1,4 @@
+use connector_domain::client_claim::ZK_NOTE_NAMESPACE;
 use connector_domain::{AssetChain, AssetId, Network};
 
 use crate::denomination::DenominationConfig;
@@ -55,9 +56,24 @@ pub struct ClientChannelAssets {
     /// one (ADR 0086) -- each asset id naming its own network, so a linear
     /// scan is not a compromise here, it is the whole table.
     assets: Vec<AssetId>,
+    /// What an allowance claim's packet is denominated in on a zk edge
+    /// (ADR 0080 decision 7, as amended): the vault's asset,
+    /// [`ZkNoteConfig::asset`](crate::ZkNoteConfig::asset). `None` on a node
+    /// that is no zk edge, or that deals nothing.
+    zk_note: Option<AssetId>,
 }
 
 impl ClientChannelAssets {
+    /// This table, on a zk edge whose vault holds `vault_asset`: an
+    /// allowance's key, `zk-note:<allowance id>`, resolves to it, so a
+    /// forward out of an allowance-paid packet crosses into the outgoing
+    /// peering's token at the operator's declared rate.
+    #[must_use]
+    pub fn with_zk_edge(mut self, vault_asset: AssetId) -> ClientChannelAssets {
+        self.zk_note = Some(vault_asset);
+        self
+    }
+
     /// Whether this node resolved no client channel at all -- `true` for
     /// every node that declares no `[[tokens]]`, which is every config this
     /// repository ships. The question a caller asks before any other, since
@@ -88,6 +104,10 @@ impl ClientChannelAssets {
     /// On a chain where this node holds several networks -- several EVM
     /// tables (ADR 0086) -- the key alone does not say which, and this
     /// answers `None`: ask [`Self::asset_on`] with the channel's network.
+    ///
+    /// On a zk edge, an allowance's key (`zk-note:<allowance id>`) resolves
+    /// to the vault's asset (ADR 0080 decision 7, as amended), whatever the
+    /// allowance id.
     pub fn asset(&self, channel_key: &str) -> Option<&AssetId> {
         self.asset_on(channel_key, None)
     }
@@ -100,6 +120,9 @@ impl ClientChannelAssets {
     /// and for an unknown network on a chain with several tables.
     pub fn asset_on(&self, channel_key: &str, network: Option<&Network>) -> Option<&AssetId> {
         let (namespace, _) = channel_key.split_once(':')?;
+        if namespace == ZK_NOTE_NAMESPACE {
+            return self.zk_note.as_ref();
+        }
         let chain = namespace.parse::<SettlementChain>().ok()?.asset_chain();
         let on_chain: Vec<&AssetId> = self
             .assets
@@ -132,6 +155,7 @@ impl FromIterator<AssetId> for ClientChannelAssets {
     fn from_iter<I: IntoIterator<Item = AssetId>>(assets: I) -> ClientChannelAssets {
         ClientChannelAssets {
             assets: assets.into_iter().collect(),
+            zk_note: None,
         }
     }
 }
@@ -153,9 +177,13 @@ impl FromIterator<AssetId> for ClientChannelAssets {
 /// deals nothing resolves nothing, is held to nothing, and reaches the
 /// forwarding path with the empty table it had before this function
 /// existed.
+///
+/// On a zk edge (`zk_vault_asset`), an allowance's key resolves to the
+/// vault's asset as well ([`ClientChannelAssets::with_zk_edge`]).
 pub(crate) fn resolve_client_channel_assets(
     settlements: &[SettlementConfig],
     denomination: &DenominationConfig,
+    zk_vault_asset: Option<AssetId>,
 ) -> Result<ClientChannelAssets, ConfigError> {
     if !denomination.declares_tokens() {
         return Ok(ClientChannelAssets::default());
@@ -178,7 +206,14 @@ pub(crate) fn resolve_client_channel_assets(
         assets.push(asset);
     }
 
-    Ok(ClientChannelAssets { assets })
+    let assets = ClientChannelAssets {
+        assets,
+        zk_note: None,
+    };
+    Ok(match zk_vault_asset {
+        Some(vault_asset) => assets.with_zk_edge(vault_asset),
+        None => assets,
+    })
 }
 
 #[cfg(test)]

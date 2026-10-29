@@ -1,7 +1,7 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
-**`schema_version` 10** (issue #1599, [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
+**`schema_version` 11** (issue #1599, [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
 decision 1): **every claim names its network.** Every voucher — client, peer and payout — every
 claim-state entry, every peer-role challenge and every `claim-ack` carries a required CAIP-2
 `network` (`eip155:<chainId>`, `solana:<genesis prefix>`); `blockchain` stays and still picks the
@@ -270,6 +270,35 @@ and pinned cross-repo by the `claim_state_toon_channel_refused` section, checked
 `connector_domain::client_claim::declared_scheme` — the same function the endpoint branches on —
 before being committed, and replayed against the real route, over a backend admitting nothing, by
 `connector-client-edge`'s `claim_state::the_committed_claim_state_toon_channel_refused_vectors_match_the_real_endpoint`.
+
+### 13. A zk edge's allowance, claim, close and successor are signed bytes a wallet can rebuild
+
+ADR 0080 decisions 2, 4, 8 and 12, issue #1523 (schema 10): the `zk_note` section pins the zk edge's
+own wire and nothing of zk_toon's. Every value is computed through zk_toon's `zk-note` crate at the
+commit `zk_toon_commit` names — the `rev` `crates/connector-zk-note/Cargo.toml` pins — and every
+signature is Mina kimchi Schnorr under the **devnet** domain (`CodaSignature`) with the **chunked**
+nonce, on every network. zk_toon's own derived values (tags, generators, anchors, commitments) are its
+`test-vectors/zk-note.json`'s to pin; here they appear only as inputs.
+
+- `allowance_request` / `allowance_answer`: `POST /ilp/zk-note/allowances` with `{proof, sessionKey,
+expiresAt}`, where `proof` is an o1js `JsonProof` whose public input is the request proof's twelve
+  fields, its tag binding this edge's state key, the session key, the tier and the expiry. The proof
+  string itself is a placeholder; a proof o1js made is #1514's fixture.
+- `allowance_claim`: `{version, scheme: "zk-note", allowanceId, cumulativeAmount, signature}`, its
+  three signed fields `[tag_to_field("toon-allowance-claim.v1"), allowanceId, cumulativeAmount]` and
+  `(r, s)`.
+- `allowance_close`: `{allowanceId, signature}` on the same endpoint, its two signed fields
+  `[tag_to_field("toon-allowance-close.v1"), allowanceId]` and `(r, s)`. No claim signature is a close.
+- `successor`: the charge Δ — the allowance's final watermark — and zk_toon's five state fields
+  `[stateKey.x, stateKey.isOdd, C'.x, C'.y, next_anchor(N)]` for `C' = charge(C, Δ)`, with `(r, s)`
+  pinned rather than merely valid, and `GET /ilp/zk-note/allowances/:id/successor`'s `200` answer
+  and its `202` "pending" one.
+
+No `asset`, `token` or decimals key appears ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md));
+the asset is stated in the greeting. Replayed by `connector-vectors`'
+`the_committed_zk_note_vectors_replay_against_the_real_implementation`: the claim through the client
+edge's decoder and the session-key check, the close through its own, the request's tag against
+`expected_tag`, and the successor re-derived to the same `(r, s)` and verified under the state key.
 
 ## Generation
 

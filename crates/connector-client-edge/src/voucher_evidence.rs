@@ -81,7 +81,11 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         | ClaimIngestRejection::BatchSettlementNotAccepted
         | ClaimIngestRejection::VoucherChannelConfigMismatch { .. }
         | ClaimIngestRejection::NetworkMissing
-        | ClaimIngestRejection::NetworkNotSettled { .. } => {
+        | ClaimIngestRejection::NetworkNotSettled { .. }
+        | ClaimIngestRejection::UnknownAllowance
+        | ClaimIngestRejection::AllowanceExpired
+        | ClaimIngestRejection::AllowanceClosed
+        | ClaimIngestRejection::OverBudget { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::UnknownChannel)
         }
     }

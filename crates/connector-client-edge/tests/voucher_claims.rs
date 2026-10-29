@@ -351,7 +351,7 @@ async fn an_evm_voucher_whose_network_is_not_its_channels_domain_is_refused() {
     );
 }
 
-/// Schema 10's `claim_network` refusals (issue #1599), replayed from the
+/// Schema 11's `claim_network` refusals (issue #1599), replayed from the
 /// committed artifact against this gate -- a node on [`CHAIN_ID`] and
 /// [`SOLANA_NETWORK`]. The vector's refusals are each made before any
 /// channel is looked up, so the fake's own channels play no part.
@@ -451,7 +451,7 @@ impl BatchSettlementChannels for EveryNetwork {
     }
 }
 
-/// Schema 10's two-network acceptances (#1601), replayed against the real
+/// Schema 11's two-network acceptances (#1601), replayed against the real
 /// gate on a node settling on both EVM networks the case names: each voucher
 /// is accepted, and its channel is asked of its own network's backend only.
 #[tokio::test]

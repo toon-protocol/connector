@@ -264,7 +264,8 @@ impl RateSources {
                 .iter()
                 .find(|(held, _)| held.chain() == AssetChain::Solana)
                 .map(|(_, source)| source),
-            Network::Eip155(_) => None,
+            // No TWAP source quotes MINA (ADR 0080 decision 7).
+            Network::Eip155(_) | Network::Mina(_) => None,
         })
     }
 
@@ -1181,6 +1182,131 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 token: asset(SOL_DEALT),
                 network: asset(SOL_DEALT).network().clone(),
             })
+        );
+    }
+
+    /// ADR 0086 decision 13, issue #1604: on a node with two EVM tables,
+    /// each with its own rate source, a quoted token is read only by its
+    /// own network's source -- and the other network's USDC, which cannot
+    /// quote itself, is priced by its static row and asked of no source.
+    ///
+    /// The 31338 source holds the very pools the 31337 path names, at a
+    /// different price: a poller that asked it would write that price, so
+    /// the figure in the table is which source was asked.
+    #[tokio::test]
+    async fn no_rate_source_is_asked_about_a_token_on_another_network() {
+        const USDC_SECOND: &str = "eip155:31338/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let key_file = dir.path().join("signer.key");
+        std::fs::write(&key_file, [13u8; 32]).expect("write a raw 32-byte key");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create a state dir");
+        let config_file = dir.path().join("connector.toml");
+        let mut file = std::fs::File::create(&config_file).expect("create the config file");
+        let table = |chain_id: u64, port: u16| {
+            format!(
+                r#"
+[settlement.eip155.{chain_id}]
+rpc_url = "http://127.0.0.1:{port}"
+token_address = "{usdc}"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+
+[settlement.eip155.{chain_id}.key]
+key_file = "{key_file}"
+"#,
+                usdc = USDC.trim_start_matches("eip155:31337/erc20:"),
+                key_file = key_file.display(),
+            )
+        };
+        write!(
+            file,
+            r#"
+client_edge_addr = "127.0.0.1:0"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key_file}"
+{first}
+{second}
+[[tokens]]
+asset = "{USDC}"
+numeraire = true
+
+[[tokens]]
+asset = "{USDC_SECOND}"
+
+[[tokens]]
+asset = "{ANYONE}"
+quote = [
+  {{ pool = "{POOL_ANYONE_WETH}", quote_token = "{WETH}", twap_window_secs = 1800 }},
+  {{ pool = "{POOL_WETH_USDC}", quote_token = "{USDC}", twap_window_secs = 900 }},
+]
+
+[[rates]]
+from = "{USDC}"
+to = "{USDC_SECOND}"
+rate = {{ numerator = 1, denominator = 1 }}
+
+[rate_guards]
+spread = {{ numerator = 30, denominator = 10000 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+            state_dir = state_dir.display(),
+            key_file = key_file.display(),
+            first = table(31337, 8545),
+            second = table(31338, 8546),
+        )
+        .expect("write the config file");
+        let config = Config::load(&config_file).expect("load the config");
+
+        // 31338's source: the same pool addresses, a price ten times off.
+        let elsewhere = Arc::new(InMemoryRateSource::new());
+        for (pool, base, quote, figure) in [
+            (POOL_ANYONE_WETH, ANYONE, WETH, rate(1, 400)),
+            (POOL_WETH_USDC, WETH, USDC, rate(3, 1_000_000_000)),
+        ] {
+            elsewhere.insert_pool(
+                PoolId(pool.to_string()),
+                PoolContents {
+                    base: asset(base),
+                    quote: asset(quote),
+                    rate: figure,
+                    observed_at: at(0),
+                    shortest_window: TimeDelta::seconds(60),
+                    longest_window: TimeDelta::seconds(3600),
+                },
+            );
+        }
+        let sources = RateSources::none()
+            .with(evm_network(), two_leg_source())
+            .with("eip155:31338".parse().expect("a CAIP-2 network"), elsewhere);
+
+        let table = SharedRateTable::from_config(config.denomination()).expect("a dealing node");
+        let pollers = RatePoller::for_config(&table, &sources, config.denomination())
+            .expect("usable quote paths");
+        assert_eq!(
+            pollers.iter().map(RatePoller::token).collect::<Vec<_>>(),
+            vec![&asset(ANYONE)],
+            "only the token on the numeraire's network is polled; 31338's USDC is not"
+        );
+        pollers[0].refresh_once().await;
+
+        let held = table.read();
+        assert_eq!(
+            held.lookup(&asset(ANYONE), &asset(USDC), at(30)).rate(),
+            // 31337's pools: 1/4000 composed with 3/10^12, less the spread.
+            // 31338's would have been ten times that.
+            Some(rate(2991, 4_000_000_000_000_000)),
+            "ANYONE was quoted by its own network's source"
+        );
+        assert_eq!(
+            held.lookup(&asset(USDC), &asset(USDC_SECOND), at(30))
+                .rate(),
+            Some(rate(997, 1000)),
+            "and the pair across networks is the declared static row, less the spread"
         );
     }
 

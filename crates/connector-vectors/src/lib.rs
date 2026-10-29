@@ -185,8 +185,17 @@ use serde::Serialize;
 /// `probe_terminates_here` -- with each case's code, cost, reason and the
 /// exact `toon-reject-reason` HTTP header and BTP protocolData entry. Nothing
 /// existing changes; a replaying SDK that ignores the section is unaffected.
-///
-/// **10** (issue #1599 / ADR 0086): **every claim names its network.** Every
+/// **10** (issue #1523, ADR 0080 decision 12): a new top-level `zk_note`
+/// section -- a zk edge's own wire: the allowance request and answer, the
+/// allowance claim with its three signed fields and `(r, s)`, the close
+/// request with its two, and the signed successor with zk_toon's five state
+/// fields, `(r, s)` and the endpoint's answer, every value computed through
+/// zk_toon's `zk-note` crate at the commit the section's `zk_toon_commit`
+/// names, signed under the devnet domain with the chunked nonce. zk_toon's
+/// own derived values stay in its `test-vectors/zk-note.json`, and no asset
+/// or decimals key appears (ADR 0071). Nothing existing changes; a replaying
+/// SDK that ignores the section is unaffected.
+/// **11** (issue #1599 / ADR 0086): **every claim names its network.** Every
 /// voucher -- client, peer and payout -- every claim-state entry, every
 /// peer-role challenge and every `claim-ack` carries a required CAIP-2
 /// `network` (`eip155:<chainId>`, `solana:<genesis prefix>`); `blockchain`
@@ -205,7 +214,9 @@ use serde::Serialize;
 /// of every legacy spelling. A
 /// replaying SDK that omits `network` is sending a claim every connector on
 /// this schema refuses -- which is what this number exists to announce.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
+
+pub mod zk_note;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
     let mut out = [0u8; N];
@@ -245,11 +256,13 @@ pub struct WireVectors {
     pub client_auth_channel_challenge: ClientAuthChannelChallengeVectors,
     pub claim_state_toon_channel_refused: ClaimStateToonChannelRefusedVectors,
     pub client_edge: ClientEdgeVectors,
-    /// Schema 10: a node's verdict on a claim's `network`.
+    /// Schema 11: a node's verdict on a claim's `network`.
     pub claim_network: ClaimNetworkVectors,
+    /// Schema 10: the zk edge's own wire (ADR 0080 decision 12).
+    pub zk_note: zk_note::ZkNoteVectors,
 }
 
-/// `vectors/asset-ids.json` (schema 10, ADR 0086 decision 2): CAIP-19 asset
+/// `vectors/asset-ids.json` (schema 11, ADR 0086 decision 2): CAIP-19 asset
 /// ids on both chains, and every legacy spelling refused by name.
 ///
 /// **A file of its own, not a section of `wire-vectors.json`.** No asset id
@@ -995,7 +1008,7 @@ pub struct PeerZeroValueCase {
 pub struct AckFields {
     pub result: &'static str,
     pub reason: Option<&'static str>,
-    /// The CAIP-2 network of the voucher the ack judged (schema 10, ADR
+    /// The CAIP-2 network of the voucher the ack judged (schema 11, ADR
     /// 0086): a payer reads the verdict only for the network it sent on.
     pub network: String,
 }
@@ -1055,7 +1068,7 @@ pub struct PeerCarriageVectors {
     pub reject_with_cost: PeerAnswerCase,
     pub ack_absent: PeerAnswerCase,
     pub ack_malformed: PeerMalformedAckCase,
-    /// Schema 10: an ack naming a network other than the one its voucher
+    /// Schema 11: an ack naming a network other than the one its voucher
     /// was sent on -- not acknowledged, like a malformed one (ADR 0086).
     pub ack_other_network: PeerMalformedAckCase,
     pub forwarded_data_unchanged: PeerForwardedDataCase,
@@ -2195,7 +2208,7 @@ fn generate_charge_vectors() -> ChargeVectors {
 
 const VOUCHER_EVM_CHAIN_ID: u64 = 84_532;
 
-/// The CAIP-2 network every EVM fixture here is on (schema 10, ADR 0086):
+/// The CAIP-2 network every EVM fixture here is on (schema 11, ADR 0086):
 /// [`VOUCHER_EVM_CHAIN_ID`]'s.
 fn vector_evm_network() -> Network {
     Network::Eip155(VOUCHER_EVM_CHAIN_ID)
@@ -2241,7 +2254,7 @@ pub struct VoucherEvmChannelConfigFields {
 #[derive(Debug, Serialize)]
 pub struct VoucherEvmCase {
     pub name: &'static str,
-    /// The CAIP-2 network the voucher names (schema 10, ADR 0086): always
+    /// The CAIP-2 network the voucher names (schema 11, ADR 0086): always
     /// `eip155:<chain_id>`, the chain whose domain `channel_id_hex` and
     /// `digest_hex` are computed under.
     pub network: String,
@@ -2367,7 +2380,7 @@ fn generate_voucher_evm_case() -> VoucherEvmCase {
 #[derive(Debug, Serialize)]
 pub struct VoucherSolanaCase {
     pub name: &'static str,
-    /// The CAIP-2 network the voucher names (schema 10, ADR 0086):
+    /// The CAIP-2 network the voucher names (schema 11, ADR 0086):
     /// `solana:<genesis prefix>`.
     pub network: String,
     pub channel_account_hex: String,
@@ -2704,7 +2717,7 @@ pub struct ClaimVoucherVectors {
     /// Schema 8 (#1429): a `uint128` amount above `u64::MAX`, admitted
     /// exactly. See [`generate_voucher_evm_above_u64_max_case`].
     pub evm_above_u64_max: VoucherEvmCase,
-    /// Schema 10 (ADR 0086): `evm`'s channel config and key on a second
+    /// Schema 11 (ADR 0086): `evm`'s channel config and key on a second
     /// EVM network. See [`generate_voucher_evm_second_network_case`].
     pub evm_second_network: VoucherEvmCase,
     pub solana: VoucherSolanaCase,
@@ -2734,7 +2747,7 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
 /// Base's chain id: the second EVM network of the two-network case.
 const SECOND_EVM_CHAIN_ID: u64 = 8_453;
 
-/// `claim_voucher.evm_second_network` (schema 10, ADR 0086): `claim_voucher.
+/// `claim_voucher.evm_second_network` (schema 11, ADR 0086): `claim_voucher.
 /// evm`'s own `ChannelConfig` and signing key, on a second EVM network. The
 /// channel id and the voucher digest both bind the chain through the
 /// EIP-712 domain, so the same config is a different channel there, and a
@@ -2855,7 +2868,7 @@ fn generate_voucher_network_missing_cases(
 }
 
 // ---------------------------------------------------------------------
-// A node's verdict on a claim's network (schema 10, ADR 0086 decision 1)
+// A node's verdict on a claim's network (schema 11, ADR 0086 decision 1)
 // ---------------------------------------------------------------------
 //
 // Structural refusals live in `claim_voucher.invalid`. These need a node:
@@ -3022,7 +3035,7 @@ fn generate_claim_network_vectors(vouchers: &ClaimVoucherVectors) -> ClaimNetwor
 }
 
 // ---------------------------------------------------------------------
-// CAIP-19 asset ids (schema 10, ADR 0086 decision 2)
+// CAIP-19 asset ids (schema 11, ADR 0086 decision 2)
 // ---------------------------------------------------------------------
 
 /// One asset id, built from its parts and spelled in CAIP-19.
@@ -3760,6 +3773,7 @@ pub fn generate() -> WireVectors {
     let claim_state_toon_channel_refused = generate_claim_state_toon_channel_refused_vectors();
     let client_edge = generate_client_edge_vectors();
     let claim_network = generate_claim_network_vectors(&claim_voucher);
+    let zk_note = zk_note::generate_zk_note_vectors();
 
     WireVectors {
         schema_version: SCHEMA_VERSION,
@@ -3776,6 +3790,7 @@ pub fn generate() -> WireVectors {
         claim_state_toon_channel_refused,
         client_edge,
         claim_network,
+        zk_note,
     }
 }
 

@@ -7,7 +7,7 @@ see `crates/connector-vectors` and `docs/protocol/wire-vectors.md` for the invar
 is evidence of. This file is plain JSON so a client SDK can replay it without importing anything
 from this repository.
 
-`asset-ids.json` (schema 10, ADR 0086 decision 2) is its sibling: CAIP-19 asset ids on both chains
+`asset-ids.json` (schema 11, ADR 0086 decision 2) is its sibling: CAIP-19 asset ids on both chains
 and the by-name refusal of every legacy spelling. It is kept out of `wire-vectors.json` because no
 asset id rides a packet, and ADR 0071 decision 7 keeps that file unit-silent. The same command
 regenerates both, and the same test gates both.

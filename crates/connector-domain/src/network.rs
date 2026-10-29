@@ -17,7 +17,11 @@
 //! * `eip155:<chainId>` -- the chain id in decimal, with no sign, no leading
 //!   zero and no zero, so two spellings can never name one chain;
 //! * `solana:<genesis prefix>` -- the first 32 base58 characters of the
-//!   cluster's genesis hash.
+//!   cluster's genesis hash;
+//! * `mina:mainnet` or `mina:devnet` -- the network a zk-note vault lives on
+//!   (ADR 0080 decision 7). Mina has no settlement backend: the zk-note table
+//!   is the one place a `mina` network may be named, and the config refuses it
+//!   everywhere else.
 //!
 //! [`FromStr`], [`Display`](fmt::Display) and serde all read and write that one
 //! form. Any other namespace -- including the family names `evm` and `solana`
@@ -39,6 +43,9 @@ pub const EIP155_NAMESPACE: &str = "eip155";
 /// CAIP-2's namespace for Solana clusters identified by their genesis hash.
 pub const SOLANA_NETWORK_NAMESPACE: &str = "solana";
 
+/// The CAIP-2 namespace a zk-note vault's Mina network is named in.
+pub const MINA_NETWORK_NAMESPACE: &str = "mina";
+
 /// How many base58 characters of the genesis hash CAIP-2 keeps for Solana.
 pub const SOLANA_GENESIS_PREFIX_LEN: usize = 32;
 
@@ -53,6 +60,48 @@ pub enum Network {
     /// A Solana cluster, by the first 32 base58 characters of its genesis
     /// hash.
     Solana(SolanaGenesisPrefix),
+    /// The Mina network a zk-note vault lives on.
+    Mina(MinaNetwork),
+}
+
+/// The two Mina networks a zk-note vault may live on, as CAIP-2 names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MinaNetwork {
+    /// `mina:mainnet`.
+    Mainnet,
+    /// `mina:devnet`.
+    Devnet,
+}
+
+impl MinaNetwork {
+    /// The CAIP-2 network id: what the greeting's `network` and the app's
+    /// `X-TOON-Chain` name.
+    pub const fn caip2(self) -> &'static str {
+        match self {
+            MinaNetwork::Mainnet => "mina:mainnet",
+            MinaNetwork::Devnet => "mina:devnet",
+        }
+    }
+
+    /// The reference half: `mainnet` or `devnet`.
+    pub const fn reference(self) -> &'static str {
+        match self {
+            MinaNetwork::Mainnet => "mainnet",
+            MinaNetwork::Devnet => "devnet",
+        }
+    }
+}
+
+impl FromStr for MinaNetwork {
+    type Err = NetworkError;
+
+    fn from_str(s: &str) -> Result<Self, NetworkError> {
+        match s {
+            "mainnet" => Ok(MinaNetwork::Mainnet),
+            "devnet" => Ok(MinaNetwork::Devnet),
+            other => Err(NetworkError::InvalidMinaNetwork(other.to_string())),
+        }
+    }
 }
 
 /// The reference half of a `solana:` network: exactly
@@ -87,6 +136,7 @@ impl Network {
         match self {
             Network::Eip155(_) => AssetChain::Evm,
             Network::Solana(_) => AssetChain::Solana,
+            Network::Mina(_) => AssetChain::Mina,
         }
     }
 
@@ -94,7 +144,7 @@ impl Network {
     pub const fn eip155_chain_id(&self) -> Option<u64> {
         match self {
             Network::Eip155(chain_id) => Some(*chain_id),
-            Network::Solana(_) => None,
+            Network::Solana(_) | Network::Mina(_) => None,
         }
     }
 
@@ -119,6 +169,7 @@ impl fmt::Display for Network {
         match self {
             Network::Eip155(chain_id) => write!(f, "{EIP155_NAMESPACE}:{chain_id}"),
             Network::Solana(prefix) => write!(f, "{SOLANA_NETWORK_NAMESPACE}:{}", prefix.0),
+            Network::Mina(network) => f.write_str(network.caip2()),
         }
     }
 }
@@ -133,6 +184,7 @@ impl FromStr for Network {
         match namespace {
             EIP155_NAMESPACE => Ok(Network::Eip155(Network::parse_eip155_chain_id(reference)?)),
             SOLANA_NETWORK_NAMESPACE => Ok(Network::Solana(reference.parse()?)),
+            MINA_NETWORK_NAMESPACE => Ok(Network::Mina(reference.parse()?)),
             other => Err(NetworkError::UnknownNamespace {
                 namespace: other.to_string(),
                 value: s.to_string(),
@@ -182,6 +234,12 @@ pub enum NetworkError {
          characters of its genesis hash (ADR 0086)"
     )]
     InvalidSolanaGenesisPrefix(String),
+    /// A `mina` reference other than `mainnet` or `devnet`.
+    #[error(
+        "'{0}' is not a Mina network a zk-note vault may live on: write mina:mainnet or \
+         mina:devnet (ADR 0080)"
+    )]
+    InvalidMinaNetwork(String),
 }
 
 #[cfg(test)]
@@ -198,6 +256,14 @@ mod tests {
         let solana: Network = format!("solana:{DEVNET}").parse().unwrap();
         assert_eq!(solana.to_string(), format!("solana:{DEVNET}"));
         assert_eq!(solana.chain(), AssetChain::Solana);
+        let mina: Network = "mina:devnet".parse().unwrap();
+        assert_eq!(mina, Network::Mina(MinaNetwork::Devnet));
+        assert_eq!(mina.to_string(), "mina:devnet");
+        assert_eq!(mina.chain(), AssetChain::Mina);
+        assert_eq!(
+            "mina:berkeley".parse::<Network>(),
+            Err(NetworkError::InvalidMinaNetwork("berkeley".to_string()))
+        );
         assert_eq!(Network::Eip155(1).chain(), AssetChain::Evm);
         assert_eq!(Network::Eip155(42161).eip155_chain_id(), Some(42161));
         assert_eq!(solana.eip155_chain_id(), None);
@@ -284,6 +350,8 @@ mod tests {
             )
             .unwrap()
             .prop_map(|prefix| Network::Solana(prefix.parse().unwrap())),
+            prop::sample::select(vec![MinaNetwork::Mainnet, MinaNetwork::Devnet])
+                .prop_map(Network::Mina),
         ]
     }
 

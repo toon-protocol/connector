@@ -16,10 +16,13 @@
 # on `ghcr.io/toon-protocol/connector` is untouched and stays frozen on the
 # last TypeScript build.
 #
-# The base is rust:1.90 (matching CI's stable toolchain), NOT the 1.82 this file
-# originally pinned: 1.82 cannot build the locked graph at all — idna_adapter
-# 1.2.2 requires the edition2024 Cargo feature. Nothing in CI ever built this
-# file, so that was undetected until #465.
+# The base is rust:1.92. It was 1.90 until #1522, and the 1.82 this file
+# originally pinned before that: 1.82 cannot build the locked graph at all —
+# idna_adapter 1.2.2 requires the edition2024 Cargo feature, and nothing in CI
+# ever built this file, so that was undetected until #465. 1.92 is the
+# toolchain toon-protocol/zk_toon builds its `zk-note` crate on and the
+# `rust-version` o1-labs/proof-systems 0.7.0 declares; #1522 is the first
+# change that puts proof-systems into the image (ADR 0080 decision 12).
 #
 # One static binary, one config file, no JavaScript runtime anywhere in the
 # final image -- contrast the TypeScript connector's root ./Dockerfile, which
@@ -48,10 +51,10 @@
 # ============================================
 # Stage 1a: chef -- base image with cargo-chef installed. No source of any
 # kind is copied in here, so this stage's own layers are as stable as the
-# rust:1.90-alpine3.22 tag itself and are never invalidated by a source or
+# rust:1.92-alpine3.22 tag itself and are never invalidated by a source or
 # manifest edit.
 # ============================================
-FROM rust:1.90-alpine3.22 AS chef
+FROM rust:1.92-alpine3.22 AS chef
 
 RUN apk add --no-cache musl-dev
 RUN cargo install cargo-chef --locked

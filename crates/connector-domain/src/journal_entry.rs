@@ -163,4 +163,61 @@ pub enum JournalEntry {
         channel_id: String,
         cumulative_amount: u128,
     },
+    /// A zk edge granted an allowance (ADR 0080 decisions 3 and 11): the
+    /// note state `nullifier` is spent, the request proof that spent it is
+    /// the evidence-file record whose SHA-256 is `evidence_hash`, and these
+    /// are the allowance's terms. Written, and fsynced, after the evidence
+    /// record and before the grant is answered, so no nullifier is ever
+    /// spent twice across a crash.
+    ///
+    /// `allowance_id` is the opaque id the zk edge minted (32 lowercase
+    /// hex); field elements are 32 bytes little-endian, the evidence file's
+    /// encoding. The allowance's watermark is carried by the
+    /// `InboundClaim*` kinds under the key `zk-note:<allowance_id>`, so an
+    /// allowance claim rolls back exactly as a voucher does; this entry is
+    /// what marks that key as an allowance's rather than a retired
+    /// `toon-channel`'s. `commitment` is the proof's re-randomised balance
+    /// commitment, which the successor is charged from.
+    ///
+    /// Written only by `connector_client_edge::ClientClaimGate`, into the
+    /// client edge's own journal.
+    AllowanceGranted {
+        allowance_id: String,
+        nullifier: [u8; 32],
+        evidence_hash: [u8; 32],
+        tier: u64,
+        expires_at_ms: u64,
+        session_key_x: [u8; 32],
+        session_key_is_odd: bool,
+        commitment_x: [u8; 32],
+        commitment_y: [u8; 32],
+    },
+    /// A zk edge stopped an allowance taking claims (ADR 0080 decision 4):
+    /// on its session key's signed close, on a claim reaching its budget, or
+    /// at its expiry. Written, and fsynced, when the close starts -- before
+    /// a signed close is answered -- so a restart brings the allowance back
+    /// closing, never open, and the boot sweep finishes it. Written at most
+    /// once per allowance, before its [`JournalEntry::AllowanceClosed`].
+    AllowanceClosing { allowance_id: String },
+    /// A zk edge closed an allowance and fixed its charge Δ (ADR 0080
+    /// decisions 4 and 11, #1523): the allowance's final watermark, written
+    /// once every forward in flight on it had resolved, and never
+    /// rewritten. Written, and fsynced, before the evidence file's close
+    /// record and before the successor is signed, so a restart can finish
+    /// a close but never charge it differently.
+    AllowanceClosed { allowance_id: String, charge: u64 },
+    /// The successor state a zk edge signed for a closed allowance (ADR
+    /// 0080 decision 11, #1523): zk_toon's state message over the charged
+    /// commitment and the next anchor, and the state key's signature over
+    /// it. Field elements and the signature's two halves are 32 bytes
+    /// little-endian. Written once, after [`JournalEntry::AllowanceClosed`];
+    /// a successor fetch only ever reads it back.
+    AllowanceSuccessorSigned {
+        allowance_id: String,
+        commitment_x: [u8; 32],
+        commitment_y: [u8; 32],
+        anchor: [u8; 32],
+        signature_rx: [u8; 32],
+        signature_s: [u8; 32],
+    },
 }

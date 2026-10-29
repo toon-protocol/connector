@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 bs58 = "0.5"
 connector-btp = { path = "../connector-btp" }
+connector-client-edge = { path = "../connector-client-edge" }
 connector-config = { path = "../connector-config" }
 connector-domain = { path = "../connector-domain" }
 connector-peer-auth = { path = "../connector-peer-auth" }
@@ -15,6 +16,7 @@ connector-peer-http = { path = "../connector-peer-http" }
 connector-runtime = { path = "../connector-runtime" }
 connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer", features = ["test-util"] }
+connector-zk-note = { path = "../connector-zk-note" }
 base64 = "0.22"
 chrono = "0.4"
 hex = "0.4"

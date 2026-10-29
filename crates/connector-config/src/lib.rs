@@ -33,6 +33,7 @@ mod route;
 mod secret;
 mod settlement;
 mod x402_row;
+mod zk_note;
 
 pub use batch_settlement::{
     EvmBatchSettlementConfig, SolanaBatchSettlementConfig, BATCH_SETTLEMENT_DELAY_FLOOR_SECS,
@@ -61,3 +62,4 @@ pub use settlement::{
     EvmSettlementConfig, SettlementChain, SettlementConfig, SolanaSettlementConfig,
     UnknownSettlementChain,
 };
+pub use zk_note::{MinaNetwork, ZkNoteConfig, MAX_ALLOWANCE_LIFETIME_MS, ZK_NOTE_DECIMALS};
