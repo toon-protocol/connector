@@ -62,7 +62,7 @@ pub use fee::{amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_
 pub use identity::{
     anonymous_identity, resolve_identity, ConfiguredIdentity, SenderIdentity, UnauthorizedIdentity,
 };
-pub use journal_entry::JournalEntry;
+pub use journal_entry::{AllowanceSubsidy, JournalEntry};
 pub use network::{MinaNetwork, Network, NetworkError, SolanaGenesisPrefix};
 pub use node::{
     agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,

@@ -861,3 +861,123 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
     assert_eq!(answer["signature"]["r"], next["signature"]["r"]);
     assert_eq!(answer["anchor"], next["signed_fields"][4]);
 }
+
+/// ADR 0080 decision 14 (#1581): the committed subsidy vectors replay -- the
+/// subsidised request's public input states the flag, the smallest tier, a
+/// period and a per-period nullifier and binds the edge by its tag; the
+/// successor carries the old balance unchanged under the state key's
+/// signature; the greeting says `subsidy` open or closed, and nothing when
+/// the budget is zero -- and none of them states an asset, a token or a
+/// budget.
+#[test]
+fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
+    use connector_zk_note::note::field_to_string;
+    use connector_zk_note::note::policy::TIERS;
+    use connector_zk_note::note::state::verify_state;
+    use connector_zk_note::request::{expected_tag, RequestProof};
+    use connector_zk_note::successor::successor_state;
+    use connector_zk_note::{
+        commitment_from_le_bytes, field_to_le_bytes, scalar_to_string, CompressedPubKey, Field,
+        Keypair, Scalar, SecKey,
+    };
+    use std::str::FromStr;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/wire-vectors.json");
+    let committed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read the committed vectors"))
+            .expect("the committed vectors are valid JSON");
+    let zk = &committed["zk_note"];
+    let text = |value: &serde_json::Value| value.as_str().expect("a string").to_string();
+    let field = |value: &serde_json::Value| Field::from_str(&text(value)).expect("a field");
+
+    // The request.
+    let request = &zk["subsidised_allowance_request"];
+    let body = &request["body"];
+    let proof = RequestProof::parse(body["proof"].to_string().as_bytes()).expect("a JsonProof");
+    let public = proof.public();
+    assert!(public.subsidised);
+    assert_eq!(
+        public.tier, TIERS[0],
+        "a subsidised allowance is the smallest tier"
+    );
+    assert_eq!(
+        public.period,
+        Field::from(text(&request["subsidy_period"]).parse::<u64>().unwrap())
+    );
+    assert_ne!(public.period_nullifier, Field::from(0u64));
+    let session_key =
+        CompressedPubKey::from_address(&text(&body["sessionKey"])).expect("a B62 key");
+    assert_eq!(
+        public.tag,
+        expected_tag(
+            public.nullifier,
+            &public.vault,
+            &session_key,
+            public.tier,
+            text(&body["expiresAt"]).parse().unwrap()
+        )
+    );
+    assert_eq!(
+        request["refusals"],
+        serde_json::json!({
+            "tier_above_the_smallest": "subsidy_tier_not_smallest",
+            "period_not_the_current_one": "subsidy_period_not_current",
+            "budget_closed": "subsidy_budget_closed",
+            "per_period_nullifier_seen": "subsidy_nullifier_spent",
+        })
+    );
+
+    // The successor: the note is charged nothing.
+    let next = &zk["subsidised_successor"];
+    assert_eq!(next["charge"], "0");
+    assert_eq!(next["answer"]["body"]["charge"], "0");
+    let before = &next["commitment_before"];
+    let commitment = commitment_from_le_bytes(
+        &field_to_le_bytes(field(&before["x"])),
+        &field_to_le_bytes(field(&before["y"])),
+    )
+    .expect("a point");
+    assert_eq!(field(&next["nullifier"]), public.nullifier);
+    let state_secret = SecKey::new(Scalar::from(
+        text(&zk["keys"]["state_secret"]).parse::<u64>().unwrap(),
+    ));
+    let state = Keypair::try_from(state_secret.clone()).expect("a keypair");
+    let derived = successor_state(
+        &state.public.into_compressed(),
+        commitment,
+        public.nullifier,
+        0,
+    )
+    .expect("signable");
+    assert_eq!(
+        derived.commitment, commitment,
+        "a zero charge leaves the balance commitment unchanged"
+    );
+    let signer = connector_signer::ZkStateSigner::from_base58(&state_secret.to_base58())
+        .expect("the fixture state key");
+    let signature = signer.sign(&derived.message);
+    assert_eq!(text(&next["signature"]["r"]), field_to_string(signature.rx));
+    assert_eq!(text(&next["signature"]["s"]), scalar_to_string(signature.s));
+    assert!(verify_state(&signature, &state.public, &derived.message));
+    assert_eq!(
+        next["answer"]["body"]["commitment"]["x"], before["x"],
+        "the answer's commitment is the old one"
+    );
+
+    // The greeting's field.
+    let greeting = &zk["greeting_subsidy"];
+    assert_eq!(greeting["open"]["subsidy"], "open");
+    assert_eq!(greeting["closed"]["subsidy"], "closed");
+    assert!(greeting["not_offered"].get("subsidy").is_none());
+
+    // No asset, token or budget amount in any of it.
+    for section in [request, next, greeting] {
+        let rendered = section.to_string();
+        for forbidden in ["\"asset\"", "\"token\"", "budget\":"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden} appears in a subsidy vector"
+            );
+        }
+    }
+}

@@ -12,8 +12,8 @@ use chrono::{Duration as TimeDelta, TimeZone, Utc};
 use connector_client_edge::zk_note::{InMemoryZkNoteVault, ZkNoteVault};
 use connector_client_edge::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
-    ClaimIngestRejection, ClientClaimGate, EvidenceFile, SignedSuccessor, SuccessorStatus, ZkEdge,
-    EVIDENCE_FILE,
+    ClaimIngestRejection, ClientClaimGate, EvidenceFile, SignedSuccessor, Subsidy, SuccessorStatus,
+    ZkEdge, EVIDENCE_FILE,
 };
 use connector_domain::client_claim::{AllowanceId, ClientEdgeClaim};
 use connector_domain::JournalEntry;
@@ -21,7 +21,7 @@ use connector_runtime::{Clock, FileJournal, Journal, TestClock};
 use connector_signer::ZkStateSigner;
 use connector_zk_note::evidence::{evidence_hash, scan, Record};
 use connector_zk_note::note::balance::{commit, Commitment};
-use connector_zk_note::note::policy::TIERS;
+use connector_zk_note::note::policy::{subsidy_period, SUBSIDY_PERIOD_MS, TIERS};
 use connector_zk_note::note::state::verify_state;
 use connector_zk_note::request::{expected_tag, json_proof_for, RequestProof, RequestPublic};
 use connector_zk_note::session::{
@@ -53,6 +53,8 @@ struct Edge {
     vault: Arc<InMemoryZkNoteVault>,
     dir: tempfile::TempDir,
     cap: u64,
+    /// The `subsidy_budget` per period; zero offers no subsidy.
+    subsidy_budget: u64,
 }
 
 impl Edge {
@@ -69,7 +71,33 @@ impl Edge {
             vault: Arc::new(InMemoryZkNoteVault::new()),
             dir: tempfile::tempdir().expect("state dir"),
             cap,
+            subsidy_budget: 0,
         }
+    }
+
+    /// An edge that pays `budget` of subsidy per period.
+    fn with_subsidy(budget: u64) -> Edge {
+        Edge {
+            subsidy_budget: budget,
+            ..Edge::new()
+        }
+    }
+
+    /// When the vault was created: ten whole subsidy periods and a day
+    /// before the clock starts, so the first period this edge is in is 10.
+    fn vault_creation_ms(&self) -> u64 {
+        let start = u64::try_from(
+            Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0)
+                .unwrap()
+                .timestamp_millis(),
+        )
+        .unwrap();
+        start - 10 * SUBSIDY_PERIOD_MS - 86_400_000
+    }
+
+    /// The subsidy period the clock is in, as zk_toon counts it.
+    fn period(&self) -> u64 {
+        subsidy_period(self.vault_creation_ms(), self.now_ms()).expect("after the vault")
     }
 
     fn now_ms(&self) -> u64 {
@@ -104,6 +132,10 @@ impl Edge {
                 tiers: Tiers::new([TIERS[0], TIERS[1]]).expect("tiers"),
                 allowance_lifetime: std::time::Duration::from_millis(HOUR_MS),
                 open_budget_cap: self.cap,
+                subsidy: (self.subsidy_budget > 0).then(|| Subsidy {
+                    budget: self.subsidy_budget,
+                    vault_creation_ms: self.vault_creation_ms(),
+                }),
                 clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
             })
             .expect("the evidence holds every grant")
@@ -187,6 +219,18 @@ impl Payer {
             subsidised: self.subsidised,
             period: self.period,
             period_nullifier: self.period_nullifier,
+        }
+    }
+
+    /// This payer's request as a subsidised one, for the period the clock is
+    /// in: the smallest tier, and a per-period nullifier of its own.
+    fn subsidised(self, edge: &Edge) -> Payer {
+        Payer {
+            tier: TIERS[0],
+            subsidised: true,
+            period: Field::from(edge.period()),
+            period_nullifier: self.nullifier + Field::from(1_000_000u64),
+            ..self
         }
     }
 
@@ -382,31 +426,32 @@ async fn each_cheap_refusal_is_named_and_asks_the_vault_nothing() {
             |r| matches!(r, AllowanceRefusal::RequestTimeOutsideWindow { .. }),
         ),
         (
-            "a subsidised proof",
+            "a subsidised proof at an edge with no subsidy budget",
             Payer {
                 subsidised: true,
+                tier: TIERS[0],
                 ..base.clone()
             }
             .request(),
-            |r| matches!(r, AllowanceRefusal::Subsidised),
+            |r| matches!(r, AllowanceRefusal::SubsidyBudgetClosed),
         ),
         (
-            "a period",
+            "a period on an unsubsidised proof",
             Payer {
                 period: Field::from(3u64),
                 ..base.clone()
             }
             .request(),
-            |r| matches!(r, AllowanceRefusal::Subsidised),
+            |r| matches!(r, AllowanceRefusal::Malformed(_)),
         ),
         (
-            "a per-period nullifier",
+            "a per-period nullifier on an unsubsidised proof",
             Payer {
                 period_nullifier: Field::from(3u64),
                 ..base.clone()
             }
             .request(),
-            |r| matches!(r, AllowanceRefusal::Subsidised),
+            |r| matches!(r, AllowanceRefusal::Malformed(_)),
         ),
         (
             "a tag bound to another session key",
@@ -1592,4 +1637,281 @@ mod btp {
         let reject = Reject::decode(&packet).expect("a REJECT");
         assert_eq!(reject.code.as_str(), "F03");
     }
+}
+
+// -- Subsidised allowances (ADR 0080 decision 14, #1581) --
+
+/// Every journaled charge Δ, in order: a subsidised allowance's is the
+/// budget's, not the note's.
+fn subsidised_payer(edge: &Edge, seed: u64) -> Payer {
+    Payer::new(edge, seed).subsidised(edge).provable(edge)
+}
+
+#[tokio::test]
+async fn a_subsidised_allowance_is_granted_and_charges_the_note_nothing() {
+    let edge = Edge::with_subsidy(3 * TIERS[0]);
+    let gate = edge.gate();
+    let payer = subsidised_payer(&edge, 50);
+
+    let granted = grant(&gate, &payer).await;
+    assert_eq!(granted.tier, TIERS[0]);
+    let id = granted.allowance_id;
+    gate.ingest(&payer.claim(id, 100), 100).await.unwrap();
+    gate.ingest(&payer.claim(id, 400), 300).await.unwrap();
+
+    // The successor carries the old balance unchanged: the note is charged 0.
+    let successor = signed(gate.close_allowance(payer.close(id)).expect("closed"));
+    payer.check(&edge, &successor, 0);
+    assert_eq!(successor.commitment, payer.commitment);
+    // Δ is journaled as the budget's.
+    assert_eq!(edge.charges(), vec![(id.to_string(), 400)]);
+    // The grant journals its period and per-period nullifier.
+    let subsidy = edge.entries().into_iter().find_map(|entry| match entry {
+        JournalEntry::AllowanceGranted { subsidy, .. } => subsidy,
+        _ => None,
+    });
+    let subsidy = subsidy.expect("a subsidised grant journals its subsidy");
+    assert_eq!(subsidy.period, edge.period());
+    assert_eq!(
+        subsidy.period_nullifier,
+        field_to_le_bytes(payer.period_nullifier)
+    );
+    // And so does a restart.
+    let restarted = edge.gate();
+    assert_eq!(
+        restarted.successor(id),
+        Ok(SuccessorStatus::Signed(Box::new(successor)))
+    );
+    // The close record the challenger reads charges the note nothing.
+    let charges: Vec<u64> = edge
+        .evidence()
+        .iter()
+        .filter_map(|payload| match Record::from_payload(payload).unwrap() {
+            Record::Close(close) => Some(close.charge),
+            Record::Grant(_) => None,
+        })
+        .collect();
+    assert_eq!(charges, vec![0]);
+}
+
+#[tokio::test]
+async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
+    let edge = Edge::with_subsidy(TIERS[0]);
+    let gate = edge.gate();
+    let period = edge.period();
+    let base = |seed: u64| Payer::new(&edge, seed).subsidised(&edge);
+
+    // A budget of exactly one tier: the first grant closes it.
+    let first = base(60).provable(&edge);
+    grant(&gate, &first).await;
+    let (evidence, entries) = (edge.evidence().len(), edge.entries().len());
+
+    let cases: Vec<(&str, Payer, &str)> = vec![
+        (
+            "a tier above the smallest",
+            Payer {
+                tier: TIERS[1],
+                ..base(61)
+            },
+            "subsidy_tier_not_smallest",
+        ),
+        (
+            "the previous period",
+            Payer {
+                period: Field::from(period - 1),
+                ..base(62)
+            },
+            "subsidy_period_not_current",
+        ),
+        (
+            "the next period",
+            Payer {
+                period: Field::from(period + 1),
+                ..base(63)
+            },
+            "subsidy_period_not_current",
+        ),
+        ("a closed budget", base(64), "subsidy_budget_closed"),
+    ];
+    for (case, payer, name) in cases {
+        let payer = payer.provable(&edge);
+        let refusal = gate.admit_allowance(payer.request()).await.expect_err(case);
+        assert_eq!(refusal.name(), name, "{case}: {refusal}");
+    }
+    assert_eq!(edge.evidence().len(), evidence, "nothing was written");
+    assert_eq!(edge.entries().len(), entries, "nothing was journaled");
+}
+
+#[tokio::test]
+async fn a_per_period_nullifier_is_seen_once_even_after_a_restart() {
+    let edge = Edge::with_subsidy(10 * TIERS[0]);
+    let first = subsidised_payer(&edge, 70);
+    grant(&edge.gate(), &first).await;
+
+    // Another note, the same per-period nullifier: refused, before and
+    // after a restart, by the per-period rule and not the state's.
+    let reused = Payer {
+        period_nullifier: first.period_nullifier,
+        ..Payer::new(&edge, 71).subsidised(&edge)
+    }
+    .provable(&edge);
+    let (evidence, entries) = (edge.evidence().len(), edge.entries().len());
+    for gate in [edge.gate(), edge.gate()] {
+        let refusal = gate.admit_allowance(reused.request()).await.unwrap_err();
+        assert_eq!(refusal, AllowanceRefusal::SubsidyNullifierSpent);
+        assert_eq!(refusal.name(), "subsidy_nullifier_spent");
+    }
+    assert_eq!(edge.evidence().len(), evidence);
+    assert_eq!(edge.entries().len(), entries);
+}
+
+#[tokio::test]
+async fn reservations_cannot_overspend_the_budget_and_a_remainder_reopens_it() {
+    // One and a half tiers: one reservation fits, two do not.
+    let edge = Edge::with_subsidy(TIERS[0] + TIERS[0] / 2);
+    let gate = edge.gate();
+    let (a, b) = (subsidised_payer(&edge, 80), subsidised_payer(&edge, 81));
+    assert_eq!(gate.subsidy_open(), Some(true));
+    let id = grant(&gate, &a).await.allowance_id;
+    assert_eq!(gate.subsidy_open(), Some(false));
+    assert_eq!(
+        gate.admit_allowance(b.request()).await.unwrap_err(),
+        AllowanceRefusal::SubsidyBudgetClosed
+    );
+
+    // The first closes having used a quarter of its tier: its remainder
+    // reopens the budget in the same period.
+    gate.ingest(&a.claim(id, TIERS[0] / 4), TIERS[0] / 4)
+        .await
+        .unwrap();
+    gate.close_allowance(a.close(id)).expect("closed");
+    assert_eq!(gate.subsidy_open(), Some(true));
+    grant(&gate, &b).await;
+    assert_eq!(gate.subsidy_open(), Some(false));
+
+    // None of it is forgotten by a restart.
+    let restarted = edge.gate();
+    assert_eq!(restarted.subsidy_open(), Some(false));
+}
+
+#[tokio::test]
+async fn a_remainder_released_after_its_period_ended_does_not_raise_the_next_budget() {
+    let edge = Edge::with_subsidy(TIERS[0]);
+    let gate = edge.gate();
+    let old = subsidised_payer(&edge, 90);
+    grant(&gate, &old).await;
+    assert_eq!(gate.subsidy_open(), Some(false));
+
+    // The period ends with the allowance unclosed; the sweep closes it, and
+    // its whole reservation returns to a period that is over.
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    gate.sweep_allowances();
+    assert_eq!(edge.charges().len(), 1);
+
+    // The new period has the budget, and no more than the budget.
+    assert_eq!(gate.subsidy_open(), Some(true));
+    grant(&gate, &subsidised_payer(&edge, 91)).await;
+    assert_eq!(gate.subsidy_open(), Some(false));
+    assert_eq!(
+        gate.admit_allowance(subsidised_payer(&edge, 92).request())
+            .await
+            .unwrap_err(),
+        AllowanceRefusal::SubsidyBudgetClosed
+    );
+    // The old period's proof is refused by its period, whatever its budget.
+    let stale = Payer {
+        request_time: edge.now_ms(),
+        expires_at_ms: edge.now_ms() + HOUR_MS / 2,
+        ..old
+    }
+    .provable(&edge);
+    assert_eq!(
+        gate.admit_allowance(stale.request())
+            .await
+            .unwrap_err()
+            .name(),
+        "subsidy_period_not_current"
+    );
+}
+
+#[tokio::test]
+async fn a_subsidised_allowance_counts_toward_the_open_budget_cap() {
+    let edge = Edge {
+        subsidy_budget: 5 * TIERS[0],
+        ..Edge::with_cap(TIERS[0])
+    };
+    let gate = edge.gate();
+    grant(&gate, &subsidised_payer(&edge, 100)).await;
+    let refusal = gate
+        .admit_allowance(subsidised_payer(&edge, 101).request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refusal, AllowanceRefusal::OpenBudgetExceeded { .. }),
+        "{refusal:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_greeting_reads_open_and_closed_and_says_nothing_without_a_budget() {
+    assert_eq!(Edge::new().gate().subsidy_open(), None);
+    let edge = Edge::with_subsidy(TIERS[0]);
+    let gate = edge.gate();
+    assert_eq!(gate.subsidy_open(), Some(true));
+    let payer = subsidised_payer(&edge, 110);
+    let id = grant(&gate, &payer).await.allowance_id;
+    assert_eq!(gate.subsidy_open(), Some(false));
+    gate.close_allowance(payer.close(id)).expect("closed");
+    assert_eq!(
+        gate.subsidy_open(),
+        Some(true),
+        "nothing used, all returned"
+    );
+    // A new period reopens a budget that was spent.
+    grant(&gate, &subsidised_payer(&edge, 111)).await;
+    assert_eq!(gate.subsidy_open(), Some(false));
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    assert_eq!(gate.subsidy_open(), Some(true));
+}
+
+#[tokio::test]
+async fn the_self_description_counts_the_last_finished_period_only() {
+    assert_eq!(Edge::new().gate().subsidised_last_period(), None);
+    let edge = Edge::with_subsidy(5 * TIERS[0]);
+    let gate = edge.gate();
+    grant(&gate, &subsidised_payer(&edge, 120)).await;
+    grant(&gate, &subsidised_payer(&edge, 121)).await;
+    // Two are granted in the current period, which is not finished.
+    assert_eq!(gate.subsidised_last_period(), Some(0));
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    assert_eq!(gate.subsidised_last_period(), Some(2));
+    grant(&gate, &subsidised_payer(&edge, 122)).await;
+    assert_eq!(
+        gate.subsidised_last_period(),
+        Some(2),
+        "the new period's grant is not counted until it ends"
+    );
+    // The count is rebuilt from the journal.
+    assert_eq!(edge.gate().subsidised_last_period(), Some(2));
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    assert_eq!(gate.subsidised_last_period(), Some(1));
+}
+
+#[tokio::test]
+async fn the_vaults_creation_time_is_read_once_and_only_for_a_budget() {
+    let vault = InMemoryZkNoteVault::new();
+    vault.created_at(1_234);
+    assert_eq!(Subsidy::read(&vault, 0).await, Ok(None));
+    assert_eq!(vault.creation_reads(), 0, "a zero budget reads nothing");
+    assert_eq!(
+        Subsidy::read(&vault, 9).await,
+        Ok(Some(Subsidy {
+            budget: 9,
+            vault_creation_ms: 1_234
+        }))
+    );
+    assert_eq!(vault.creation_reads(), 1);
+    vault.go_down();
+    assert!(Subsidy::read(&vault, 9).await.is_err(), "boot fails");
+    assert_eq!(Subsidy::read(&vault, 0).await, Ok(None));
 }

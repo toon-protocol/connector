@@ -11,7 +11,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use connector_domain::JournalEntry;
+use connector_domain::{AllowanceSubsidy, JournalEntry};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -178,15 +178,28 @@ fn encode_line(entry: &JournalEntry) -> String {
             session_key_is_odd,
             commitment_x,
             commitment_y,
-        } => format!(
-            "allowance_granted\t{allowance_id}\t{}\t{}\t{tier}\t{expires_at_ms}\t{}\t{}\t{}\t{}",
-            encode_hex(nullifier),
-            encode_hex(evidence_hash),
-            encode_hex(session_key_x),
-            u8::from(*session_key_is_odd),
-            encode_hex(commitment_x),
-            encode_hex(commitment_y),
-        ),
+            subsidy,
+        } => {
+            let line = format!(
+                "allowance_granted\t{allowance_id}\t{}\t{}\t{tier}\t{expires_at_ms}\t{}\t{}\t{}\t{}",
+                encode_hex(nullifier),
+                encode_hex(evidence_hash),
+                encode_hex(session_key_x),
+                u8::from(*session_key_is_odd),
+                encode_hex(commitment_x),
+                encode_hex(commitment_y),
+            );
+            // Two more columns only on a subsidised grant, so a journal an
+            // earlier build wrote still reads.
+            match subsidy {
+                Some(subsidy) => format!(
+                    "{line}\t{}\t{}",
+                    subsidy.period,
+                    encode_hex(&subsidy.period_nullifier)
+                ),
+                None => line,
+            }
+        }
         JournalEntry::AllowanceClosing { allowance_id } => {
             format!("allowance_closing\t{allowance_id}")
         }
@@ -282,7 +295,8 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 cumulative_amount: cumulative_amount.parse::<u128>().map_err(|_| corrupt())?,
             })
         }
-        ["allowance_granted", allowance_id, nullifier, evidence_hash, tier, expires_at_ms, session_key_x, session_key_is_odd, commitment_x, commitment_y] =>
+        ["allowance_granted", allowance_id, nullifier, evidence_hash, tier, expires_at_ms, session_key_x, session_key_is_odd, commitment_x, commitment_y, subsidy @ ..]
+            if subsidy.is_empty() || subsidy.len() == 2 =>
         {
             let bytes32 = |hex: &str| -> Result<[u8; 32], JournalError> {
                 decode_hex(hex)
@@ -303,6 +317,13 @@ fn decode_line(line: &str) -> Result<JournalEntry, JournalError> {
                 },
                 commitment_x: bytes32(commitment_x)?,
                 commitment_y: bytes32(commitment_y)?,
+                subsidy: match subsidy {
+                    [period, period_nullifier] => Some(AllowanceSubsidy {
+                        period: parse_u64(period)?,
+                        period_nullifier: bytes32(period_nullifier)?,
+                    }),
+                    _ => None,
+                },
             })
         }
         ["allowance_closing", allowance_id] => Ok(JournalEntry::AllowanceClosing {
@@ -472,6 +493,22 @@ mod tests {
                 session_key_is_odd: true,
                 commitment_x: [0x04; 32],
                 commitment_y: [0x05; 32],
+                subsidy: None,
+            },
+            JournalEntry::AllowanceGranted {
+                allowance_id: "ffeeddccbbaa99887766554433221100".to_string(),
+                nullifier: [0x0b; 32],
+                evidence_hash: [0x0c; 32],
+                tier: 10_000_000,
+                expires_at_ms: 1,
+                session_key_x: [0x0d; 32],
+                session_key_is_odd: false,
+                commitment_x: [0x0e; 32],
+                commitment_y: [0x0f; 32],
+                subsidy: Some(AllowanceSubsidy {
+                    period: 7,
+                    period_nullifier: [0x10; 32],
+                }),
             },
             JournalEntry::AllowanceClosing {
                 allowance_id: "00112233445566778899aabbccddeeff".to_string(),

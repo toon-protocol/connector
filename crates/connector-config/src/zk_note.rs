@@ -52,6 +52,8 @@ pub(crate) struct RawZkNoteTable {
     tiers: Vec<u64>,
     allowance_lifetime_secs: u64,
     open_budget_cap: u64,
+    #[serde(default)]
+    subsidy_budget: u64,
 }
 
 /// The Mina network a vault lives on, as its CAIP-2 id: the domain's, since
@@ -70,6 +72,7 @@ pub struct ZkNoteConfig {
     tiers: Tiers,
     allowance_lifetime: Duration,
     open_budget_cap: u64,
+    subsidy_budget: u64,
 }
 
 impl ZkNoteConfig {
@@ -118,6 +121,13 @@ impl ZkNoteConfig {
     /// (ADR 0080 decision 5).
     pub fn open_budget_cap(&self) -> u64 {
         self.open_budget_cap
+    }
+
+    /// The subsidy budget per subsidy period, in MINA base units (ADR 0080
+    /// decision 14): zero -- the default -- offers no subsidised allowance.
+    /// Fixed for the process lifetime.
+    pub fn subsidy_budget(&self) -> u64 {
+        self.subsidy_budget
     }
 
     /// The vault's asset inside the connector: native MINA on the vault's
@@ -195,6 +205,14 @@ pub(crate) fn resolve_zk_note(
             tier: smallest,
         });
     }
+    // A subsidised allowance is opened at the smallest tier only (decision 14).
+    let smallest_published = connector_zk_note::note::policy::TIERS[0];
+    if raw.subsidy_budget > 0 && tiers.get(smallest_published).is_none() {
+        return Err(ConfigError::ZkNoteSubsidyWithoutSmallestTier {
+            budget: raw.subsidy_budget,
+            tier: smallest_published,
+        });
+    }
     Ok(ZkNoteConfig {
         vault: raw.vault,
         network,
@@ -205,6 +223,7 @@ pub(crate) fn resolve_zk_note(
         tiers,
         allowance_lifetime: Duration::from_millis(lifetime_ms),
         open_budget_cap: raw.open_budget_cap,
+        subsidy_budget: raw.subsidy_budget,
     })
 }
 
@@ -363,6 +382,40 @@ key_file = "{signer}"
             matches!(error, ConfigError::ZkNoteOpenBudgetCapBelowTier { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_subsidy_budget_defaults_to_zero_and_is_read_when_set() {
+        let none = load(|text| text).expect("loads");
+        assert_eq!(none.zk_note().unwrap().subsidy_budget(), 0);
+        let set =
+            load(|text| text.replace("open_budget_cap", "subsidy_budget = 5\nopen_budget_cap"))
+                .expect("loads");
+        assert_eq!(set.zk_note().unwrap().subsidy_budget(), 5);
+    }
+
+    #[test]
+    fn a_subsidy_budget_without_the_smallest_tier_is_refused() {
+        let without = |text: String| {
+            text.replace(
+                &format!("tiers = [{}, {}]", TIERS[0], TIERS[1]),
+                &format!("tiers = [{}]", TIERS[1]),
+            )
+            .replace("open_budget_cap", "subsidy_budget = 5\nopen_budget_cap")
+        };
+        let error = load(without).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::ZkNoteSubsidyWithoutSmallestTier { .. }),
+            "{error}"
+        );
+        // A zero budget needs no smallest tier.
+        load(|text| {
+            text.replace(
+                &format!("tiers = [{}, {}]", TIERS[0], TIERS[1]),
+                &format!("tiers = [{}]", TIERS[1]),
+            )
+        })
+        .expect("no subsidy, no smallest tier needed");
     }
 
     #[test]

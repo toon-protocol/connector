@@ -1685,6 +1685,14 @@ pub enum ConfigError {
     )]
     ZkNoteOpenBudgetCapBelowTier { cap: u64, tier: u64 },
 
+    /// A subsidy budget with no smallest tier to spend it on (ADR 0080 decision 14).
+    #[error(
+        "[zk_note] subsidy_budget = {budget} is set but 'tiers' does not include {tier}, the \
+         smallest of zk_toon's tiers: a subsidised allowance can only be opened at that tier, so \
+         the budget could never be spent. Add {tier} to 'tiers', or set subsidy_budget = 0"
+    )]
+    ZkNoteSubsidyWithoutSmallestTier { budget: u64, tier: u64 },
+
     /// A zk edge with nowhere to journal its spent nullifiers or keep its evidence.
     #[error(
         "[zk_note] is set but 'state_dir' is not: a zk edge journals every spent nullifier and \

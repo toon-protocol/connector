@@ -17,7 +17,7 @@
 //! committed fixtures o1js produced.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -45,6 +45,11 @@ pub trait ZkNoteVault: Send + Sync + std::fmt::Debug {
 
     /// Whether `nullifier` is already used on chain.
     async fn nullifier_used(&self, nullifier: Field) -> Result<bool, ZkNoteVaultUnavailable>;
+
+    /// When the vault was created, in ms since the epoch: the origin of
+    /// zk_toon's subsidy periods (ADR 0080 decision 14). Read once, at boot,
+    /// and only by a node with a non-zero `subsidy_budget`.
+    async fn creation_time_ms(&self) -> Result<u64, ZkNoteVaultUnavailable>;
 }
 
 /// An in-memory [`ZkNoteVault`]: the roots it has held, the nullifiers
@@ -54,7 +59,9 @@ pub struct InMemoryZkNoteVault {
     roots: Mutex<HashSet<[u8; 32]>>,
     used: Mutex<HashSet<[u8; 32]>>,
     valid: Mutex<HashSet<Vec<u8>>>,
+    created_at_ms: AtomicU64,
     unavailable: AtomicBool,
+    creation_reads: AtomicUsize,
     root_reads: AtomicUsize,
     nullifier_reads: AtomicUsize,
     verifications: AtomicUsize,
@@ -91,6 +98,16 @@ impl InMemoryZkNoteVault {
             .insert(proof.json().to_vec());
     }
 
+    /// The vault was created at `created_at_ms` (ms since the epoch).
+    pub fn created_at(&self, created_at_ms: u64) {
+        self.created_at_ms.store(created_at_ms, Ordering::SeqCst);
+    }
+
+    /// How many times the vault's creation time has been read.
+    pub fn creation_reads(&self) -> usize {
+        self.creation_reads.load(Ordering::SeqCst)
+    }
+
     /// Every read fails from now on, as an unreachable endpoint would.
     pub fn go_down(&self) {
         self.unavailable.store(true, Ordering::SeqCst);
@@ -98,7 +115,7 @@ impl InMemoryZkNoteVault {
 
     /// How many times the vault has been asked anything.
     pub fn reads(&self) -> usize {
-        self.root_reads() + self.nullifier_reads() + self.verifications()
+        self.root_reads() + self.nullifier_reads() + self.verifications() + self.creation_reads()
     }
 
     /// How many root reads.
@@ -159,6 +176,12 @@ impl ZkNoteVault for InMemoryZkNoteVault {
             .expect("vault lock")
             .contains(&field_to_le_bytes(nullifier)))
     }
+
+    async fn creation_time_ms(&self) -> Result<u64, ZkNoteVaultUnavailable> {
+        self.creation_reads.fetch_add(1, Ordering::SeqCst);
+        self.available()?;
+        Ok(self.created_at_ms.load(Ordering::SeqCst))
+    }
 }
 
 /// The contract every [`ZkNoteVault`] upholds, run against the fake here and
@@ -187,6 +210,14 @@ pub mod contract {
         /// One that does not: its proof bytes altered, or made under
         /// another key.
         pub invalid_proof: RequestProof,
+        /// A subsidised request proof that verifies under the configured key.
+        pub valid_subsidised_proof: RequestProof,
+        /// Proofs made from `valid_subsidised_proof` by altering what it says
+        /// about its subsidy -- its flag, its period, its per-period
+        /// nullifier -- and nothing else. None verifies.
+        pub subsidy_altered_proofs: Vec<RequestProof>,
+        /// When the vault was created, ms since the epoch.
+        pub creation_time_ms: u64,
     }
 
     /// Assert every rule of the port against `fixture`.
@@ -227,6 +258,51 @@ pub mod contract {
                 "a proof not made under it does not"
             );
         }
+        // The subsidised flag, the period and the per-period nullifier are
+        // public inputs the proof is verified over: read as the proof states
+        // them, and a proof whose claim about its subsidy was altered is not
+        // the proof that was made.
+        let subsidised = fixture.valid_subsidised_proof.public();
+        assert!(
+            subsidised.subsidised,
+            "the fixture's subsidised proof states that it is"
+        );
+        assert_eq!(
+            vault
+                .verify_request_proof(&fixture.valid_subsidised_proof)
+                .await,
+            Ok(true),
+            "a subsidised proof made under the configured key verifies"
+        );
+        assert!(
+            !fixture.subsidy_altered_proofs.is_empty(),
+            "a fixture must alter the subsidy at least once"
+        );
+        for altered in &fixture.subsidy_altered_proofs {
+            let (was, now) = (subsidised, altered.public());
+            assert!(
+                was.subsidised != now.subsidised
+                    || was.period != now.period
+                    || was.period_nullifier != now.period_nullifier,
+                "an altered proof alters the subsidy"
+            );
+            assert_eq!(
+                vault.verify_request_proof(altered).await,
+                Ok(false),
+                "a proof whose subsidised flag, period or per-period nullifier was altered \
+                 does not verify"
+            );
+        }
+        assert_eq!(
+            vault.creation_time_ms().await,
+            Ok(fixture.creation_time_ms),
+            "the vault says when it was created"
+        );
+        assert_eq!(
+            vault.creation_time_ms().await,
+            Ok(fixture.creation_time_ms),
+            "and says the same every time"
+        );
         // Verifying is a read: it spends nothing.
         assert_eq!(
             vault
@@ -245,8 +321,16 @@ pub mod contract {
     }
 
     /// A fixture over the in-memory fake.
-    pub fn in_memory_fixture(valid: RequestProof, invalid: RequestProof) -> ZkNoteVaultFixture {
+    pub fn in_memory_fixture(
+        valid: RequestProof,
+        invalid: RequestProof,
+        valid_subsidised: RequestProof,
+        subsidy_altered: Vec<RequestProof>,
+    ) -> ZkNoteVaultFixture {
+        const CREATED_AT_MS: u64 = 1_700_000_000_000;
         let vault = InMemoryZkNoteVault::new();
+        vault.created_at(CREATED_AT_MS);
+        vault.accept(&valid_subsidised);
         let (known, unknown) = (Field::from(11u64), Field::from(12u64));
         let (used, unused) = (Field::from(21u64), Field::from(22u64));
         vault.hold_root(known);
@@ -260,6 +344,9 @@ pub mod contract {
             unused_nullifier: unused,
             valid_proof: valid,
             invalid_proof: invalid,
+            valid_subsidised_proof: valid_subsidised,
+            subsidy_altered_proofs: subsidy_altered,
+            creation_time_ms: CREATED_AT_MS,
         }
     }
 
@@ -271,6 +358,15 @@ pub mod contract {
         use connector_zk_note::CompressedPubKey;
 
         fn proof(bytes: &str) -> RequestProof {
+            subsidy_proof(bytes, false, 0, 0)
+        }
+
+        fn subsidy_proof(
+            bytes: &str,
+            subsidised: bool,
+            period: u64,
+            period_nullifier: u64,
+        ) -> RequestProof {
             let public = RequestPublic {
                 vault: CompressedPubKey {
                     x: Field::from(1u64),
@@ -282,16 +378,26 @@ pub mod contract {
                 nullifier: Field::from(99u64),
                 tag: Field::from(3u64),
                 commitment: generator_g(),
-                subsidised: false,
-                period: Field::from(0u64),
-                period_nullifier: Field::from(0u64),
+                subsidised,
+                period: Field::from(period),
+                period_nullifier: Field::from(period_nullifier),
             };
             RequestProof::parse(&json_proof_for(&public, bytes)).expect("a proof")
         }
 
         #[tokio::test]
         async fn the_in_memory_vault_upholds_the_contract() {
-            assert_upholds_the_contract(in_memory_fixture(proof("valid"), proof("forged"))).await;
+            assert_upholds_the_contract(in_memory_fixture(
+                proof("valid"),
+                proof("forged"),
+                subsidy_proof("subsidised", true, 3, 77),
+                vec![
+                    subsidy_proof("subsidised", false, 3, 77),
+                    subsidy_proof("subsidised", true, 4, 77),
+                    subsidy_proof("subsidised", true, 3, 78),
+                ],
+            ))
+            .await;
         }
     }
 }

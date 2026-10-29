@@ -26,6 +26,7 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
         tiers: Tiers::new([TIERS[1]]).unwrap(),
         allowance_lifetime: Duration::from_secs(3600),
         open_budget_cap: TIERS[1],
+        subsidy: None,
         clock,
     }
 }
