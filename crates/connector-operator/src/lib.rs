@@ -1392,9 +1392,9 @@ fn node_identity(signer: &dyn Signer) -> Result<NodeIdentity, SignerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use connector_runtime::SettlementChain;
     use axum::body::Body;
     use connector_config::{ControllerKey, StaticRoute};
+    use connector_runtime::SettlementChain;
     use connector_runtime::{
         FakeAppClient, InMemoryJournal, InProcessPeerTransport, RouteSource, TestClock,
     };

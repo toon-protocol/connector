@@ -88,10 +88,10 @@ pub enum VoucherBindingError {
          establish it again to move it"
     )]
     SignerBoundOnAnotherNetwork {
-        signer: String,
-        peer_id: String,
-        bound_on: String,
-        wanted: String,
+        signer: Box<str>,
+        peer_id: Box<str>,
+        bound_on: Box<str>,
+        wanted: Box<str>,
     },
 }
 
@@ -198,10 +198,13 @@ impl VoucherSignerBindings {
                 ..
             }) if network.as_ref().is_some_and(|wanted| wanted != bound_on) => {
                 Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
-                    signer: describe(&signer),
-                    peer_id: peer_id.to_string(),
-                    bound_on: bound_on.to_string(),
-                    wanted: network.map(|wanted| wanted.to_string()).unwrap_or_default(),
+                    signer: describe(&signer).into(),
+                    peer_id: peer_id.to_string().into(),
+                    bound_on: bound_on.to_string().into(),
+                    wanted: network
+                        .map(|wanted| wanted.to_string())
+                        .unwrap_or_default()
+                        .into(),
                 })
             }
             Some(_) => Ok(()),
@@ -430,10 +433,10 @@ mod tests {
         assert_eq!(
             bindings.bind_on_network("store", EVM, Some(&arbitrum), None),
             Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
-                signer: format!("0x{}", "11".repeat(20)),
-                peer_id: "store".to_string(),
-                bound_on: base.to_string(),
-                wanted: arbitrum.to_string(),
+                signer: format!("0x{}", "11".repeat(20)).into(),
+                peer_id: "store".to_string().into(),
+                bound_on: base.to_string().into(),
+                wanted: arbitrum.to_string().into(),
             })
         );
         bindings

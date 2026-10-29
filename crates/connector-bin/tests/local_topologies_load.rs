@@ -434,9 +434,11 @@ fn topology(name: &str) -> Topology {
             let network = format!("{}:{}", parts[1], parts[2]);
             let chain = match parts[1] {
                 "eip155" => {
-                    network.parse::<connector_domain::Network>().unwrap_or_else(|error| {
-                        panic!("local/keys.sh's {name} peering network `{network}`: {error}")
-                    });
+                    network
+                        .parse::<connector_domain::Network>()
+                        .unwrap_or_else(|error| {
+                            panic!("local/keys.sh's {name} peering network `{network}`: {error}")
+                        });
                     SettlementChain::Evm
                 }
                 "solana" => {

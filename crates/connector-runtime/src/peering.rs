@@ -385,10 +385,10 @@ impl Connector {
             if let Some(bound_on) = self.voucher_signer_network(&signer) {
                 if bound_on != on {
                     return Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
-                        signer: published_signer.to_string(),
-                        peer_id: bound_to,
-                        bound_on: bound_on.to_string(),
-                        wanted: on.to_string(),
+                        signer: published_signer.to_string().into(),
+                        peer_id: bound_to.into(),
+                        bound_on: bound_on.to_string().into(),
+                        wanted: on.to_string().into(),
                     }
                     .into());
                 }
@@ -577,7 +577,11 @@ pub(crate) fn shared_settlement_of(
                 .map(|signer| signer.signer.clone());
             entry
         })
-        .filter(|entry| wanted.as_deref().is_none_or(|wanted| entry.network() == wanted))
+        .filter(|entry| {
+            wanted
+                .as_deref()
+                .is_none_or(|wanted| entry.network() == wanted)
+        })
         .filter(|entry| {
             ours.iter().any(|own| {
                 own.parse::<connector_domain::Network>()
@@ -776,8 +780,7 @@ mod tests {
             Vec::new(),
         );
 
-        let shared =
-            shared_settlement_of(&evm_only, &[NETWORK], None, &url()).expect("one shared");
+        let shared = shared_settlement_of(&evm_only, &[NETWORK], None, &url()).expect("one shared");
         assert_eq!(shared.chain(), SettlementChain::Evm);
         assert_eq!(shared.network(), NETWORK);
 

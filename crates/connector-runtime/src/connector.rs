@@ -715,10 +715,10 @@ pub enum ConfigPeeringError {
          channel this node opened on {row}, or put the row on {held_on}"
     )]
     OutboundChannelOnAnotherNetwork {
-        peer_id: String,
-        channel: String,
-        row: String,
-        held_on: String,
+        peer_id: Box<str>,
+        channel: Box<str>,
+        row: Box<str>,
+        held_on: Box<str>,
     },
     /// A `[[peer_channels]]` row's voucher signer is not in its chain's
     /// spelling. `Config::load` refuses one first; the second lock.
@@ -1505,10 +1505,10 @@ impl Connector {
         if let (Some(row), Some(held_on)) = (network, outbound.network(outbound_channel)) {
             if *row != held_on {
                 return Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
-                    peer_id: peer_id.to_string(),
-                    channel: outbound_channel.to_string(),
-                    row: row.to_string(),
-                    held_on: held_on.to_string(),
+                    peer_id: peer_id.into(),
+                    channel: outbound_channel.into(),
+                    row: row.to_string().into(),
+                    held_on: held_on.to_string().into(),
                 });
             }
         }
@@ -9891,7 +9891,13 @@ mod tests {
                 let (connector, _, _, _, channel) = peered().await;
                 let wired = connector
                     .with_config_peer_ids(["next-hop".to_string()])
-                    .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None, None)
+                    .with_config_voucher_signer(
+                        "next-hop",
+                        SettlementChain::Evm,
+                        &signer,
+                        None,
+                        None,
+                    )
                     .expect("bind the signer")
                     .with_config_pay_channel("next-hop", &channel, &url, timeout, None);
                 if pays_it {
@@ -9926,9 +9932,9 @@ mod tests {
                     held_on,
                     ..
                 }) => {
-                    assert_eq!(peer_id, "next-hop");
-                    assert_eq!(row, "eip155:8453");
-                    assert_eq!(held_on, "eip155:31337");
+                    assert_eq!(&*peer_id, "next-hop");
+                    assert_eq!(&*row, "eip155:8453");
+                    assert_eq!(&*held_on, "eip155:31337");
                 }
                 Err(other) => panic!("expected a network refusal, got {other:?}"),
                 Ok(_) => panic!("expected a network refusal, got a wired peering"),

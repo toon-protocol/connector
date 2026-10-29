@@ -351,8 +351,8 @@ pub async fn decide_frame(
                     voucher.network(),
                     true,
                 )
-                    .as_ref()
-                    .map(as_presented),
+                .as_ref()
+                .map(as_presented),
             )
         }
         None => match (&evidence.challenge, vouchers) {
@@ -367,8 +367,8 @@ pub async fn decide_frame(
                         challenge.network(),
                         in_window,
                     )
-                        .as_ref()
-                        .map(as_presented),
+                    .as_ref()
+                    .map(as_presented),
                 )
             }
             _ => decide_voucher_role(None),
