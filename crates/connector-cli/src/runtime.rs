@@ -4432,7 +4432,7 @@ key_file = "{key}"
             }
 
             let connects = proxy.connects();
-            for (host, username) in [
+            for (host, circuit) in [
                 (EVM_HOST, "toon-settlement-eip155-31337"),
                 (SECOND_EVM_HOST, "toon-settlement-eip155-31338"),
             ] {
@@ -4442,10 +4442,8 @@ key_file = "{key}"
                     .collect();
                 assert!(!dials.is_empty(), "{host} was dialed: {connects:?}");
                 assert!(
-                    dials
-                        .iter()
-                        .all(|c| c.username.as_deref() == Some(username)),
-                    "every dial to {host} is on {username}'s circuit: {connects:?}"
+                    dials.iter().all(|c| c.username.as_deref() == Some(circuit)),
+                    "every dial to {host} is on circuit {circuit}: {connects:?}"
                 );
             }
         }
