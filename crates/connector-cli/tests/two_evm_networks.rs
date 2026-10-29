@@ -27,7 +27,8 @@ use connector_domain::JournalEntry;
 use connector_domain::{Fulfill, Network, Reject};
 use connector_runtime::{FileJournal, Journal};
 use connector_settlement::batch::contract::{
-    assert_upholds_the_contract, BatchContractFixture, BoxFuture, ChannelTerms, OpenedChannel,
+    assert_refuses_a_channel_in_another_token, assert_upholds_the_contract, BatchContractFixture,
+    BoxFuture, ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation,
@@ -575,8 +576,9 @@ async fn each_networks_backend_upholds_the_batch_settlement_contract() {
                 .get(&network(&net.network()))
                 .expect("a backend per network"),
         );
-        let net = Arc::clone(net);
-        assert_upholds_the_contract(|| async move { fixture(net, backend) }).await;
+        let fixture = fixture(Arc::clone(net), backend);
+        assert_refuses_a_channel_in_another_token(&fixture).await;
+        assert_upholds_the_contract(|| async move { fixture }).await;
     }
 }
 
@@ -670,7 +672,6 @@ fn fixture(
             })
         },
         unopened,
-        holds_other_tokens: true,
     }
 }
 

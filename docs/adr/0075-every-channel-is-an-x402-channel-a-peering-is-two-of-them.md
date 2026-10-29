@@ -956,8 +956,8 @@ that holds on every chain; the fixture, not the suite, absorbs a chain's clock a
 **Built (issue #1612): XRPL's receiving half.** `XrplBatchSettlement` is held to
 `assert_upholds_the_contract` against a spawned `xrpld`. One clause did not hold on every chain, and rule
 1 says what that means: "a channel in another token is refused" cannot be asked of a `PayChannel`, which
-holds XRP only. The fixture says so with `holds_other_tokens: false` (true on EVM and Solana), and the
-suite skips that clause for it, the one change the suite took. The port gained `ChannelPresentation::Xrpl`,
+holds XRP only, so it left the suite for `assert_refuses_a_channel_in_another_token`, run beside the
+suite by the fake, EVM and Solana and not by XRPL. The port gained `ChannelPresentation::Xrpl`,
 `ReceiverTerms::Xrpl`, `AdmissionRefusal::CancelAfter` and `InvalidChannelKey`, and
 `BatchSettlementError::AmountExceedsChain`, which Solana's `land`, `open` and `top_up` now return where
 they returned `Backend(String)`. An `Expiration` already set is the existing `NotOpen`, and a short

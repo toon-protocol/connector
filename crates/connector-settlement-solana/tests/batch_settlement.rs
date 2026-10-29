@@ -15,7 +15,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use connector_settlement::batch::contract::{
-    assert_upholds_the_contract, BatchContractFixture, ChannelTerms, OpenedChannel,
+    assert_refuses_a_channel_in_another_token, assert_upholds_the_contract, BatchContractFixture,
+    ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
@@ -212,9 +213,9 @@ async fn solana_batch_settlement_upholds_the_contract() {
         begin_exit,
         sign,
         unopened: presentation(&Pubkey::new_unique()),
-        holds_other_tokens: true,
     };
 
+    assert_refuses_a_channel_in_another_token(&fixture).await;
     assert_upholds_the_contract(|| async move { fixture }).await;
 }
 

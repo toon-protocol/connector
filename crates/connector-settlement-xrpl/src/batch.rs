@@ -312,6 +312,9 @@ impl BatchSettlementBackend for XrplBatchSettlement {
                 })
             }
         };
+        // Held from the read to the landing's fate, so a second land judges
+        // staleness against the first one's outcome, not the ledger before it.
+        let landing = self.landing.lock().await;
         let read = self.read(&id).await?;
         let landed = u128::from(read.balance);
         if amount <= landed {
@@ -332,7 +335,6 @@ impl BatchSettlementBackend for XrplBatchSettlement {
             )));
         }
 
-        let landing = self.landing.lock().await;
         let account = self
             .rpc
             .account_info(&self.address)

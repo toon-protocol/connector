@@ -301,7 +301,6 @@ async fn xrpl_batch_settlement_upholds_the_contract() {
         begin_exit,
         sign: sign_voucher,
         unopened: presentation(&ChannelId("c4".repeat(32))),
-        holds_other_tokens: false,
     };
 
     assert_upholds_the_contract(|| async move { fixture }).await;

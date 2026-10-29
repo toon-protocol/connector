@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use connector_settlement::batch::contract::{
-    assert_upholds_the_contract, BatchContractFixture, BoxFuture, ChannelTerms, OpenedChannel,
+    assert_refuses_a_channel_in_another_token, assert_upholds_the_contract, BatchContractFixture,
+    BoxFuture, ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
     AdmissionRefusal, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
@@ -175,7 +176,7 @@ async fn evm_batch_settlement_backend_upholds_the_contract() {
     }
     let chain = Arc::new(Chain::spawn().await);
 
-    assert_upholds_the_contract(|| async {
+    let fixture = {
         let unopened = {
             let config = chain.config();
             ChannelPresentation::Evm {
@@ -238,10 +239,11 @@ async fn evm_batch_settlement_backend_upholds_the_contract() {
                 })
             },
             unopened,
-            holds_other_tokens: true,
         }
-    })
-    .await;
+    };
+
+    assert_refuses_a_channel_in_another_token(&fixture).await;
+    assert_upholds_the_contract(|| async move { fixture }).await;
 }
 
 /// ADR 0074 decision 2, as amended on 2026-09-25: a channel must name a

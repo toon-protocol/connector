@@ -72,14 +72,6 @@ pub struct BatchContractFixture {
     /// A presentation, for this backend's chain, of a channel that does not
     /// exist.
     pub unopened: ChannelPresentation,
-    /// Whether a channel on this chain can hold a token other than the one
-    /// the backend settles in. True on EVM and Solana. False on XRPL, whose
-    /// `PayChannel` holds XRP and nothing else (ADR 0087 decision 6), so the
-    /// clause "a channel in another token is refused" does not hold there and,
-    /// by ADR 0075's update (#1565), belongs to a suite only for the chains
-    /// where it does. When false, the fixture's `open` is never asked for
-    /// `in_settled_token: false`.
-    pub holds_other_tokens: bool,
 }
 
 fn voucher(sign: &SignFn, channel: &ChannelId, cumulative_amount: u128) -> Voucher {
@@ -112,7 +104,6 @@ where
         begin_exit,
         sign,
         unopened,
-        holds_other_tokens,
     } = build().await;
     assert!(
         minimum_delay_secs > 901,
@@ -148,17 +139,10 @@ where
         "a channel paying someone else is not this node's to accept vouchers on"
     );
 
-    if holds_other_tokens {
-        let foreign_token = open(ChannelTerms {
-            in_settled_token: false,
-            ..admissible
-        })
-        .await;
-        assert_eq!(
-            refusal(backend.admit(foreign_token.presentation.clone()).await),
-            AdmissionRefusal::TokenNotSettled
-        );
-    }
+    // A channel in another token is refused by name too, but not here: an
+    // XRPL `PayChannel` holds XRP and nothing else (ADR 0087 decision 6), so
+    // the clause does not hold on every chain and lives beside the suite, in
+    // [`assert_refuses_a_channel_in_another_token`] (ADR 0075, #1565 rule 1).
 
     let short_delay = open(ChannelTerms {
         delay_secs: minimum_delay_secs - 1,
@@ -421,6 +405,25 @@ pub struct PayingContractFixture {
     /// restart. The suite never uses an earlier instance again once it has
     /// restarted, as a process that crashed never runs again.
     pub restart: RestartFn,
+}
+
+/// The receiving clause that holds only where a channel can hold a token
+/// other than the one the backend settles in -- EVM and Solana, not XRPL --
+/// and so is tested beside [`assert_upholds_the_contract`] rather than in it
+/// (ADR 0075, #1565 rule 1): a channel in another token is refused by name.
+/// The fixture is the one the chain hands the suite, and is left fit for it.
+pub async fn assert_refuses_a_channel_in_another_token(fixture: &BatchContractFixture) {
+    let foreign_token = (fixture.open)(ChannelTerms {
+        deposit: 1_000,
+        delay_secs: fixture.minimum_delay_secs,
+        pays_this_node: true,
+        in_settled_token: false,
+    })
+    .await;
+    assert_eq!(
+        refusal(fixture.backend.admit(foreign_token.presentation).await),
+        AdmissionRefusal::TokenNotSettled
+    );
 }
 
 /// The shape of [`PayingContractFixture::restart`].
@@ -1029,7 +1032,6 @@ mod tests {
             // The fake verifies no signature, so any bytes do.
             sign: Box::new(|_channel, _amount| vec![0u8; 65]),
             unopened,
-            holds_other_tokens: true,
         }
     }
 
@@ -1045,6 +1047,12 @@ mod tests {
     #[tokio::test]
     async fn the_in_memory_fake_with_a_close_exit_upholds_the_contract() {
         assert_upholds_the_contract(|| async { fixture(PayerExit::Close) }).await;
+    }
+
+    /// The fake's channels name a token, so one in another is refused.
+    #[tokio::test]
+    async fn the_in_memory_fake_refuses_a_channel_in_another_token() {
+        assert_refuses_a_channel_in_another_token(&fixture(PayerExit::Withdrawal)).await;
     }
 
     /// Two fake nodes on one chain: the first pays, the second receives.
