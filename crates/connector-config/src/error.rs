@@ -1421,6 +1421,21 @@ pub enum ConfigError {
     )]
     TokenWithoutSettlement { asset: AssetId },
 
+    /// A declared token on a network other than the numeraire's, with no
+    /// `[[rates]]` row giving it a static rate (ADR 0086 decision 13). A
+    /// quote path cannot leave its token's network, so only tokens on the
+    /// numeraire's own network quote themselves; this one has no way to be
+    /// priced at all, and every forward across it would be refused.
+    #[error(
+        "[[tokens]] declares '{asset}', which is on {network} while the numeraire '{numeraire}' \
+         is on {numeraire_network}: a quote path cannot leave its token's network, so only \
+         tokens on the numeraire's network quote themselves by TWAP. Give '{asset}' a static \
+         rate in a [[rates]] row (a row with `rate`, from or to it), or remove it",
+        network = .asset.network(),
+        numeraire_network = .numeraire.network()
+    )]
+    TokenOffNumeraireNetworkWithoutRate { asset: AssetId, numeraire: AssetId },
+
     /// A quote path with no numeraire to end at.
     #[error(
         "'{asset}' has a quote but no [[tokens]] row sets 'numeraire = true': a quote path \

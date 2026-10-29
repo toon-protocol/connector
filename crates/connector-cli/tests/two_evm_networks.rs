@@ -200,8 +200,15 @@ impl Files {
 
     /// A node settling as `settlement_key_hex` on every table.
     fn with_settlement_key(settlement_key_hex: &str) -> Files {
+        Self::with_keys(settlement_key_hex, 0x07)
+    }
+
+    /// [`Self::with_settlement_key`], with its own signer seed: nodes on one
+    /// path are distinct identities, so a packet sealed to one is opened by
+    /// it alone.
+    fn with_keys(settlement_key_hex: &str, signer_seed: u8) -> Files {
         let mut signer_key = tempfile::NamedTempFile::new().expect("signer key");
-        signer_key.write_all(&[0x07; 32]).expect("write");
+        signer_key.write_all(&[signer_seed; 32]).expect("write");
         let mut settlement_key = tempfile::NamedTempFile::new().expect("settlement key");
         settlement_key
             .write_all(settlement_key_hex.as_bytes())
@@ -704,17 +711,29 @@ struct PeerNode {
     addr: std::net::SocketAddr,
     operator: ed25519_dalek::Keypair,
     /// Held so the node's key files and state outlive the test.
-    _files: Files,
-    _runtime: connector_cli::Runtime,
+    files: Files,
+    runtime: connector_cli::Runtime,
     router: axum::Router,
 }
 
 impl PeerNode {
     async fn boot(name: &'static str, settlement_key: &str, nets: &[&Net]) -> PeerNode {
+        Self::boot_with(name, settlement_key, 0x07, nets, "").await
+    }
+
+    /// [`Self::boot`] with its own signer seed and `extra` TOML appended:
+    /// routes, `[[tokens]]`, `[[rates]]`.
+    async fn boot_with(
+        name: &'static str,
+        settlement_key: &str,
+        signer_seed: u8,
+        nets: &[&Net],
+        extra: &str,
+    ) -> PeerNode {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the node");
         let addr = listener.local_addr().expect("the node's address");
         let operator = ed25519_dalek::Keypair::generate(&mut rand::rngs::OsRng);
-        let files = Files::with_settlement_key(settlement_key);
+        let files = Files::with_keys(settlement_key, signer_seed);
         let tables: String = nets
             .iter()
             .map(|net| net.table(files.settlement_key.path(), ""))
@@ -742,6 +761,7 @@ key_file = "{signer_key}"
 bearer_token = "operator-secret"
 write_keys = ["{write_key}"]
 {tables}
+{extra}
 "#,
             state_dir = files.state_dir.path().display(),
             signer_key = files.signer_key.path().display(),
@@ -759,8 +779,8 @@ write_keys = ["{write_key}"]
             name,
             addr,
             operator,
-            _files: files,
-            _runtime: runtime,
+            files,
+            runtime,
             router,
         }
     }
@@ -831,6 +851,115 @@ write_keys = ["{write_key}"]
             .iter()
             .filter(|view| view["direction"] == "outbound")
             .cloned()
+            .collect()
+    }
+
+    /// The key a payload for this node is sealed to (ADR 0018).
+    fn identity(&self) -> connector_signer::PublicKeyBytes {
+        self.runtime
+            .signer
+            .public_key()
+            .expect("a local signer has a public key")
+    }
+
+    /// Route everything under `g.example.<to>` to the peering with `via`.
+    async fn route(&self, to: &PeerNode, via: &PeerNode) {
+        let (status, body) = self
+            .write(
+                "/routes/peers",
+                serde_json::json!({
+                    "prefix": format!("g.example.{}", to.name),
+                    "peer_id": via.name,
+                    "price": APP_PRICE,
+                }),
+            )
+            .await;
+        assert!(
+            status.is_success(),
+            "{} routes to {}: {body}",
+            self.name,
+            to.name
+        );
+    }
+
+    /// Originate one packet of `amount` over `POST /packets`, sealed to
+    /// `payee`'s app route: `Ok` once the app answered, or the reject.
+    async fn originate(&self, payee: &PeerNode, amount: u64) -> Result<(), Reject> {
+        let plaintext = connector_domain::EnvelopeRequest {
+            method: "POST".to_string(),
+            target: "/".to_string(),
+            headers: vec![],
+            body: b"across networks".to_vec(),
+        }
+        .encode();
+        let (data, shared_secret) =
+            connector_signer::giftwrap::seal_request(&plaintext, &payee.identity()).expect("seal");
+        let prepare = connector_domain::Prepare {
+            amount,
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            greeting: false,
+            destination: format!("g.example.{}.app", payee.name),
+            data,
+        }
+        .encode();
+        let created = NEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        let (sig_input, sig, digest) = connector_operator::test_support::sign_request(
+            &self.operator,
+            "POST",
+            "/packets",
+            &prepare,
+            created,
+            Some(9_999_999_999),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/packets")
+            .header("signature-input", sig_input)
+            .header("signature", sig)
+            .header("content-digest", digest)
+            .body(Body::from(prepare))
+            .expect("a request");
+        let response = self
+            .router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("an answer");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = hyper::body::to_bytes(response.into_body())
+            .await
+            .expect("the body");
+        match Fulfill::decode(&bytes) {
+            Ok(fulfill) => {
+                let opened =
+                    connector_signer::giftwrap::open_response(&shared_secret, &fulfill.data)
+                        .expect("open the response");
+                let envelope =
+                    connector_domain::EnvelopeResponse::decode(&opened).expect("an envelope");
+                assert_eq!(envelope.status, 200);
+                Ok(())
+            }
+            Err(_) => Err(Reject::decode(&bytes).expect("a FULFILL or a REJECT")),
+        }
+    }
+
+    /// Every voucher amount this node's client-edge journal accepted on
+    /// inbound channel `id`, in order -- what the payee was paid.
+    fn journaled(&self, id: &str) -> Vec<u64> {
+        let journal = std::fs::read_to_string(
+            self.files
+                .state_dir
+                .path()
+                .join(support::CLIENT_EDGE_JOURNAL),
+        )
+        .unwrap_or_default();
+        journal
+            .lines()
+            .filter(|line| line.starts_with("inbound_claim_accepted\t"))
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                (fields[1] == format!("evm:{id}")).then(|| fields[3].parse().expect("an amount"))
+            })
             .collect()
     }
 }
@@ -977,6 +1106,249 @@ async fn post_peers_with_a_network_lands_both_halves_on_it() {
     assert_eq!(status, StatusCode::OK, "{repeated}");
     assert_eq!(repeated["channel"]["status"], "found");
     assert_eq!(repeated["channel"]["id"], halves[1].0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// A forward between networks (ADR 0086 decision 13, issue #1604): A pays B
+// on 31337, B pays C on 31338, and B -- holding both tables -- forwards
+// between them. USDC on the two networks sits at one address and is two
+// assets, so it is a forward between assets: passed through when B
+// declares no `[[tokens]]`, converted at B's declared rate when it does,
+// and refused when B declares no rate for the pair.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What C's app route charges, and so the least a packet to it carries.
+const APP_PRICE: u64 = 1_000;
+/// What A originates toward C's app: an operator's own packet pays its own
+/// node no fee (ADR 0061), and every peering here charges none, so this is
+/// what B receives -- and, unconverted, what C receives.
+const AMOUNT: u64 = 1_000;
+/// Anvil's third well-known dev account: C's settlement key, so C's
+/// voucher signer is not A's. Not genesis-funded; [`Crossing::build`] gives it
+/// gas.
+const THIRD_PRIVATE_KEY: &str = "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+
+/// A three-node path across two networks: A -> B -> C.
+struct Crossing {
+    base: Net,
+    other: Net,
+    a: PeerNode,
+    b: PeerNode,
+    c: PeerNode,
+    /// A's channel to B, on 31337.
+    a_to_b: String,
+    /// B's channel to C, on 31338.
+    b_to_c: String,
+    app: Arc<Mutex<Vec<support::RecordedWrite>>>,
+}
+
+impl Crossing {
+    /// A–B peered on 31337, B–C on 31338, each payee first, and a route
+    /// from A through B to C's app. `dealing` is B's `[[tokens]]`/`[[rates]]`
+    /// declaration, given the two networks.
+    async fn build(dealing: impl Fn(&Net, &Net) -> String) -> Crossing {
+        let base = Net::spawn(31_337).await;
+        let other = Net::spawn(31_338).await;
+        other
+            .x402
+            .fund_gas(wallet_of(THIRD_PRIVATE_KEY).address())
+            .await;
+        fund_nodes(&base, &[COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY]).await;
+        fund_nodes(&other, &[DEPLOYER_PRIVATE_KEY, THIRD_PRIVATE_KEY]).await;
+        let (app_addr, app) = spawn_recording_app().await;
+
+        let a = PeerNode::boot_with("a", COUNTERPARTY_PRIVATE_KEY, 0x0a, &[&base], "").await;
+        let b = PeerNode::boot_with(
+            "b",
+            DEPLOYER_PRIVATE_KEY,
+            0x0b,
+            &[&base, &other],
+            &dealing(&base, &other),
+        )
+        .await;
+        let c = PeerNode::boot_with(
+            "c",
+            THIRD_PRIVATE_KEY,
+            0x0c,
+            &[&other],
+            &format!(
+                "[[routes]]\nprefix = \"g.example.c.app\"\nhandler_url = \"http://{app_addr}\"\n\
+                 price = {APP_PRICE}\n"
+            ),
+        )
+        .await;
+
+        let mut payers = Vec::new();
+        for (payee, payer, net) in [(&b, &a, &base), (&c, &b, &other)] {
+            let on = serde_json::json!({ "network": net.network() });
+            let (status, body) = payee.peer_with(payer, on.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{}: {body}", payee.name);
+            let (status, body) = payer.peer_with(payee, on).await;
+            assert_eq!(status, StatusCode::OK, "{}: {body}", payer.name);
+            assert_eq!(body["channel"]["network"], net.network());
+            payers.push(body["channel"]["id"].as_str().expect("an id").to_string());
+        }
+        a.route(&c, &b).await;
+        b.route(&c, &c).await;
+
+        let b_to_c = payers.pop().expect("B's channel to C");
+        let a_to_b = payers.pop().expect("A's channel to B");
+        Crossing {
+            base,
+            other,
+            a,
+            b,
+            c,
+            a_to_b,
+            b_to_c,
+            app,
+        }
+    }
+}
+
+/// B's dealing declaration: 31337's USDC its numeraire, 31338's USDC a
+/// token it deals, a third token on 31337 (that anvil's second FiatToken)
+/// it also deals, and `rates` as written -- `{base}`, `{other}` and
+/// `{third}` stand for the three assets.
+fn dealing_with(rates: &str) -> impl Fn(&Net, &Net) -> String + '_ {
+    move |base_net, other_net| {
+        let base = format!("{}/erc20:{:?}", base_net.network(), base_net.token);
+        let other = format!("{}/erc20:{:?}", other_net.network(), other_net.token);
+        let third = format!("{}/erc20:{:?}", base_net.network(), base_net.other_token);
+        format!(
+            r#"
+[[tokens]]
+asset = "{base}"
+numeraire = true
+
+[[tokens]]
+asset = "{other}"
+
+[[tokens]]
+asset = "{third}"
+{rates}
+[rate_guards]
+spread = {{ numerator = 1, denominator = 100 }}
+ttl_secs = 300
+max_move = {{ numerator = 5, denominator = 100 }}
+"#,
+            rates = rates
+                .replace("{base}", &base)
+                .replace("{other}", &other)
+                .replace("{third}", &third),
+        )
+    }
+}
+
+/// Story 36: a node with no `[[tokens]]` forwards a packet that arrived on
+/// its 31337 peering out over its 31338 peering unconverted, as
+/// `mixed-chain` forwards Base to Solana.
+#[tokio::test]
+async fn a_pass_through_node_forwards_between_networks_unconverted() {
+    if !require_anvil() {
+        return;
+    }
+    let path = Crossing::build(|_, _| String::new()).await;
+
+    path.a
+        .originate(&path.c, AMOUNT)
+        .await
+        .unwrap_or_else(|reject| panic!("A→B→C: {reject:?}"));
+
+    assert_eq!(
+        path.b.journaled(&path.a_to_b),
+        vec![AMOUNT],
+        "B was paid on 31337"
+    );
+    assert_eq!(
+        path.c.journaled(&path.b_to_c),
+        vec![AMOUNT],
+        "C was paid on 31338 exactly what B was paid on 31337"
+    );
+    // Each channel is on its own network's chain and not on the other's.
+    assert_eq!(
+        path.other
+            .x402
+            .channel(&ChannelId(path.a_to_b.clone()))
+            .await,
+        (0, 0)
+    );
+    assert_eq!(
+        path.base
+            .x402
+            .channel(&ChannelId(path.b_to_c.clone()))
+            .await,
+        (0, 0)
+    );
+    let writes = path.app.lock().unwrap().clone();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].header("x-toon-network"),
+        Some(path.other.network().as_str()),
+        "C's app is told the payment it was reached by is on 31338"
+    );
+}
+
+/// Story 37: a dealing node converts the same forward at its declared
+/// `[[rates]]` figure, and the payee's journal shows the converted amount.
+#[tokio::test]
+async fn a_dealing_node_converts_a_forward_between_networks_at_its_declared_rate() {
+    if !require_anvil() {
+        return;
+    }
+    let path = Crossing::build(dealing_with(
+        "[[rates]]\nfrom = \"{base}\"\nto = \"{other}\"\nrate = { numerator = 2, denominator = 1 }\n",
+    ))
+    .await;
+
+    path.a
+        .originate(&path.c, AMOUNT)
+        .await
+        .unwrap_or_else(|reject| panic!("A→B→C: {reject:?}"));
+
+    assert_eq!(path.b.journaled(&path.a_to_b), vec![AMOUNT]);
+    assert_eq!(
+        path.c.journaled(&path.b_to_c),
+        // 1000 at the declared 2/1 mid, less B's 1/100 spread: 1980.
+        vec![1_980],
+        "C was paid the converted amount, not the amount B received"
+    );
+}
+
+/// Story 38: with no declared rate for the pair, the forward is refused,
+/// never dealt at an implicit 1:1, and C is paid nothing.
+///
+/// B prices 31338's USDC only against a third token, so the load rule (a
+/// token off the numeraire's network needs a static rate) is met while
+/// 31337's USDC to 31338's has no row and composes through nothing. (A row
+/// from 31338's USDC to the numeraire would compose this pair as its
+/// inverse.)
+#[tokio::test]
+async fn a_forward_between_networks_with_no_declared_rate_is_refused() {
+    if !require_anvil() {
+        return;
+    }
+    let path = Crossing::build(dealing_with(
+        "[[rates]]\nfrom = \"{other}\"\nto = \"{third}\"\nrate = { numerator = 1, denominator = 1 }\n",
+    ))
+    .await;
+
+    let reject = path
+        .a
+        .originate(&path.c, AMOUNT)
+        .await
+        .expect_err("no rate is declared for 31337's USDC to 31338's");
+
+    assert_eq!(reject.code.as_str(), "F02", "{reject:?}");
+    assert!(
+        reject.message.contains("eip155:31337/") && reject.message.contains("eip155:31338/"),
+        "the refusal names the pair: {reject:?}"
+    );
+    assert!(
+        path.c.journaled(&path.b_to_c).is_empty(),
+        "C was paid nothing"
+    );
+    assert!(path.app.lock().unwrap().is_empty());
 }
 
 /// The outbound channel journal under `state_dir`, as the runtime names it.

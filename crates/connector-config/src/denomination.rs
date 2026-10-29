@@ -635,6 +635,46 @@ fn resolve_rate_rows(
     Ok(rows)
 }
 
+/// Refuse a declared token on a network other than the numeraire's that no
+/// `[[rates]]` row gives a static rate (ADR 0086 decision 13).
+///
+/// A quote path cannot leave its token's network
+/// ([`ConfigError::TokenQuoteOffChain`]), and every path ends at the
+/// numeraire, so only a token on the numeraire's own network can quote
+/// itself. Any other is priced by a static row or by nothing -- and nothing
+/// is a token every forward across would refuse, so it is refused here,
+/// by name, instead. A row with a `rate` on either side satisfies it; a
+/// rate-less row only tightens guards and prices nothing.
+///
+/// A node with no numeraire composes nothing and quotes nothing, so every
+/// pair it deals is already a static row or a refused forward; this rule
+/// is about the numeraire's network, and such a node has none.
+fn refuse_unpriced_off_numeraire_network(
+    tokens: &[DeclaredToken],
+    numeraire: Option<&AssetId>,
+    rates: &[RateRow],
+) -> Result<(), ConfigError> {
+    let Some(numeraire) = numeraire else {
+        return Ok(());
+    };
+    let priced = |asset: &AssetId| {
+        rates
+            .iter()
+            .any(|row| row.rate.is_some() && (&row.from == asset || &row.to == asset))
+    };
+    match tokens
+        .iter()
+        .map(DeclaredToken::asset)
+        .find(|asset| asset.network() != numeraire.network() && !priced(asset))
+    {
+        Some(asset) => Err(ConfigError::TokenOffNumeraireNetworkWithoutRate {
+            asset: asset.clone(),
+            numeraire: numeraire.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Validate everything ADR 0071 decisions 3 and 5 let an operator declare:
 /// `[[tokens]]`, `[[rates]]` and `[rate_guards]`.
 ///
@@ -655,6 +695,7 @@ pub(crate) fn resolve_denomination(
 
     let (tokens, numeraire) = resolve_tokens(raw_tokens, networks)?;
     let rates = resolve_rate_rows(raw_rates, &tokens, zk_vault_asset)?;
+    refuse_unpriced_off_numeraire_network(&tokens, numeraire.as_ref(), &rates)?;
 
     let guards = match raw_guards {
         None => None,
@@ -1209,6 +1250,13 @@ rate = {{ numerator = 4000000000000, denominator = 1 }}
 from = "{ANYONE}"
 to = "{USDC}"
 rate = {{ numerator = 1, denominator = 4200000000000 }}
+
+# The declaration's Solana USDC is off the numeraire's network, so it
+# keeps its static row (ADR 0086 decision 13).
+[[rates]]
+from = "{USDC_SOLANA}"
+to = "{ANYONE}"
+rate = {{ numerator = 4000000000000, denominator = 1 }}
 "#
         ));
         let (tokens, _) = full_declaration();
