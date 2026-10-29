@@ -127,6 +127,9 @@ pub struct EstablishedChannel {
     pub status: ChannelBranch,
     /// Which chain it lives on -- `"evm"` or `"solana"`.
     pub chain: String,
+    /// The CAIP-2 network it lives on, and with it the whole peering: both
+    /// halves of a peering are on this one network (ADR 0086 decision 11).
+    pub network: String,
 }
 
 /// What `POST /peers` answers: the peering, and the channel branch.
@@ -168,13 +171,15 @@ pub enum EstablishPeeringError {
          batch-settlement on both nodes), so no channel can be opened"
     )]
     NoSharedChain { url: String },
-    /// Both nodes settle on more than one chain in common and the request
-    /// named none. Refused rather than resolved silently -- picking one for
-    /// the operator is picking which asset a peering settles in.
+    /// Both nodes settle on more than one network in common and the request
+    /// named none (ADR 0086 decision 12). Refused rather than resolved
+    /// silently -- picking one for the operator is picking which asset a
+    /// peering settles in.
     #[error(
-        "this connector and {url} share settlement on {chains}; name one as `chain` in the request"
+        "this connector and {url} share settlement on {networks}; name one as `network` (CAIP-2) \
+         in the request"
     )]
-    AmbiguousChain { url: String, chains: String },
+    AmbiguousNetwork { url: String, networks: String },
     /// The document's settlement address or voucher signer for the chosen
     /// chain is not one of that chain's shape. Never coerced into one.
     #[error("{url} published a {chain} settlement address this connector cannot read: {value}")]
@@ -234,9 +239,9 @@ impl Connector {
     /// id, or one the config file owns (ADR 0034). A peering that could
     /// never be written is not worth a stranger's host being dialled for.
     ///
-    /// `chain` is an optional disambiguator for the one case that has no
-    /// honest default: two nodes that settle on more than one chain in
-    /// common. `deposit` is what the peering's outbound channel is opened
+    /// `network` (CAIP-2) is an optional filter for the one case that has
+    /// no honest default: two nodes that settle on more than one network in
+    /// common (ADR 0086 decision 12). `deposit` is what the peering's outbound channel is opened
     /// with when this node has none toward the counterparty yet; with one
     /// already open it is not spent (top that channel up with
     /// `POST /channels/:id/fund` instead).
@@ -246,10 +251,10 @@ impl Connector {
         url: &Url,
         fee: u64,
         max_packet_amount: u64,
-        chain: Option<SettlementChain>,
+        network: Option<connector_domain::Network>,
         deposit: Option<u128>,
     ) -> Result<PeeringEstablished, EstablishPeeringError> {
-        self.establish_peering_with(id, url, fee, max_packet_amount, chain, deposit, None)
+        self.establish_peering_with(id, url, fee, max_packet_amount, network, deposit, None)
             .await
     }
 
@@ -264,7 +269,7 @@ impl Connector {
         url: &Url,
         fee: u64,
         max_packet_amount: u64,
-        chain: Option<SettlementChain>,
+        network: Option<connector_domain::Network>,
         deposit: Option<u128>,
         gate: Option<&dyn DepositGate>,
     ) -> Result<PeeringEstablished, EstablishPeeringError> {
@@ -287,7 +292,7 @@ impl Connector {
             }
         })?;
 
-        let shared = self.shared_settlement(&document, chain, url)?;
+        let shared = self.shared_settlement(&document, network.as_ref(), url)?;
         let (binding, channel) = self
             .open_peering_channel(&id, url, &shared, deposit, gate)
             .await?;
@@ -374,6 +379,20 @@ impl Connector {
                 }
                 .into());
             }
+            // A peering is on one network (ADR 0086 decision 11): a repeat
+            // that resolves to another is refused before a second channel is
+            // opened there, never a peering whose halves sit on two.
+            if let Some(bound_on) = self.voucher_signer_network(&signer) {
+                if bound_on != on {
+                    return Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
+                        signer: published_signer.to_string().into(),
+                        peer_id: bound_to.into(),
+                        bound_on: bound_on.to_string().into(),
+                        wanted: on.to_string().into(),
+                    }
+                    .into());
+                }
+            }
         }
         let pay_to = shared.pay_to();
         let receiver = parse_chain_key(chain, pay_to).ok_or_else(|| unreadable(pay_to))?;
@@ -420,6 +439,7 @@ impl Connector {
                 id: channel_id,
                 status,
                 chain: chain.to_string(),
+                network: network.to_string(),
             },
         ))
     }
@@ -470,7 +490,7 @@ impl SharedSettlement {
     }
 
     /// The CAIP-2 network the terms name.
-    fn network(&self) -> &str {
+    pub(crate) fn network(&self) -> &str {
         match &self.terms {
             X402BatchSettlementTerms::Evm(evm) => &evm.network,
             X402BatchSettlementTerms::Solana(solana) => &solana.network,
@@ -523,16 +543,26 @@ pub(crate) fn parse_chain_key(chain: SettlementChain, value: &str) -> Option<Vou
 }
 
 /// Narrow a document's published x402 terms (`batchSettlements`, ADR 0075
-/// decision 10) to the one chain this connector will peer on, each with the
-/// voucher signer the document publishes for the same network. A
-/// `toon-channel` `settlements` entry is never read: no chain peers on one.
+/// decision 10) to the one network this connector will peer on (ADR 0086
+/// decision 12), each with the voucher signer the document publishes for the
+/// same network. A `toon-channel` `settlements` entry is never read: no chain
+/// peers on one.
+///
+/// `ours` is every CAIP-2 network this node pays on. `wanted` is the
+/// operator's filter: with it, only that network is a candidate; without it,
+/// one network in common is the answer and several are refused as
+/// [`EstablishPeeringError::AmbiguousNetwork`], naming them. A counterparty
+/// on this node's chain family but on none of its networks is refused as
+/// [`EstablishPeeringError::NetworkMismatch`], naming both sides' networks,
+/// since the fix for that is a settlement table, not a chain.
 pub(crate) fn shared_settlement_of(
     document: &connector_domain::NodeSelfDescription,
-    pays_on: impl Fn(SettlementChain) -> bool,
-    wanted: Option<SettlementChain>,
+    ours: &[&str],
+    wanted: Option<&connector_domain::Network>,
     url: &Url,
 ) -> Result<SharedSettlement, EstablishPeeringError> {
-    let mut shared: Vec<SharedSettlement> = document
+    let wanted = wanted.map(ToString::to_string);
+    let candidates: Vec<SharedSettlement> = document
         .batch_settlements
         .iter()
         .map(|terms| {
@@ -547,26 +577,43 @@ pub(crate) fn shared_settlement_of(
                 .map(|signer| signer.signer.clone());
             entry
         })
-        .filter(|entry| pays_on(entry.chain()))
+        .filter(|entry| {
+            wanted
+                .as_deref()
+                .is_none_or(|wanted| entry.network() == wanted)
+        })
+        .filter(|entry| {
+            ours.iter().any(|own| {
+                own.parse::<connector_domain::Network>()
+                    .is_ok_and(|own| own.chain() == entry.chain().asset_chain())
+            })
+        })
         .collect();
-    if let Some(wanted) = wanted {
-        shared.retain(|entry| entry.chain() == wanted);
-    }
+    let (mut shared, elsewhere): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|entry| ours.contains(&entry.network()));
     match shared.len() {
-        0 => Err(EstablishPeeringError::NoSharedChain {
+        0 if elsewhere.is_empty() => Err(EstablishPeeringError::NoSharedChain {
             url: url.to_string(),
         }),
-        1 => Ok(shared.remove(0)),
-        _ => {
-            let chains: Vec<String> = shared
+        0 => Err(EstablishPeeringError::NetworkMismatch {
+            url: url.to_string(),
+            theirs: elsewhere
                 .iter()
-                .map(|entry| entry.chain().to_string())
-                .collect();
-            Err(EstablishPeeringError::AmbiguousChain {
-                url: url.to_string(),
-                chains: chains.join(", "),
-            })
-        }
+                .map(SharedSettlement::network)
+                .collect::<Vec<_>>()
+                .join(", "),
+            ours: ours.join(", "),
+        }),
+        1 => Ok(shared.remove(0)),
+        _ => Err(EstablishPeeringError::AmbiguousNetwork {
+            url: url.to_string(),
+            networks: shared
+                .iter()
+                .map(SharedSettlement::network)
+                .collect::<Vec<_>>()
+                .join(", "),
+        }),
     }
 }
 
@@ -603,14 +650,23 @@ mod tests {
     use crate::self_description::SelfDescriptionSource;
 
     const NETWORK: &str = "eip155:31337";
+    const OTHER_NETWORK: &str = "eip155:31338";
+
+    fn network(text: &str) -> connector_domain::Network {
+        text.parse().expect("a CAIP-2 network")
+    }
 
     fn url() -> Url {
         Url::parse("https://peer.example/ilp").expect("url")
     }
 
     fn evm_batch(pay_to: &str) -> X402BatchSettlementTerms {
+        evm_batch_on(NETWORK, pay_to)
+    }
+
+    fn evm_batch_on(network: &str, pay_to: &str) -> X402BatchSettlementTerms {
         X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
-            network: NETWORK.to_string(),
+            network: network.to_string(),
             asset: "0x00000000000000000000000000000000000000dd".to_string(),
             pay_to: pay_to.to_string(),
             receiver_authorizer: pay_to.to_string(),
@@ -713,11 +769,11 @@ mod tests {
         assert_eq!(peer_endpoint(&endpoints(None, None), true), None);
     }
 
-    /// A chain is shared on the counterparty's x402 terms (ADR 0075), never
-    /// on its `toon-channel` ones: a node that publishes only the latter
-    /// shares no chain this build can peer on.
+    /// A network is shared on the counterparty's x402 terms (ADR 0075),
+    /// never on its `toon-channel` ones: a node that publishes only the
+    /// latter shares nothing this build can peer on.
     #[test]
-    fn one_shared_chain_is_the_answer_and_none_is_a_named_refusal() {
+    fn one_shared_network_is_the_answer_and_none_is_a_named_refusal() {
         let evm_only = document(
             None,
             Some("https://peer.example/ilp"),
@@ -725,17 +781,13 @@ mod tests {
             Vec::new(),
         );
 
-        let shared = shared_settlement_of(&evm_only, |_| true, None, &url()).expect("one shared");
+        let shared = shared_settlement_of(&evm_only, &[NETWORK], None, &url()).expect("one shared");
         assert_eq!(shared.chain(), SettlementChain::Evm);
+        assert_eq!(shared.network(), NETWORK);
 
         // This node settles only on Solana; the counterparty only on EVM.
-        let error = shared_settlement_of(
-            &evm_only,
-            |chain| chain == SettlementChain::Solana,
-            None,
-            &url(),
-        )
-        .expect_err("no chain in common");
+        let error = shared_settlement_of(&evm_only, &[SOLANA_NETWORK], None, &url())
+            .expect_err("no network in common");
         assert!(matches!(error, EstablishPeeringError::NoSharedChain { .. }));
 
         let no_x402 = document(
@@ -745,38 +797,84 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(
-            shared_settlement_of(&no_x402, |_| true, Some(SettlementChain::Evm), &url()),
+            shared_settlement_of(&no_x402, &[NETWORK], Some(&network(NETWORK)), &url()),
             Err(EstablishPeeringError::NoSharedChain { .. })
         ));
     }
 
-    /// Two nodes settling on both chains have no honest default, so the
-    /// write refuses by name and says which chains it saw.
+    /// Both nodes on EVM, on different networks: refused naming both sides'
+    /// networks rather than as "nothing in common", since the operator's
+    /// fix is a table, not a chain.
     #[test]
-    fn several_shared_chains_are_refused_unless_the_request_names_one() {
+    fn a_counterparty_on_another_evm_network_is_refused_naming_both() {
+        let theirs = document(
+            None,
+            Some("https://peer.example/ilp"),
+            vec![evm_batch_on(
+                "eip155:84532",
+                "0x00000000000000000000000000000000000000aa",
+            )],
+            Vec::new(),
+        );
+        match shared_settlement_of(&theirs, &[NETWORK], None, &url()) {
+            Err(EstablishPeeringError::NetworkMismatch { theirs, ours, .. }) => {
+                assert_eq!(theirs, "eip155:84532");
+                assert_eq!(ours, NETWORK);
+            }
+            other => panic!("expected a network mismatch, got {other:?}"),
+        }
+    }
+
+    /// ADR 0086 decision 12: two nodes sharing several networks have no
+    /// honest default, so the write refuses as `AmbiguousNetwork` and names
+    /// every candidate -- two EVM networks as much as EVM and Solana.
+    #[test]
+    fn several_shared_networks_are_refused_unless_the_request_names_one() {
         let both = document(
             None,
             Some("https://peer.example/ilp"),
             vec![
                 evm_batch("0x00000000000000000000000000000000000000aa"),
+                evm_batch_on(OTHER_NETWORK, "0x00000000000000000000000000000000000000aa"),
                 solana_batch("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"),
             ],
             Vec::new(),
         );
 
-        let error =
-            shared_settlement_of(&both, |_| true, None, &url()).expect_err("ambiguous chain");
-        match error {
-            EstablishPeeringError::AmbiguousChain { chains, .. } => {
-                assert!(chains.contains("evm"), "{chains}");
-                assert!(chains.contains("solana"), "{chains}");
+        let ours = [NETWORK, OTHER_NETWORK, SOLANA_NETWORK];
+        match shared_settlement_of(&both, &ours, None, &url()) {
+            Err(EstablishPeeringError::AmbiguousNetwork { networks, .. }) => {
+                assert_eq!(
+                    networks,
+                    format!("{NETWORK}, {OTHER_NETWORK}, {SOLANA_NETWORK}")
+                );
             }
             other => panic!("expected an ambiguity refusal, got {other:?}"),
         }
+        // Only what this node also settles on is a candidate.
+        match shared_settlement_of(&both, &[NETWORK, OTHER_NETWORK], None, &url()) {
+            Err(EstablishPeeringError::AmbiguousNetwork { networks, .. }) => {
+                assert_eq!(networks, format!("{NETWORK}, {OTHER_NETWORK}"));
+            }
+            other => panic!("expected an ambiguity refusal, got {other:?}"),
+        }
+        let only_one = shared_settlement_of(&both, &[OTHER_NETWORK], None, &url())
+            .expect("one network in common is no ambiguity");
+        assert_eq!(only_one.network(), OTHER_NETWORK);
 
-        let named = shared_settlement_of(&both, |_| true, Some(SettlementChain::Solana), &url())
+        let named = shared_settlement_of(&both, &ours, Some(&network(OTHER_NETWORK)), &url())
+            .expect("the request named one");
+        assert_eq!(named.network(), OTHER_NETWORK);
+        let named = shared_settlement_of(&both, &ours, Some(&network(SOLANA_NETWORK)), &url())
             .expect("the request named one");
         assert_eq!(named.chain(), SettlementChain::Solana);
+
+        // A named network the counterparty does not publish is nothing in
+        // common, never a fallback to another one.
+        assert!(matches!(
+            shared_settlement_of(&both, &ours, Some(&network("eip155:1")), &url()),
+            Err(EstablishPeeringError::NoSharedChain { .. })
+        ));
     }
 
     /// The voucher signer read for a peering is the one the document
@@ -799,7 +897,7 @@ mod tests {
                 },
             ],
         );
-        let shared = shared_settlement_of(&published, |_| true, None, &url()).expect("shared");
+        let shared = shared_settlement_of(&published, &[NETWORK], None, &url()).expect("shared");
         assert_eq!(shared.chain(), SettlementChain::Evm);
         assert_eq!(
             shared.voucher_signer.as_deref(),
@@ -1308,7 +1406,7 @@ mod tests {
                 &url(),
                 5,
                 0,
-                Some(SettlementChain::Solana),
+                Some(network(SOLANA_NETWORK)),
                 Some(1_000),
             )
             .await

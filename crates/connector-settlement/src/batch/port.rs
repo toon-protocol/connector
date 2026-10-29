@@ -372,10 +372,28 @@ impl OutboundChannelRecord {
         }
     }
 
-    /// This record as bytes, for a journal to carry opaquely. Versioned, so
-    /// a record written by this build is never misread by a later one.
-    pub fn encode(&self) -> Vec<u8> {
+    /// This record on `network` (its CAIP-2 spelling) as bytes, for a
+    /// journal to carry opaquely: version 2, which names the network whose
+    /// payer the channel is on (ADR 0086 decision 10). Versioned, so a
+    /// record written by this build is never misread by a later one.
+    pub fn encode_on(&self, network: &str) -> Vec<u8> {
         let mut out = vec![RECORD_VERSION];
+        put_str(&mut out, network);
+        self.put_body(&mut out);
+        out
+    }
+
+    /// This record as an earlier build wrote it: version 1, naming no
+    /// network. Nothing in this build writes one; it exists so a test can
+    /// stand for a journal from before ADR 0086.
+    #[doc(hidden)]
+    pub fn encode_version_1(&self) -> Vec<u8> {
+        let mut out = vec![RECORD_VERSION_UNASSIGNED];
+        self.put_body(&mut out);
+        out
+    }
+
+    fn put_body(&self, out: &mut Vec<u8>) {
         match self {
             OutboundChannelRecord::Evm {
                 channel,
@@ -383,7 +401,7 @@ impl OutboundChannelRecord {
                 deposit,
             } => {
                 out.push(RECORD_EVM);
-                put_str(&mut out, &channel.0);
+                put_str(out, &channel.0);
                 for address in [
                     config.payer,
                     config.payer_authorizer,
@@ -406,25 +424,28 @@ impl OutboundChannelRecord {
                 last_valid_block_height,
             } => {
                 out.push(RECORD_SOLANA);
-                put_str(&mut out, &channel.0);
+                put_str(out, &channel.0);
                 out.extend_from_slice(receiver);
-                put_str(&mut out, sponsor_endpoint);
+                put_str(out, sponsor_endpoint);
                 out.extend_from_slice(&deposit.to_be_bytes());
                 out.extend_from_slice(&last_valid_block_height.to_be_bytes());
                 out.extend_from_slice(&(transaction.len() as u32).to_be_bytes());
                 out.extend_from_slice(transaction);
             }
         }
-        out
     }
 
-    /// Read back what [`encode`](Self::encode) wrote; `None` for anything
-    /// else, trailing bytes included.
-    pub fn decode(bytes: &[u8]) -> Option<OutboundChannelRecord> {
+    /// Read back what [`encode_on`](Self::encode_on) wrote, or a version-1
+    /// record an earlier build wrote, which decodes **unassigned**
+    /// (`network: None`) for restore to prove its network (ADR 0086
+    /// decision 10); `None` for anything else, trailing bytes included.
+    pub fn decode(bytes: &[u8]) -> Option<JournaledRecord> {
         let mut reader = Reader(bytes);
-        if reader.take(1)?[0] != RECORD_VERSION {
-            return None;
-        }
+        let network = match reader.take(1)?[0] {
+            RECORD_VERSION => Some(reader.string()?),
+            RECORD_VERSION_UNASSIGNED => None,
+            _ => return None,
+        };
         let record = match reader.take(1)?[0] {
             RECORD_EVM => {
                 let channel = ChannelId(reader.string()?);
@@ -469,11 +490,29 @@ impl OutboundChannelRecord {
             }
             _ => return None,
         };
-        reader.0.is_empty().then_some(record)
+        reader
+            .0
+            .is_empty()
+            .then_some(JournaledRecord { network, record })
     }
 }
 
-const RECORD_VERSION: u8 = 1;
+/// An [`OutboundChannelRecord`] as a journal holds it: with the CAIP-2
+/// network whose payer the channel is on (ADR 0086 decision 10), or with
+/// none for a version-1 record, which no build since names and restore
+/// assigns by proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournaledRecord {
+    /// `eip155:<chainId>` or `solana:<genesis prefix>`; `None` for a
+    /// record written before ADR 0086.
+    pub network: Option<String>,
+    pub record: OutboundChannelRecord,
+}
+
+/// Version 2: the record names its network.
+const RECORD_VERSION: u8 = 2;
+/// Version 1, written before ADR 0086: the record names no network.
+const RECORD_VERSION_UNASSIGNED: u8 = 1;
 const RECORD_EVM: u8 = 1;
 const RECORD_SOLANA: u8 = 2;
 
@@ -1045,29 +1084,59 @@ mod tests {
 
     /// The journal carries a record as bytes, so every field must come back
     /// exactly: a salt or a transaction off by one byte is a channel this
-    /// node can never find again.
+    /// node can never find again. Version 2 carries its network with it
+    /// (ADR 0086 decision 10).
     #[test]
-    fn a_record_round_trips_through_its_bytes() {
-        for record in [evm_record(), solana_record()] {
+    fn a_record_round_trips_through_its_bytes_with_its_network() {
+        for (record, network) in [
+            (evm_record(), "eip155:8453"),
+            (solana_record(), "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
+        ] {
+            let bytes = record.encode_on(network);
+            assert_eq!(bytes[0], 2, "written as version 2");
             assert_eq!(
-                OutboundChannelRecord::decode(&record.encode()),
-                Some(record)
+                OutboundChannelRecord::decode(&bytes),
+                Some(JournaledRecord {
+                    network: Some(network.to_string()),
+                    record,
+                })
+            );
+        }
+    }
+
+    /// A record an earlier build wrote names no network: it decodes,
+    /// whole, as unassigned, for restore to prove its network.
+    #[test]
+    fn a_version_1_record_decodes_unassigned() {
+        for record in [evm_record(), solana_record()] {
+            let bytes = record.encode_version_1();
+            assert_eq!(bytes[0], 1);
+            assert_eq!(
+                OutboundChannelRecord::decode(&bytes),
+                Some(JournaledRecord {
+                    network: None,
+                    record,
+                })
             );
         }
     }
 
     #[test]
     fn bytes_that_are_not_a_whole_record_decode_to_nothing() {
-        let bytes = evm_record().encode();
-        assert_eq!(
-            OutboundChannelRecord::decode(&bytes[..bytes.len() - 1]),
-            None
-        );
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert_eq!(OutboundChannelRecord::decode(&trailing), None);
-        let mut other_version = bytes;
-        other_version[0] = 2;
+        for bytes in [
+            evm_record().encode_on("eip155:8453"),
+            evm_record().encode_version_1(),
+        ] {
+            assert_eq!(
+                OutboundChannelRecord::decode(&bytes[..bytes.len() - 1]),
+                None
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(OutboundChannelRecord::decode(&trailing), None);
+        }
+        let mut other_version = evm_record().encode_on("eip155:8453");
+        other_version[0] = 3;
         assert_eq!(OutboundChannelRecord::decode(&other_version), None);
         assert_eq!(OutboundChannelRecord::decode(&[]), None);
     }

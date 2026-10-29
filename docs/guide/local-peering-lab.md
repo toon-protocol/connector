@@ -336,7 +336,7 @@ B's answer to its own write:
   "fee": 100,
   "max_packet_amount": 5000,
   "source": "runtime",
-  "channel": { "id": "0x…", "status": "created", "chain": "evm" }
+  "channel": { "id": "0x…", "status": "created", "chain": "evm", "network": "eip155:31337" }
 }
 ```
 

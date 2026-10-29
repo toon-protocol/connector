@@ -348,7 +348,7 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
             &Url::parse("http://ignored.example/ilp").expect("url"),
             0,
             0,
-            Some(SettlementChain::Evm),
+            Some(network.parse().expect("a CAIP-2 network")),
             Some(DEPOSIT),
         )
         .await

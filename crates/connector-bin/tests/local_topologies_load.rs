@@ -325,6 +325,12 @@ struct TableNode {
 #[derive(Debug)]
 struct TablePeering {
     id: String,
+    /// The CAIP-2 network the peering is on (ADR 0086 decision 12), as
+    /// `POST /peers` is sent it -- except a Solana peering's reference,
+    /// which is [`LOCAL_SOLANA_GENESIS`] until the `channels` stage reads it
+    /// off the validator.
+    network: String,
+    /// The network's chain family.
     chain: SettlementChain,
     payer: String,
     payee: String,
@@ -421,20 +427,41 @@ fn topology(name: &str) -> Topology {
             let parts: Vec<&str> = entry.split(':').collect();
             assert_eq!(
                 parts.len(),
-                6,
-                "a PEERINGS entry is id:chain:payer:payee:fee:max_packet_amount, got {entry}"
+                7,
+                "a PEERINGS entry is id:<CAIP-2 network>:payer:payee:fee:max_packet_amount, got \
+                 {entry} -- a peering names its network, never just its chain (ADR 0086)"
             );
+            let network = format!("{}:{}", parts[1], parts[2]);
+            let chain = match parts[1] {
+                "eip155" => {
+                    network
+                        .parse::<connector_domain::Network>()
+                        .unwrap_or_else(|error| {
+                            panic!("local/keys.sh's {name} peering network `{network}`: {error}")
+                        });
+                    SettlementChain::Evm
+                }
+                "solana" => {
+                    assert_eq!(
+                        parts[2], LOCAL_SOLANA_GENESIS,
+                        "a local Solana peering's reference is `{LOCAL_SOLANA_GENESIS}`: the \
+                         validator starts from a fresh genesis, so the channels stage reads it"
+                    );
+                    SettlementChain::Solana
+                }
+                other => panic!(
+                    "local/keys.sh's {name} names `{other}` where a CAIP-2 namespace goes \
+                     (eip155 or solana)"
+                ),
+            };
             TablePeering {
                 id: parts[0].to_owned(),
-                chain: match parts[1] {
-                    "evm" => SettlementChain::Evm,
-                    "solana" => SettlementChain::Solana,
-                    other => panic!("local/keys.sh names an unknown chain `{other}`"),
-                },
-                payer: parts[2].to_owned(),
-                payee: parts[3].to_owned(),
-                fee: number(parts[4], "fee"),
-                max_packet_amount: number(parts[5], "max_packet_amount"),
+                network,
+                chain,
+                payer: parts[3].to_owned(),
+                payee: parts[4].to_owned(),
+                fee: number(parts[5], "fee"),
+                max_packet_amount: number(parts[6], "max_packet_amount"),
             }
         })
         .collect();
@@ -461,6 +488,11 @@ fn topology(name: &str) -> Topology {
         routes,
     }
 }
+
+/// The reference a local Solana peering's network is written with in
+/// `local/keys.sh`'s table, resolved from the validator's genesis hash at the
+/// `channels` stage.
+const LOCAL_SOLANA_GENESIS: &str = "genesis";
 
 /// The value of a bare `NAME=value` assignment in a script, as an integer.
 fn script_constant(script: &str, file: &str, name: &str) -> u128 {
@@ -943,9 +975,22 @@ fn every_peered_node_publishes_itself_and_can_be_written_to() {
                         "{file} reads a plaintext self-description in POST /peers (CF-18)"
                     );
                 }
-                // The peering's chain has a settlement table, which is its
-                // x402 terms (ADR 0075 decision 9).
-                let _ = settlement(&config, peering.chain);
+                // The peering's network has a settlement table on both
+                // nodes, which is its x402 terms (ADR 0075 decision 9, ADR
+                // 0086 decision 12): on EVM the table keyed by the table's
+                // CAIP-2 network itself.
+                let table = settlement(&config, peering.chain);
+                if let Some(network) = table.network() {
+                    assert_eq!(
+                        network.to_string(),
+                        peering.network,
+                        "{file}: '{}' is on {} in local/keys.sh's table, and this node's \
+                         settlement table is {}",
+                        peering.id,
+                        peering.network,
+                        table.table_name()
+                    );
+                }
             }
         }
     }
@@ -1006,6 +1051,32 @@ fn local_keys_sh_opens_channels_only_through_the_nodes_own_writes() {
         .find("establish \"$payer\"")
         .expect("the payer establishes its side");
     assert!(payee < payer, "the payee's POST /peers must come first");
+}
+
+/// **`POST /peers` names each peering's network** (ADR 0086 decision 12):
+/// the `channels` stage sends the table's CAIP-2 `network` -- never the
+/// retired `chain` filter, which is refused by name -- reads the local
+/// Solana genesis off the validator to complete a Solana one, and holds the
+/// answer to the network it asked for.
+#[test]
+fn local_keys_sh_peers_on_each_peerings_caip2_network() {
+    let stage = code(KEYS_SCRIPT);
+    assert!(
+        stage.contains(r#""network":"%s""#),
+        "local/keys.sh's POST /peers body must name the peering's `network`"
+    );
+    assert!(
+        !stage.contains(r#""chain":"%s""#),
+        "local/keys.sh still sends POST /peers the retired `chain` filter"
+    );
+    assert!(
+        stage.contains("solana genesis-hash"),
+        "local/keys.sh must read the local validator's genesis to name a Solana peering's network"
+    );
+    assert!(
+        stage.contains(r#"doc["channel"]["network"]"#),
+        "local/keys.sh must hold POST /peers' answer to the network it asked for"
+    );
 }
 
 /// **The rehearsal reads the chain and the payee's voucher journal** --
@@ -1203,11 +1274,11 @@ fn the_two_hop_path_adds_up_across_the_table_and_the_configs() {
     let peering = table.peering("a-b");
     assert_eq!(
         (
-            peering.chain,
+            peering.network.as_str(),
             peering.payer.as_str(),
             peering.payee.as_str()
         ),
-        (SettlementChain::Evm, "connector-a", "connector-b")
+        ("eip155:31337", "connector-a", "connector-b")
     );
     let forward = table.route_on("connector-a");
     assert_eq!(forward.prefix, "g.local.two-hop.b");
@@ -1300,8 +1371,11 @@ fn the_mixed_chain_topology_puts_one_node_on_both_chains() {
     let mut chains: Vec<SettlementChain> = b.settlements().iter().map(|s| s.chain()).collect();
     chains.sort_by_key(|chain| format!("{chain:?}"));
     assert_eq!(chains, vec![SettlementChain::Evm, SettlementChain::Solana]);
-    assert_eq!(table.peering("a-b").chain, SettlementChain::Evm);
-    assert_eq!(table.peering("b-c").chain, SettlementChain::Solana);
+    assert_eq!(table.peering("a-b").network, "eip155:31337");
+    assert_eq!(
+        table.peering("b-c").network,
+        format!("solana:{LOCAL_SOLANA_GENESIS}")
+    );
     for (name, config) in [("A", &a), ("B", &b), ("C", &c)] {
         assert!(
             !config.denomination().declares_tokens(),

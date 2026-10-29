@@ -956,6 +956,7 @@ key_file = "{key_file}"
                         connector_runtime::SettlementChain::Evm,
                         &format!("0x{}", hex::encode(address_of(&peer_key()))),
                         Some(&channel),
+                        None,
                     )
                     .expect("store is a configured peering"),
                 );
