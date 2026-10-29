@@ -1234,6 +1234,13 @@ rate = {{ numerator = 4000000000000, denominator = 1 }}
 from = "{ANYONE}"
 to = "{USDC}"
 rate = {{ numerator = 1, denominator = 4200000000000 }}
+
+# The declaration's Solana USDC is off the numeraire's network, so it
+# keeps its static row (ADR 0086 decision 13).
+[[rates]]
+from = "{USDC_SOLANA}"
+to = "{ANYONE}"
+rate = {{ numerator = 4000000000000, denominator = 1 }}
 "#
         ));
         let (tokens, _) = full_declaration();
