@@ -95,7 +95,7 @@ use connector_runtime::{
     BatchChannelError, BatchChannelView, BatchChannels, ClaimBookKind, ClaimDirection, ClaimScheme,
     ClaimView, Connector, DeclaredRates, EstablishPeeringError, LeaseRouteError, LeasedRouteView,
     PeerRouteTableError, PeerRouteView, PeerView, RateView, RouteView, SelfDescriptionError,
-    SettlementChain, WithdrawStep,
+    WithdrawStep,
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_signer::{derive_evm_address, to_hex, Signer, SignerError};
@@ -707,10 +707,12 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
 ///   connector will forward to `id` in one packet, refused `T04` above it.
 ///   Omitted -- or zero -- keeps `DEFAULT_MAX_PACKET_AMOUNT`; no value
 ///   here removes the bound.
-/// * `chain` disambiguates the one case with no honest default: two nodes
-///   settling on more than one chain in common. Left out, a single shared
-///   chain is used and several are refused by name rather than resolved
-///   silently, the same posture `POST /channels` takes.
+/// * `network` (CAIP-2, `eip155:8453` or `solana:<genesis prefix>`) chooses
+///   the one network the peering is on -- both of its channels (ADR 0086
+///   decisions 11 and 12). Left out, a single shared network is used and
+///   several are refused as `AmbiguousNetwork`, naming them, rather than
+///   resolved silently. The `chain` filter it replaced is refused by name,
+///   so an operator script still sending it fails loudly.
 /// * `deposit` is what the peering's outbound x402 channel is opened with,
 ///   in base units of the shared token (ADR 0075 decision 4), on either
 ///   chain: this node opens and funds its own channel toward the
@@ -732,10 +734,19 @@ struct UpsertPeerRequest {
     #[serde(default)]
     max_packet_amount: u64,
     #[serde(default)]
-    chain: Option<String>,
+    network: Option<String>,
+    /// Parsed only to be refused by name (ADR 0086 decision 12).
+    #[serde(default)]
+    chain: Option<serde_json::Value>,
     #[serde(default)]
     deposit: Option<u128>,
 }
+
+/// The refusal a `POST /peers` body naming `chain` gets.
+const PEERS_CHAIN_FILTER_REMOVED: &str =
+    "`chain` was removed from POST /peers (ADR 0086): a peering is on one network, so name it \
+     as `network` in CAIP-2 form -- e.g. \"eip155:8453\" or \"solana:<genesis prefix>\" -- or \
+     leave it out when the two nodes share only one";
 
 /// Appended to the `502` when the URL that failed to answer a
 /// self-description does not end in `/ilp` -- the single near-miss ADR 0050
@@ -774,7 +785,7 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
         | EstablishPeeringError::InvalidTerms { .. } => {
             (StatusCode::BAD_GATEWAY, error.to_string()).into_response()
         }
-        EstablishPeeringError::AmbiguousChain { .. }
+        EstablishPeeringError::AmbiguousNetwork { .. }
         | EstablishPeeringError::DepositRequired { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
@@ -828,10 +839,23 @@ async fn upsert_peer(
                 .into_response()
         }
     };
-    let chain = match request.chain.as_deref().map(str::parse::<SettlementChain>) {
+    if request.chain.is_some() {
+        return (StatusCode::BAD_REQUEST, PEERS_CHAIN_FILTER_REMOVED).into_response();
+    }
+    let network = match request
+        .network
+        .as_deref()
+        .map(str::parse::<connector_domain::Network>)
+    {
         None => None,
-        Some(Ok(chain)) => Some(chain),
-        Some(Err(error)) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Some(Ok(network)) => Some(network),
+        Some(Err(error)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("`network` must be a CAIP-2 network: {error}"),
+            )
+                .into_response()
+        }
     };
 
     let gate = state.write_auth.deposit_gate(&keyid);
@@ -842,7 +866,7 @@ async fn upsert_peer(
             &url,
             request.fee,
             request.max_packet_amount,
-            chain,
+            network,
             request.deposit,
             gate.as_ref().map(|gate| gate as &dyn DepositGate),
         )
@@ -1368,6 +1392,7 @@ fn node_identity(signer: &dyn Signer) -> Result<NodeIdentity, SignerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connector_runtime::SettlementChain;
     use axum::body::Body;
     use connector_config::{ControllerKey, StaticRoute};
     use connector_runtime::{
@@ -3049,6 +3074,7 @@ mod tests {
             // unintended second channel is visible here (ADR 0058, ADR 0075).
             assert_eq!(established["channel"]["status"], "created");
             assert_eq!(established["channel"]["chain"], "evm");
+            assert_eq!(established["channel"]["network"], NETWORK);
             let created: PeerView = serde_json::from_value(established).unwrap();
 
             let read_response = get(app, "/peers", Some("correct-token")).await;
@@ -3058,6 +3084,64 @@ mod tests {
                 .unwrap();
             let peers: Vec<PeerView> = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(peers, vec![created]);
+        }
+
+        /// ADR 0086 decision 12: the filter is a CAIP-2 `network`. The old
+        /// `chain` filter is refused by name -- an operator script still
+        /// sending it fails loudly rather than peering on a network it did
+        /// not choose -- and before the counterparty is dialled.
+        #[tokio::test]
+        async fn post_peers_takes_a_network_filter_and_refuses_chain_by_name() {
+            let keypair = keypair();
+            let app = router_with(vec![keypair.public.to_bytes()]).await;
+            let addr = serve_self_description(COUNTERPARTY_SETTLEMENT);
+            let post = |body: serde_json::Value| {
+                let app = app.clone();
+                let request = signed(
+                    &keypair,
+                    "POST",
+                    "/peers",
+                    serde_json::to_vec(&body).unwrap(),
+                );
+                async move {
+                    let response = app.oneshot(request).await.unwrap();
+                    let status = response.status();
+                    let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                    (status, String::from_utf8_lossy(&bytes).into_owned())
+                }
+            };
+            let url = format!("http://{addr}/ilp");
+
+            let (status, body) = post(serde_json::json!({
+                "id": "hop", "url": url, "chain": "evm", "deposit": 1_000,
+            }))
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("`chain`"), "{body}");
+            assert!(body.contains("`network`"), "{body}");
+
+            let (status, body) = post(serde_json::json!({
+                "id": "hop", "url": url, "network": "evm", "deposit": 1_000,
+            }))
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("evm"), "{body}");
+
+            // A network the counterparty does not publish is nothing in
+            // common, never a fallback to the one it does.
+            let (status, body) = post(serde_json::json!({
+                "id": "hop", "url": url, "network": "eip155:31338", "deposit": 1_000,
+            }))
+            .await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+            let (status, body) = post(serde_json::json!({
+                "id": "hop", "url": url, "network": NETWORK, "deposit": 1_000,
+            }))
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let established: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(established["channel"]["network"], NETWORK);
         }
 
         #[tokio::test]

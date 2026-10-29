@@ -41,6 +41,17 @@
 //! because `DELETE /peers` is ADR 0060's kill switch and a switch that left
 //! the peer role reachable would not be one.
 //!
+//! # A signer bound on one network
+//!
+//! A peering is on one network (ADR 0086 decision 11): both of its channels
+//! are. A signer bound with a network ([`VoucherSignerBindings::bind_on_network`])
+//! proves the peering only on a voucher or challenge that names that
+//! network; the same key's voucher on another of this node's networks -- one
+//! settlement key may serve several (ADR 0086 decision 5) -- proves nothing
+//! and is a client's. Binding it again for the same peering on another
+//! network is refused by name: a peering is moved by removing it and
+//! establishing it again, never by a second write.
+//!
 //! # A signer pinned to one channel
 //!
 //! A `[[peer_channels]]` row may also name the one `inbound_channel` its
@@ -52,6 +63,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use connector_domain::Network;
 pub use connector_settlement::batch::VoucherSigner;
 use thiserror::Error;
 
@@ -67,6 +79,20 @@ pub enum VoucherBindingError {
     /// route to nothing.
     #[error("no peering '{0}' exists to bind a voucher signer to")]
     UnknownPeer(String),
+    /// The signer already proves this peering on another network. A peering
+    /// is on one network (ADR 0086 decision 11); remove it and establish it
+    /// again to move it.
+    #[error(
+        "peering '{peer_id}' is on {bound_on} (voucher signer {signer}), so it cannot also be on \
+         {wanted}: a peering is on one network (ADR 0086) -- remove it with DELETE /peers and \
+         establish it again to move it"
+    )]
+    SignerBoundOnAnotherNetwork {
+        signer: String,
+        peer_id: String,
+        bound_on: String,
+        wanted: String,
+    },
 }
 
 /// Every voucher signer bound to a peering, and the peering it proves.
@@ -85,6 +111,9 @@ pub struct VoucherSignerBindings {
 struct Binding {
     peer_id: String,
     channel: Option<String>,
+    /// The one network the peering is on, when known. `None` proves it on
+    /// any network of the signer's chain.
+    network: Option<Network>,
 }
 
 impl VoucherSignerBindings {
@@ -101,7 +130,31 @@ impl VoucherSignerBindings {
     /// [`VoucherBindingError::SignerBoundElsewhere`] when `signer` already
     /// proves a different peering.
     pub fn bind(&self, peer_id: &str, signer: VoucherSigner) -> Result<(), VoucherBindingError> {
-        self.insert(peer_id, signer, None)
+        self.insert(peer_id, signer, None, None)
+    }
+
+    /// Bind `signer` to `peer_id` on `network` (any network when `None`)
+    /// and, when given, on `channel` only.
+    ///
+    /// # Errors
+    ///
+    /// [`VoucherBindingError::SignerBoundElsewhere`] when `signer` already
+    /// proves a different peering, and
+    /// [`VoucherBindingError::SignerBoundOnAnotherNetwork`] when it proves
+    /// this one on another network.
+    pub fn bind_on_network(
+        &self,
+        peer_id: &str,
+        signer: VoucherSigner,
+        network: Option<&Network>,
+        channel: Option<&str>,
+    ) -> Result<(), VoucherBindingError> {
+        self.insert(
+            peer_id,
+            signer,
+            channel.map(str::to_string),
+            network.cloned(),
+        )
     }
 
     /// Bind `signer` to `peer_id` on `channel` only -- an EVM channel id as
@@ -119,7 +172,7 @@ impl VoucherSignerBindings {
         signer: VoucherSigner,
         channel: &str,
     ) -> Result<(), VoucherBindingError> {
-        self.insert(peer_id, signer, Some(channel.to_string()))
+        self.insert(peer_id, signer, Some(channel.to_string()), None)
     }
 
     fn insert(
@@ -127,6 +180,7 @@ impl VoucherSignerBindings {
         peer_id: &str,
         signer: VoucherSigner,
         channel: Option<String>,
+        network: Option<Network>,
     ) -> Result<(), VoucherBindingError> {
         let mut by_signer = self
             .by_signer
@@ -139,6 +193,17 @@ impl VoucherSignerBindings {
                     bound_to: bound.peer_id.clone(),
                 })
             }
+            Some(Binding {
+                network: Some(bound_on),
+                ..
+            }) if network.as_ref().is_some_and(|wanted| wanted != bound_on) => {
+                Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
+                    signer: describe(&signer),
+                    peer_id: peer_id.to_string(),
+                    bound_on: bound_on.to_string(),
+                    wanted: network.map(|wanted| wanted.to_string()).unwrap_or_default(),
+                })
+            }
             Some(_) => Ok(()),
             None => {
                 by_signer.insert(
@@ -146,6 +211,7 @@ impl VoucherSignerBindings {
                     Binding {
                         peer_id: peer_id.to_string(),
                         channel,
+                        network,
                     },
                 );
                 Ok(())
@@ -171,10 +237,26 @@ impl VoucherSignerBindings {
             .map(|bound| bound.peer_id.clone())
     }
 
-    /// The peering `signer` proves on `channel`: [`Self::peer_for`], unless
-    /// the signer is pinned to another channel, when it proves none.
+    /// The network `signer`'s peering is on, when it was bound on one.
     #[must_use]
-    pub fn peer_for_channel(&self, signer: &VoucherSigner, channel: &str) -> Option<String> {
+    pub fn network_of(&self, signer: &VoucherSigner) -> Option<Network> {
+        self.by_signer
+            .read()
+            .expect("voucher signer bindings lock poisoned")
+            .get(signer)
+            .and_then(|bound| bound.network.clone())
+    }
+
+    /// The peering `signer` proves on `channel`, on `network`:
+    /// [`Self::peer_for`], unless the signer is pinned to another channel or
+    /// bound on another network, when it proves none.
+    #[must_use]
+    pub fn peer_for_channel(
+        &self,
+        signer: &VoucherSigner,
+        channel: &str,
+        network: &Network,
+    ) -> Option<String> {
         self.by_signer
             .read()
             .expect("voucher signer bindings lock poisoned")
@@ -184,6 +266,7 @@ impl VoucherSignerBindings {
                     .channel
                     .as_deref()
                     .is_none_or(|pinned| pinned == channel)
+                    && bound.network.as_ref().is_none_or(|on| on == network)
             })
             .map(|bound| bound.peer_id.clone())
     }
@@ -290,20 +373,72 @@ mod tests {
         bindings.bind_on_channel("store", EVM, "0xaa").unwrap();
         bindings.bind("relay", SOLANA).unwrap();
 
+        let on = network("eip155:8453");
         assert_eq!(
-            bindings.peer_for_channel(&EVM, "0xaa").as_deref(),
+            bindings.peer_for_channel(&EVM, "0xaa", &on).as_deref(),
             Some("store")
         );
-        assert_eq!(bindings.peer_for_channel(&EVM, "0xbb"), None);
+        assert_eq!(bindings.peer_for_channel(&EVM, "0xbb", &on), None);
         assert_eq!(bindings.peer_for(&EVM).as_deref(), Some("store"));
         assert_eq!(
-            bindings.peer_for_channel(&SOLANA, "any").as_deref(),
+            bindings
+                .peer_for_channel(&SOLANA, "any", &network(SOLANA_NETWORK))
+                .as_deref(),
             Some("relay")
         );
         assert!(matches!(
             bindings.bind_on_channel("relay", EVM, "0xaa"),
             Err(VoucherBindingError::SignerBoundElsewhere { .. })
         ));
+    }
+
+    fn network(text: &str) -> Network {
+        text.parse().expect("a CAIP-2 network")
+    }
+
+    const SOLANA_NETWORK: &str = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+
+    /// ADR 0086 decision 11: a peering is on one network, so a signer bound
+    /// on one proves the peering only on a voucher on that network -- the
+    /// same key's voucher on another of this node's networks is a client's.
+    /// An unscoped binding proves it on any.
+    #[test]
+    fn a_signer_bound_on_a_network_proves_its_peer_on_that_network_only() {
+        let bindings = VoucherSignerBindings::new();
+        let base = network("eip155:8453");
+        let arbitrum = network("eip155:42161");
+        bindings
+            .bind_on_network("store", EVM, Some(&base), None)
+            .unwrap();
+        bindings.bind("relay", SOLANA).unwrap();
+
+        assert_eq!(
+            bindings.peer_for_channel(&EVM, "0xaa", &base).as_deref(),
+            Some("store")
+        );
+        assert_eq!(bindings.peer_for_channel(&EVM, "0xaa", &arbitrum), None);
+        assert_eq!(bindings.network_of(&EVM), Some(base.clone()));
+        assert_eq!(
+            bindings
+                .peer_for_channel(&SOLANA, "any", &network(SOLANA_NETWORK))
+                .as_deref(),
+            Some("relay")
+        );
+
+        // The same peering cannot be moved onto another network by binding
+        // its signer again: one peering, one network.
+        assert_eq!(
+            bindings.bind_on_network("store", EVM, Some(&arbitrum), None),
+            Err(VoucherBindingError::SignerBoundOnAnotherNetwork {
+                signer: format!("0x{}", "11".repeat(20)),
+                peer_id: "store".to_string(),
+                bound_on: base.to_string(),
+                wanted: arbitrum.to_string(),
+            })
+        );
+        bindings
+            .bind_on_network("store", EVM, Some(&base), None)
+            .unwrap();
     }
 
     #[test]

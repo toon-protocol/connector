@@ -954,22 +954,26 @@ impl Connector {
     }
 
     /// Narrow a fetched self-description's published x402 terms to the one
-    /// chain this connector will open its outbound channel on.
+    /// network this connector will open its outbound channel on (ADR 0086
+    /// decision 12).
     pub(crate) fn shared_settlement(
         &self,
         document: &connector_domain::NodeSelfDescription,
-        wanted: Option<SettlementChain>,
+        wanted: Option<&connector_domain::Network>,
         url: &url::Url,
     ) -> Result<crate::peering::SharedSettlement, crate::peering::EstablishPeeringError> {
         // A peering is two x402 channels on either chain (ADR 0075 decision
         // 4, #1378 on EVM, #1379 on Solana): a node with no x402 channels to
-        // pay on a chain shares that chain with nobody.
-        crate::peering::shared_settlement_of(
-            document,
-            |chain| self.outbound_channels.is_some() && self.pays_on(chain),
-            wanted,
-            url,
-        )
+        // pay on shares no network with anybody.
+        let ours: Vec<&str> = if self.outbound_channels.is_some() {
+            self.x402_networks
+                .iter()
+                .map(|(_, network)| network.as_str())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        crate::peering::shared_settlement_of(document, &ours, wanted, url)
     }
 
     /// Make a runtime peering dialable, if this node holds a registrar.
@@ -1311,13 +1315,6 @@ impl Connector {
         self.outbound_channels.as_ref()
     }
 
-    /// Whether this node pays x402 on `chain` at all.
-    pub(crate) fn pays_on(&self, chain: SettlementChain) -> bool {
-        self.x402_networks
-            .iter()
-            .any(|(configured, _)| *configured == chain)
-    }
-
     /// This node's own CAIP-2 networks on `chain`, in table order.
     pub(crate) fn x402_networks_on(&self, chain: SettlementChain) -> Vec<&str> {
         self.x402_networks
@@ -1557,6 +1554,7 @@ impl Connector {
         chain: SettlementChain,
         voucher_signer: &str,
         inbound_channel: Option<&str>,
+        network: Option<&connector_domain::Network>,
     ) -> Result<Self, ConfigPeeringError> {
         let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
             return Err(ConfigPeeringError::VoucherSignerUnreadable {
@@ -1573,16 +1571,10 @@ impl Connector {
                 peer_id.to_string(),
             )));
         }
-        match inbound_channel {
-            None => self
-                .voucher_bindings
-                .bind(peer_id, signer)
-                .map_err(unbound)?,
-            Some(channel) => self
-                .voucher_bindings
-                .bind_on_channel(peer_id, signer, channel)
-                .map_err(unbound)?,
-        }
+        // ADR 0086 decision 11: the row's network is the peering's.
+        self.voucher_bindings
+            .bind_on_network(peer_id, signer, network, inbound_channel)
+            .map_err(unbound)?;
         Ok(self)
     }
 
@@ -1620,13 +1612,17 @@ impl Connector {
         peer_id: &str,
         binding: &RuntimePeerChannel,
     ) -> Result<(), VoucherBindingError> {
-        let (chain, voucher_signer) = match binding {
-            RuntimePeerChannel::EvmVoucher { voucher_signer, .. } => {
-                (SettlementChain::Evm, voucher_signer)
-            }
-            RuntimePeerChannel::SolanaVoucher { voucher_signer, .. } => {
-                (SettlementChain::Solana, voucher_signer)
-            }
+        let (chain, voucher_signer, network) = match binding {
+            RuntimePeerChannel::EvmVoucher {
+                voucher_signer,
+                network,
+                ..
+            } => (SettlementChain::Evm, voucher_signer, network),
+            RuntimePeerChannel::SolanaVoucher {
+                voucher_signer,
+                network,
+                ..
+            } => (SettlementChain::Solana, voucher_signer, network),
             RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return Ok(()),
         };
         let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
@@ -1638,7 +1634,12 @@ impl Connector {
             );
             return Ok(());
         };
-        self.voucher_bindings.bind(peer_id, signer)
+        // ADR 0086 decision 11: the peer's half is the peering's only on the
+        // peering's own network. A row whose network does not parse (none
+        // written since #1599 lacks one) binds on any, as before.
+        let network = network.parse::<connector_domain::Network>().ok();
+        self.voucher_bindings
+            .bind_on_network(peer_id, signer, network.as_ref(), None)
     }
 
     /// Configure this node's own identity key (issue #524), used to open a
@@ -1883,13 +1884,30 @@ impl Connector {
     }
 
     /// The peering `signer` proves on `channel` -- an EVM channel id as
-    /// lower-case `0x` hex, a Solana channel account in base58 -- if it is
-    /// bound to one: [`Self::voucher_signer_peer`], except that a signer a
-    /// `[[peer_channels]]` row pinned to one `inbound_channel` proves
-    /// nothing on any other.
+    /// lower-case `0x` hex, a Solana channel account in base58 -- on
+    /// `network`, if it is bound to one: [`Self::voucher_signer_peer`],
+    /// except that a signer a `[[peer_channels]]` row pinned to one
+    /// `inbound_channel` proves nothing on any other, and one bound on a
+    /// network proves nothing on another (ADR 0086 decision 11).
     #[must_use]
-    pub fn voucher_signer_peer_on(&self, signer: &VoucherSigner, channel: &str) -> Option<String> {
-        self.voucher_bindings.peer_for_channel(signer, channel)
+    pub fn voucher_signer_peer_on(
+        &self,
+        signer: &VoucherSigner,
+        channel: &str,
+        network: &connector_domain::Network,
+    ) -> Option<String> {
+        self.voucher_bindings
+            .peer_for_channel(signer, channel, network)
+    }
+
+    /// The network the peering `signer` proves is on, when it was bound on
+    /// one.
+    #[must_use]
+    pub fn voucher_signer_network(
+        &self,
+        signer: &VoucherSigner,
+    ) -> Option<connector_domain::Network> {
+        self.voucher_bindings.network_of(signer)
     }
 
     /// Whether any voucher signer is bound at all. `false` on every node
@@ -9847,7 +9865,7 @@ mod tests {
                 let (connector, _, _, _, channel) = peered().await;
                 let wired = connector
                     .with_config_peer_ids(["next-hop".to_string()])
-                    .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None)
+                    .with_config_voucher_signer("next-hop", SettlementChain::Evm, &signer, None, None)
                     .expect("bind the signer")
                     .with_config_pay_channel("next-hop", &channel, &url, timeout);
                 if pays_it {

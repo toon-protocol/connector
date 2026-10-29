@@ -118,6 +118,11 @@ pub struct BatchChannelView {
     pub scheme: String,
     /// `"evm"` or `"solana"`.
     pub chain: String,
+    /// The CAIP-2 network the channel is on (ADR 0086), and so where its
+    /// collateral sits. Absent only for a channel no configured network
+    /// reproduces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
     pub direction: ChannelDirection,
     pub status: BatchChannelViewStatus,
     /// Outbound: the receiver this node pays. Inbound: the voucher signer
@@ -937,6 +942,7 @@ impl OutboundChannels {
                 id: id.clone(),
                 scheme: BATCH_SETTLEMENT.to_string(),
                 chain: tracked.chain.name().to_string(),
+                network: tracked.network.as_ref().map(ToString::to_string),
                 direction: ChannelDirection::Outbound,
                 status: BatchChannelViewStatus::Opening,
                 counterparty,
@@ -1026,6 +1032,13 @@ impl BatchChannels {
         &self.outbound
     }
 
+    /// The network the inbound channel `presentation` is on, as an operator
+    /// reads it: the one of this node's networks whose domain reproduces it.
+    fn network_of(&self, presentation: &ChannelPresentation) -> Option<String> {
+        network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n))
+            .map(|network| network.to_string())
+    }
+
     /// The receiving half of the network the inbound channel
     /// `presentation` is on.
     fn receiver(
@@ -1109,6 +1122,7 @@ impl BatchChannels {
                 id,
                 scheme: BATCH_SETTLEMENT.to_string(),
                 chain: chain.name().to_string(),
+                network: self.network_of(&held.presentation),
                 direction: ChannelDirection::Inbound,
                 status: BatchChannelViewStatus::Unreadable,
                 counterparty: String::new(),
@@ -1166,6 +1180,7 @@ impl BatchChannels {
             id,
             scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
+            network: self.network_of(&held.presentation),
             direction: ChannelDirection::Inbound,
             status: state.status.into(),
             counterparty: spell_signer(&state.voucher_signer),
@@ -1207,10 +1222,14 @@ impl OutboundChannels {
                 VoucherSigner::Solana(_) => (SettlementChain::Solana, String::new()),
             },
         };
+        let network = self
+            .network(&state.on_chain.id.0)
+            .map(|network| network.to_string());
         BatchChannelView {
             id: state.on_chain.id.0.clone(),
             scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
+            network,
             direction: ChannelDirection::Outbound,
             status: state.on_chain.status.into(),
             counterparty,

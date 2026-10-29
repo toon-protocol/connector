@@ -344,7 +344,13 @@ pub async fn decide_frame(
             };
             let check = vouchers.check_voucher(voucher).await;
             decide_voucher_role(
-                presented(connector, check, &voucher_channel(voucher), true)
+                presented(
+                    connector,
+                    check,
+                    &voucher_channel(voucher),
+                    voucher.network(),
+                    true,
+                )
                     .as_ref()
                     .map(as_presented),
             )
@@ -354,7 +360,13 @@ pub async fn decide_frame(
                 let check = vouchers.check_challenge(challenge).await;
                 let in_window = challenge_in_window(challenge.expires(), connector.now_unix());
                 decide_voucher_role(
-                    presented(connector, check, &challenge.channel(), in_window)
+                    presented(
+                        connector,
+                        check,
+                        &challenge.channel(),
+                        challenge.network(),
+                        in_window,
+                    )
                         .as_ref()
                         .map(as_presented),
                 )
@@ -404,12 +416,15 @@ pub fn challenge_in_window(expires: u64, now: u64) -> bool {
     expires > now && expires - now <= MAX_PEER_CHALLENGE_LIFETIME_SECS
 }
 
-/// A check, as the peering its signer is bound to on `channel` and a
-/// verdict. `None` for a channel the receiving half could not resolve.
+/// A check, as the peering its signer is bound to on `channel` and
+/// `network` and a verdict. `None` for a channel the receiving half could
+/// not resolve. A signer bound on another network proves nothing here: a
+/// peering's two halves are on one network (ADR 0086 decision 11).
 fn presented(
     connector: &Connector,
     check: VoucherCheck,
     channel: &str,
+    network: &connector_domain::Network,
     in_window: bool,
 ) -> Option<(Option<String>, VoucherVerification)> {
     let (signer, verification) = match check {
@@ -419,7 +434,7 @@ fn presented(
         VoucherCheck::Unresolved => return None,
     };
     Some((
-        connector.voucher_signer_peer_on(&signer, channel),
+        connector.voucher_signer_peer_on(&signer, channel, network),
         verification,
     ))
 }
