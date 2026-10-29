@@ -4,7 +4,7 @@
 
 **Scope:** protocol law — binds every implementation, because an XRPL claim, its claim-state challenge, an asset id and the vectors are specified here. See the [ADR index](README.md).
 
-**Falsifier:** none — the record builds nothing and claims nothing absent from the tree; what it refuses (`xrpl:native`, a second XRPL table on one account, an XRPL claim with no `network`) is refused by name once built, which is a presence the tests will hold rather than an absence a pattern can find.
+**Falsifier:** none — the record builds nothing and claims nothing absent from the tree; `xrpl:native` is already refused by name (`AssetIdError::LegacyNative`, since #1607), and what else it refuses (a second XRPL table on one account, an XRPL claim with no `network`) is refused by name once built, which is a presence the tests will hold rather than an absence a pattern can find.
 
 **A node may settle on XRPL over the ledger's own `PayChannel`, built to x402's `xrpl-paychan-v1` binding at one pinned commit. A voucher is `CLM\0 ‖ channelId ‖ u64 drops`, and a node's account on one XRPL network may never be its account on another, because a claim binds no network. Every XRPL leg is an ADR 0071 dealing boundary at a declared rate, since a channel holds XRP only. A receiving node answers a payer's exit by landing its latest voucher with `tfClose`.**
 
@@ -93,7 +93,7 @@ Boot checks that the table's `rpc_url` answers `server_info` with `network_id` e
 1. **A native-coin-only chain is admitted as a peering leg** as ordinary [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) dealing. A hop whose two sides hold different tokens converts at a declared rate; with no rate there is no forward (0071 decision 2). A path that holds XRP end to end forwards unconverted.
 2. **There is no extra cap.** An XRP channel is real escrow, unlike [0080](0080-a-client-may-pay-from-a-zk-note.md)'s allowance claims. The numeraire stays a stablecoin.
 3. **The rate is static**: a `[[rates]]` row plus a spread, as 0080 does for MINA. XRPL has no rate source. An AMM gives only a spot price, which 0071 rejects, and an XLS-47 oracle is not a pool, so using one would amend 0071 and is not done here.
-4. **`[[tokens]]` may name a native coin when the node has a settlement backend for its chain.** Every peering must resolve to a declared token, so an XRPL peering forces the XRP asset into `[[tokens]]`. 0080's refusal of a `mina:` asset in `[[tokens]]` holds only while Mina has no backend.
+4. **`[[tokens]]` may name a native coin when the node has a settlement backend for its chain.** Every peering must resolve to a declared token, so an XRPL peering forces the XRP asset into `[[tokens]]`. 0080's refusal of a `mina:` asset in `[[tokens]]` is untouched: Mina has no settlement backend.
 5. **A forward between two XRPL networks is a forward between two assets** (0086 decision 13). XRP on testnet is never XRP on mainnet.
 6. **Fees are paid in XRP, the asset being settled.** No party needs a second coin for gas. There is no fee sponsorship on XRPL (XLS-68 is not enabled on mainnet), so each party pays its own fees and its own reserve, and a peering costs each side one owner reserve (0.2 XRP on 2026-10-28) until its channel is deleted. This costs a payer with no spare XRP a refusal by name (the shortfall), never a `tecUNFUNDED`.
 
@@ -102,8 +102,8 @@ Boot checks that the table's `rpc_url` answers `server_info` with `network_id` e
 **Amends #1567 decision 2** (owner, 2026-10-28). #1567 spelled a native coin `<chain>:native` inside the connector, with CAIP-19 only in the greeting. 0086 decision 2 had made every asset id CAIP-19 inside the connector, and the two conflicted. CAIP-19 wins:
 
 - XRP is **`xrpl:<id>/slip44:144`** everywhere: config, `[[tokens]]`, `[[rates]]`, the journal and the greeting. There is one asset-id grammar.
-- **`xrpl:native` is refused by name**, and so is every other `<chain>:native` spelling in a place that parses an asset id. Today `evm:native` would parse as an ERC-20 at an address `native`.
-- This amends #1567's internal spelling only; its other resolutions stand (decision 6 carries them). [0080](0080-a-client-may-pay-from-a-zk-note.md) decision 7's `mina:native` is a zk-note table's own spelling and is left to Mina's record (#1548), which meets the same rule when Mina gets a settlement backend.
+- **`xrpl:native` is refused by name**, and so is every other `<chain>:native` spelling in a place that parses an asset id. The asset-id parser already refuses them by name (`AssetIdError::LegacyNative`, since #1607); this decision is the record of that refusal.
+- This amends #1567's internal spelling only; its other resolutions stand (decision 6 carries them). [0080](0080-a-client-may-pay-from-a-zk-note.md) decision 7 already meets the same rule: its 2026-10-28 amendment (merge of #1607) spells MINA `mina:<net>/slip44:12586` and refuses `mina:native` by name.
 
 ### 8. The watcher lands with `tfClose` on a payer's exit
 
@@ -118,7 +118,7 @@ The ordinary land (`POST /channels/:id/land`) is a destination `PaymentChannelCl
 - **One `batch-settlement` entry per XRPL table**: `network: xrpl:<id>`, `asset: xrpl:<id>/slip44:144`, `payTo` the node's classic r-address, and `extra: {binding: "xrpl-paychan-v1", minSettleDelay, redemptionSafetySeconds}`. The self-description's `voucherSigners` publishes the channel key.
 - **Admission refuses**, each by a named `AdmissionRefusal`: a `Destination` that is not the node's settlement account; a `SettleDelay` below the table's minimum (above the port's 901 s floor); an `Expiration` already set; a `CancelAfter` of any value (a new variant, since it is an immutable deadline the node cannot see coming and could strip a held voucher); a key that is not a valid channel `PublicKey`. A `DestinationTag` is not an admission dimension. A node's own outbound channels never set `CancelAfter`, so its peers never refuse them.
 - **A land that delivered nothing is a failure.** An expired channel answers `tesSUCCESS` with nothing delivered, so success is read from transaction metadata (the channel's `Balance` advanced), never from the result code alone.
-- **Every wait is bounded by `LastLedgerSequence`**, and a transaction past it is known-not-landed (0073). A retried open resumes the same journaled, signed transaction and creates no second channel (0075 decision 8).
+- **Every wait is bounded by `LastLedgerSequence`**, and a transaction past it is known-not-landed (0073). A retried open resumes the journaled channel and creates no second one (0075 decision 8's outbound-channel journal entry).
 
 ### 10. The state a ledger entry has
 
@@ -131,7 +131,7 @@ An XRPL channel deletes itself on close, so the port reads it as follows (0075, 
 - **Reuse Solana's challenge domain tag.** Rejected: one signature would be valid on two chains' channels if an Ed25519 key were shared, and Solana's message has a different shape.
 - **Land without `tfClose` on a payer's exit.** Rejected for the watcher (decision 8): it leaves the delay to run against the node.
 - **Check the PayChan amendment at boot.** Rejected (0085 decision 3): testnet reports it disabled while channels work.
-- **A `<chain>:native` asset spelling.** Rejected (decision 7), by the same reason 0086 refused `evm:<chainId>:0x…`: a second grammar that today's parser reads as a different token.
+- **A `<chain>:native` asset spelling.** Rejected (decision 7), by the same reason 0086 refused `evm:<chainId>:0x…`: a second grammar beside CAIP-19, which the old parser read as a different token.
 - **A stand-alone id above 1024.** Rejected: transactions would carry `NetworkID`, and the harness would sign bytes mainnet transactions never carry.
 - **An XLS-47 oracle as the XRP rate source.** Parked as fog on #1563. It needs an amendment to 0071, and the only confirmed publisher updates up to about 5 h 40 m apart.
 
