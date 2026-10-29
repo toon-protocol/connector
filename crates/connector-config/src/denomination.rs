@@ -354,7 +354,9 @@ fn canonical_pool(chain: AssetChain, pool: &str) -> Option<String> {
     match chain {
         AssetChain::Evm => parse_evm_address(pool).map(|address| to_hex(&address)),
         AssetChain::Solana => is_base58_32_bytes(pool).then(|| pool.to_string()),
-        AssetChain::Mina => None,
+        // Neither has a pool a rate source reads: Mina's rate is static, and so
+        // is XRPL's (ADR 0087 decision 6).
+        AssetChain::Mina | AssetChain::Xrpl => None,
     }
 }
 

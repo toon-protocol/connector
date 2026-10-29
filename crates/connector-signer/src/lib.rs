@@ -52,6 +52,7 @@ mod local;
 pub mod nip59;
 mod signer;
 mod voucher_signature;
+mod xrpl;
 mod zk_state;
 
 pub use address::{derive_evm_address, to_hex, Address};
@@ -71,6 +72,13 @@ pub use voucher_signature::{
     verify_evm_voucher, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,
     VoucherSignature, SOLANA_VOUCHER_PREFIX, X402_BATCH_SETTLEMENT_ADDRESS,
     X402_BATCH_SETTLEMENT_EIP712_NAME, X402_BATCH_SETTLEMENT_EIP712_VERSION,
+};
+pub use xrpl::{
+    checked_drops, decode_xrpl_classic_address, sha512_half, verify_xrpl_claim,
+    verify_xrpl_signature, verify_xrpl_voucher_claim_state_challenge, xrpl_account_id,
+    xrpl_channel_id, xrpl_claim_message, xrpl_classic_address, xrpl_family_seed,
+    xrpl_voucher_claim_state_challenge_message, XrplAlgorithm, XrplError, XrplSigner,
+    XRPL_CLAIM_PREFIX, XRPL_CLAIM_STATE_CHALLENGE_TAG, XRPL_ED25519_PREFIX, XRPL_MAX_DROPS,
 };
 pub use zk_state::{ZkStateKeyError, ZkStateSigner};
 

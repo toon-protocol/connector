@@ -84,6 +84,17 @@ pub enum PeerRoleChallenge {
         expires: u64,
         signature: [u8; 64],
     },
+    /// An XRPL `PayChan` (ADR 0087 decision 3).
+    Xrpl {
+        /// The CAIP-2 network the channel is on: the challenge binds it,
+        /// which a claim does not.
+        network: Network,
+        channel_id: [u8; 32],
+        expires: u64,
+        /// DER (secp256k1) or 64 raw bytes (Ed25519): 64 to 72 bytes, whose
+        /// algorithm is the channel key's, not the signature's.
+        signature: Vec<u8>,
+    },
 }
 
 impl PeerRoleChallenge {
@@ -103,6 +114,7 @@ impl PeerRoleChallenge {
             PeerRoleChallenge::Solana {
                 channel_account, ..
             } => bs58::encode(channel_account).into_string(),
+            PeerRoleChallenge::Xrpl { channel_id, .. } => hex::encode(channel_id),
         }
     }
 
@@ -110,9 +122,9 @@ impl PeerRoleChallenge {
     #[must_use]
     pub fn network(&self) -> &Network {
         match self {
-            PeerRoleChallenge::Evm { network, .. } | PeerRoleChallenge::Solana { network, .. } => {
-                network
-            }
+            PeerRoleChallenge::Evm { network, .. }
+            | PeerRoleChallenge::Solana { network, .. }
+            | PeerRoleChallenge::Xrpl { network, .. } => network,
         }
     }
 
@@ -120,9 +132,9 @@ impl PeerRoleChallenge {
     #[must_use]
     pub fn expires(&self) -> u64 {
         match self {
-            PeerRoleChallenge::Evm { expires, .. } | PeerRoleChallenge::Solana { expires, .. } => {
-                *expires
-            }
+            PeerRoleChallenge::Evm { expires, .. }
+            | PeerRoleChallenge::Solana { expires, .. }
+            | PeerRoleChallenge::Xrpl { expires, .. } => *expires,
         }
     }
 }
@@ -267,8 +279,28 @@ pub fn parse(raw: &[u8]) -> Result<PeerRoleChallenge, ChallengeDecodeError> {
                 signature,
             })
         }
+        Some("xrpl") => {
+            let network = network(AssetChain::Xrpl)?;
+            let channel_id = hex_bytes::<32>(text("channelId")?).ok_or_else(|| {
+                ChallengeDecodeError::Malformed("'channelId' must be 32 bytes of hex".to_string())
+            })?;
+            let signature = hex::decode(text("signature")?)
+                .ok()
+                .filter(|bytes| (64..=72).contains(&bytes.len()))
+                .ok_or_else(|| {
+                    ChallengeDecodeError::Malformed(
+                        "'signature' must be 64 to 72 bytes of hex".to_string(),
+                    )
+                })?;
+            Ok(PeerRoleChallenge::Xrpl {
+                network,
+                channel_id,
+                expires,
+                signature,
+            })
+        }
         _ => Err(ChallengeDecodeError::Malformed(
-            "'blockchain' must be 'evm' or 'solana'".to_string(),
+            "'blockchain' must be 'evm', 'solana' or 'xrpl'".to_string(),
         )),
     }
 }
@@ -320,6 +352,20 @@ pub fn encode(challenge: &PeerRoleChallenge) -> String {
             "signature": BASE64.encode(signature),
         })
         .to_string(),
+        PeerRoleChallenge::Xrpl {
+            network,
+            channel_id,
+            expires,
+            signature,
+        } => serde_json::json!({
+            "blockchain": "xrpl",
+            "network": network.to_string(),
+            "scheme": SCHEME_BATCH_SETTLEMENT,
+            "channelId": hex::encode(channel_id),
+            "expires": expires,
+            "signature": hex::encode(signature),
+        })
+        .to_string(),
     }
 }
 
@@ -364,9 +410,18 @@ mod tests {
         }
     }
 
+    fn xrpl() -> PeerRoleChallenge {
+        PeerRoleChallenge::Xrpl {
+            network: "xrpl:1".parse().expect("a CAIP-2 network"),
+            channel_id: [0xd5; 32],
+            expires: 1_800_000_000,
+            signature: vec![0x33; 71],
+        }
+    }
+
     #[test]
-    fn a_challenge_reads_back_as_itself_on_either_chain() {
-        for challenge in [evm(), solana()] {
+    fn a_challenge_reads_back_as_itself_on_every_chain() {
+        for challenge in [evm(), solana(), xrpl()] {
             assert_eq!(parse(encode(&challenge).as_bytes()), Ok(challenge));
         }
     }
@@ -416,7 +471,7 @@ mod tests {
     /// and one with none is refused by name on either chain.
     #[test]
     fn a_challenge_with_no_network_is_refused_by_name() {
-        for challenge in [evm(), solana()] {
+        for challenge in [evm(), solana(), xrpl()] {
             let mut json: Value = serde_json::from_str(&encode(&challenge)).unwrap();
             assert!(json.as_object_mut().unwrap().remove("network").is_some());
             assert_eq!(

@@ -65,7 +65,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::client_claim::{EVM_NAMESPACE, SOLANA_NAMESPACE};
-use crate::network::{MinaNetwork, Network, NetworkError, MINA_NETWORK_NAMESPACE};
+use crate::network::{
+    MinaNetwork, Network, NetworkError, XrplNetwork, MINA_NETWORK_NAMESPACE, XRPL_NETWORK_NAMESPACE,
+};
 
 /// The family name of Mina, whose one asset is a zk-note vault's (ADR 0080
 /// decision 7, as amended).
@@ -73,6 +75,13 @@ pub const MINA_NAMESPACE: &str = MINA_NETWORK_NAMESPACE;
 
 /// MINA's SLIP-44 coin type: native MINA is `mina:<network>/slip44:12586`.
 pub const MINA_SLIP44_COIN_TYPE: u32 = 12586;
+
+/// The family name of XRPL, whose one asset is XRP (ADR 0087).
+pub const XRPL_NAMESPACE: &str = XRPL_NETWORK_NAMESPACE;
+
+/// XRP's SLIP-44 coin type: XRP is `xrpl:<id>/slip44:144` (ADR 0087 decision
+/// 7).
+pub const XRPL_SLIP44_COIN_TYPE: u32 = 144;
 
 /// How many hex characters an EVM contract address is, unprefixed.
 const EVM_ADDRESS_HEX_LEN: usize = 40;
@@ -111,6 +120,9 @@ pub enum AssetChain {
     /// asset stays refused in `[[tokens]]` and in every settlement table, and
     /// no TWAP source quotes it. A `[[rates]]` row may name it as its `from`.
     Mina,
+    /// The ledger's own `PayChannel` (ADR 0087): a channel holds XRP only, so
+    /// its one [`AssetId`] is `xrpl:<id>/slip44:144` ([`AssetId::xrp`]).
+    Xrpl,
 }
 
 impl AssetChain {
@@ -120,6 +132,7 @@ impl AssetChain {
             AssetChain::Evm => EVM_NAMESPACE,
             AssetChain::Solana => SOLANA_NAMESPACE,
             AssetChain::Mina => MINA_NAMESPACE,
+            AssetChain::Xrpl => XRPL_NAMESPACE,
         }
     }
 }
@@ -209,6 +222,9 @@ impl AssetId {
 
             // Mina has one asset, so there is no token to name on it.
             Network::Mina(mina) => AssetId::mina(mina),
+
+            // So has XRPL: a channel holds XRP only (ADR 0087).
+            Network::Xrpl(xrpl) => AssetId::xrp(xrpl),
         }
     }
 
@@ -230,6 +246,12 @@ impl AssetId {
     /// Mina asset (ADR 0080 decision 7, as amended by ADR 0086's CAIP-19).
     pub fn mina(network: MinaNetwork) -> AssetId {
         AssetId::slip44(Network::Mina(network), MINA_SLIP44_COIN_TYPE)
+    }
+
+    /// XRP on `network`: the only asset an XRPL channel holds (ADR 0087
+    /// decision 7).
+    pub fn xrp(network: XrplNetwork) -> AssetId {
+        AssetId::slip44(Network::Xrpl(network), XRPL_SLIP44_COIN_TYPE)
     }
 
     /// The CAIP-2 network this token is on.
@@ -326,6 +348,9 @@ impl FromStr for AssetId {
                 let coin_type = reference.parse::<u32>().map_err(|_| invalid())?;
                 // Mina has one asset (ADR 0080 decision 7, as amended).
                 if matches!(network, Network::Mina(_)) && coin_type != MINA_SLIP44_COIN_TYPE {
+                    return Err(invalid());
+                }
+                if matches!(network, Network::Xrpl(_)) && coin_type != XRPL_SLIP44_COIN_TYPE {
                     return Err(invalid());
                 }
                 coin_type.to_string()

@@ -412,6 +412,8 @@ fn place_on_networks(
                     // No payer settles on Mina: a zk edge's vault is not a
                     // channel this node pays from.
                     AssetChain::Mina => None,
+                    // Nor on XRPL, until its backend lands (ADR 0087).
+                    AssetChain::Xrpl => None,
                 };
                 let Some(placed) = placed else {
                     return Err(OutboundRestoreError::OnNoNetwork {
@@ -464,6 +466,7 @@ fn spell(chain: SettlementChain, bytes: &[u8]) -> String {
     match chain {
         SettlementChain::Evm => hex(bytes),
         SettlementChain::Solana => bs58::encode(bytes).into_string(),
+        SettlementChain::Xrpl => hex(bytes),
     }
 }
 
@@ -471,6 +474,7 @@ fn spell_signer(signer: &VoucherSigner) -> String {
     match signer {
         VoucherSigner::Evm(address) => hex(address),
         VoucherSigner::Solana(key) => bs58::encode(key).into_string(),
+        VoucherSigner::Xrpl(key) => hex(key),
     }
 }
 
@@ -1070,6 +1074,7 @@ impl OutboundChannels {
         let (chain, receiver) = match receiver {
             VoucherSigner::Evm(address) => (SettlementChain::Evm, address.to_vec()),
             VoucherSigner::Solana(key) => (SettlementChain::Solana, key.to_vec()),
+            VoucherSigner::Xrpl(key) => (SettlementChain::Xrpl, key.to_vec()),
         };
         self.channels()
             .iter()
@@ -1379,6 +1384,7 @@ impl OutboundChannels {
             Err(_) => match state.on_chain.voucher_signer {
                 VoucherSigner::Evm(_) => (SettlementChain::Evm, String::new()),
                 VoucherSigner::Solana(_) => (SettlementChain::Solana, String::new()),
+                VoucherSigner::Xrpl(_) => (SettlementChain::Xrpl, String::new()),
             },
         };
         let network = self
@@ -2171,6 +2177,7 @@ mod tests {
                         AssetChain::Evm => PayerExit::Withdrawal,
                         AssetChain::Solana => PayerExit::Close,
                         AssetChain::Mina => unreachable!("no payer settles on Mina"),
+                        AssetChain::Xrpl => unreachable!("no payer settles on XRPL yet"),
                     };
                     let payer =
                         InMemoryBatchSettlement::on(InMemoryBatchChain::new(exit), 0x01, ONE_DAY);

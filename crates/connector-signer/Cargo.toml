@@ -26,6 +26,10 @@ libsecp256k1 = "0.6"
 k256 = { version = "0.13", features = ["schnorr"] }
 sha2 = "0.10"
 sha3 = "0.10"
+# XRPL (ADR 0087): classic addresses are base58 over the ripple alphabet of
+# RIPEMD160(SHA256(public key)).
+ripemd = "0.1"
+bs58 = "0.5"
 ed25519-dalek = "1"
 rand = "0.7"
 thiserror = "2"
