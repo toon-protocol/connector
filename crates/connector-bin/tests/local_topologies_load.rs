@@ -1340,7 +1340,9 @@ fn the_solo_config_and_its_compose_file_agree() {
     let connector = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "connector");
     for chain in ["anvil:", "anvil-31338:", "solana-validator:"] {
         assert!(
-            connector.contains(&format!("      {chain}\n        condition: service_healthy")),
+            connector.contains(&format!(
+                "      {chain}\n        condition: service_healthy"
+            )),
             "solo's connector boots only once `{chain}` is healthy: a node refuses to start on \
              a table whose chain has no x402 on it"
         );
