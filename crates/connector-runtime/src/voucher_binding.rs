@@ -308,6 +308,7 @@ fn describe(signer: &VoucherSigner) -> String {
                 .collect::<String>()
         ),
         VoucherSigner::Solana(key) => bs58::encode(key).into_string(),
+        VoucherSigner::Xrpl(key) => key.iter().map(|byte| format!("{byte:02x}")).collect(),
     }
 }
 

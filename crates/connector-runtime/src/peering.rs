@@ -196,6 +196,9 @@ pub enum EstablishPeeringError {
         theirs: String,
         ours: String,
     },
+    /// A channel on a chain whose peering is not built yet (XRPL, ADR 0087).
+    #[error("a {chain} channel cannot be bound to a peering yet")]
+    ChainNotPeerable { chain: String },
     /// The counterparty publishes no voucher signer for the chain (ADR 0075
     /// decision 10), so its channel toward this node could never be bound
     /// to the peering, and its packets would never prove the peer role.
@@ -432,6 +435,13 @@ impl Connector {
                 voucher_signer: bs58::encode(signer).into_string(),
                 network: network.to_string(),
             },
+            // The peer-route store has no XRPL binding yet: an XRPL peering
+            // is the backend tickets' to build (ADR 0087, #1596).
+            VoucherSigner::Xrpl(_) => {
+                return Err(EstablishPeeringError::ChainNotPeerable {
+                    chain: chain.name().to_string(),
+                })
+            }
         };
         Ok((
             binding,
@@ -533,12 +543,28 @@ pub(crate) fn parse_solana_key(value: &str) -> Option<[u8; 32]> {
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
 }
 
+/// A 33-byte XRPL channel key from its hex spelling (either case, no prefix),
+/// or `None` for anything else -- including a first byte that is neither a
+/// compressed secp256k1 prefix (`02`/`03`) nor Ed25519's `ED`, which no
+/// channel key can start with (ADR 0087 decision 2).
+pub(crate) fn parse_xrpl_key(value: &str) -> Option<[u8; 33]> {
+    if value.len() != 66 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut key = [0u8; 33];
+    for (byte, pair) in key.iter_mut().zip(value.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    matches!(key[0], 0x02 | 0x03 | 0xED).then_some(key)
+}
+
 /// A key or address in `chain`'s own shape, as the [`VoucherSigner`] a
 /// channel names it by: a voucher signer, or the receiver a channel pays.
 pub(crate) fn parse_chain_key(chain: SettlementChain, value: &str) -> Option<VoucherSigner> {
     match chain {
         SettlementChain::Evm => parse_evm_address(value).map(VoucherSigner::Evm),
         SettlementChain::Solana => parse_solana_key(value).map(VoucherSigner::Solana),
+        SettlementChain::Xrpl => parse_xrpl_key(value).map(VoucherSigner::Xrpl),
     }
 }
 
@@ -633,6 +659,31 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
+
+    #[test]
+    fn an_xrpl_voucher_signer_is_a_33_byte_channel_key_in_hex() {
+        let secp = format!("03{}", "ab".repeat(32));
+        let ed = format!("ED{}", "cd".repeat(32));
+        assert_eq!(
+            parse_chain_key(SettlementChain::Xrpl, &secp),
+            Some(VoucherSigner::Xrpl(parse_xrpl_key(&secp).unwrap()))
+        );
+        assert_eq!(parse_xrpl_key(&ed).map(|key| key[0]), Some(0xED));
+        assert_eq!(
+            parse_xrpl_key(&ed.to_lowercase()).map(|key| key[0]),
+            Some(0xED)
+        );
+        for bad in [
+            "".to_string(),
+            "ab".repeat(33),                    // a prefix no channel key has
+            format!("0x03{}", "ab".repeat(32)), // no 0x prefix
+            format!("03{}", "ab".repeat(31)),   // too short
+            format!("03{}zz", "ab".repeat(31)), // not hex
+            "ab".repeat(20),                    // an EVM address
+        ] {
+            assert_eq!(parse_xrpl_key(&bad), None, "{bad}");
+        }
+    }
 
     use async_trait::async_trait;
     use connector_domain::x402::{X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms};
