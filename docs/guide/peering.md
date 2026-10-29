@@ -134,7 +134,7 @@ The script prints the three headers it computed, then the node's answer:
   "fee": 100,
   "max_packet_amount": 5000,
   "source": "runtime",
-  "channel": { "id": "0x…", "status": "created", "chain": "evm" }
+  "channel": { "id": "0x…", "status": "created", "chain": "evm", "network": "eip155:8453" }
 }
 ```
 
@@ -160,9 +160,12 @@ from — so neither figure carries over to a peering holding a different token, 
 `5000` is half a cent of 6-decimals USDC and a rounding error of an 18-decimals
 one. Neither can come from a document, which is why they are in the request.
 
-Two nodes that settle on **more than one chain in common** must say which: add
-`"chain": "evm"` or `"chain": "solana"`. Without it the write is refused by name
-rather than resolved silently.
+A peering is on **one network**, both of its channels. Two nodes that settle on
+**more than one network in common** — Base and Arbitrum, say, or Base and Solana
+— must say which: add `"network": "eip155:8453"` (CAIP-2). Without it the write
+is refused as `AmbiguousNetwork`, naming the candidates, rather than resolved
+silently. To carry value between two networks, make two peerings and forward
+between them.
 
 **2. Keep your own collateral behind your own vouchers.** The opening deposit
 came with the write above; top your channel up when it runs low. `fund` takes an

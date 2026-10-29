@@ -305,6 +305,7 @@ fn payer(
         channel,
         &Url::parse(&format!("http://{payee}/ilp")).expect("url"),
         std::time::Duration::from_secs(10),
+        None,
     )
     .expect("the pay channel is this node's own journaled outbound channel")
 }

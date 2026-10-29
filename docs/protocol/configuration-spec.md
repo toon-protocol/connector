@@ -703,6 +703,12 @@ absent there; with one EVM table it may be left out, and is that table's. It MUS
 table, or the row is refused by name. A Solana row may write `solana:<genesis prefix>`. The retired
 `chain_id` key stays refused: it named a `toon-channel` domain, not a network.
 
+**A peering is on one network** (ADR 0086 decision 11): its two rows on one chain MUST name the same
+network, or the config is refused by name (`PeeringNetworksDiffer`). The `[[peer_channels]]` row's
+network is the only one its voucher signer proves the peering on: the same key's voucher on another
+of this node's networks is a client's. A `[[pay_channels]]` row whose channel this node holds on
+another network than the row's is refused at boot by name.
+
 **A pay-from row's `client_edge_url`** is where this node asks `POST /ilp/claim-state` where its
 vouchers on the channel stand. The receiver is the authority on its own watermark: a node that lost
 its outbound-channel journal restores the channel's watermark from that answer rather than guessing.

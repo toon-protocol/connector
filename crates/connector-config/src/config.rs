@@ -475,6 +475,24 @@ impl Config {
                     value: pay_channel.outbound_channel().to_string(),
                 });
             }
+            // A peering is on one network, both of its channels (ADR 0086
+            // decision 11): this row and the peer's own row on the same
+            // chain must name one network.
+            if let Some(outbound) = pay_channel.network() {
+                let inbound = peer_channels.iter().find_map(|row| {
+                    row.network()
+                        .filter(|_| row.peer_id() == pay_channel.peer_id())
+                        .filter(|inbound| inbound.chain() == outbound.chain())
+                        .filter(|inbound| *inbound != outbound)
+                });
+                if let Some(inbound) = inbound {
+                    return Err(ConfigError::PeeringNetworksDiffer {
+                        peer_id: pay_channel.peer_id().to_string(),
+                        inbound: inbound.to_string(),
+                        outbound: outbound.to_string(),
+                    });
+                }
+            }
         }
         // ADR 0042, and the load-time half of issue #1145: **a connector
         // covers every PREPARE it sends**, so a peering this node has a
@@ -1660,6 +1678,35 @@ client_edge_url = "https://store.example/ilp"
         let on = "eip155:31338".parse::<connector_domain::Network>().unwrap();
         assert_eq!(config.peer_channels()[0].network(), Some(&on));
         assert_eq!(config.pay_channels()[0].network(), Some(&on));
+    }
+
+    /// ADR 0086 decision 11: both channels of a peering are on one network,
+    /// so a config peering whose `[[peer_channels]]` row is on one network
+    /// and whose `[[pay_channels]]` row is on another is refused by name.
+    #[test]
+    fn a_config_peering_whose_two_rows_are_on_two_networks_is_refused_by_name() {
+        let error = load_two_network_peering(|text| {
+            text.replace(
+                &format!("voucher_signer = \"{PEER_KEY}\""),
+                &format!("voucher_signer = \"{PEER_KEY}\"\nnetwork = \"eip155:31337\""),
+            )
+            .replace(
+                "client_edge_url = \"https://store.example/ilp\"",
+                "client_edge_url = \"https://store.example/ilp\"\nnetwork = \"eip155:31338\"",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::PeeringNetworksDiffer { peer_id, inbound, outbound }
+                    if peer_id == "store" && inbound == "eip155:31337" && outbound == "eip155:31338"
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("store"), "{message}");
+        assert!(message.contains("one network"), "{message}");
     }
 
     /// ADR 0086 decision 8: with one EVM table a `0x` row's network is that

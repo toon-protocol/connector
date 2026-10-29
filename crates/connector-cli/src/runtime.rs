@@ -1276,6 +1276,7 @@ fn wire_config_peerings(
                 row.chain(),
                 row.voucher_signer(),
                 row.inbound_channel(),
+                row.network(),
             )
             .map_err(RuntimeError::ConfigPeering)?;
         tracing::info!(
@@ -1301,6 +1302,7 @@ fn wire_config_peerings(
                 row.outbound_channel(),
                 row.client_edge_url(),
                 std::time::Duration::from_millis(answer_timeout),
+                row.network(),
             )
             .map_err(RuntimeError::ConfigPeering)?;
         tracing::info!(
