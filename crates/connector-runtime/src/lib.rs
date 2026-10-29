@@ -41,7 +41,7 @@ pub use attribution::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER}
 pub use batch_channels::{
     network_of_presentation, receiver_terms, BatchChannelError, BatchChannelView,
     BatchChannelViewStatus, BatchChannels, ChannelDirection, DepositGate, LandedChannel,
-    OutboundChannels, WithdrawStep,
+    OutboundChannels, OutboundRestoreError, WithdrawStep,
 };
 pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};

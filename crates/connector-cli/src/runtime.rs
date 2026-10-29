@@ -25,8 +25,8 @@ use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
     BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector, DeclaredRates,
     FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError, OutboundChannels,
-    PeerRegistrar, PeerRoute, PeerRouteStore, PeerRouteStoreError, PeerTransport,
-    QuotePathUnusable, RatePoller, RateSources, SharedRateTable, SystemClock,
+    OutboundRestoreError, PeerRegistrar, PeerRoute, PeerRouteStore, PeerRouteStoreError,
+    PeerTransport, QuotePathUnusable, RatePoller, RateSources, SharedRateTable, SystemClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
@@ -182,6 +182,22 @@ pub enum RuntimeError {
     /// tables on one chain would be one network settled twice, under one
     /// EIP-712 domain.
     EvmNetworkReportedTwice { tables: Vec<String>, reported: u64 },
+    /// ADR 0086 decision 10: the outbound channel journal holds a channel
+    /// on no network this node has a table for -- a version-1 record no
+    /// table's EIP-712 domain reproduces (`network: None`), or a version-2
+    /// record naming a network whose table was removed. The node still
+    /// holds value in it, so it refuses to start rather than forget it.
+    /// `channel_id` is the journal key, `evm:0x…` or `solana:…`.
+    OutboundChannelOnNoNetwork {
+        channel_id: String,
+        network: Option<Network>,
+    },
+    /// ADR 0086 decision 10: a version-1 outbound record more than one
+    /// table's domain reproduces. Never assigned by guess.
+    OutboundChannelOnSeveralNetworks {
+        channel_id: String,
+        networks: Vec<Network>,
+    },
     /// `[settlement.evm] asset_transfer_method` is `"eip3009"`, and the
     /// token has no ERC-3009: it fails the very probe this node's own
     /// deposits are routed by (`EvmBatchSettlementBackend::deposit_route`,
@@ -318,6 +334,28 @@ impl fmt::Display for RuntimeError {
                      [settlement.eip155.{reported}] if that is the network you meant"
                 )
             }
+            RuntimeError::OutboundChannelOnNoNetwork {
+                channel_id,
+                network,
+            } => write!(
+                f,
+                "{}",
+                OutboundRestoreError::OnNoNetwork {
+                    channel_id: channel_id.clone(),
+                    network: network.clone(),
+                }
+            ),
+            RuntimeError::OutboundChannelOnSeveralNetworks {
+                channel_id,
+                networks,
+            } => write!(
+                f,
+                "{}",
+                OutboundRestoreError::OnSeveralNetworks {
+                    channel_id: channel_id.clone(),
+                    networks: networks.clone(),
+                }
+            ),
             RuntimeError::EvmNetworkReportedTwice { tables, reported } => {
                 let tables: Vec<String> = tables
                     .iter()
@@ -1317,9 +1355,28 @@ async fn restore_outbound_channels(
             PathBuf::from(OUTBOUND_CHANNEL_JOURNAL),
         ),
     };
-    let outbound = OutboundChannels::restore(journal, payers)
-        .await
-        .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?;
+    let outbound =
+        OutboundChannels::restore(journal, payers)
+            .await
+            .map_err(|error| match error {
+                OutboundRestoreError::Journal(source) => {
+                    RuntimeError::JournalUnreplayable { path, source }
+                }
+                OutboundRestoreError::OnNoNetwork {
+                    channel_id,
+                    network,
+                } => RuntimeError::OutboundChannelOnNoNetwork {
+                    channel_id,
+                    network,
+                },
+                OutboundRestoreError::OnSeveralNetworks {
+                    channel_id,
+                    networks,
+                } => RuntimeError::OutboundChannelOnSeveralNetworks {
+                    channel_id,
+                    networks,
+                },
+            })?;
     Ok(Some(Arc::new(outbound)))
 }
 
