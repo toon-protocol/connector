@@ -214,8 +214,24 @@ use serde::Serialize;
 /// of every legacy spelling. A
 /// replaying SDK that omits `network` is sending a claim every connector on
 /// this schema refuses -- which is what this number exists to announce.
-pub const SCHEMA_VERSION: u32 = 11;
+/// **12** (issue #1611 / ADR 0087): **XRPL's claim wire.** `blockchain:
+/// "xrpl"` and `network: "xrpl:<id>"` (`xrpl:0` mainnet, `xrpl:1` testnet,
+/// `xrpl:2` devnet, `xrpl:1000` stand-alone) are new values of fields that
+/// already existed, so an SDK that does not read them has no signal that a
+/// third claim shape rides the header it already parses. A voucher is the
+/// ledger's own `PaymentChannelClaim` authorisation: `"CLM\0" ‖ channelId ‖
+/// drops (u64 BE)`, signed by the channel's `PublicKey` -- secp256k1 as DER
+/// over `SHA512Half`, Ed25519 raw -- and **binds no network**, so the account
+/// is bound to one instead. New: `claim_voucher.xrpl` (one claim per
+/// algorithm, offline `PayChan` id derivation, the claim that binds no
+/// network, the 10^17-drop ceiling refused by name, a voucher with no
+/// `network`), `payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl`
+/// (a challenge with its own domain tag that binds the CAIP-2 network and
+/// is never a claim) and `client_auth_channel_challenge.xrpl`. Nothing
+/// existing changes bytes.
+pub const SCHEMA_VERSION: u32 = 12;
 
+pub mod xrpl;
 pub mod zk_note;
 
 fn seq_bytes<const N: usize>(start: u8) -> [u8; N] {
@@ -1891,6 +1907,8 @@ pub struct PayoutVoucherSolanaCase {
 pub struct PayoutVoucherVectors {
     pub evm: PayoutVoucherEvmCase,
     pub solana: PayoutVoucherSolanaCase,
+    /// Schema 12 (ADR 0087).
+    pub xrpl: xrpl::PayoutVoucherXrplCase,
 }
 
 /// Restore a payout entry's envelope and parse it as a client would its own
@@ -2006,7 +2024,11 @@ fn generate_payout_voucher_vectors() -> PayoutVoucherVectors {
         json: solana_json,
     };
 
-    PayoutVoucherVectors { evm, solana }
+    PayoutVoucherVectors {
+        evm,
+        solana,
+        xrpl: xrpl::generate_payout_voucher_xrpl_case(),
+    }
 }
 
 /// What a route charges for one packet, as a function of that packet's
@@ -2721,6 +2743,11 @@ pub struct ClaimVoucherVectors {
     /// EVM network. See [`generate_voucher_evm_second_network_case`].
     pub evm_second_network: VoucherEvmCase,
     pub solana: VoucherSolanaCase,
+    /// Schema 12 (ADR 0087): XRPL's claim wire. See [`xrpl`].
+    pub xrpl: xrpl::ClaimVoucherXrplVectors,
+    /// Schema 12 (ADR 0087): an XRPL amount above the drop ceiling, refused
+    /// by name and never truncated. See [`xrpl::above_ceiling_case`].
+    pub xrpl_above_ceiling: xrpl::XrplAboveCeilingCase,
     pub amount_only_watermark: Vec<VoucherWatermarkCase>,
     pub invalid: Vec<VoucherInvalidClaimCase>,
 }
@@ -2730,6 +2757,8 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
     let evm_above_u64_max = generate_voucher_evm_above_u64_max_case();
     let evm_second_network = generate_voucher_evm_second_network_case(&evm);
     let solana = generate_voucher_solana_case();
+    let xrpl = xrpl::generate_claim_voucher_xrpl_vectors();
+    let xrpl_above_ceiling = xrpl::above_ceiling_case(&xrpl.secp256k1);
     let amount_only_watermark = generate_voucher_watermark_cases();
     let mut invalid = generate_voucher_invalid_cases(&solana);
     invalid.extend(generate_voucher_network_missing_cases(&evm, &solana));
@@ -2739,6 +2768,8 @@ fn generate_claim_voucher_vectors() -> ClaimVoucherVectors {
         evm_above_u64_max,
         evm_second_network,
         solana,
+        xrpl,
+        xrpl_above_ceiling,
         amount_only_watermark,
         invalid,
     }
@@ -2949,6 +2980,8 @@ fn judge_claim_network(node: &[Network], claim_json: &str) -> (&'static str, Opt
             ("accepted", Some(hex_of(&recomputed)))
         }
         ClientClaim::SolanaVoucher(_) => ("accepted", None),
+        // The claim binds no network, so the verdict is the node's table alone.
+        ClientClaim::XrplVoucher(_) => ("accepted", None),
     }
 }
 
@@ -3220,6 +3253,8 @@ pub struct VoucherClaimStateSolanaCase {
 pub struct VoucherClaimStateChallengeVectors {
     pub evm: Vec<VoucherClaimStateEvmCase>,
     pub solana: Vec<VoucherClaimStateSolanaCase>,
+    /// Schema 12 (ADR 0087 decision 3).
+    pub xrpl: Vec<xrpl::VoucherClaimStateXrplCase>,
 }
 
 /// 2100-01-01T00:00:00Z: far enough ahead to be valid against any clock.
@@ -3381,7 +3416,11 @@ fn generate_voucher_claim_state_challenge_vectors() -> VoucherClaimStateChalleng
         ),
     ];
 
-    VoucherClaimStateChallengeVectors { evm, solana }
+    VoucherClaimStateChallengeVectors {
+        evm,
+        solana,
+        xrpl: xrpl::generate_voucher_claim_state_xrpl_cases(),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3445,6 +3484,9 @@ pub struct ClientAuthChannelChallengeVectors {
     pub max_lifetime_secs: u64,
     pub evm: Vec<ClientAuthChannelChallengeCase>,
     pub solana: Vec<ClientAuthChannelChallengeCase>,
+    /// Schema 12 (ADR 0087 decision 3): the same shape as the claim-state
+    /// challenge, which the client edge reads through the peer-role reader.
+    pub xrpl: Vec<ClientAuthChannelChallengeCase>,
 }
 
 fn client_auth_channel_challenge_frame(request_id: u32, auth_entry: &serde_json::Value) -> Vec<u8> {
@@ -3638,6 +3680,7 @@ fn generate_client_auth_channel_challenge_vectors() -> ClientAuthChannelChalleng
         max_lifetime_secs: role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS,
         evm,
         solana,
+        xrpl: xrpl::generate_client_auth_xrpl_cases(),
     }
 }
 

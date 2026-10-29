@@ -151,9 +151,9 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
                     authorized_signer,
                     max_cumulative: max_cumulative_solana(&state),
                 }),
-                // A Solana backend reporting an EVM signer is not a channel
-                // this gate can verify a voucher against.
-                VoucherSigner::Evm(_) => None,
+                // A Solana backend reporting another chain's signer is not a
+                // channel this gate can verify a voucher against.
+                VoucherSigner::Evm(_) | VoucherSigner::Xrpl(_) => None,
             }),
         )
     }

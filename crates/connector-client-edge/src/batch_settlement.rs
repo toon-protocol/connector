@@ -125,6 +125,8 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
             Network::Solana(_) => self.solana_network().as_ref() == Some(network),
             // No settlement table holds MINA: a zk edge's vault is not one.
             Network::Mina(_) => false,
+            // Nor XRP, until the XRPL backend lands (ADR 0087, #1596).
+            Network::Xrpl(_) => false,
         }
     }
 

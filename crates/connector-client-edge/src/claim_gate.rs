@@ -1132,6 +1132,9 @@ impl ClientClaimGate {
         let accepted_here = match &claim {
             ClientClaim::EvmVoucher(_) => backend.accepts_evm(),
             ClientClaim::SolanaVoucher(_) => backend.accepts_solana(),
+            // No XRPL table is read until its backend lands (ADR 0087, #1596):
+            // the claim parses and verifies off-line, but settles nowhere.
+            ClientClaim::XrplVoucher(_) => false,
         };
         if !accepted_here {
             return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
@@ -1741,6 +1744,8 @@ fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, Cla
                     "a Solana voucher's 'signature' must be base58 of 64 bytes".to_string(),
                 )
             }),
+        // Refused before this point: no settlement backend accepts XRPL yet.
+        ClientClaim::XrplVoucher(_) => Err(ClaimIngestRejection::BatchSettlementNotAccepted),
     }
 }
 

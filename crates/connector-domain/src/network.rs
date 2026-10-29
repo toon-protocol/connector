@@ -46,6 +46,9 @@ pub const SOLANA_NETWORK_NAMESPACE: &str = "solana";
 /// The CAIP-2 namespace a zk-note vault's Mina network is named in.
 pub const MINA_NETWORK_NAMESPACE: &str = "mina";
 
+/// The CAIP-2 namespace an XRPL network is named in (ADR 0087 decision 5).
+pub const XRPL_NETWORK_NAMESPACE: &str = "xrpl";
+
 /// How many base58 characters of the genesis hash CAIP-2 keeps for Solana.
 pub const SOLANA_GENESIS_PREFIX_LEN: usize = 32;
 
@@ -62,6 +65,65 @@ pub enum Network {
     Solana(SolanaGenesisPrefix),
     /// The Mina network a zk-note vault lives on.
     Mina(MinaNetwork),
+    /// An XRPL network, by `server_info.network_id` (ADR 0087 decision 5).
+    Xrpl(XrplNetwork),
+}
+
+/// The XRPL networks a node may name (ADR 0087 decision 5): the table of
+/// `server_info.network_id`s, each with an empty binding. A reference with no
+/// row is refused by name, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum XrplNetwork {
+    /// `xrpl:0`: mainnet.
+    Mainnet,
+    /// `xrpl:1`: testnet.
+    Testnet,
+    /// `xrpl:2`: devnet.
+    Devnet,
+    /// `xrpl:1000`: stand-alone, the test harness and `local/`, testnet-class.
+    /// At most 1024, so a transaction on it carries no `NetworkID` field.
+    Standalone,
+}
+
+impl XrplNetwork {
+    /// `server_info.network_id`.
+    pub const fn network_id(self) -> u32 {
+        match self {
+            XrplNetwork::Mainnet => 0,
+            XrplNetwork::Testnet => 1,
+            XrplNetwork::Devnet => 2,
+            XrplNetwork::Standalone => 1000,
+        }
+    }
+
+    /// The CAIP-2 network id: `xrpl:<id>`.
+    pub const fn caip2(self) -> &'static str {
+        match self {
+            XrplNetwork::Mainnet => "xrpl:0",
+            XrplNetwork::Testnet => "xrpl:1",
+            XrplNetwork::Devnet => "xrpl:2",
+            XrplNetwork::Standalone => "xrpl:1000",
+        }
+    }
+
+    /// Whether this is a network whose coin has value.
+    pub const fn is_mainnet(self) -> bool {
+        matches!(self, XrplNetwork::Mainnet)
+    }
+}
+
+impl FromStr for XrplNetwork {
+    type Err = NetworkError;
+
+    fn from_str(s: &str) -> Result<Self, NetworkError> {
+        match s {
+            "0" => Ok(XrplNetwork::Mainnet),
+            "1" => Ok(XrplNetwork::Testnet),
+            "2" => Ok(XrplNetwork::Devnet),
+            "1000" => Ok(XrplNetwork::Standalone),
+            other => Err(NetworkError::InvalidXrplNetwork(other.to_string())),
+        }
+    }
 }
 
 /// The two Mina networks a zk-note vault may live on, as CAIP-2 names them.
@@ -137,6 +199,7 @@ impl Network {
             Network::Eip155(_) => AssetChain::Evm,
             Network::Solana(_) => AssetChain::Solana,
             Network::Mina(_) => AssetChain::Mina,
+            Network::Xrpl(_) => AssetChain::Xrpl,
         }
     }
 
@@ -144,7 +207,7 @@ impl Network {
     pub const fn eip155_chain_id(&self) -> Option<u64> {
         match self {
             Network::Eip155(chain_id) => Some(*chain_id),
-            Network::Solana(_) | Network::Mina(_) => None,
+            Network::Solana(_) | Network::Mina(_) | Network::Xrpl(_) => None,
         }
     }
 
@@ -170,6 +233,7 @@ impl fmt::Display for Network {
             Network::Eip155(chain_id) => write!(f, "{EIP155_NAMESPACE}:{chain_id}"),
             Network::Solana(prefix) => write!(f, "{SOLANA_NETWORK_NAMESPACE}:{}", prefix.0),
             Network::Mina(network) => f.write_str(network.caip2()),
+            Network::Xrpl(network) => f.write_str(network.caip2()),
         }
     }
 }
@@ -185,6 +249,7 @@ impl FromStr for Network {
             EIP155_NAMESPACE => Ok(Network::Eip155(Network::parse_eip155_chain_id(reference)?)),
             SOLANA_NETWORK_NAMESPACE => Ok(Network::Solana(reference.parse()?)),
             MINA_NETWORK_NAMESPACE => Ok(Network::Mina(reference.parse()?)),
+            XRPL_NETWORK_NAMESPACE => Ok(Network::Xrpl(reference.parse()?)),
             other => Err(NetworkError::UnknownNamespace {
                 namespace: other.to_string(),
                 value: s.to_string(),
@@ -240,6 +305,12 @@ pub enum NetworkError {
          mina:devnet (ADR 0080)"
     )]
     InvalidMinaNetwork(String),
+    /// An `xrpl` reference with no row in ADR 0087's table.
+    #[error(
+        "'{0}' is not an XRPL network this connector names: write xrpl:0 (mainnet), xrpl:1 \
+         (testnet), xrpl:2 (devnet) or xrpl:1000 (stand-alone) (ADR 0087)"
+    )]
+    InvalidXrplNetwork(String),
 }
 
 #[cfg(test)]
@@ -267,6 +338,38 @@ mod tests {
         assert_eq!(Network::Eip155(1).chain(), AssetChain::Evm);
         assert_eq!(Network::Eip155(42161).eip155_chain_id(), Some(42161));
         assert_eq!(solana.eip155_chain_id(), None);
+    }
+
+    #[test]
+    fn the_xrpl_networks_are_the_four_rows_of_adr_0087() {
+        for (text, network, id) in [
+            ("xrpl:0", XrplNetwork::Mainnet, 0),
+            ("xrpl:1", XrplNetwork::Testnet, 1),
+            ("xrpl:2", XrplNetwork::Devnet, 2),
+            ("xrpl:1000", XrplNetwork::Standalone, 1000),
+        ] {
+            let parsed: Network = text.parse().unwrap();
+            assert_eq!(parsed, Network::Xrpl(network));
+            assert_eq!(parsed.to_string(), text);
+            assert_eq!(network.network_id(), id);
+            assert_eq!(parsed.chain(), AssetChain::Xrpl);
+        }
+        for bad in [
+            "xrpl:",
+            "xrpl:3",
+            "xrpl:00",
+            "xrpl:01",
+            "xrpl:1001",
+            "xrpl:main",
+        ] {
+            assert!(
+                matches!(
+                    bad.parse::<Network>(),
+                    Err(NetworkError::InvalidXrplNetwork(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -352,6 +455,13 @@ mod tests {
             .prop_map(|prefix| Network::Solana(prefix.parse().unwrap())),
             prop::sample::select(vec![MinaNetwork::Mainnet, MinaNetwork::Devnet])
                 .prop_map(Network::Mina),
+            prop::sample::select(vec![
+                XrplNetwork::Mainnet,
+                XrplNetwork::Testnet,
+                XrplNetwork::Devnet,
+                XrplNetwork::Standalone,
+            ])
+            .prop_map(Network::Xrpl),
         ]
     }
 

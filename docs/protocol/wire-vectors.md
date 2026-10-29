@@ -1,7 +1,21 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
-**`schema_version` 11** (issue #1599, [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
+**`schema_version` 12** (issue #1611, [ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)
+decisions 2 and 3): **XRPL's claim wire.** `blockchain: "xrpl"` and `network: "xrpl:<id>"` are new
+values of fields that already existed. A voucher is the ledger's own `PaymentChannelClaim`
+authorisation, `"CLM\0" ‖ channelId[32] ‖ drops (u64 BE)`, signed by the channel's 33-byte
+`PublicKey` — secp256k1 as DER over `SHA512Half(message)`, Ed25519 (`0xED`-prefixed) over the raw
+message — and it **binds no network**, so the _account_ is bound to one. The ceiling is 10¹⁷ drops,
+refused by name (`AmountExceedsChain`) and never truncated. New: `claim_voucher.xrpl` (a claim per
+algorithm; `channel_id`, the offline `SHA512Half(0x0078 ‖ source ‖ destination ‖ sequence)`
+derivation; `claim_binds_no_network`; an `invalid` voucher with no `network`),
+`claim_voucher.xrpl_above_ceiling`,
+`payout_voucher.xrpl`, `voucher_claim_state_challenge.xrpl` (a challenge under its own domain tag
+that binds the CAIP-2 network, and is never a claim) and `client_auth_channel_challenge.xrpl`.
+Nothing existing changed bytes. The keys are published development family seeds; the channel ids,
+the Ed25519 claim bytes and every signature were checked against xrpl.js 4 when the vectors were
+written. Before that, **`schema_version` 11** (issue #1599, [ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md)
 decision 1): **every claim names its network.** Every voucher — client, peer and payout — every
 claim-state entry, every peer-role challenge and every `claim-ack` carries a required CAIP-2
 `network` (`eip155:<chainId>`, `solana:<genesis prefix>`); `blockchain` stays and still picks the

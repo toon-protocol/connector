@@ -378,11 +378,13 @@ pub async fn decide_frame(
 
 /// The channel a voucher names, in the spelling a `[[peer_channels]]`
 /// row's `inbound_channel` is canonicalized to: an EVM channel id as
-/// lower-case `0x` hex, a Solana channel account in base58 as written.
+/// lower-case `0x` hex, a Solana channel account in base58 as written, an
+/// XRPL channel id as lower-case hex.
 fn voucher_channel(voucher: &ClientClaim) -> String {
     match voucher {
         ClientClaim::EvmVoucher(voucher) => voucher.channel_id.to_ascii_lowercase(),
         ClientClaim::SolanaVoucher(voucher) => voucher.channel_id.clone(),
+        ClientClaim::XrplVoucher(voucher) => voucher.channel_id.to_ascii_lowercase(),
     }
 }
 

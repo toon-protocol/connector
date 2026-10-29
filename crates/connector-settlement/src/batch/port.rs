@@ -64,6 +64,10 @@ pub enum VoucherSigner {
     Evm([u8; 20]),
     /// The channel's `authorized_signer`, an Ed25519 public key.
     Solana([u8; 32]),
+    /// The channel's `PublicKey` (ADR 0087 decision 2), 33 bytes: secp256k1
+    /// compressed, or Ed25519 prefixed `0xED` -- the prefix byte picks the
+    /// algorithm. Spelled in config as the key in hex.
+    Xrpl([u8; 33]),
 }
 
 /// What [`BatchSettlementBackend::land`] reports: the channel as re-read

@@ -250,6 +250,8 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
+            // `settles_on` refused it above: no XRPL table is read yet.
+            ClientClaim::XrplVoucher(_) => VoucherCheck::Unresolved,
         }
     }
 
@@ -321,6 +323,8 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
+            // `settles_on` refused it above: no XRPL table is read yet.
+            PeerRoleChallenge::Xrpl { .. } => VoucherCheck::Unresolved,
         }
     }
 }
