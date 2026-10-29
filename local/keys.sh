@@ -959,7 +959,8 @@ doc = json.loads(sys.argv[1])
 network, counterparty = sys.argv[2], sys.argv[3]
 mine = [t for t in doc.get("batchSettlements", []) if t.get("network") == network]
 if len(mine) != 1:
-    sys.exit(f"{len(mine)} batchSettlements entries on {network}: {doc.get(\"batchSettlements\")}")
+    sys.exit("%d batchSettlements entries on %s: %s"
+             % (len(mine), network, doc.get("batchSettlements")))
 terms = mine[0]
 terms["payTo"] = counterparty
 terms["receiverAuthorizer"] = counterparty
