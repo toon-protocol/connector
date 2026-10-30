@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use connector_chain_rpc::{FakeRpc, RpcReply};
 use connector_settlement::batch::contract::{
-    assert_upholds_the_paying_contract, PayingContractFixture,
+    assert_refuses_terms_in_another_token, assert_upholds_the_paying_contract,
+    PayingContractFixture,
 };
 use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer,
@@ -155,7 +156,7 @@ fn hex32(text: &str) -> [u8; 32] {
 async fn upholds_the_paying_contract(token: Token) {
     let peering = Arc::new(Peering::spawn(token).await);
     let not_outbound = peering.clients_channel().await;
-    assert_upholds_the_paying_contract(|| async {
+    let fixture = {
         PayingContractFixture {
             payer: Arc::clone(&peering.payer) as Arc<dyn BatchSettlementPayer>,
             receiver: Arc::clone(&peering.receiver) as Arc<dyn BatchSettlementBackend>,
@@ -190,8 +191,9 @@ async fn upholds_the_paying_contract(token: Token) {
                 })
             },
         }
-    })
-    .await;
+    };
+    assert_refuses_terms_in_another_token(&fixture).await;
+    assert_upholds_the_paying_contract(|| async move { fixture }).await;
 }
 
 #[tokio::test]

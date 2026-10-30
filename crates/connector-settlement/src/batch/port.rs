@@ -344,23 +344,26 @@ pub enum OutboundChannelRecord {
         /// valid. Past it, an `open` the chain does not hold never will.
         last_valid_block_height: u64,
     },
-    /// XRPL: the `PaymentChannelCreate` this node built and signed as the
-    /// channel's source, byte for byte (ADR 0087 decision 9). The channel id
-    /// derives from the source, the destination and this transaction's
-    /// sequence, so the same bytes can never make a second channel: a
-    /// sequence is used once.
+    /// XRPL: the `PaymentChannelCreate` this node signed as source, byte
+    /// for byte, at a fixed `Sequence` and `LastLedgerSequence` (ADR 0087
+    /// decision 9). The channel's id derives from the source, the
+    /// destination and that `Sequence`, so it is known before anything is
+    /// sent; posting the same blob again can never make a second channel,
+    /// because a `Sequence` is consumed once.
     Xrpl {
         channel: ChannelId,
-        /// The counterparty's classic `r…` address: the channel's
-        /// `Destination`.
-        receiver: String,
-        /// The channel's funded drops.
+        /// The counterparty's account id: the channel's `Destination`.
+        receiver: [u8; 20],
+        /// The channel's `SettleDelay`, in seconds.
+        settle_delay_secs: u64,
         deposit: u128,
-        /// The signed `PaymentChannelCreate`, as wire bytes.
-        transaction: Vec<u8>,
-        /// The transaction's `LastLedgerSequence`. Past it, a create the
-        /// ledger does not hold never will be (ADR 0087 decision 9).
+        /// The `Sequence` the blob is signed at.
+        sequence: u32,
+        /// The last ledger the blob may be included in. Past it, an open the
+        /// ledger does not hold never will be.
         last_ledger_sequence: u32,
+        /// The signed `PaymentChannelCreate`, as the ledger's binary form.
+        transaction: Vec<u8>,
     },
 }
 
@@ -399,7 +402,7 @@ impl OutboundChannelRecord {
         match self {
             OutboundChannelRecord::Evm { config, .. } => config.receiver.to_vec(),
             OutboundChannelRecord::Solana { receiver, .. } => receiver.to_vec(),
-            OutboundChannelRecord::Xrpl { receiver, .. } => receiver.as_bytes().to_vec(),
+            OutboundChannelRecord::Xrpl { receiver, .. } => receiver.to_vec(),
         }
     }
 
@@ -485,14 +488,18 @@ impl OutboundChannelRecord {
             OutboundChannelRecord::Xrpl {
                 channel,
                 receiver,
+                settle_delay_secs,
                 deposit,
-                transaction,
+                sequence,
                 last_ledger_sequence,
+                transaction,
             } => {
                 out.push(RECORD_XRPL);
                 put_str(out, &channel.0);
-                put_str(out, receiver);
+                out.extend_from_slice(receiver);
+                out.extend_from_slice(&settle_delay_secs.to_be_bytes());
                 out.extend_from_slice(&deposit.to_be_bytes());
+                out.extend_from_slice(&sequence.to_be_bytes());
                 out.extend_from_slice(&last_ledger_sequence.to_be_bytes());
                 out.extend_from_slice(&(transaction.len() as u32).to_be_bytes());
                 out.extend_from_slice(transaction);
@@ -555,17 +562,21 @@ impl OutboundChannelRecord {
             }
             RECORD_XRPL => {
                 let channel = ChannelId(reader.string()?);
-                let receiver = reader.string()?;
+                let receiver = reader.array()?;
+                let settle_delay_secs = u64::from_be_bytes(reader.array()?);
                 let deposit = u128::from_be_bytes(reader.array()?);
+                let sequence = u32::from_be_bytes(reader.array()?);
                 let last_ledger_sequence = u32::from_be_bytes(reader.array()?);
                 let len = u32::from_be_bytes(reader.array()?) as usize;
                 let transaction = reader.take(len)?.to_vec();
                 OutboundChannelRecord::Xrpl {
                     channel,
                     receiver,
+                    settle_delay_secs,
                     deposit,
-                    transaction,
+                    sequence,
                     last_ledger_sequence,
+                    transaction,
                 }
             }
             _ => return None,
@@ -583,7 +594,7 @@ impl OutboundChannelRecord {
 /// assigns by proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournaledRecord {
-    /// `eip155:<chainId>`, `solana:<genesis prefix>` or `xrpl:<id>`; `None` for a
+    /// `eip155:<chainId>` or `solana:<genesis prefix>`; `None` for a
     /// record written before ADR 0086.
     pub network: Option<String>,
     pub record: OutboundChannelRecord,
@@ -760,6 +771,22 @@ pub enum BatchSettlementError {
     /// Solana: the channel is sealed, and nothing more can land on it.
     #[error("batch-settlement channel '{0}' is sealed")]
     ChannelSealed(ChannelId),
+
+    /// An open or a top-up the settlement account cannot afford on XRPL:
+    /// the deposit, the owner reserve the new channel locks (read live; 0
+    /// for a top-up) and the fee, against what the account holds above its
+    /// own reserve. `shortfall` is how many drops short it is. Refused
+    /// before anything is signed, never left to the ledger's `tecUNFUNDED`
+    /// (ADR 0087 decision 6).
+    #[error(
+        "the settlement account is {shortfall} drops short: {required} drops needed (deposit, \
+         reserve and fee) against {spendable} spendable"
+    )]
+    Underfunded {
+        required: u128,
+        spendable: u128,
+        shortfall: u128,
+    },
 
     /// A voucher above the most the chain can name, never truncated: `max` is
     /// the chain's real ceiling, not its integer type's (XRPL: 10¹⁷ drops,
@@ -1184,13 +1211,13 @@ mod tests {
 
     fn xrpl_record() -> OutboundChannelRecord {
         OutboundChannelRecord::Xrpl {
-            channel: ChannelId(
-                "5db01b7ffed6b67e6b0414ded11e051d2ee2b7619ce0eaa6286d67a3a4d5bdb3".to_string(),
-            ),
-            receiver: "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string(),
-            deposit: 25_000_000,
-            transaction: vec![7; 211],
-            last_ledger_sequence: 4_000_021,
+            channel: ChannelId("ab".repeat(32)),
+            receiver: [7; 20],
+            settle_delay_secs: 120,
+            deposit: 2_500,
+            sequence: 31,
+            last_ledger_sequence: 4_000_000,
+            transaction: vec![8; 211],
         }
     }
 
@@ -1203,7 +1230,7 @@ mod tests {
         for (record, network) in [
             (evm_record(), "eip155:8453"),
             (solana_record(), "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
-            (xrpl_record(), "xrpl:1000"),
+            (xrpl_record(), "xrpl:0"),
         ] {
             let bytes = record.encode_on(network);
             assert_eq!(bytes[0], 2, "written as version 2");
@@ -1221,7 +1248,7 @@ mod tests {
     /// whole, as unassigned, for restore to prove its network.
     #[test]
     fn a_version_1_record_decodes_unassigned() {
-        for record in [evm_record(), solana_record()] {
+        for record in [evm_record(), solana_record(), xrpl_record()] {
             let bytes = record.encode_version_1();
             assert_eq!(bytes[0], 1);
             assert_eq!(

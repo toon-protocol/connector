@@ -6,9 +6,14 @@
 //! - `test_support::Xrpld`: a disposable stand-alone `xrpld` in a container,
 //!   the repository's first container-backed tier-3 chain (ADR 0084).
 //!
-//! The paying half and the watcher are later tickets of the spec.
+//! - The same type is the paying half (`BatchSettlementPayer`): this node
+//!   opens, funds and exits its own channels, at most once per open (issue
+//!   #1613).
+//!
+//! The watcher is a later ticket of the spec.
 
 mod batch;
+mod pay;
 mod tx;
 
 pub use batch::XrplBatchSettlement;

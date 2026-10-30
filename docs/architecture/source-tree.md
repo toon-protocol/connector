@@ -133,8 +133,13 @@ connector-settlement-xrpl        XRPL settlement (spec #1596, ADR 0087)
   │                               `PaymentChannelClaim`, judged from its metadata. A node
   │                               binds one per `[settlement.xrpl.<id>]` table at boot
   │                               (`connector-cli`'s `build_xrpl_batch_settlement`, #1614)
-  ├─ tx.rs                       that one transaction in canonical binary, signed with
-  │                               the settlement key
+  ├─ pay.rs                      the paying half: opens at most once (a signed
+  │                               `PaymentChannelCreate` journaled and resubmitted), funds,
+  │                               exits with `tfClose`, one sequence allocator per account,
+  │                               a named shortfall before any spend
+  ├─ tx.rs                       the transactions this node signs, in canonical binary,
+  │                               with the settlement key: a destination's claim, a
+  │                               source's create, fund and close
   └─ test_support.rs             `Xrpld`, a stand-alone `xrpld` in a container, pinned by
                                   digest, one per test (ADR 0084)
 connector-settlement-solana      real Solana backend, speaking solana-foundation's
