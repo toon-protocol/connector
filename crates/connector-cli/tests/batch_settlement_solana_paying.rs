@@ -30,7 +30,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use connector_settlement::batch::contract::{
-    assert_upholds_the_paying_contract, PayingContractFixture,
+    assert_refuses_terms_in_another_token, assert_upholds_the_paying_contract,
+    PayingContractFixture,
 };
 use connector_settlement::batch::{
     BatchChannelStatus, BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer,
@@ -280,6 +281,7 @@ async fn solana_batch_settlement_upholds_the_paying_contract() {
             })
         },
     };
+    assert_refuses_terms_in_another_token(&fixture).await;
     assert_upholds_the_paying_contract(|| async move { fixture }).await;
 }
 

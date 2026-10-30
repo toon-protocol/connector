@@ -1,5 +1,5 @@
 //! The receiving half of the batch-settlement port over the ledger's own
-//! `PayChannel` (ADR 0087, issue #1612).
+//! `PayChannel` (ADR 0087, issue #1612); the paying half is [`crate::pay`].
 //!
 //! **Nothing is deployed and nothing is held.** A channel is a ledger entry
 //! its id names; every answer here is read from a *validated* ledger, and
@@ -18,7 +18,7 @@
 //! answers `tesSUCCESS` and delivers nothing, so [`delivered`] reads the
 //! channel's `Balance` out of the transaction's own metadata.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -36,11 +36,18 @@ use serde_json::Value;
 use crate::tx::LandClaim;
 
 /// The chain this backend answers for, in the port's spelling.
-const CHAIN: &str = "xrpl";
+pub(crate) const CHAIN: &str = "xrpl";
 
 /// How many ledgers past the open one a landing may still be included in:
 /// `LastLedgerSequence`, which bounds every wait (ADR 0087 decision 9).
-const LAST_LEDGER_WINDOW: u32 = 20;
+pub(crate) const LAST_LEDGER_WINDOW: u32 = 20;
+
+/// How many ledgers a prepared open may wait to be sent: longer than a
+/// landing's, since the caller journals between preparing and sending.
+const OPEN_LAST_LEDGER_WINDOW: u32 = 100;
+
+/// The most a transaction's fee may be unless the table says otherwise.
+const DEFAULT_MAX_FEE_DROPS: u64 = 1_000;
 
 /// The receiving half of the settlement port on one XRPL network.
 ///
@@ -50,16 +57,30 @@ const LAST_LEDGER_WINDOW: u32 = 20;
 /// voucher. The account is never the account of another network (ADR 0087
 /// decision 4: a claim binds no network).
 pub struct XrplBatchSettlement {
-    rpc: XrplRpc,
-    signer: XrplSigner,
-    address: String,
-    network_id: u32,
+    pub(crate) rpc: XrplRpc,
+    pub(crate) signer: XrplSigner,
+    pub(crate) address: String,
+    pub(crate) network_id: u32,
     min_settle_delay_secs: u64,
-    wait: TxWait,
+    pub(crate) wait: TxWait,
     admitted: Mutex<HashSet<String>>,
-    // A landing signs with the account's next sequence number, and waits for
-    // the transaction to validate: one at a time, so none races another's.
-    landing: tokio::sync::Mutex<()>,
+    // The one sequence allocator of this node's account. A transaction signs
+    // with the account's next `Sequence` and waits for the ledger to
+    // validate it, and **every** transaction this node sends from the
+    // account -- an open, a top-up, a landing, a close -- does so under this
+    // lock, one at a time, so none races another's (the counterpart of EVM
+    // nonce handling).
+    pub(crate) sequencer: tokio::sync::Mutex<()>,
+    // The `Sequence`s of opens prepared and not yet sent (ADR 0075 decision
+    // 8 journals a prepared open before it is sent). Other transactions wait
+    // for one rather than take it, since taking it would lapse the open.
+    pub(crate) reserved: Mutex<BTreeSet<u32>>,
+    // The channels this node opened as payer.
+    pub(crate) outbound: Mutex<HashMap<String, crate::pay::Outbound>>,
+    // The most a transaction's fee may be, in drops, before it is refused.
+    pub(crate) max_fee_drops: u64,
+    // How many ledgers past the current one a prepared open may still land.
+    pub(crate) open_window: u32,
 }
 
 impl XrplBatchSettlement {
@@ -115,8 +136,30 @@ impl XrplBatchSettlement {
                 give_up_after: Duration::from_secs(60),
             },
             admitted: Mutex::new(HashSet::new()),
-            landing: tokio::sync::Mutex::new(()),
+            sequencer: tokio::sync::Mutex::new(()),
+            reserved: Mutex::new(BTreeSet::new()),
+            outbound: Mutex::new(HashMap::new()),
+            max_fee_drops: DEFAULT_MAX_FEE_DROPS,
+            open_window: OPEN_LAST_LEDGER_WINDOW,
         })
+    }
+
+    /// The most a transaction's fee may be, in drops. A ledger whose open
+    /// ledger fee has escalated past it refuses the send, naming the fee,
+    /// rather than spending it. The default is 1,000 drops.
+    #[must_use]
+    pub fn with_max_fee_drops(mut self, max_fee_drops: u64) -> XrplBatchSettlement {
+        self.max_fee_drops = max_fee_drops;
+        self
+    }
+
+    /// How many ledgers past the current one a prepared open may still be
+    /// included in (`LastLedgerSequence`). The default is 100: about six
+    /// minutes on a network.
+    #[must_use]
+    pub fn with_open_window(mut self, ledgers: u32) -> XrplBatchSettlement {
+        self.open_window = ledgers;
+        self
     }
 
     /// How a landing paces its wait for validation. The default polls every
@@ -139,7 +182,9 @@ impl XrplBatchSettlement {
 
     /// The channel `presentation` names, as the port keeps it, and its
     /// ledger index. A string that is not 64 hex characters names nothing.
-    fn parse(channel: &ChannelId) -> Result<(ChannelId, [u8; 32]), BatchSettlementError> {
+    pub(crate) fn parse(
+        channel: &ChannelId,
+    ) -> Result<(ChannelId, [u8; 32]), BatchSettlementError> {
         let bytes = hex::decode(&channel.0)
             .ok()
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
@@ -164,7 +209,7 @@ impl XrplBatchSettlement {
 
     /// The channel from the validated ledger, or `ChannelNotFound`: absent,
     /// or an entry of another type.
-    async fn read(&self, id: &ChannelId) -> Result<Channel, BatchSettlementError> {
+    pub(crate) async fn read(&self, id: &ChannelId) -> Result<Channel, BatchSettlementError> {
         let node = self
             .rpc
             .ledger_entry(&id.0)
@@ -174,7 +219,7 @@ impl XrplBatchSettlement {
         Channel::from_entry(&node).ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))
     }
 
-    fn state_of(
+    pub(crate) fn state_of(
         id: &ChannelId,
         channel: &Channel,
     ) -> Result<BatchChannelState, BatchSettlementError> {
@@ -314,7 +359,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
         };
         // Held from the read to the landing's fate, so a second land judges
         // staleness against the first one's outcome, not the ledger before it.
-        let landing = self.landing.lock().await;
+        let landing = self.sequence_turn().await;
         let read = self.read(&id).await?;
         let landed = u128::from(read.balance);
         if amount <= landed {
@@ -417,17 +462,19 @@ impl BatchSettlementBackend for XrplBatchSettlement {
 }
 
 /// A `PayChannel` ledger entry, as far as admission and landing read it.
-struct Channel {
-    destination: String,
+pub(crate) struct Channel {
+    /// The source: the account that opened the channel.
+    pub(crate) account: String,
+    pub(crate) destination: String,
     /// Drops funded.
-    amount: u64,
+    pub(crate) amount: u64,
     /// Drops delivered.
-    balance: u64,
+    pub(crate) balance: u64,
     settle_delay: u64,
-    expiration: Option<u64>,
+    pub(crate) expiration: Option<u64>,
     cancel_after: Option<u64>,
     /// `None` when the entry's `PublicKey` is not 33 bytes of hex.
-    key: Option<[u8; 33]>,
+    pub(crate) key: Option<[u8; 33]>,
 }
 
 impl Channel {
@@ -439,6 +486,7 @@ impl Channel {
         }
         let drops = |name: &str| node[name].as_str()?.parse::<u64>().ok();
         Some(Channel {
+            account: node["Account"].as_str()?.to_string(),
             destination: node["Destination"].as_str()?.to_string(),
             amount: drops("Amount")?,
             balance: drops("Balance")?,
@@ -472,7 +520,7 @@ pub(crate) fn delivered(meta: &Value, channel_hex: &str, drops: u64) -> bool {
     })
 }
 
-fn rpc_error(error: XrplRpcError) -> BatchSettlementError {
+pub(crate) fn rpc_error(error: XrplRpcError) -> BatchSettlementError {
     match error.refusal() {
         Some(refused) => BatchSettlementError::Refused {
             endpoint: refused.endpoint,
@@ -492,6 +540,7 @@ mod tests {
     fn entry(extra: Value) -> Value {
         let mut node = json!({
             "LedgerEntryType": "PayChannel",
+            "Account": "rSource",
             "Destination": "rDest",
             "Amount": "1000",
             "Balance": "0",
@@ -570,7 +619,11 @@ mod tests {
                 give_up_after: Duration::from_secs(1),
             },
             admitted: Mutex::new(HashSet::new()),
-            landing: tokio::sync::Mutex::new(()),
+            sequencer: tokio::sync::Mutex::new(()),
+            reserved: Mutex::new(BTreeSet::new()),
+            outbound: Mutex::new(HashMap::new()),
+            max_fee_drops: DEFAULT_MAX_FEE_DROPS,
+            open_window: OPEN_LAST_LEDGER_WINDOW,
         }
     }
 
@@ -590,6 +643,7 @@ mod tests {
     fn every_admission_rule_refuses_by_name() {
         let backend = offline("rNode");
         let admissible = Channel {
+            account: "rSource".to_string(),
             destination: "rNode".to_string(),
             amount: 1_000,
             balance: 0,
@@ -602,6 +656,7 @@ mod tests {
 
         let broken = |change: fn(&mut Channel)| {
             let mut channel = Channel {
+                account: admissible.account.clone(),
                 destination: admissible.destination.clone(),
                 ..admissible
             };

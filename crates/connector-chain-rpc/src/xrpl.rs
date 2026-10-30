@@ -121,6 +121,15 @@ pub struct AccountInfo {
     pub owner_count: u32,
 }
 
+/// The reserves the validated ledger charges, in drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reserve {
+    /// What every account must keep.
+    pub base_drops: u64,
+    /// What each object an account owns (a channel, say) adds.
+    pub owner_drops: u64,
+}
+
 /// The fee the node would charge now, in drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fee {
@@ -399,6 +408,42 @@ impl XrplRpc {
             transaction_result: str_field(&result["meta"], "TransactionResult"),
             meta: result["meta"].clone(),
         }))
+    }
+
+    /// The reserves the validated ledger charges now: they are amendment-
+    /// and vote-driven, so read live and never assumed (ADR 0087 decision 6).
+    pub async fn reserve(&self) -> Result<Reserve, XrplRpcError> {
+        let result = self.call("server_state", json!({})).await?;
+        let ledger = &result["state"]["validated_ledger"];
+        let drops = |name: &str| ledger[name].as_u64();
+        match (drops("reserve_base"), drops("reserve_inc")) {
+            (Some(base_drops), Some(owner_drops)) => Ok(Reserve {
+                base_drops,
+                owner_drops,
+            }),
+            _ => Err(XrplRpcError::Unreadable {
+                endpoint: self.transport.endpoint(),
+                status: 200,
+                reason: "server_state has no validated ledger reserves".to_string(),
+                body: String::new(),
+            }),
+        }
+    }
+
+    /// The newest validated ledger's close time, in seconds since the Ripple
+    /// epoch: the clock an `Expiration` is judged against.
+    pub async fn validated_close_time(&self) -> Result<u64, XrplRpcError> {
+        let result = self
+            .call("ledger", json!({ "ledger_index": "validated" }))
+            .await?;
+        result["ledger"]["close_time"]
+            .as_u64()
+            .ok_or_else(|| XrplRpcError::Unreadable {
+                endpoint: self.transport.endpoint(),
+                status: 200,
+                reason: "the validated ledger has no close_time".to_string(),
+                body: String::new(),
+            })
     }
 
     pub async fn fee(&self) -> Result<Fee, XrplRpcError> {

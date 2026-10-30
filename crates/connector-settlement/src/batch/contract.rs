@@ -426,11 +426,48 @@ pub async fn assert_refuses_a_channel_in_another_token(fixture: &BatchContractFi
     );
 }
 
+/// The paying clause that holds only where a channel can hold a token other
+/// than the one the backend settles in -- EVM and Solana, not XRPL -- and so
+/// is tested beside [`assert_upholds_the_paying_contract`] rather than in it
+/// (ADR 0075, #1565 rule 1): terms naming another token open nothing, by
+/// name, and spend nothing, whether opened at once or prepared. Run it on a
+/// fixture before handing the fixture to the suite.
+pub async fn assert_refuses_terms_in_another_token(fixture: &PayingContractFixture) {
+    let PayingContractFixture {
+        payer,
+        terms,
+        payer_balance,
+        ..
+    } = fixture;
+    let funded = payer_balance().await;
+    assert_eq!(
+        payer
+            .open(in_another_token(terms), 1_000)
+            .await
+            .unwrap_err(),
+        BatchSettlementError::TokenNotShared,
+        "a channel is opened only in a token both ends settle in"
+    );
+    assert_eq!(
+        payer
+            .prepare_open(in_another_token(terms), 1_000)
+            .await
+            .unwrap_err(),
+        BatchSettlementError::TokenNotShared
+    );
+    assert_eq!(
+        payer_balance().await,
+        funded,
+        "a refused open spends nothing"
+    );
+}
+
 /// The shape of [`PayingContractFixture::restart`].
 pub type RestartFn = Box<dyn Fn() -> BoxFuture<'static, Arc<dyn BatchSettlementPayer>> + Send>;
 
 /// `terms`, naming a token no node settles in. XRPL has none to name: a
-/// channel holds XRP only, so its terms come back as they were.
+/// channel holds XRP only, so its terms come back as they were, and its
+/// fixture does not run [`assert_refuses_terms_in_another_token`].
 fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
     match terms.clone() {
         ReceiverTerms::Evm(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
@@ -505,15 +542,10 @@ where
 
     // -- Opening (ADR 0075 decision 3) --
 
-    // Terms this node cannot meet open nothing, and spend nothing.
-    assert_eq!(
-        payer
-            .open(in_another_token(&terms), 1_000)
-            .await
-            .unwrap_err(),
-        BatchSettlementError::TokenNotShared,
-        "a channel is opened only in a token both ends settle in"
-    );
+    // Terms this node cannot meet open nothing, and spend nothing. (Terms in
+    // a token this node does not settle in are
+    // [`assert_refuses_terms_in_another_token`]'s: XRPL has no other token to
+    // name -- ADR 0075, #1565 rule 1.)
     let other_chain = for_the_other_chain(&terms);
     assert_eq!(
         payer.open(other_chain.clone(), 1_000).await.unwrap_err(),
@@ -784,13 +816,6 @@ where
     // the channel is not this node's to pay on until it is opened. Two
     // preparations are two channels.
     let before = payer_balance().await;
-    assert_eq!(
-        payer
-            .prepare_open(in_another_token(&terms), 1_000)
-            .await
-            .unwrap_err(),
-        BatchSettlementError::TokenNotShared
-    );
     let record = payer
         .prepare_open(terms.clone(), 1_000)
         .await
@@ -977,19 +1002,21 @@ fn record_for_the_other_chain(record: &OutboundChannelRecord) -> OutboundChannel
             transaction: Vec::new(),
             last_valid_block_height: 0,
         },
-        OutboundChannelRecord::Solana { .. } => OutboundChannelRecord::Evm {
-            channel: ChannelId(format!("0x{}", "5a".repeat(32))),
-            config: super::port::EvmChannelConfig {
-                payer: [0x5a; 20],
-                payer_authorizer: [0x5a; 20],
-                receiver: [0x5b; 20],
-                receiver_authorizer: [0x5b; 20],
-                token: [0x5c; 20],
-                withdraw_delay: 86_400,
-                salt: [0x5d; 32],
-            },
-            deposit: 1_000,
-        },
+        OutboundChannelRecord::Solana { .. } | OutboundChannelRecord::Xrpl { .. } => {
+            OutboundChannelRecord::Evm {
+                channel: ChannelId(format!("0x{}", "5a".repeat(32))),
+                config: super::port::EvmChannelConfig {
+                    payer: [0x5a; 20],
+                    payer_authorizer: [0x5a; 20],
+                    receiver: [0x5b; 20],
+                    receiver_authorizer: [0x5b; 20],
+                    token: [0x5c; 20],
+                    withdraw_delay: 86_400,
+                    salt: [0x5d; 32],
+                },
+                deposit: 1_000,
+            }
+        }
     }
 }
 
@@ -1119,14 +1146,17 @@ mod tests {
     /// channel survives.
     #[tokio::test]
     async fn the_in_memory_fake_with_a_withdrawal_exit_upholds_the_paying_contract() {
-        assert_upholds_the_paying_contract(|| async { paying_fixture(PayerExit::Withdrawal) })
-            .await;
+        let fixture = paying_fixture(PayerExit::Withdrawal);
+        assert_refuses_terms_in_another_token(&fixture).await;
+        assert_upholds_the_paying_contract(|| async move { fixture }).await;
     }
 
     /// The fake's paying half on a Solana-shaped chain: a close that the
     /// receiver's landing seals and a distribution ends.
     #[tokio::test]
     async fn the_in_memory_fake_with_a_close_exit_upholds_the_paying_contract() {
-        assert_upholds_the_paying_contract(|| async { paying_fixture(PayerExit::Close) }).await;
+        let fixture = paying_fixture(PayerExit::Close);
+        assert_refuses_terms_in_another_token(&fixture).await;
+        assert_upholds_the_paying_contract(|| async move { fixture }).await;
     }
 }

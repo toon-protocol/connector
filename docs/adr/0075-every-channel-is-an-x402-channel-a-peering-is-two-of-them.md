@@ -963,6 +963,19 @@ suite by the fake, EVM and Solana and not by XRPL. The port gained `ChannelPrese
 they returned `Backend(String)`. An `Expiration` already set is the existing `NotOpen`, and a short
 `SettleDelay` the existing `DelayBelowMinimum`.
 
+**Built (issue #1613): XRPL's paying half.** `XrplBatchSettlement` also implements `BatchSettlementPayer`
+and is held to `assert_upholds_the_paying_contract` against a spawned `xrpld`. Rule 1 applied again: "terms
+naming another token open nothing" cannot be asked of a channel that holds XRP only, so it left the paying
+suite for `assert_refuses_terms_in_another_token`, run on a fixture beside the suite by the fake, EVM and
+Solana and not by XRPL. `OutboundChannelRecord` gained `Xrpl` (the signed `PaymentChannelCreate`, its
+`Sequence` and `LastLedgerSequence`; record tag 3, no version bump), and `BatchSettlementError` gained
+`Underfunded { required, spendable, shortfall }`, the pre-flight refusal ADR 0087 decision 6 promises. The
+fixture's `payer_balance` adds back the fees from `account_tx`, and its `let_delay_pass` closes ledgers
+until the validated close time has moved on. One sequence allocator serialises every transaction of the
+account, the receiving half's landing included; a prepared open's `Sequence` is held aside in process, and a
+prepared open another transaction of the account has outrun reads `OpenLapsed`, as one past its
+`LastLedgerSequence` does.
+
 ## Update (issue #1564) — whose code a channel may bind to
 
 [ADR 0085](0085-whose-code-a-channel-may-bind-to.md) (owner, 2026-10-28) amends decision 1. A channel
