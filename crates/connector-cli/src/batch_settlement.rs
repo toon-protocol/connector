@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use connector_client_edge::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelLookupFailed, ChannelResolutionError, ChannelTerminal, ClientClaimGate,
-    JournaledBatchChannel,
+    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, AdmittedXrplVoucherChannel,
+    BatchSettlementChannels, ChannelLookupFailed, ChannelResolutionError, ChannelTerminal,
+    ClientClaimGate, JournaledBatchChannel,
 };
-use connector_domain::Network;
+use connector_domain::{Network, XrplNetwork};
 use connector_runtime::network_of_presentation;
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
@@ -44,6 +44,8 @@ pub(crate) struct BatchSettlementChannelsAdapter {
     evm: Vec<EvmLeg>,
     /// The Solana backend, and the CAIP-2 network it reached at connect.
     solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
+    /// One leg per XRPL network, in table order (ADR 0087).
+    xrpl: Vec<(Arc<dyn BatchSettlementBackend>, XrplNetwork)>,
     /// Every channel this adapter has seen `admit` accept in this process.
     /// A backend also answers for channels it only **restored** -- ones the
     /// journal holds vouchers on, brought back at boot without judging them
@@ -67,8 +69,9 @@ impl BatchSettlementChannelsAdapter {
     pub(crate) fn new(
         evm: Vec<(Arc<dyn BatchSettlementBackend>, BatchSettlementDomain)>,
         solana: Option<(Arc<dyn BatchSettlementBackend>, Network)>,
+        xrpl: Vec<(Arc<dyn BatchSettlementBackend>, XrplNetwork)>,
     ) -> Option<BatchSettlementChannelsAdapter> {
-        if evm.is_empty() && solana.is_none() {
+        if evm.is_empty() && solana.is_none() && xrpl.is_empty() {
             return None;
         }
         Some(BatchSettlementChannelsAdapter {
@@ -77,6 +80,7 @@ impl BatchSettlementChannelsAdapter {
                 .map(|(backend, domain)| EvmLeg { backend, domain })
                 .collect(),
             solana,
+            xrpl,
             admitted: Mutex::new(HashSet::new()),
         })
     }
@@ -96,6 +100,14 @@ impl fmt::Debug for BatchSettlementChannelsAdapter {
                 &self.evm.iter().map(|leg| leg.domain).collect::<Vec<_>>(),
             )
             .field("solana", &self.solana.is_some())
+            .field(
+                "xrpl",
+                &self
+                    .xrpl
+                    .iter()
+                    .map(|(_, network)| network)
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -108,6 +120,38 @@ impl BatchSettlementChannels for BatchSettlementChannelsAdapter {
 
     fn solana_network(&self) -> Option<Network> {
         self.solana.as_ref().map(|(_, network)| network.clone())
+    }
+
+    fn xrpl_networks(&self) -> Vec<XrplNetwork> {
+        self.xrpl.iter().map(|(_, network)| *network).collect()
+    }
+
+    /// An XRPL channel is found from its id alone: every field is on the
+    /// ledger. Asked of the backend of the network the voucher names and
+    /// no other (ADR 0087 decision 2).
+    async fn xrpl(
+        &self,
+        network: &XrplNetwork,
+        channel_id: &[u8; 32],
+    ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
+        let Some((backend, _)) = self.xrpl.iter().find(|(_, held)| held == network) else {
+            return Ok(None);
+        };
+        let presentation = ChannelPresentation::Xrpl {
+            channel: xrpl_channel(channel_id),
+        };
+        let state = self.state_of(backend.as_ref(), presentation).await;
+        Ok(
+            resolution(state)?.and_then(|state| match state.voucher_signer {
+                VoucherSigner::Xrpl(public_key) => Some(AdmittedXrplVoucherChannel {
+                    public_key,
+                    max_cumulative: max_cumulative_xrpl(&state),
+                }),
+                // An XRPL backend reporting another chain's signer is not a
+                // channel this gate can verify a voucher against.
+                VoucherSigner::Evm(_) | VoucherSigner::Solana(_) => None,
+            }),
+        )
     }
 
     /// An EVM channel is found only from its config: the contract stores a
@@ -254,6 +298,23 @@ fn max_cumulative_solana(state: &BatchChannelState) -> u64 {
     u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
 }
 
+/// The port's voucher ceiling, in the gate's `u64` XRPL amounts: drops.
+/// XRP's whole supply is inside `u64` (ADR 0087 decision 2), so the
+/// saturation here only bounds a figure the ledger could not hold.
+fn max_cumulative_xrpl(state: &BatchChannelState) -> u64 {
+    u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
+}
+
+/// An XRPL channel id as the port spells it: 64 lowercase hex, no prefix.
+fn xrpl_channel(channel_id: &[u8; 32]) -> ChannelId {
+    ChannelId(
+        channel_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 /// An EVM channel id as the port spells it: `0x` and 64 lowercase hex.
 fn evm_channel(channel_id: &[u8; 32]) -> ChannelId {
     ChannelId(format!(
@@ -300,6 +361,22 @@ impl HeldVouchers for ClaimGateVouchers {
             })
             .collect()
     }
+
+    /// An XRPL channel id binds no network, so the gate's record of the
+    /// network the channel's voucher named answers where the presentation
+    /// cannot (ADR 0087 decision 2).
+    fn network_of(&self, channel: &ChannelId) -> Option<String> {
+        self.0
+            .batch_channels()
+            .into_iter()
+            .find_map(|held| match held {
+                JournaledBatchChannel::Xrpl {
+                    channel_id,
+                    network,
+                } if xrpl_channel(&channel_id) == *channel => Some(network.caip2().to_string()),
+                _ => None,
+            })
+    }
 }
 
 /// [`ClaimGateVouchers`] narrowed to the channels on one network (ADR
@@ -318,7 +395,14 @@ impl HeldVouchers for NetworkVouchers {
             .held_vouchers()
             .into_iter()
             .filter(|held| {
-                network_of_presentation(&held.presentation, &self.networks).as_ref()
+                // The gate's record first: an XRPL id says no network.
+                let recorded = self
+                    .held
+                    .network_of(held.presentation.channel())
+                    .and_then(|network| network.parse::<Network>().ok());
+                recorded
+                    .or_else(|| network_of_presentation(&held.presentation, &self.networks))
+                    .as_ref()
                     == Some(&self.network)
             })
             .collect()
@@ -340,7 +424,11 @@ impl connector_runtime::ChannelNetworks for GateChannelNetworks {
             .batch_channels()
             .into_iter()
             .find(|channel| channel.channel_key() == channel_key)?;
-        network_of_presentation(&presentation(channel), &self.networks)
+        match channel {
+            // Recorded with the channel: its id says none (ADR 0087).
+            JournaledBatchChannel::Xrpl { network, .. } => Some(Network::Xrpl(network)),
+            channel => network_of_presentation(&presentation(channel), &self.networks),
+        }
     }
 }
 
@@ -364,6 +452,9 @@ fn presentation(channel: JournaledBatchChannel) -> ChannelPresentation {
         },
         JournaledBatchChannel::Solana { channel_account } => ChannelPresentation::Solana {
             channel: solana_channel(&channel_account),
+        },
+        JournaledBatchChannel::Xrpl { channel_id, .. } => ChannelPresentation::Xrpl {
+            channel: xrpl_channel(&channel_id),
         },
     }
 }
@@ -396,8 +487,13 @@ pub(crate) async fn restore_journaled_channels(
 ) {
     for channel in channels {
         let presentation = presentation(*channel);
-        let network =
-            network_of_presentation(&presentation, backends.iter().map(|(network, _)| network));
+        let network = match channel {
+            // The network the voucher named, journaled with the channel.
+            JournaledBatchChannel::Xrpl { network, .. } => Some(Network::Xrpl(*network)),
+            _ => {
+                network_of_presentation(&presentation, backends.iter().map(|(network, _)| network))
+            }
+        };
         let backend = backends
             .iter()
             .find(|(held, _)| Some(held) == network.as_ref())

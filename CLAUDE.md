@@ -176,11 +176,12 @@ key handling belongs to `toon-client`.
 
 A node reads these:
 
-| Config                                       | File                    | What it signs                                                                                |
-| -------------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------- |
-| `[signer] key_file`                          | `signer.key`            | identity: gift-wrap and the self-description, never value. 32 raw bytes or 64 hex, secp256k1 |
-| `[settlement.eip155.<chainId>.key] key_file` | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)       |
-| `[settlement.solana.key] key_file`           | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075) |
+| Config                                       | File                    | What it signs                                                                                                       |
+| -------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `[signer] key_file`                          | `signer.key`            | identity: gift-wrap and the self-description, never value. 32 raw bytes or 64 hex, secp256k1                        |
+| `[settlement.eip155.<chainId>.key] key_file` | `settlement.key`        | EVM settlement transactions and EVM claims, client-payout vouchers included (ADR 0075)                              |
+| `[settlement.solana.key] key_file`           | `settlement-solana.key` | Solana settlement transactions and Solana claims, client-payout vouchers included (ADR 0075)                        |
+| `[settlement.xrpl.<id>.key] key_file`        | `settlement-xrpl.key`   | XRPL transactions and claims (ADR 0087). An XRPL family seed, `s…` or `sEd…`, not 32 bytes. One account per network |
 
 Each chain's settlement key signs every voucher on that chain — client payouts and peer claims
 included — under [ADR 0075](docs/adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md).

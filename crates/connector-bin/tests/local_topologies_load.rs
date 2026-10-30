@@ -768,6 +768,9 @@ fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
                         "{name}: a sponsor minimum bounds the public sponsor endpoint"
                     );
                 }
+                SettlementConfig::Xrpl(xrpl) => {
+                    panic!("{name} commits an XRPL table, {}", xrpl.table_name())
+                }
             }
         }
     }
@@ -1303,6 +1306,7 @@ fn the_solo_topologys_committed_config_loads() {
         .map(|table| match table {
             SettlementConfig::Evm(evm) => evm.network().to_string(),
             SettlementConfig::Solana(_) => "solana".to_owned(),
+            SettlementConfig::Xrpl(xrpl) => xrpl.network().caip2().to_owned(),
         })
         .collect();
     assert_eq!(
@@ -1902,6 +1906,8 @@ fn settlement_decimals(settlement: &SettlementConfig) -> u8 {
     match settlement {
         SettlementConfig::Evm(evm) => evm.decimals(),
         SettlementConfig::Solana(solana) => solana.decimals(),
+        // XRP counts in drops: six decimals.
+        SettlementConfig::Xrpl(_) => 6,
     }
 }
 

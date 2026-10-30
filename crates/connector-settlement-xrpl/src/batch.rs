@@ -38,6 +38,11 @@ use crate::tx::LandClaim;
 /// The chain this backend answers for, in the port's spelling.
 const CHAIN: &str = "xrpl";
 
+/// The fee ceiling a backend starts with, until the table's own is applied:
+/// 0.1 XRP. Mirrors `connector_config::DEFAULT_XRPL_MAX_FEE_DROPS`, which this
+/// crate cannot name.
+const DEFAULT_MAX_FEE_DROPS: u64 = 100_000;
+
 /// How many ledgers past the open one a landing may still be included in:
 /// `LastLedgerSequence`, which bounds every wait (ADR 0087 decision 9).
 const LAST_LEDGER_WINDOW: u32 = 20;
@@ -55,6 +60,7 @@ pub struct XrplBatchSettlement {
     address: String,
     network_id: u32,
     min_settle_delay_secs: u64,
+    max_fee_drops: u64,
     wait: TxWait,
     admitted: Mutex<HashSet<String>>,
     // A landing signs with the account's next sequence number, and waits for
@@ -93,15 +99,20 @@ impl XrplBatchSettlement {
                         .to_string())
             )));
         }
-        if rpc
-            .account_info(&address)
-            .await
-            .map_err(rpc_error)?
-            .is_none()
-        {
+        let Some(account) = rpc.account_info(&address).await.map_err(rpc_error)? else {
             return Err(BatchSettlementError::Backend(format!(
                 "the settlement account {address} does not exist on XRPL network {network_id}: \
                  fund it with at least the base reserve"
+            )));
+        };
+        if let Some(reserve) = info
+            .reserve_base_drops
+            .filter(|r| account.balance_drops < *r)
+        {
+            return Err(BatchSettlementError::Backend(format!(
+                "the settlement account {address} holds {} drops, below the base reserve of \
+                 {reserve} on XRPL network {network_id}: fund it",
+                account.balance_drops
             )));
         }
         Ok(XrplBatchSettlement {
@@ -110,6 +121,7 @@ impl XrplBatchSettlement {
             address,
             network_id,
             min_settle_delay_secs,
+            max_fee_drops: DEFAULT_MAX_FEE_DROPS,
             wait: TxWait {
                 poll: Duration::from_millis(500),
                 give_up_after: Duration::from_secs(60),
@@ -125,6 +137,23 @@ impl XrplBatchSettlement {
     pub fn with_wait(mut self, wait: TxWait) -> XrplBatchSettlement {
         self.wait = wait;
         self
+    }
+
+    /// The most one landing may pay in fee, in drops (`[settlement.xrpl.<id>]
+    /// max_fee_drops`). A fee the open ledger has escalated past it is
+    /// refused before anything is signed, not paid.
+    #[must_use]
+    pub fn with_max_fee_drops(mut self, max_fee_drops: u64) -> XrplBatchSettlement {
+        self.max_fee_drops = max_fee_drops;
+        self
+    }
+
+    /// The settlement key's public key as the ledger spells a channel
+    /// `PublicKey`'s peer: 33 bytes, lowercase hex, secp256k1 compressed or
+    /// `ED`-prefixed Ed25519. What the self-description's `voucherSigners`
+    /// publishes for this network (ADR 0087 decision 9).
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.signer.public_key())
     }
 
     /// This node's settlement account, the `payTo` the greeting publishes.
@@ -347,6 +376,14 @@ impl BatchSettlementBackend for XrplBatchSettlement {
                 ))
             })?;
         let fee = self.rpc.fee().await.map_err(rpc_error)?;
+        let fee_drops = fee.open_ledger_fee_drops.max(fee.base_fee_drops);
+        if fee_drops > self.max_fee_drops {
+            return Err(BatchSettlementError::Backend(format!(
+                "the ledger asks {fee_drops} drops to land a PaymentChannelClaim, above this \
+                 table's max_fee_drops of {}: nothing was signed",
+                self.max_fee_drops
+            )));
+        }
         let last_ledger_sequence = fee.ledger_current_index + LAST_LEDGER_WINDOW;
         let signed = LandClaim {
             account: self.signer.account_id(),
@@ -354,7 +391,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
             drops,
             claim_signature: voucher.signature.clone(),
             channel_key: key,
-            fee_drops: fee.open_ledger_fee_drops.max(fee.base_fee_drops),
+            fee_drops,
             sequence: account.sequence,
             last_ledger_sequence,
         }
@@ -565,6 +602,7 @@ mod tests {
             address: address.to_string(),
             network_id: 1000,
             min_settle_delay_secs: 3600,
+            max_fee_drops: DEFAULT_MAX_FEE_DROPS,
             wait: TxWait {
                 poll: Duration::from_millis(10),
                 give_up_after: Duration::from_secs(1),

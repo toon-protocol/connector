@@ -344,6 +344,24 @@ pub enum OutboundChannelRecord {
         /// valid. Past it, an `open` the chain does not hold never will.
         last_valid_block_height: u64,
     },
+    /// XRPL: the `PaymentChannelCreate` this node built and signed as the
+    /// channel's source, byte for byte (ADR 0087 decision 9). The channel id
+    /// derives from the source, the destination and this transaction's
+    /// sequence, so the same bytes can never make a second channel: a
+    /// sequence is used once.
+    Xrpl {
+        channel: ChannelId,
+        /// The counterparty's classic `r…` address: the channel's
+        /// `Destination`.
+        receiver: String,
+        /// The channel's funded drops.
+        deposit: u128,
+        /// The signed `PaymentChannelCreate`, as wire bytes.
+        transaction: Vec<u8>,
+        /// The transaction's `LastLedgerSequence`. Past it, a create the
+        /// ledger does not hold never will be (ADR 0087 decision 9).
+        last_ledger_sequence: u32,
+    },
 }
 
 impl OutboundChannelRecord {
@@ -351,15 +369,17 @@ impl OutboundChannelRecord {
     pub fn channel(&self) -> &ChannelId {
         match self {
             OutboundChannelRecord::Evm { channel, .. }
-            | OutboundChannelRecord::Solana { channel, .. } => channel,
+            | OutboundChannelRecord::Solana { channel, .. }
+            | OutboundChannelRecord::Xrpl { channel, .. } => channel,
         }
     }
 
-    /// `"evm"` or `"solana"`, spelled as [`ChannelPresentation::chain`].
+    /// `"evm"`, `"solana"` or `"xrpl"`, spelled as [`ChannelPresentation::chain`].
     pub fn chain(&self) -> &'static str {
         match self {
             OutboundChannelRecord::Evm { .. } => "evm",
             OutboundChannelRecord::Solana { .. } => "solana",
+            OutboundChannelRecord::Xrpl { .. } => "xrpl",
         }
     }
 
@@ -367,7 +387,8 @@ impl OutboundChannelRecord {
     pub fn deposit(&self) -> u128 {
         match self {
             OutboundChannelRecord::Evm { deposit, .. }
-            | OutboundChannelRecord::Solana { deposit, .. } => *deposit,
+            | OutboundChannelRecord::Solana { deposit, .. }
+            | OutboundChannelRecord::Xrpl { deposit, .. } => *deposit,
         }
     }
 
@@ -378,6 +399,7 @@ impl OutboundChannelRecord {
         match self {
             OutboundChannelRecord::Evm { config, .. } => config.receiver.to_vec(),
             OutboundChannelRecord::Solana { receiver, .. } => receiver.to_vec(),
+            OutboundChannelRecord::Xrpl { receiver, .. } => receiver.as_bytes().to_vec(),
         }
     }
 
@@ -392,6 +414,9 @@ impl OutboundChannelRecord {
                 config: config.clone(),
             },
             OutboundChannelRecord::Solana { channel, .. } => ChannelPresentation::Solana {
+                channel: channel.clone(),
+            },
+            OutboundChannelRecord::Xrpl { channel, .. } => ChannelPresentation::Xrpl {
                 channel: channel.clone(),
             },
         }
@@ -457,6 +482,21 @@ impl OutboundChannelRecord {
                 out.extend_from_slice(&(transaction.len() as u32).to_be_bytes());
                 out.extend_from_slice(transaction);
             }
+            OutboundChannelRecord::Xrpl {
+                channel,
+                receiver,
+                deposit,
+                transaction,
+                last_ledger_sequence,
+            } => {
+                out.push(RECORD_XRPL);
+                put_str(out, &channel.0);
+                put_str(out, receiver);
+                out.extend_from_slice(&deposit.to_be_bytes());
+                out.extend_from_slice(&last_ledger_sequence.to_be_bytes());
+                out.extend_from_slice(&(transaction.len() as u32).to_be_bytes());
+                out.extend_from_slice(transaction);
+            }
         }
     }
 
@@ -513,6 +553,21 @@ impl OutboundChannelRecord {
                     last_valid_block_height,
                 }
             }
+            RECORD_XRPL => {
+                let channel = ChannelId(reader.string()?);
+                let receiver = reader.string()?;
+                let deposit = u128::from_be_bytes(reader.array()?);
+                let last_ledger_sequence = u32::from_be_bytes(reader.array()?);
+                let len = u32::from_be_bytes(reader.array()?) as usize;
+                let transaction = reader.take(len)?.to_vec();
+                OutboundChannelRecord::Xrpl {
+                    channel,
+                    receiver,
+                    deposit,
+                    transaction,
+                    last_ledger_sequence,
+                }
+            }
             _ => return None,
         };
         reader
@@ -528,7 +583,7 @@ impl OutboundChannelRecord {
 /// assigns by proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournaledRecord {
-    /// `eip155:<chainId>` or `solana:<genesis prefix>`; `None` for a
+    /// `eip155:<chainId>`, `solana:<genesis prefix>` or `xrpl:<id>`; `None` for a
     /// record written before ADR 0086.
     pub network: Option<String>,
     pub record: OutboundChannelRecord,
@@ -540,6 +595,7 @@ const RECORD_VERSION: u8 = 2;
 const RECORD_VERSION_UNASSIGNED: u8 = 1;
 const RECORD_EVM: u8 = 1;
 const RECORD_SOLANA: u8 = 2;
+const RECORD_XRPL: u8 = 3;
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(&(text.len() as u32).to_be_bytes());
@@ -1126,6 +1182,18 @@ mod tests {
         }
     }
 
+    fn xrpl_record() -> OutboundChannelRecord {
+        OutboundChannelRecord::Xrpl {
+            channel: ChannelId(
+                "5db01b7ffed6b67e6b0414ded11e051d2ee2b7619ce0eaa6286d67a3a4d5bdb3".to_string(),
+            ),
+            receiver: "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string(),
+            deposit: 25_000_000,
+            transaction: vec![7; 211],
+            last_ledger_sequence: 4_000_021,
+        }
+    }
+
     /// The journal carries a record as bytes, so every field must come back
     /// exactly: a salt or a transaction off by one byte is a channel this
     /// node can never find again. Version 2 carries its network with it
@@ -1135,6 +1203,7 @@ mod tests {
         for (record, network) in [
             (evm_record(), "eip155:8453"),
             (solana_record(), "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
+            (xrpl_record(), "xrpl:1000"),
         ] {
             let bytes = record.encode_on(network);
             assert_eq!(bytes[0], 2, "written as version 2");

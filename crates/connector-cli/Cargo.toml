@@ -11,7 +11,7 @@ license.workspace = true
 connector-btp = { path = "../connector-btp" }
 # Each settlement table's one transport, built here and handed to every
 # client of its rpc_url (ADR 0073 decision 2).
-connector-chain-rpc = { path = "../connector-chain-rpc" }
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl"] }
 connector-config = { path = "../connector-config" }
 connector-client-edge = { path = "../connector-client-edge" }
 connector-domain = { path = "../connector-domain" }
@@ -35,6 +35,8 @@ connector-runtime = { path = "../connector-runtime" }
 connector-settlement = { path = "../connector-settlement" }
 connector-settlement-evm = { path = "../connector-settlement-evm" }
 connector-settlement-solana = { path = "../connector-settlement-solana" }
+# The XRPL backend, bound over a `[settlement.xrpl.<id>]` table's transport (ADR 0087).
+connector-settlement-xrpl = { path = "../connector-settlement-xrpl" }
 connector-signer = { path = "../connector-signer" }
 async-trait = "0.1"
 arc-swap = "1.9.2"
@@ -82,7 +84,7 @@ connector-zk-note = { path = "../connector-zk-note" }
 [dev-dependencies]
 # `FakeRpc` behind the SOCKS5 fake: the proxied settlement route is asserted
 # at the seam where the node builds its settlement clients (ADR 0073).
-connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm", "solana", "test-support"] }
+connector-chain-rpc = { path = "../connector-chain-rpc", features = ["evm", "solana", "xrpl", "test-support"] }
 # `test-support` for the SOCKS5 server fake the onion dial tests dial through
 # (ADR 0070). A dev-dependency, so `cargo build` never carries a listener.
 connector-runtime = { path = "../connector-runtime", features = ["test-support"] }
@@ -101,8 +103,11 @@ connector-operator = { path = "../connector-operator", features = ["test-util"] 
 connector-settlement = { path = "../connector-settlement", features = ["test-util"] }
 connector-settlement-evm = { path = "../connector-settlement-evm", features = ["test-util"] }
 connector-settlement-solana = { path = "../connector-settlement-solana", features = ["test-util"] }
+# `Xrpld`, the disposable stand-alone chain a node is booted against (ADR 0084).
+connector-settlement-xrpl = { path = "../connector-settlement-xrpl", features = ["test-util"] }
 chrono = "0.4"
 ed25519-dalek = "1"
+hex = "0.4"
 hyper = { version = "0.14", features = ["full"] }
 # Derives an announced pubkey INDEPENDENTLY of `connector_signer::nostr`
 # (issue #799's `identity_key_file` pubkey-pinning test), so a bug in that

@@ -18,7 +18,7 @@ use connector_client_edge::{
 };
 use connector_config::{
     Config, EvmSettlementConfig, PeerCarriage, SecretLocation, SettlementChain, SettlementConfig,
-    SolanaSettlementConfig,
+    SolanaSettlementConfig, XrplSettlementConfig,
 };
 use connector_domain::Network;
 use connector_rate_source_evm::UniswapV3RateSource;
@@ -34,7 +34,8 @@ use connector_settlement::batch::{
 use connector_settlement::watch_interval::watch_interval;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
-use connector_signer::{LocalSigner, Signer, SignerError};
+use connector_settlement_xrpl::XrplBatchSettlement;
+use connector_signer::{LocalSigner, Signer, SignerError, XrplSigner};
 
 use crate::batch_settlement::{
     restore_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
@@ -226,6 +227,39 @@ pub enum RuntimeError {
         name: String,
         version: String,
     },
+    /// A `[settlement.xrpl.<id>]` key file that is no XRPL family seed (ADR
+    /// 0087): unreadable, or holding something else.
+    XrplKeyUnusable { table: String, message: String },
+    /// Two `[settlement.xrpl.<id>]` tables whose keys are one account (ADR
+    /// 0087 decision 4). A claim binds no network, so an account may be on
+    /// one network only: a voucher signed for a testnet channel would
+    /// redeem on a mainnet channel of the same id.
+    XrplAccountOnTwoNetworks {
+        tables: Vec<String>,
+        address: String,
+    },
+    /// A `[settlement.xrpl.<id>]` table whose `rpc_url` serves another
+    /// network than its key names (ADR 0087 decision 5). `reported` is the
+    /// endpoint's `server_info.network_id`, absent on a node with none
+    /// (mainnet reports none).
+    XrplNetworkMismatch {
+        table: String,
+        expected: u32,
+        reported: Option<u32>,
+    },
+    /// The settlement account is not on the ledger (ADR 0087 decision 5):
+    /// it has to be funded with at least the base reserve before the node
+    /// can receive a channel.
+    XrplAccountMissing { table: String, address: String },
+    /// The settlement account holds less than the ledger's base reserve
+    /// (ADR 0087 decision 5): it cannot sign the transactions that land a
+    /// voucher.
+    XrplAccountUnderfunded {
+        table: String,
+        address: String,
+        balance_drops: u64,
+        reserve_drops: u64,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -410,6 +444,47 @@ impl fmt::Display for RuntimeError {
                  them, so the token would refuse every one -- set them to the token's own name \
                  and version (cast call {token} 'name()(string)' and 'version()(string)') \
                  (issue #1422)"
+            ),
+            RuntimeError::XrplKeyUnusable { table, message } => {
+                write!(f, "[settlement.{table}.key] cannot be used: {message}")
+            }
+            RuntimeError::XrplAccountOnTwoNetworks { tables, address } => write!(
+                f,
+                "[settlement.{}] name one XRPL account, {address}. A claim binds no network, so \
+                 an account may be on one network only: a voucher signed for a channel on one \
+                 network is redeemable by anyone on another network that holds a channel with \
+                 the same id. Give each table its own key (ADR 0087 decision 4)",
+                tables.join("] and [settlement."),
+            ),
+            RuntimeError::XrplNetworkMismatch {
+                table,
+                expected,
+                reported,
+            } => write!(
+                f,
+                "[settlement.{table}] is for XRPL network {expected}, but its rpc_url serves {}. \
+                 The table key is the ledger's server_info network_id: correct the key or point \
+                 rpc_url at the right ledger (ADR 0087 decision 5)",
+                reported.map_or("a node that reports no network_id (mainnet is 0)".to_string(), |id| {
+                    format!("network {id}")
+                }),
+            ),
+            RuntimeError::XrplAccountMissing { table, address } => write!(
+                f,
+                "[settlement.{table}]'s settlement account {address} does not exist on the \
+                 ledger its rpc_url serves. Fund it with at least the base reserve; an account \
+                 comes into being with its first payment (ADR 0087 decision 5)"
+            ),
+            RuntimeError::XrplAccountUnderfunded {
+                table,
+                address,
+                balance_drops,
+                reserve_drops,
+            } => write!(
+                f,
+                "[settlement.{table}]'s settlement account {address} holds {balance_drops} drops, \
+                 below the ledger's base reserve of {reserve_drops}. It could not sign the \
+                 transaction that lands a voucher: fund it (ADR 0087 decision 5)"
             ),
         }
     }
@@ -693,6 +768,94 @@ async fn build_solana_batch_settlement(
     Ok(Arc::new(backend))
 }
 
+/// The key an `[settlement.xrpl.<id>]` table signs with: an XRPL family seed
+/// in a file, secp256k1 or Ed25519 (ADR 0087 decision 2).
+fn read_xrpl_signer(settlement: &XrplSettlementConfig) -> Result<XrplSigner, RuntimeError> {
+    match settlement.key() {
+        SecretLocation::File(path) => {
+            XrplSigner::from_key_file(path).map_err(|error| RuntimeError::XrplKeyUnusable {
+                table: settlement.table_name(),
+                message: error.to_string(),
+            })
+        }
+        SecretLocation::Kms { .. } => Err(RuntimeError::UnsupportedSettlementKeyLocation),
+    }
+}
+
+/// ADR 0087 decision 4: one XRPL account is one network. Every table's
+/// account is derived from its key -- no network is dialed -- and two tables
+/// resolving to one account are refused by name, before either is bound.
+fn check_xrpl_accounts_are_distinct(config: &Config) -> Result<(), RuntimeError> {
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for settlement in config.settlements() {
+        let SettlementConfig::Xrpl(xrpl) = settlement else {
+            continue;
+        };
+        let address = read_xrpl_signer(xrpl)?.classic_address();
+        seen.entry(address).or_default().push(xrpl.table_name());
+    }
+    match seen.into_iter().find(|(_, tables)| tables.len() > 1) {
+        Some((address, tables)) => Err(RuntimeError::XrplAccountOnTwoNetworks { tables, address }),
+        None => Ok(()),
+    }
+}
+
+/// This node's x402 settlement backend on one XRPL network (ADR 0087): the
+/// receiving half, bound over the table's one transport (ADR 0073).
+///
+/// Refused by name, before the backend is built: an endpoint that cannot be
+/// read, a `server_info.network_id` that is not the table's key, a settlement
+/// account the ledger does not hold, and one below the base reserve (decision
+/// 5). It never checks the PayChan amendment, which a testnet reports
+/// disabled while its channels work.
+async fn build_xrpl_batch_settlement(
+    settlement: &XrplSettlementConfig,
+    transport: &RpcTransport,
+) -> Result<Arc<XrplBatchSettlement>, RuntimeError> {
+    let table = settlement.table_name();
+    let signer = read_xrpl_signer(settlement)?;
+    let address = signer.classic_address();
+    let unreadable =
+        |error: connector_chain_rpc::xrpl::XrplRpcError| RuntimeError::BatchSettlementUnusable {
+            table: table.clone(),
+            source: BatchSettlementError::Backend(error.to_string()),
+        };
+    let rpc = connector_chain_rpc::xrpl::XrplRpc::new(transport.clone());
+    let expected = settlement.network().network_id();
+    let info = rpc.server_info().await.map_err(unreadable)?;
+    // A node with no `network_id` is mainnet's (0).
+    if info.network_id.unwrap_or(0) != expected {
+        return Err(RuntimeError::XrplNetworkMismatch {
+            table,
+            expected,
+            reported: info.network_id,
+        });
+    }
+    let Some(account) = rpc.account_info(&address).await.map_err(unreadable)? else {
+        return Err(RuntimeError::XrplAccountMissing { table, address });
+    };
+    if let Some(reserve_drops) = info.reserve_base_drops {
+        if account.balance_drops < reserve_drops {
+            return Err(RuntimeError::XrplAccountUnderfunded {
+                table,
+                address,
+                balance_drops: account.balance_drops,
+                reserve_drops,
+            });
+        }
+    }
+    let backend = XrplBatchSettlement::connect(
+        transport.clone(),
+        expected,
+        signer,
+        settlement.min_settle_delay_secs(),
+    )
+    .await
+    .map_err(|source| unbound(&table, source))?
+    .with_max_fee_drops(settlement.max_fee_drops());
+    Ok(Arc::new(backend))
+}
+
 /// Refuse a `state_dir` whose claim journals hold `toon-channel` entries
 /// (ADR 0075 decision 8, issue #1385), before anything is served.
 ///
@@ -887,6 +1050,11 @@ pub struct Runtime {
     /// when `[settlement.solana]` is written -- and what
     /// the public sponsor endpoint (issue #1346) co-signs an `open` with.
     pub batch_settlement_solana: Option<Arc<SolanaBatchSettlement>>,
+    /// The XRPL twin of [`Self::batch_settlement_evm`] (ADR 0087): the
+    /// receiving half over each `[settlement.xrpl.<id>]` table, keyed by its
+    /// CAIP-2 network. No paying half is built on XRPL yet, so none is among
+    /// the outbound channels' payers.
+    pub batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
     /// over the paying half of the backends above and journaled to
     /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when either backend is.
@@ -1045,6 +1213,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     let mut batch_settlement_evm: BTreeMap<Network, Arc<EvmBatchSettlementBackend>> =
         BTreeMap::new();
     let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
+    let mut batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>> = BTreeMap::new();
+    // ADR 0087 decision 4, before any ledger is dialed: one account is one
+    // network, and two tables on one are refused by name.
+    check_xrpl_accounts_are_distinct(config)?;
     // Each table's one transport, built once and handed to every client of
     // its `rpc_url` below (ADR 0073 decision 2).
     let transports = settlement_transports(config)?;
@@ -1135,14 +1307,44 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 ));
                 batch_settlement_solana = Some(backend);
             }
+            SettlementConfig::Xrpl(xrpl) => {
+                let transport = transports.for_settlement(settlement)?;
+                // ADR 0087 decision 5: the network, the account and its
+                // reserve are checked by name before the backend is bound.
+                let backend = build_xrpl_batch_settlement(xrpl, transport).await?;
+                let network = xrpl.network().caip2().to_string();
+                // ADR 0087 decision 9: the channel key is the settlement
+                // account's own public key -- the one a payer's channel
+                // names as its destination is the address derived from it.
+                voucher_signers.push(connector_domain::VoucherSignerFact {
+                    network: network.clone(),
+                    signer: backend.public_key_hex(),
+                });
+                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Xrpl(
+                    connector_client_edge::X402BatchSettlementXrplTerms {
+                        network,
+                        asset: xrpl.asset().to_string(),
+                        pay_to: backend.address().to_string(),
+                        binding: connector_domain::x402::XRPL_PAYCHAN_BINDING.to_string(),
+                        min_settle_delay_secs: xrpl.min_settle_delay_secs(),
+                        redemption_safety_secs: xrpl.redemption_safety_secs(),
+                    },
+                ));
+                batch_settlement_xrpl.insert(Network::Xrpl(xrpl.network()), backend);
+            }
         }
     }
     // ADR 0075 decisions 4 and 8: the x402 channels this node pays on,
     // restored from their journal before the runtime peer table below is
     // replayed, because a durable x402 peering is rehydrated onto them --
     // one replayed first would have nothing to sign its forwards on.
-    let outbound_channels =
-        restore_outbound_channels(config, &batch_settlement_evm, &batch_settlement_solana).await?;
+    let outbound_channels = restore_outbound_channels(
+        config,
+        &batch_settlement_evm,
+        &batch_settlement_solana,
+        &batch_settlement_xrpl,
+    )
+    .await?;
     if let Some(outbound) = &outbound_channels {
         let networks = batch_settlements
             .iter()
@@ -1152,6 +1354,9 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 }
                 connector_client_edge::X402BatchSettlementTerms::Solana(solana) => {
                     (SettlementChain::Solana, solana.network.clone())
+                }
+                connector_client_edge::X402BatchSettlementTerms::Xrpl(xrpl) => {
+                    (SettlementChain::Xrpl, xrpl.network.clone())
                 }
             })
             .collect();
@@ -1238,7 +1443,10 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // tightened since cannot strand a voucher already accepted (decision 5).
     // The journal is where an EVM channel's config survives a restart; the
     // chain never gives it back.
-    if !batch_settlement_evm.is_empty() || batch_settlement_solana.is_some() {
+    if !batch_settlement_evm.is_empty()
+        || batch_settlement_solana.is_some()
+        || !batch_settlement_xrpl.is_empty()
+    {
         if let Some(state_dir) = config.state_dir() {
             let path = state_dir.join(CLIENT_EDGE_JOURNAL);
             let unreplayable = |source| RuntimeError::JournalUnreplayable {
@@ -1252,7 +1460,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
             restore_journaled_channels(
                 &channels,
-                &receivers(&batch_settlement_evm, &batch_settlement_solana),
+                &receivers(
+                    &batch_settlement_evm,
+                    &batch_settlement_solana,
+                    &batch_settlement_xrpl,
+                ),
             )
             .await;
         }
@@ -1266,6 +1478,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         rate_table,
         batch_settlement_evm,
         batch_settlement_solana,
+        batch_settlement_xrpl,
         outbound_channels,
         state_dir_lock,
     })
@@ -1352,6 +1565,7 @@ async fn restore_outbound_channels(
     config: &Config,
     evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
     solana: &Option<Arc<SolanaBatchSettlement>>,
+    xrpl: &BTreeMap<Network, Arc<XrplBatchSettlement>>,
 ) -> Result<Option<Arc<OutboundChannels>>, RuntimeError> {
     // ADR 0086: one payer per network, each EVM table's own.
     let mut payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)> = evm
@@ -1369,7 +1583,12 @@ async fn restore_outbound_channels(
             Arc::clone(solana) as Arc<dyn BatchSettlementPayer>,
         ));
     }
-    if payers.is_empty() {
+    // An XRPL table has no paying half yet (ADR 0087), so it adds no payer
+    // -- but a node that settles on XRPL alone still has the channels the
+    // operator surface lists, which hang off this record, and a journal that
+    // holds an outbound channel it can no longer pay from is refused by name
+    // rather than forgotten.
+    if payers.is_empty() && xrpl.is_empty() {
         return Ok(None);
     }
     let (journal, path): (Arc<dyn Journal>, PathBuf) = match config.state_dir() {
@@ -1425,10 +1644,12 @@ fn batch_channels_for_operator(
 }
 
 /// The receiving half of every backend this node connected, keyed by its
-/// CAIP-2 network (ADR 0086): each EVM table's, then the Solana one.
+/// CAIP-2 network (ADR 0086, ADR 0087): each EVM table's, the Solana one,
+/// then each XRPL table's.
 fn receivers(
     evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
     solana: &Option<Arc<SolanaBatchSettlement>>,
+    xrpl: &BTreeMap<Network, Arc<XrplBatchSettlement>>,
 ) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
     let mut receivers: Vec<(Network, Arc<dyn BatchSettlementBackend>)> = evm
         .iter()
@@ -1445,6 +1666,12 @@ fn receivers(
             Arc::clone(solana) as Arc<dyn BatchSettlementBackend>,
         ));
     }
+    receivers.extend(xrpl.iter().map(|(network, backend)| {
+        (
+            network.clone(),
+            Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
+        )
+    }));
     receivers
 }
 
@@ -1452,6 +1679,7 @@ fn runtime_receivers(runtime: &Runtime) -> Vec<(Network, Arc<dyn BatchSettlement
     receivers(
         &runtime.batch_settlement_evm,
         &runtime.batch_settlement_solana,
+        &runtime.batch_settlement_xrpl,
     )
 }
 
@@ -1484,6 +1712,17 @@ fn batch_settlement_channels(runtime: &Runtime) -> Option<BatchSettlementChannel
                 solana_network_of(backend),
             )
         }),
+        runtime
+            .batch_settlement_xrpl
+            .iter()
+            .filter_map(|(network, backend)| match network {
+                Network::Xrpl(xrpl) => Some((
+                    Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
+                    *xrpl,
+                )),
+                _ => None,
+            })
+            .collect(),
     )
 }
 
@@ -1633,6 +1872,8 @@ pub(crate) struct SettlementTransports {
     /// One per EVM table, keyed by its network (ADR 0086).
     evm: BTreeMap<Network, RpcTransport>,
     solana: Option<RpcTransport>,
+    /// One per XRPL table, keyed by its network (ADR 0087).
+    xrpl: BTreeMap<Network, RpcTransport>,
 }
 
 impl SettlementTransports {
@@ -1642,6 +1883,7 @@ impl SettlementTransports {
         let transport = match settlement {
             SettlementConfig::Evm(evm) => self.evm.get(evm.network()),
             SettlementConfig::Solana(_) => self.solana.as_ref(),
+            SettlementConfig::Xrpl(xrpl) => self.xrpl.get(&Network::Xrpl(xrpl.network())),
         };
         transport.ok_or_else(|| RuntimeError::SettlementEndpointUnusable {
             table: settlement.table_name(),
@@ -1655,6 +1897,7 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
     let mut transports = SettlementTransports {
         evm: BTreeMap::new(),
         solana: None,
+        xrpl: BTreeMap::new(),
     };
     for settlement in config.settlements() {
         let unusable = |message: String| RuntimeError::SettlementEndpointUnusable {
@@ -1674,6 +1917,10 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
                     chain_id: evm.chain_id(),
                 },
                 SettlementConfig::Solana(_) => Circuit::SolanaSettlement,
+                // ADR 0087: a circuit of its own per XRPL network.
+                SettlementConfig::Xrpl(xrpl) => Circuit::XrplSettlement {
+                    network_id: xrpl.network().network_id(),
+                },
             };
             let transport = RpcTransport::through(settlement.rpc_url(), proxy, circuit)
                 .map_err(|error| unusable(error.to_string()))?;
@@ -1693,6 +1940,11 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
                 transports.evm.insert(evm.network().clone(), transport);
             }
             SettlementConfig::Solana(_) => transports.solana = Some(transport),
+            SettlementConfig::Xrpl(xrpl) => {
+                transports
+                    .xrpl
+                    .insert(Network::Xrpl(xrpl.network()), transport);
+            }
         }
     }
     Ok(transports)
@@ -3716,7 +3968,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
         /// both chains composes both chains' x402 batch-settlement facts and
         /// voucher signers, read off the very backends it connected -- so
         /// the greeting can never name a deployment the node is not on
-        /// (CF-26).
+        /// (CF-26). And, since ADR 0087 (#1614), beside an XRPL table's, here
+        /// over a scripted ledger.
         #[tokio::test]
         async fn a_both_chains_config_composes_both_chains_batch_settlement_facts() {
             if !require_anvil() {
@@ -3741,33 +3994,104 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 .expect("derive keypair")
                 .pubkey();
 
+            // An XRPL ledger that answers just what boot reads: its network,
+            // its reserve and the node's funded account.
+            let xrpl_seed = connector_signer::xrpl_family_seed(
+                connector_signer::XrplAlgorithm::Secp256k1,
+                &[41; 16],
+            );
+            let xrpl_node =
+                connector_signer::XrplSigner::from_family_seed(&xrpl_seed).expect("a seed");
+            let xrpl_address = xrpl_node.classic_address();
+            let ledger_account = xrpl_address.clone();
+            let ledger = connector_chain_rpc::FakeRpc::spawn(move |call| {
+                use connector_chain_rpc::RpcReply;
+                match call.method.as_str() {
+                    "server_info" => RpcReply::Result(serde_json::json!({
+                        "status": "success",
+                        "info": {
+                            "network_id": 1000,
+                            "server_state": "full",
+                            "validated_ledger": { "seq": 4, "reserve_base_xrp": 1 },
+                        },
+                    })),
+                    "account_info" if call.params[0]["account"] == ledger_account => {
+                        RpcReply::Result(serde_json::json!({
+                            "status": "success",
+                            "account_data": {
+                                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+                            },
+                        }))
+                    }
+                    _ => RpcReply::Result(serde_json::json!({
+                        "status": "error", "error": "actNotFound", "error_message": "no",
+                    })),
+                }
+            })
+            .await;
+            let xrpl_key_path = key_file_with(&xrpl_seed);
+
             let evm_key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
             let evm_key = evm_key_path.display().to_string();
             let solana_key_path = raw_key_file(seed);
             let config = node_config(
                 &evm_key,
                 &format!(
-                    "{}{}",
+                    "{}{}\n[settlement.xrpl.1000]\nrpc_url = \"{}\"\n\n\
+                     [settlement.xrpl.1000.key]\nkey_file = \"{}\"\n",
                     evm_table(&anvil.rpc_url, token, 6, &evm_key),
                     solana_table(
                         &validator.rpc_url,
                         token_mint,
                         6,
                         &solana_key_path.display().to_string()
-                    )
+                    ),
+                    ledger.url(),
+                    xrpl_key_path.display(),
                 ),
             );
 
             let runtime = build(&config)
                 .await
-                .expect("both chains bind without either refusing startup");
+                .expect("all three chains bind without any refusing startup");
             assert!(!runtime.batch_settlement_evm.is_empty());
             assert!(runtime.batch_settlement_solana.is_some());
+            assert_eq!(runtime.batch_settlement_xrpl.len(), 1);
 
             // No `{:?}` of the facts: they carry keys derived from the
             // settlement key files (rust/cleartext-logging).
-            assert_eq!(runtime.batch_settlements.len(), 2, "both chains");
-            assert_eq!(runtime.voucher_signers.len(), 2, "both chains");
+            assert_eq!(runtime.batch_settlements.len(), 3, "all three chains");
+            assert_eq!(runtime.voucher_signers.len(), 3, "all three chains");
+
+            let xrpl_batch = runtime
+                .batch_settlements
+                .iter()
+                .find_map(|entry| match entry {
+                    connector_client_edge::X402BatchSettlementTerms::Xrpl(terms) => {
+                        Some(terms.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the batch-settlement list carries an XRPL entry");
+            assert_eq!(xrpl_batch.network, "xrpl:1000");
+            assert_eq!(xrpl_batch.asset, "xrpl:1000/slip44:144");
+            assert_eq!(xrpl_batch.pay_to, xrpl_address);
+            assert_eq!(xrpl_batch.binding, "xrpl-paychan-v1");
+            assert_eq!(xrpl_batch.min_settle_delay_secs, 86_400);
+            assert_eq!(xrpl_batch.redemption_safety_secs, 60);
+            assert!(
+                runtime
+                    .voucher_signers
+                    .iter()
+                    .any(|fact| fact.network == "xrpl:1000"
+                        && fact.signer
+                            == xrpl_node
+                                .public_key()
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()),
+                "the XRPL channel key is a voucher signer"
+            );
 
             let evm_batch = runtime
                 .batch_settlements

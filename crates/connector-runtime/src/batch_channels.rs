@@ -58,7 +58,7 @@ use connector_settlement::batch::{
     BatchChannelState, BatchChannelStatus, BatchSettlementBackend, BatchSettlementError,
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, HeldVouchers, Landed,
     OutboundChannelRecord, OutboundChannelState, ReceiverTerms, SolanaReceiverTerms, Voucher,
-    VoucherSigner,
+    VoucherSigner, XrplReceiverTerms,
 };
 use connector_settlement::ChannelId;
 use serde::{Deserialize, Serialize};
@@ -419,8 +419,10 @@ fn place_on_networks(
                     // No payer settles on Mina: a zk edge's vault is not a
                     // channel this node pays from.
                     AssetChain::Mina => None,
-                    // Nor on XRPL, until its backend lands (ADR 0087).
-                    AssetChain::Xrpl => None,
+                    // An XRPL network is placed on its exact payer, if the
+                    // node has one: none is built yet (ADR 0087), so a record
+                    // naming one is refused by name below.
+                    AssetChain::Xrpl => configured().find(|network| **network == journaled),
                 };
                 let Some(placed) = placed else {
                     return Err(OutboundRestoreError::OnNoNetwork {
@@ -473,7 +475,9 @@ fn spell(chain: SettlementChain, bytes: &[u8]) -> String {
     match chain {
         SettlementChain::Evm => hex(bytes),
         SettlementChain::Solana => bs58::encode(bytes).into_string(),
-        SettlementChain::Xrpl => hex(bytes),
+        // A receiver is spelled as its classic address, whose bytes the
+        // record keeps as UTF-8.
+        SettlementChain::Xrpl => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -481,7 +485,9 @@ fn spell_signer(signer: &VoucherSigner) -> String {
     match signer {
         VoucherSigner::Evm(address) => hex(address),
         VoucherSigner::Solana(key) => bs58::encode(key).into_string(),
-        VoucherSigner::Xrpl(key) => hex(key),
+        // The channel key as ADR 0087 spells a voucher signer: 33 bytes in
+        // bare lowercase hex, which `[[peer_channels]] voucher_signer` reads.
+        VoucherSigner::Xrpl(key) => key.iter().map(|byte| format!("{byte:02x}")).collect(),
     }
 }
 
@@ -1207,8 +1213,12 @@ impl BatchChannels {
     /// The network the inbound channel `presentation` is on, as an operator
     /// reads it: the one of this node's networks whose domain reproduces it.
     fn network_of(&self, presentation: &ChannelPresentation) -> Option<String> {
-        network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n))
-            .map(|network| network.to_string())
+        // What recorded the channel knows beats what the presentation can
+        // say: an XRPL channel id binds no network.
+        self.held.network_of(presentation.channel()).or_else(|| {
+            network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n))
+                .map(|network| network.to_string())
+        })
     }
 
     /// The receiving half of the network the inbound channel
@@ -1217,7 +1227,13 @@ impl BatchChannels {
         &self,
         presentation: &ChannelPresentation,
     ) -> Result<&Arc<dyn BatchSettlementBackend>, BatchChannelError> {
-        let network = network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n));
+        let network = self
+            .held
+            .network_of(presentation.channel())
+            .and_then(|network| network.parse::<Network>().ok())
+            .or_else(|| {
+                network_of_presentation(presentation, self.receivers.iter().map(|(n, _)| n))
+            });
         self.receivers
             .iter()
             .find(|(configured, _)| Some(configured) == network.as_ref())
@@ -1249,6 +1265,7 @@ impl BatchChannels {
         let (chain, network) = match terms {
             X402BatchSettlementTerms::Evm(evm) => (SettlementChain::Evm, &evm.network),
             X402BatchSettlementTerms::Solana(solana) => (SettlementChain::Solana, &solana.network),
+            X402BatchSettlementTerms::Xrpl(xrpl) => (SettlementChain::Xrpl, &xrpl.network),
         };
         // ADR 0086: the counterparty's network must be one this node settles
         // on, and the channel is opened on exactly that one.
@@ -1463,6 +1480,28 @@ pub fn receiver_terms(
                     format!("its minDeposit '{}' is not an amount", solana.min_deposit)
                 })?,
                 sponsor_endpoint: sponsor_endpoint.to_string(),
+            }))
+        }
+        X402BatchSettlementTerms::Xrpl(xrpl) => {
+            // A binding this build was not written to is refused, not
+            // guessed at: a later `xrpl-paychan` version may sign other bytes
+            // (ADR 0087 decision 1).
+            if xrpl.binding != connector_domain::x402::XRPL_PAYCHAN_BINDING {
+                return Err(format!(
+                    "its binding is '{}', and this node speaks only '{}'",
+                    xrpl.binding,
+                    connector_domain::x402::XRPL_PAYCHAN_BINDING
+                ));
+            }
+            connector_signer::decode_xrpl_classic_address(&xrpl.pay_to).map_err(|error| {
+                format!(
+                    "its payTo '{}' is not a classic address: {error}",
+                    xrpl.pay_to
+                )
+            })?;
+            Ok(ReceiverTerms::Xrpl(XrplReceiverTerms {
+                receiver: xrpl.pay_to.clone(),
+                min_settle_delay_secs: xrpl.min_settle_delay_secs,
             }))
         }
     }

@@ -339,26 +339,26 @@ spell it however it likes.
 
 ### 2.1 Top level
 
-| key                                                     | type                                  | required | expresses                                            |
-| ------------------------------------------------------- | ------------------------------------- | -------- | ---------------------------------------------------- |
-| `client_edge_addr`                                      | socket address                        | yes      | where the client edge binds — **not** its public URL |
-| `[signer]`                                              | table                                 | yes      | CF-06, the one identity key                          |
-| `[[routes]]`                                            | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
-| `[[peers]]`                                             | array of tables                       | —        | CF-16 – CF-20                                        |
-| `[[peer_channels]]`                                     | array of tables                       | —        | CF-21, the peer book                                 |
-| `[[pay_channels]]`                                      | array of tables                       | —        | CF-21, channels this node pays from                  |
-| `[[client_identities]]`                                 | array of tables                       | —        | CF-29                                                |
-| `[settlement.eip155.<chainId>]` / `[settlement.solana]` | tables                                | —        | CF-24, CF-25                                         |
-| `[operator]`                                            | table                                 | no       | CF-30, CF-31                                         |
-| `[node]`                                                | table                                 | —        | CF-08, the facts a node cannot introspect            |
-| `peer_expose`                                           | `"neither"`/`"btp"`/`"http"`/`"both"` | no       | CF-17                                                |
-| `peer_allow_plaintext_endpoints`                        | bool                                  | no       | CF-18's node-wide opt-in                             |
-| `socks_proxy`                                           | `socks5h://` URL                      | no       | ADR 0070, the one onion dial path                    |
-| `[[tokens]]`                                            | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
-| `[[rates]]`                                             | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
-| `[rate_guards]`                                         | table                                 | —        | ADR 0071, this node's dealing policy                 |
-| `[zk_note]`                                             | table                                 | —        | ADR 0080, makes this node a zk edge                  |
-| `state_dir`                                             | path                                  | CF-39    | where durable state lives                            |
+| key                                                                                | type                                  | required | expresses                                            |
+| ---------------------------------------------------------------------------------- | ------------------------------------- | -------- | ---------------------------------------------------- |
+| `client_edge_addr`                                                                 | socket address                        | yes      | where the client edge binds — **not** its public URL |
+| `[signer]`                                                                         | table                                 | yes      | CF-06, the one identity key                          |
+| `[[routes]]`                                                                       | array of tables                       | —        | CF-10 – CF-15 (CF-13e: `max_bytes`)                  |
+| `[[peers]]`                                                                        | array of tables                       | —        | CF-16 – CF-20                                        |
+| `[[peer_channels]]`                                                                | array of tables                       | —        | CF-21, the peer book                                 |
+| `[[pay_channels]]`                                                                 | array of tables                       | —        | CF-21, channels this node pays from                  |
+| `[[client_identities]]`                                                            | array of tables                       | —        | CF-29                                                |
+| `[settlement.eip155.<chainId>]` / `[settlement.solana]` / `[settlement.xrpl.<id>]` | tables                                | —        | CF-24, CF-25                                         |
+| `[operator]`                                                                       | table                                 | no       | CF-30, CF-31                                         |
+| `[node]`                                                                           | table                                 | —        | CF-08, the facts a node cannot introspect            |
+| `peer_expose`                                                                      | `"neither"`/`"btp"`/`"http"`/`"both"` | no       | CF-17                                                |
+| `peer_allow_plaintext_endpoints`                                                   | bool                                  | no       | CF-18's node-wide opt-in                             |
+| `socks_proxy`                                                                      | `socks5h://` URL                      | no       | ADR 0070, the one onion dial path                    |
+| `[[tokens]]`                                                                       | array of tables                       | —        | ADR 0071, the tokens this node deals                 |
+| `[[rates]]`                                                                        | array of tables                       | —        | ADR 0071, one ordered pair's rate and guards         |
+| `[rate_guards]`                                                                    | table                                 | —        | ADR 0071, this node's dealing policy                 |
+| `[zk_note]`                                                                        | table                                 | —        | ADR 0080, makes this node a zk edge                  |
+| `state_dir`                                                                        | path                                  | CF-39    | where durable state lives                            |
 
 **How the file is read.** Every table in it is `deny_unknown_fields`, so an unrecognised key — a typo,
 or one from a shape this build does not implement — is a load failure that names it rather than a line
@@ -448,6 +448,19 @@ longer in this repository at all ([ADR 0065](../adr/0065-mina-leaves-the-reposit
 `[settlement]` is legal, and such a node settles on no chain and takes no claim; a present but wrong
 one is a startup failure, because a real backend is constructed for every chain configured before the
 node serves anything (CF-25).
+
+**XRPL is one table per network too**
+([ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md), issue #1614):
+`[settlement.xrpl.<id>]`, keyed by the ledger's `server_info` `network_id` (`0`, `1`, `2`, or `1000`
+for the stand-alone harness; any other key is refused by name). It carries an `rpc_url`, a key table
+holding an XRPL family seed, `rpc_via_socks_proxy`, `min_settle_delay_secs` (default one day, and
+above the settlement port's 901 s floor), `redemption_safety_secs` (default 60, below the delay) and
+`max_fee_drops` (default 100000). There is no token, `decimals` or contract: a channel holds XRP, whose
+asset is `xrpl:<id>/slip44:144` in `[[tokens]]`, `[[rates]]` and the greeting. A bare `[settlement.xrpl]`,
+a key written inline, an unknown key and every `<chain>:native` asset spelling are refused at load by
+name. Boot refuses, by name, a `network_id` the endpoint does not serve, a missing settlement
+account, one below the base reserve, and two tables resolving to one account (a claim binds no
+network, so an account may be on one).
 
 **A chain's x402 terms sit in its settlement table** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)
 decisions 1 and 5, ADR 0075 decision 9). They are not an opt-in: x402 channels are the only channels,
@@ -623,14 +636,15 @@ use and belong in an operator's guide rather than a protocol specification.
 
 **`rpc_via_socks_proxy` sends one settlement table's RPC through `socks_proxy`**
 ([ADR 0073](../adr/0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)). It
-is a boolean on each `[settlement.eip155.<chainId>]` table and on `[settlement.solana]`, `false` when omitted. When a table
+is a boolean on each `[settlement.eip155.<chainId>]` and `[settlement.xrpl.<id>]` table and on `[settlement.solana]`, `false` when omitted. When a table
 sets it:
 
 - every client of that table's `rpc_url` dials through the node's one `socks_proxy` as `socks5h`: the
   settlement backend, and on EVM the rate source too. None is left
   direct, and a proxy that is down is a failed call, never a direct dial;
 - each network rides its own circuit, pinned by a fixed SOCKS username naming it
-  (`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-solana`), which relies on
+  (`toon-settlement-eip155-<chainId>` for each EVM table, `toon-settlement-xrpl-<id>` for each XRPL
+  table, `toon-settlement-solana`), which relies on
   the daemon's `IsolateSOCKSAuth` (on by default) (ADR 0086 decision 7);
 - a node with no `socks_proxy` is refused at load (`SettlementRpcViaSocksProxyWithoutProxy`), since
   the key selects the node's one proxy and never names a second;

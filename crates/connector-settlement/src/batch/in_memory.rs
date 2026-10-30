@@ -802,6 +802,9 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
                 }
                 (None, receiver[0], delay_secs)
             }
+            OutboundChannelRecord::Xrpl { .. } => {
+                unreachable!("the fake settles on no XRPL chain")
+            }
         };
         debit(&mut ledger, self.node, deposit)?;
         let opened = chain.insert(

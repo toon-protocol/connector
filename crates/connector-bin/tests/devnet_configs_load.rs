@@ -1272,7 +1272,7 @@ fn every_fleet_configs_settlement_evm_leg_matches_the_live_identity() {
             .iter()
             .find_map(|settlement| match settlement {
                 SettlementConfig::Evm(evm) => Some(evm),
-                SettlementConfig::Solana(_) => None,
+                SettlementConfig::Solana(_) | SettlementConfig::Xrpl(_) => None,
             })
             .unwrap_or_else(|| {
                 panic!("the {label} config must carry a live [settlement.eip155.84532] leg")

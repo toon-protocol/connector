@@ -108,6 +108,9 @@ pub struct ServerInfo {
     pub server_state: String,
     /// The newest validated ledger, once there is one.
     pub validated_ledger: Option<u32>,
+    /// The base reserve of the validated ledger, in drops: what an account
+    /// must hold to exist. Absent until the node has a validated ledger.
+    pub reserve_base_drops: Option<u64>,
 }
 
 /// An account's `AccountRoot`, as far as funding and sequencing read it.
@@ -285,6 +288,12 @@ impl XrplRpc {
             validated_ledger: info["validated_ledger"]["seq"]
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok()),
+            // `reserve_base_xrp` is XRP, whole or fractional: drops are
+            // read off it rather than trusting a float's last digit.
+            reserve_base_drops: info["validated_ledger"]["reserve_base_xrp"]
+                .as_f64()
+                .filter(|xrp| xrp.is_finite() && *xrp >= 0.0)
+                .map(|xrp| (xrp * 1_000_000.0).round() as u64),
         })
     }
 

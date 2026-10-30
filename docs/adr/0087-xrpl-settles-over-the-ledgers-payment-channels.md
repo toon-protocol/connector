@@ -124,6 +124,20 @@ The ordinary land (`POST /channels/:id/land`) is a destination `PaymentChannelCl
 
 An XRPL channel deletes itself on close, so the port reads it as follows (0075, "Update (issue #1565)"): `landed = Balance`; `collateral = Amount − Balance` while there is no `Expiration` and 0 once there is; status `Open` with none and `Closing` with one, and back to `Open` after `tfRenew`, since a payer may undo its exit. There is no `Withdrawing`. A deleted entry reads `ChannelNotFound` on the receiving half, with no copy kept; on the paying half `outbound_state` answers from the journal's cache and `finish_withdrawal` returns `NoWithdrawalPending`.
 
+## Update (issue #1614): a node boots on XRPL and publishes it
+
+`[settlement.xrpl.<id>]` is read, and a node with one boots a receiving backend over it, with the
+boot refusals of decisions 4 and 5 each raised by name from `connector-cli` (`XrplNetworkMismatch`,
+`XrplAccountMissing`, `XrplAccountUnderfunded`, `XrplAccountOnTwoNetworks`; an unknown network is
+refused earlier, at config load). The refusals are checked against `server_info` and `account_info`
+before the backend is built. Decision 9's greeting entry, `voucherSigners`, and the claim gate's
+admission, journaling (`xrpl:<channel id>`, with the network the voucher named) and restore are built;
+`GET /channels` and `GET /claims` list the channels. The reserve is read from `server_info`'s
+`validated_ledger.reserve_base_xrp`. The paying half and the watcher (decision 8) are later tickets
+of the spec: an XRPL table adds no payer to the outbound channels, and
+`OutboundChannelRecord::Xrpl` (the signed `PaymentChannelCreate` and its `LastLedgerSequence`, so a
+retried open resumes the journaled channel) exists for them to write.
+
 ## Considered options
 
 - **Track PR #2952 loosely.** Rejected by 0085 decision 2.

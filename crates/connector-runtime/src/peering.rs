@@ -496,6 +496,7 @@ impl SharedSettlement {
         match self.terms {
             X402BatchSettlementTerms::Evm(_) => SettlementChain::Evm,
             X402BatchSettlementTerms::Solana(_) => SettlementChain::Solana,
+            X402BatchSettlementTerms::Xrpl(_) => SettlementChain::Xrpl,
         }
     }
 
@@ -504,6 +505,7 @@ impl SharedSettlement {
         match &self.terms {
             X402BatchSettlementTerms::Evm(evm) => &evm.network,
             X402BatchSettlementTerms::Solana(solana) => &solana.network,
+            X402BatchSettlementTerms::Xrpl(xrpl) => &xrpl.network,
         }
     }
 
@@ -513,6 +515,7 @@ impl SharedSettlement {
         match &self.terms {
             X402BatchSettlementTerms::Evm(evm) => &evm.pay_to,
             X402BatchSettlementTerms::Solana(solana) => &solana.pay_to,
+            X402BatchSettlementTerms::Xrpl(xrpl) => &xrpl.pay_to,
         }
     }
 }

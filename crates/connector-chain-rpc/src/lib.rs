@@ -93,7 +93,7 @@ impl Timeouts {
 /// with different credentials on different circuits and streams with the
 /// same credentials on one. So each network gets a fixed username of its
 /// own (ADR 0086 decision 7, amending 0073 decision 3): one per EVM network,
-/// named for its chain id, and one for Solana. That keeps one exit from
+/// named for its chain id, one per XRPL network (ADR 0087), and one for Solana. That keeps one exit from
 /// seeing two networks' RPCs, and it keeps
 /// settlement off the ILP wire's circuits, whose dials present no
 /// credentials at all. The daemon still rotates a circuit after
@@ -105,6 +105,9 @@ pub enum Circuit {
     EvmSettlement { chain_id: u64 },
     /// `[settlement.solana]`: the backend.
     SolanaSettlement,
+    /// `[settlement.xrpl.<network_id>]`: the backend of that one XRPL network
+    /// (ADR 0087), a circuit of its own like an EVM network's.
+    XrplSettlement { network_id: u32 },
 }
 
 impl Circuit {
@@ -115,6 +118,9 @@ impl Circuit {
         match self {
             Circuit::EvmSettlement { chain_id } => format!("toon-settlement-eip155-{chain_id}"),
             Circuit::SolanaSettlement => "toon-settlement-solana".to_string(),
+            Circuit::XrplSettlement { network_id } => {
+                format!("toon-settlement-xrpl-{network_id}")
+            }
         }
     }
 
@@ -703,6 +709,13 @@ mod tests {
         assert_ne!(
             base.socks_username(),
             Circuit::SolanaSettlement.socks_username()
+        );
+        // An XRPL network's is named for its network id (ADR 0087).
+        let xrpl = Circuit::XrplSettlement { network_id: 1 };
+        assert_eq!(xrpl.socks_username(), "toon-settlement-xrpl-1");
+        assert_ne!(
+            xrpl.socks_username(),
+            Circuit::XrplSettlement { network_id: 0 }.socks_username()
         );
         // Solana's is the one it has always been.
         assert_eq!(

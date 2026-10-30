@@ -90,12 +90,12 @@ use connector_domain::{
 use connector_runtime::{Journal, JournalError};
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, verify_solana_voucher,
-    BatchChannelConfig, BatchSettlementDomain, VoucherSignature,
+    verify_xrpl_claim, BatchChannelConfig, BatchSettlementDomain,
 };
 
 use crate::batch_settlement::{
     journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, JournaledBatchChannel,
+    AdmittedXrplVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
 };
 use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
 use crate::lookup_budget::{
@@ -843,6 +843,33 @@ impl ClientClaimGate {
             .await
     }
 
+    /// As [`Self::solana_voucher_channel`], for the XRPL channel `channel_id`
+    /// on `network`: every field is on the ledger, so nothing is presented.
+    /// The network is the voucher's own, since the id binds none.
+    pub(crate) async fn xrpl_voucher_channel(
+        &self,
+        network: &Network,
+        channel_id: &[u8; 32],
+        requester: &str,
+    ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
+        let (Some(backend), Network::Xrpl(xrpl)) = (
+            self.batch_settlement
+                .as_deref()
+                .filter(|backend| backend.accepts_xrpl()),
+            network,
+        ) else {
+            return Ok(None);
+        };
+        let key = format!(
+            "{}:{}",
+            connector_domain::client_claim::XRPL_CHANNEL_NAMESPACE,
+            hex::encode(channel_id)
+        );
+        let unseen = self.known_batch_channel(&key).is_none();
+        self.metered_voucher_lookup(unseen, requester, backend.xrpl(xrpl, channel_id))
+            .await
+    }
+
     /// Whether `network` names a settlement table this node has (ADR 0086
     /// decision 1) -- `false` on a node that settles on nothing.
     pub(crate) fn settles_on(&self, network: &Network) -> bool {
@@ -1132,9 +1159,7 @@ impl ClientClaimGate {
         let accepted_here = match &claim {
             ClientClaim::EvmVoucher(_) => backend.accepts_evm(),
             ClientClaim::SolanaVoucher(_) => backend.accepts_solana(),
-            // No XRPL table is read until its backend lands (ADR 0087, #1596):
-            // the claim parses and verifies off-line, but settles nowhere.
-            ClientClaim::XrplVoucher(_) => false,
+            ClientClaim::XrplVoucher(_) => backend.accepts_xrpl(),
         };
         if !accepted_here {
             return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
@@ -1724,10 +1749,29 @@ fn claim_refusal(error: ClaimError) -> ClaimIngestRejection {
     }
 }
 
+/// A voucher's signature, decoded: fixed width on the two chains that sign a
+/// fixed-width form, a DER or raw signature of 64 to 72 bytes on XRPL.
+enum VoucherSignature {
+    Evm([u8; 65]),
+    Solana([u8; 64]),
+    Xrpl(Vec<u8>),
+}
+
+impl VoucherSignature {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            VoucherSignature::Evm(signature) => signature.to_vec(),
+            VoucherSignature::Solana(signature) => signature.to_vec(),
+            VoucherSignature::Xrpl(signature) => signature.clone(),
+        }
+    }
+}
+
 /// A voucher's signature as the bytes its scheme defines: `0x` + 130 hex on
 /// EVM (65 bytes, `v` as the wallet wrote it), base58 of 64 bytes on
-/// Solana. Anything else is a structural failure -- the parser checked the
-/// alphabet, this checks the length.
+/// Solana, hex of 64 to 72 bytes on XRPL (a DER ECDSA or a raw Ed25519
+/// signature). Anything else is a structural failure -- the parser checked
+/// the alphabet, this checks the length.
 fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, ClaimIngestRejection> {
     match claim {
         ClientClaim::EvmVoucher(voucher) => decode_hex_bytes::<65>(&voucher.signature)
@@ -1744,8 +1788,15 @@ fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, Cla
                     "a Solana voucher's 'signature' must be base58 of 64 bytes".to_string(),
                 )
             }),
-        // Refused before this point: no settlement backend accepts XRPL yet.
-        ClientClaim::XrplVoucher(_) => Err(ClaimIngestRejection::BatchSettlementNotAccepted),
+        ClientClaim::XrplVoucher(voucher) => hex::decode(&voucher.signature)
+            .ok()
+            .filter(|bytes| (64..=72).contains(&bytes.len()))
+            .map(VoucherSignature::Xrpl)
+            .ok_or_else(|| {
+                ClaimIngestRejection::Malformed(
+                    "an XRPL voucher's 'signature' must be 64 to 72 bytes of hex".to_string(),
+                )
+            }),
     }
 }
 
@@ -1899,6 +1950,42 @@ async fn verify_voucher(
                     max_cumulative: u128::from(channel.max_cumulative),
                     channel: JournaledBatchChannel::Solana { channel_account },
                     signer: VoucherSigner::Solana(channel.authorized_signer),
+                })
+            } else {
+                Err(ClaimIngestRejection::SignatureInvalid)
+            }
+        }
+        (ClientClaim::XrplVoucher(voucher), VoucherSignature::Xrpl(signature)) => {
+            let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
+                return Err(ClaimIngestRejection::UnknownChannel);
+            };
+            // The network is the voucher's own and a channel id binds none
+            // (ADR 0087 decision 2): the ledger asked is the one it names.
+            let Network::Xrpl(network) = &voucher.network else {
+                return Err(ClaimIngestRejection::NetworkNotSettled {
+                    network: voucher.network.clone(),
+                });
+            };
+            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
+            let found = backend
+                .xrpl(network, &channel_id)
+                .await
+                .map_err(refuse_resolution)?;
+            refund_if_found(budget, reservation, found.is_some());
+            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
+            if verify_xrpl_claim(
+                &channel.public_key,
+                &channel_id,
+                voucher.max_claimable_amount,
+                &signature,
+            ) {
+                Ok(VerifiedVoucher {
+                    max_cumulative: u128::from(channel.max_cumulative),
+                    channel: JournaledBatchChannel::Xrpl {
+                        channel_id,
+                        network: *network,
+                    },
+                    signer: VoucherSigner::Xrpl(channel.public_key),
                 })
             } else {
                 Err(ClaimIngestRejection::SignatureInvalid)

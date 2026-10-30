@@ -178,7 +178,7 @@ pub(crate) fn settlement_asset(
         .iter()
         .filter(|settlement| settlement.chain() == chain);
     let settlement = match (chain, network) {
-        (SettlementChain::Evm, Some(network)) => {
+        (SettlementChain::Evm | SettlementChain::Xrpl, Some(network)) => {
             on_chain.find(|settlement| settlement.network().as_ref() == Some(network))?
         }
         _ => {

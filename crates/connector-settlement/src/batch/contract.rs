@@ -977,19 +977,21 @@ fn record_for_the_other_chain(record: &OutboundChannelRecord) -> OutboundChannel
             transaction: Vec::new(),
             last_valid_block_height: 0,
         },
-        OutboundChannelRecord::Solana { .. } => OutboundChannelRecord::Evm {
-            channel: ChannelId(format!("0x{}", "5a".repeat(32))),
-            config: super::port::EvmChannelConfig {
-                payer: [0x5a; 20],
-                payer_authorizer: [0x5a; 20],
-                receiver: [0x5b; 20],
-                receiver_authorizer: [0x5b; 20],
-                token: [0x5c; 20],
-                withdraw_delay: 86_400,
-                salt: [0x5d; 32],
-            },
-            deposit: 1_000,
-        },
+        OutboundChannelRecord::Solana { .. } | OutboundChannelRecord::Xrpl { .. } => {
+            OutboundChannelRecord::Evm {
+                channel: ChannelId(format!("0x{}", "5a".repeat(32))),
+                config: super::port::EvmChannelConfig {
+                    payer: [0x5a; 20],
+                    payer_authorizer: [0x5a; 20],
+                    receiver: [0x5b; 20],
+                    receiver_authorizer: [0x5b; 20],
+                    token: [0x5c; 20],
+                    withdraw_delay: 86_400,
+                    salt: [0x5d; 32],
+                },
+                deposit: 1_000,
+            }
+        }
     }
 }
 

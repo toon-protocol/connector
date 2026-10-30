@@ -46,8 +46,10 @@
 //! implementation's job.
 
 use async_trait::async_trait;
-use connector_domain::client_claim::{canonical_channel_key, EVM_NAMESPACE, SOLANA_NAMESPACE};
-use connector_domain::{JournalEntry, Network};
+use connector_domain::client_claim::{
+    canonical_channel_key, EVM_NAMESPACE, SOLANA_NAMESPACE, XRPL_CHANNEL_NAMESPACE,
+};
+use connector_domain::{JournalEntry, Network, XrplNetwork};
 use connector_runtime::JournalError;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
@@ -77,6 +79,19 @@ pub struct AdmittedSolanaVoucherChannel {
     /// signed message and SPL amounts stay `u64` (ADR 0074 decision 3,
     /// amended 2026-09-30 #1429). The channel's `deposit`, which only
     /// `top_up` moves while it is Open.
+    pub max_cumulative: u64,
+}
+
+/// An XRPL `PayChannel` this connector admits (ADR 0087 decision 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedXrplVoucherChannel {
+    /// The channel's `PublicKey`, fixed at creation: 33 bytes, secp256k1
+    /// compressed or `0xED`-prefixed Ed25519. Whose signature a voucher on it
+    /// must carry.
+    pub public_key: [u8; 33],
+    /// The channel's `Amount - Balance` in drops, plus what it has already
+    /// delivered: the most a voucher may name and still be landable (ADR
+    /// 0087 decision 10). `u64`, like the ledger's own amounts.
     pub max_cumulative: u64,
 }
 
@@ -114,6 +129,18 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
         self.solana_network().is_some()
     }
 
+    /// Each XRPL network this node settles on, one per
+    /// `[settlement.xrpl.<id>]` table (ADR 0087), in table order. Empty if
+    /// this node has not opted in to XRPL vouchers.
+    fn xrpl_networks(&self) -> Vec<XrplNetwork> {
+        Vec::new()
+    }
+
+    /// Whether this node has opted in to XRPL vouchers on any network.
+    fn accepts_xrpl(&self) -> bool {
+        !self.xrpl_networks().is_empty()
+    }
+
     /// Whether `network` names a settlement table this node has: on EVM,
     /// the chain of the domain vouchers are verified under; on Solana, the
     /// one Solana network. A voucher, claim-state entry or peer-role
@@ -125,8 +152,7 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
             Network::Solana(_) => self.solana_network().as_ref() == Some(network),
             // No settlement table holds MINA: a zk edge's vault is not one.
             Network::Mina(_) => false,
-            // Nor XRP, until the XRPL backend lands (ADR 0087, #1596).
-            Network::Xrpl(_) => false,
+            Network::Xrpl(xrpl) => self.xrpl_networks().contains(xrpl),
         }
     }
 
@@ -151,6 +177,19 @@ pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
         &self,
         channel_account: &[u8; 32],
     ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError>;
+
+    /// The XRPL channel `channel_id` on `network`, if this connector admits
+    /// it: asked of that network's backend and no other. A channel id binds
+    /// no network (ADR 0087 decision 2), so the voucher's own `network` is
+    /// what picks the ledger to read. A node with no XRPL table admits
+    /// nothing.
+    async fn xrpl(
+        &self,
+        _network: &XrplNetwork,
+        _channel_id: &[u8; 32],
+    ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
+        Ok(None)
+    }
 }
 
 /// A batch-settlement channel the client edge has accepted a voucher on, as
@@ -167,6 +206,14 @@ pub enum JournaledBatchChannel {
     },
     /// The channel account. Every other field is on chain.
     Solana { channel_account: [u8; 32] },
+    /// The channel's id, and the network its voucher named. The id binds no
+    /// network (ADR 0087 decision 2), so a restart that did not remember
+    /// which ledger the channel lives on could not read it from a node with
+    /// several XRPL tables.
+    Xrpl {
+        channel_id: [u8; 32],
+        network: XrplNetwork,
+    },
 }
 
 /// Bytes in an EVM presentation: five addresses, the `withdrawDelay` as a
@@ -185,6 +232,9 @@ impl JournaledBatchChannel {
                 "{SOLANA_NAMESPACE}:{}",
                 bs58::encode(channel_account).into_string()
             ),
+            JournaledBatchChannel::Xrpl { channel_id, .. } => {
+                format!("{XRPL_CHANNEL_NAMESPACE}:{}", hex::encode(channel_id))
+            }
         }
     }
 
@@ -207,6 +257,8 @@ impl JournaledBatchChannel {
                 bytes
             }
             JournaledBatchChannel::Solana { .. } => Vec::new(),
+            // The CAIP-2 network, UTF-8: all the ledger cannot give back.
+            JournaledBatchChannel::Xrpl { network, .. } => network.caip2().as_bytes().to_vec(),
         };
         JournalEntry::BatchChannelAdmitted {
             channel_id: self.channel_key(),
@@ -246,6 +298,19 @@ impl JournaledBatchChannel {
                 let account = bs58::decode(account).into_vec().ok()?;
                 Some(JournaledBatchChannel::Solana {
                     channel_account: account.try_into().ok()?,
+                })
+            }
+            (XRPL_CHANNEL_NAMESPACE, id) => {
+                let network = std::str::from_utf8(presentation)
+                    .ok()?
+                    .parse::<Network>()
+                    .ok()?;
+                let Network::Xrpl(network) = network else {
+                    return None;
+                };
+                Some(JournaledBatchChannel::Xrpl {
+                    channel_id: hex::decode(id).ok()?.try_into().ok()?,
+                    network,
                 })
             }
             _ => None,
@@ -446,6 +511,57 @@ mod tests {
             solana().channel_key(),
             format!("solana:{}", bs58::encode([0xc3; 32]).into_string())
         );
+    }
+
+    fn xrpl(network: XrplNetwork) -> JournaledBatchChannel {
+        JournaledBatchChannel::Xrpl {
+            channel_id: [0x5d; 32],
+            network,
+        }
+    }
+
+    /// ADR 0087 decision 2: an XRPL channel is keyed `xrpl:<channel id>`, as
+    /// its vouchers are, and its journal entry carries the network its
+    /// voucher named -- which the id cannot say -- so a restart reads it
+    /// back from the ledger it lives on.
+    #[test]
+    fn an_xrpl_channel_is_keyed_as_its_vouchers_are_and_remembers_its_network() {
+        let channel = xrpl(XrplNetwork::Testnet);
+        assert_eq!(channel.channel_key(), format!("xrpl:{}", "5d".repeat(32)));
+        let entries = vec![
+            xrpl(XrplNetwork::Testnet).to_entry(),
+            xrpl(XrplNetwork::Standalone).to_entry(),
+            // The same id on the same network is the same channel.
+            xrpl(XrplNetwork::Testnet).to_entry(),
+        ];
+        assert_eq!(
+            journaled_batch_channels(&entries).unwrap(),
+            vec![xrpl(XrplNetwork::Testnet)],
+            "an id binds no network, so it is one channel however often it is recorded"
+        );
+        let JournalEntry::BatchChannelAdmitted { presentation, .. } =
+            xrpl(XrplNetwork::Standalone).to_entry()
+        else {
+            panic!("a channel admission");
+        };
+        assert_eq!(presentation, b"xrpl:1000");
+    }
+
+    #[test]
+    fn an_xrpl_record_naming_no_xrpl_network_refuses_the_replay() {
+        for presentation in [&b""[..], b"eip155:1", b"xrpl:7", &[0xff, 0xfe]] {
+            let entries = vec![JournalEntry::BatchChannelAdmitted {
+                channel_id: format!("xrpl:{}", "5d".repeat(32)),
+                presentation: presentation.to_vec(),
+            }];
+            assert!(
+                matches!(
+                    journaled_batch_channels(&entries),
+                    Err(JournalError::Corrupt(_))
+                ),
+                "{presentation:?}"
+            );
+        }
     }
 
     #[test]
