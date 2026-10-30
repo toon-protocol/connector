@@ -359,8 +359,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
         };
         // Held from the read to the landing's fate, so a second land judges
         // staleness against the first one's outcome, not the ledger before it.
-        self.wait_unreserved().await;
-        let landing = self.sequencer.lock().await;
+        let landing = self.sequence_turn().await;
         let read = self.read(&id).await?;
         let landed = u128::from(read.balance);
         if amount <= landed {

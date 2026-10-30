@@ -43,7 +43,7 @@
 //! account cannot afford -- deposit, the owner reserve a new channel locks
 //! (read live), and the fee, above the account's own reserve -- is refused
 //! naming the shortfall, never left to a `tecUNFUNDED`. A fee above the
-//! table's `max_fee_drops` is refused, naming it.
+//! backend's `max_fee_drops` is refused, naming it.
 
 use std::time::{Duration, Instant};
 
@@ -222,14 +222,17 @@ impl XrplBatchSettlement {
         Ok((drops, fee.ledger_current_index))
     }
 
-    /// Wait, up to [`RESERVATION_PATIENCE`], while the account's next
-    /// `Sequence` belongs to a prepared open that has not been sent. Called
-    /// before taking the sequencer, which the open needs to be sent.
-    pub(crate) async fn wait_unreserved(&self) {
+    /// Take the sequencer for a transaction signed at the account's next
+    /// `Sequence`. While that `Sequence` belongs to a prepared open that has
+    /// not been sent, the sequencer is let go -- the open needs it to be sent
+    /// -- for up to [`RESERVATION_PATIENCE`]. The reservation is judged under
+    /// the lock, so no open prepared in between is overtaken unawaited.
+    pub(crate) async fn sequence_turn(&self) -> tokio::sync::MutexGuard<'_, ()> {
         let deadline = Instant::now() + RESERVATION_PATIENCE;
         loop {
+            let turn = self.sequencer.lock().await;
             let Ok(Some(account)) = self.rpc.account_info(&self.address).await else {
-                return;
+                return turn;
             };
             let held = {
                 let mut reserved = self.reserved.lock().expect("reserved");
@@ -237,8 +240,9 @@ impl XrplBatchSettlement {
                 reserved.contains(&account.sequence)
             };
             if !held || Instant::now() >= deadline {
-                return;
+                return turn;
             }
+            drop(turn);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -485,14 +489,23 @@ impl XrplBatchSettlement {
 
         let hash = blob_hash(transaction);
         // A blob the ledger is known never to take is a lapsed open.
-        let sent = self
+        let sent = match self
             .submit_and_wait(
                 &hex::encode_upper(transaction),
                 &hash,
                 *last_ledger_sequence,
             )
-            .await?
-            .ok_or_else(|| BatchSettlementError::OpenLapsed(channel.clone()))?;
+            .await
+        {
+            Ok(sent) => sent.ok_or_else(|| BatchSettlementError::OpenLapsed(channel.clone()))?,
+            // A refusal such as `tefPAST_SEQ` may be this very blob, sent
+            // before a crash, landing between the read above and the
+            // submission: the channel it made is adopted.
+            Err(error) => match self.read_channel(&id).await? {
+                Some(held) => return self.adopt(record, &id, &held),
+                None => return Err(error),
+            },
+        };
         if sent.result != "tesSUCCESS" {
             return Err(BatchSettlementError::Backend(format!(
                 "the PaymentChannelCreate {} landed as {} and opened nothing; its record can \
@@ -556,8 +569,7 @@ impl XrplBatchSettlement {
 
     /// A source's `PaymentChannelClaim` with `tfClose` on `id`.
     async fn close(&self, id_bytes: [u8; 32]) -> Result<Sent, BatchSettlementError> {
-        self.wait_unreserved().await;
-        let _sequencer = self.sequencer.lock().await;
+        let _sequencer = self.sequence_turn().await;
         let account = self.signer.account_id();
         self.send(|sequence, fee_drops, last_ledger_sequence| {
             SourceClose {
@@ -590,7 +602,8 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         terms: ReceiverTerms,
         deposit: u128,
     ) -> Result<OutboundChannelRecord, BatchSettlementError> {
-        self.wait_unreserved().await;
+        // A preparation sends nothing: it takes the `Sequence` after any
+        // already held aside, so it need not wait for them.
         let _sequencer = self.sequencer.lock().await;
         self.prepare_locked(terms, deposit).await
     }
@@ -610,8 +623,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         terms: ReceiverTerms,
         deposit: u128,
     ) -> Result<OpenedChannel, BatchSettlementError> {
-        self.wait_unreserved().await;
-        let _sequencer = self.sequencer.lock().await;
+        let _sequencer = self.sequence_turn().await;
         let record = self.prepare_locked(terms, deposit).await?;
         self.open_locked(&record).await
     }
@@ -630,7 +642,9 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         let (id, _) = Self::parse(channel)
             .map_err(|_| BatchSettlementError::ChannelNotFound(channel.clone()))?;
         let held = self.read(&id).await?;
-        if held.account != self.address {
+        // The channel key must be this node's settlement key, or no voucher
+        // signed for it verifies.
+        if held.account != self.address || held.key != Some(self.signer.public_key()) {
             return Err(BatchSettlementError::NotOutbound(id));
         }
         let state = Self::state_of(&id, &held)?;
@@ -677,8 +691,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
             // A payer that has begun to leave backs nothing new.
             return Err(BatchSettlementError::ChannelSealed(id));
         }
-        self.wait_unreserved().await;
-        let _sequencer = self.sequencer.lock().await;
+        let _sequencer = self.sequence_turn().await;
         self.require_funds(drops, 0).await?;
         let account = self.signer.account_id();
         let sent = self
