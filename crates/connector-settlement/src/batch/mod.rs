@@ -24,6 +24,7 @@ pub use port::{
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
     EvmReceiverTerms, JournaledRecord, Landed, OpenedChannel, OutboundChannelRecord,
     OutboundChannelState, ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
+    XrplReceiverTerms,
 };
 
 #[cfg(any(test, feature = "test-util"))]

@@ -139,15 +139,10 @@ where
         "a channel paying someone else is not this node's to accept vouchers on"
     );
 
-    let foreign_token = open(ChannelTerms {
-        in_settled_token: false,
-        ..admissible
-    })
-    .await;
-    assert_eq!(
-        refusal(backend.admit(foreign_token.presentation.clone()).await),
-        AdmissionRefusal::TokenNotSettled
-    );
+    // A channel in another token is refused by name too, but not here: an
+    // XRPL `PayChannel` holds XRP and nothing else (ADR 0087 decision 6), so
+    // the clause does not hold on every chain and lives beside the suite, in
+    // [`assert_refuses_a_channel_in_another_token`] (ADR 0075, #1565 rule 1).
 
     let short_delay = open(ChannelTerms {
         delay_secs: minimum_delay_secs - 1,
@@ -412,10 +407,30 @@ pub struct PayingContractFixture {
     pub restart: RestartFn,
 }
 
+/// The receiving clause that holds only where a channel can hold a token
+/// other than the one the backend settles in -- EVM and Solana, not XRPL --
+/// and so is tested beside [`assert_upholds_the_contract`] rather than in it
+/// (ADR 0075, #1565 rule 1): a channel in another token is refused by name.
+/// The fixture is the one the chain hands the suite, and is left fit for it.
+pub async fn assert_refuses_a_channel_in_another_token(fixture: &BatchContractFixture) {
+    let foreign_token = (fixture.open)(ChannelTerms {
+        deposit: 1_000,
+        delay_secs: fixture.minimum_delay_secs,
+        pays_this_node: true,
+        in_settled_token: false,
+    })
+    .await;
+    assert_eq!(
+        refusal(fixture.backend.admit(foreign_token.presentation).await),
+        AdmissionRefusal::TokenNotSettled
+    );
+}
+
 /// The shape of [`PayingContractFixture::restart`].
 pub type RestartFn = Box<dyn Fn() -> BoxFuture<'static, Arc<dyn BatchSettlementPayer>> + Send>;
 
-/// `terms`, naming a token no node settles in.
+/// `terms`, naming a token no node settles in. XRPL has none to name: a
+/// channel holds XRP only, so its terms come back as they were.
 fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
     match terms.clone() {
         ReceiverTerms::Evm(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
@@ -426,6 +441,7 @@ fn in_another_token(terms: &ReceiverTerms) -> ReceiverTerms {
             mint: terms.mint.map(|byte| !byte),
             ..terms
         }),
+        ReceiverTerms::Xrpl(terms) => ReceiverTerms::Xrpl(terms),
     }
 }
 
@@ -445,6 +461,11 @@ fn for_the_other_chain(terms: &ReceiverTerms) -> ReceiverTerms {
             receiver: [0x5a; 20],
             token: [0x5b; 20],
             min_withdraw_delay_secs: terms.min_grace_period_secs,
+        }),
+        ReceiverTerms::Xrpl(terms) => ReceiverTerms::Evm(EvmReceiverTerms {
+            receiver: [0x5a; 20],
+            token: [0x5b; 20],
+            min_withdraw_delay_secs: terms.min_settle_delay_secs,
         }),
     }
 }
@@ -1026,6 +1047,12 @@ mod tests {
     #[tokio::test]
     async fn the_in_memory_fake_with_a_close_exit_upholds_the_contract() {
         assert_upholds_the_contract(|| async { fixture(PayerExit::Close) }).await;
+    }
+
+    /// The fake's channels name a token, so one in another is refused.
+    #[tokio::test]
+    async fn the_in_memory_fake_refuses_a_channel_in_another_token() {
+        assert_refuses_a_channel_in_another_token(&fixture(PayerExit::Withdrawal)).await;
     }
 
     /// Two fake nodes on one chain: the first pays, the second receives.

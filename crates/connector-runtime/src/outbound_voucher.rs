@@ -103,6 +103,7 @@ pub fn voucher_json(
             "expiresAt": 0,
             "signature": bs58::encode(&voucher.signature).into_string(),
         }),
+        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
     }
     .to_string()
 }
@@ -138,6 +139,7 @@ pub fn challenge_entry(
             "expires": expires,
             "signature": BASE64.encode(signature),
         }),
+        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
     }
 }
 

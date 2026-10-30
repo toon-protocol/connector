@@ -413,6 +413,66 @@ impl Xrpld {
     }
 }
 
+/// A background task that closes the chain's ledger every `period`, aborted
+/// when dropped. A stand-alone `xrpld` closes a ledger only when told to, and
+/// a backend under test waits for its transactions to validate the way it
+/// would on a network that closes one every few seconds: hold one of these
+/// for as long as the backend is in use.
+///
+/// Every close moves the ledger's close time on by at least a second, so a
+/// ticker runs the chain's clock faster than the wall clock. A test that
+/// needs a delay *not* to have passed keeps it long against the pace.
+pub struct LedgerCloser(tokio::task::JoinHandle<()>);
+
+impl Drop for LedgerCloser {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Xrpld {
+    /// Close a ledger every `period` until the returned guard is dropped.
+    pub fn close_ledgers_every(&self, period: Duration) -> LedgerCloser {
+        let rpc = self.rpc();
+        LedgerCloser(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                // A failed close is the chain being gone; the test fails on
+                // its own reads.
+                let _ = rpc.ledger_accept().await;
+            }
+        }))
+    }
+
+    /// Close ledgers until the validated ledger's close time is `secs` past
+    /// what it was, the stand-alone chain's way of letting a `SettleDelay`
+    /// run out (#1610: a close moves close time at least a second, so this
+    /// takes about `secs` closes and never the wall clock's `secs`).
+    ///
+    /// Bounded: it gives up, by panicking, after `2 * secs + 10` closes, so
+    /// a chain whose clock does not advance fails loudly rather than hangs.
+    pub async fn let_close_time_pass(&self, rpc: &XrplRpc, secs: u64) {
+        let close_time = || async {
+            rpc.call("ledger", json!({ "ledger_index": "validated" }))
+                .await
+                .expect("ledger")["ledger"]["close_time"]
+                .as_u64()
+                .expect("close_time")
+        };
+        let target = close_time().await + secs;
+        for _ in 0..(2 * secs + 10) {
+            rpc.ledger_accept().await.expect("ledger_accept");
+            if close_time().await >= target {
+                return;
+            }
+        }
+        panic!(
+            "{secs} s of close time did not pass in {} closes",
+            2 * secs + 10
+        );
+    }
+}
+
 /// The used half of `docker stats`' `MemUsage` (`72.5MiB / 7.7GiB`), in
 /// bytes.
 fn parse_mem_usage(mem_usage: &str) -> Option<u64> {

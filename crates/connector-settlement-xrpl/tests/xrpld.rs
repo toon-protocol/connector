@@ -10,6 +10,17 @@ use connector_settlement_xrpl::test_support::{
 };
 use serde_json::json;
 
+/// Every spawn clears the containers of owners that are gone, so a test that
+/// plants such a container must not run beside another spawn: the sibling
+/// would clear the plant before the test looked at it. The orphan test holds
+/// this exclusively, every other test shares it.
+static SPAWNS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+async fn spawn_sharing() -> (tokio::sync::RwLockReadGuard<'static, ()>, Xrpld) {
+    let sharing = SPAWNS.read().await;
+    (sharing, Xrpld::spawn().await)
+}
+
 const WAIT: TxWait = TxWait {
     poll: Duration::from_millis(50),
     give_up_after: Duration::from_secs(10),
@@ -20,7 +31,7 @@ async fn a_funded_account_reads_back_its_balance_through_the_transport_built_cli
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let rpc = chain.rpc();
 
     let wallet = chain.funded_wallet(&rpc, 1_000_000_000).await;
@@ -39,7 +50,7 @@ async fn an_unfunded_account_does_not_exist() {
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let rpc = chain.rpc();
     let (address, _seed) = rpc.wallet_propose().await.expect("wallet_propose");
     assert_eq!(rpc.account_info(&address).await.unwrap(), None);
@@ -50,7 +61,7 @@ async fn server_info_reports_the_configured_stand_alone_network_id() {
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let info = chain.rpc().server_info().await.expect("server_info");
     assert_eq!(info.network_id, Some(STANDALONE_NETWORK_ID));
 }
@@ -60,7 +71,7 @@ async fn a_transaction_that_passes_its_last_ledger_sequence_unlanded_is_reported
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let rpc = chain.rpc();
     let payer = chain.funded_wallet(&rpc, 100_000_000).await;
     let payee = chain.funded_wallet(&rpc, 100_000_000).await;
@@ -122,7 +133,7 @@ async fn repeated_ledger_accept_advances_the_close_time_faster_than_the_wall_clo
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let rpc = chain.rpc();
     let close_time = || async {
         rpc.call("ledger", json!({ "ledger_index": "validated" }))
@@ -159,7 +170,7 @@ async fn startup_is_inside_adr_0084s_line() {
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let rpc = chain.rpc();
     for _ in 0..5 {
         chain.funded_wallet(&rpc, 100_000_000).await;
@@ -190,6 +201,7 @@ async fn a_container_left_by_a_killed_run_is_cleared_by_the_next_spawn() {
     if !require_xrpld() {
         return;
     }
+    let _alone = SPAWNS.write().await;
     // A process that has exited: its PID is no one's now.
     let mut dead = Command::new("true").spawn().unwrap();
     let dead_pid = dead.id();
@@ -231,7 +243,7 @@ async fn dropping_the_chain_removes_its_container() {
     if !require_xrpld() {
         return;
     }
-    let chain = Xrpld::spawn().await;
+    let (_sharing, chain) = spawn_sharing().await;
     let id = chain.container_id().to_string();
     let exists = || {
         let out = Command::new("docker")

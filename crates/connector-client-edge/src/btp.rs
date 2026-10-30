@@ -527,6 +527,10 @@ pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolDa
             json["expiresAt"] = 0.into();
             json["signature"] = bs58::encode(&payout.voucher.signature).into_string().into();
         }
+        ChannelPresentation::Xrpl { .. } => {
+            json["blockchain"] = "xrpl".into();
+            json["signature"] = hex::encode(&payout.voucher.signature).into();
+        }
     }
     ProtocolData {
         name: PAYOUT_CLAIM_PROTOCOL.to_string(),

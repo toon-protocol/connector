@@ -842,6 +842,14 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
             }
             wire::ChannelStatus::Open | wire::ChannelStatus::Closing => {}
         }
+        // The program's width is a `u64`: wider is refused by name, never
+        // truncated (ADR 0075, "Update (issue #1565)").
+        let amount = u64::try_from(voucher.cumulative_amount).map_err(|_| {
+            BatchSettlementError::AmountExceedsChain {
+                amount: voucher.cumulative_amount,
+                max: u64::MAX,
+            }
+        })?;
         if voucher.cumulative_amount <= landed {
             return Err(BatchSettlementError::StaleVoucher {
                 amount: voucher.cumulative_amount,
@@ -855,14 +863,6 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
                 deposited,
             });
         }
-        // At most the deposit, which is a u64, so this cannot fail; if it
-        // ever did it is refused by name rather than panicking the caller.
-        let amount = u64::try_from(voucher.cumulative_amount).map_err(|_| {
-            BatchSettlementError::VoucherExceedsDeposit {
-                amount: voucher.cumulative_amount,
-                deposited,
-            }
-        })?;
         let signature: [u8; 64] = voucher.signature.as_slice().try_into().map_err(|_| {
             BatchSettlementError::InvalidVoucherSignature(format!(
                 "a payment-channels voucher signature is 64 bytes of Ed25519, got {}",

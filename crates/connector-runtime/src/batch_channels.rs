@@ -328,6 +328,7 @@ pub fn network_of_presentation<'a>(
     let family = match presentation {
         ChannelPresentation::Evm { .. } => AssetChain::Evm,
         ChannelPresentation::Solana { .. } => AssetChain::Solana,
+        ChannelPresentation::Xrpl { .. } => AssetChain::Xrpl,
     };
     let candidates: Vec<&Network> = networks
         .into_iter()
@@ -336,7 +337,7 @@ pub fn network_of_presentation<'a>(
     if let [only] = candidates.as_slice() {
         return Some((*only).clone());
     }
-    if family == AssetChain::Solana {
+    if family != AssetChain::Evm {
         return None;
     }
     match <[Network; 1]>::try_from(networks_proving(presentation, candidates)) {
@@ -359,6 +360,12 @@ fn networks_proving<'a>(
         ChannelPresentation::Solana { .. } => {
             return candidates
                 .filter(|network| network.chain() == AssetChain::Solana)
+                .cloned()
+                .collect()
+        }
+        ChannelPresentation::Xrpl { .. } => {
+            return candidates
+                .filter(|network| network.chain() == AssetChain::Xrpl)
                 .cloned()
                 .collect()
         }
@@ -784,6 +791,7 @@ impl OutboundChannels {
         let receiver = match &terms {
             ReceiverTerms::Evm(evm) => evm.receiver.to_vec(),
             ReceiverTerms::Solana(solana) => solana.receiver.to_vec(),
+            ReceiverTerms::Xrpl(xrpl) => xrpl.receiver.as_bytes().to_vec(),
         };
         // The same open: same chain, same receiver, same deposit. A request
         // that differs is a different open, so a stale pending record --
