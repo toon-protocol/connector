@@ -72,6 +72,9 @@ struct Ledger {
     accounts: Arc<Mutex<HashMap<String, u64>>>,
     /// `PayChannel` entries by lowercase channel id.
     channels: Arc<Mutex<HashMap<String, Value>>>,
+    /// Whether `server_info` reports a validated ledger; `false` is an
+    /// endpoint still syncing, with no base reserve to read.
+    validated: bool,
 }
 
 impl Ledger {
@@ -80,6 +83,14 @@ impl Ledger {
             network_id: Some(network_id),
             accounts: Arc::default(),
             channels: Arc::default(),
+            validated: true,
+        }
+    }
+
+    fn syncing(self) -> Ledger {
+        Ledger {
+            validated: false,
+            ..self
         }
     }
 
@@ -126,10 +137,14 @@ impl Ledger {
         let params = &params[0];
         match method {
             "server_info" => {
-                let mut info = json!({
-                    "server_state": "full",
-                    "validated_ledger": { "seq": 5, "reserve_base_xrp": RESERVE_XRP },
-                });
+                let mut info = if self.validated {
+                    json!({
+                        "server_state": "full",
+                        "validated_ledger": { "seq": 5, "reserve_base_xrp": RESERVE_XRP },
+                    })
+                } else {
+                    json!({ "server_state": "syncing" })
+                };
                 if let Some(id) = self.network_id {
                     info["network_id"] = json!(id);
                 }
@@ -545,6 +560,27 @@ async fn boot_refuses_an_account_below_the_base_reserve() {
     connector_cli::build(&config).await.expect("at the reserve");
 }
 
+/// An endpoint with no validated ledger reports no base reserve, so the
+/// account's funding cannot be checked: refused, never assumed funded.
+#[tokio::test]
+async fn boot_refuses_an_endpoint_that_reports_no_base_reserve() {
+    let seed = seed(XrplAlgorithm::Secp256k1, 9);
+    let node = signer(&seed);
+    let ledger = Ledger::on(1000)
+        .with_account(&node.classic_address(), RESERVE_DROPS * 10)
+        .syncing();
+    let rpc = ledger.serve().await;
+    let (app_addr, _recorded) = spawn_recording_app().await;
+    let files = Files::new();
+    let key = key_file(&seed);
+    let config = files.config(&table(1000, &rpc.url(), key.path(), ""), &app_addr);
+
+    match refused(&config).await {
+        RuntimeError::XrplReserveUnreported { table } => assert_eq!(table, "xrpl.1000"),
+        other => panic!("expected an unreported reserve, got {other}"),
+    }
+}
+
 /// ADR 0087 decision 4: two tables on one account are refused by name, before
 /// either ledger is dialed -- so neither endpoint here need exist.
 #[tokio::test]
@@ -708,6 +744,20 @@ numeraire = true
             error.contains(native) && error.contains("CAIP-19"),
             "{native}: {error}"
         );
+
+        let text = format!(
+            "{}\n[rate_guards]\nspread = {{ numerator = 1, denominator = 100 }}\nttl_secs = 300\n\
+             max_move = {{ numerator = 5, denominator = 100 }}\n\n[[tokens]]\n\
+             asset = \"xrpl:1000/slip44:144\"\nnumeraire = true\n\n[[rates]]\n\
+             from = \"{native}\"\nto = \"xrpl:1000/slip44:144\"\n\
+             rate = {{ numerator = 1, denominator = 1 }}\n",
+            files.text(&tables, "127.0.0.1:1")
+        );
+        let error = load_error(&text);
+        assert!(
+            error.contains(native) && error.contains("CAIP-19"),
+            "[[rates]] {native}: {error}"
+        );
     }
 }
 
@@ -861,10 +911,15 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
     );
 
     let claims = read(&app, "/claims").await;
-    assert!(
-        claims.to_string().contains(&format!("xrpl:{CHANNEL}")),
-        "the journal keys the channel xrpl:<channel id>: {claims}"
-    );
+    let claim = claims
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|claim| claim["channel_id"] == format!("xrpl:{CHANNEL}"))
+        .unwrap_or_else(|| panic!("the journal keys the channel xrpl:<channel id>: {claims}"));
+    assert_eq!(claim["direction"], "inbound", "{claim}");
+    assert_eq!(claim["cumulative_amount"], 300, "{claim}");
+    assert_eq!(claim["scheme"], "batch-settlement", "{claim}");
 
     // A voucher that does not advance is refused; one signed by someone else
     // is refused as a bad signature.
@@ -929,10 +984,7 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
         paid_prepare(ROUTE, &runtime.signer.public_key().expect("key")),
     )
     .await;
-    assert!(
-        Reject::decode(&answer).is_ok() || Fulfill::decode(&answer).is_ok(),
-        "answered either way"
-    );
+    Reject::decode(&answer).expect("a replay of the restored watermark is rejected");
     let answer = post_ilp(
         &app,
         &voucher(
@@ -1078,6 +1130,34 @@ async fn with_rpc_via_socks_proxy_each_xrpl_rpc_rides_its_own_pinned_circuit() {
         connects.iter().all(|c| c.username.is_some()),
         "no XRPL dial went through the proxy unpinned: {connects:?}"
     );
+    // Fail closed: with the proxy gone, boot is refused and nothing reaches
+    // the ledger.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let dead_url = format!("socks5h://{}", dead.local_addr().expect("addr"));
+    drop(dead);
+    let direct = format!(
+        "socks_proxy = \"{dead_url}\"\n{}",
+        files.text(
+            &table(
+                1,
+                &format!("http://{HOST_ONE}/"),
+                key_one.path(),
+                "rpc_via_socks_proxy = true"
+            ),
+            &app_addr
+        )
+    );
+    let calls_before = one.calls().len();
+    connector_cli::build(&support::load_config(&direct))
+        .await
+        .err()
+        .expect("a proxied table with no proxy to ride is refused");
+    assert_eq!(
+        one.calls().len(),
+        calls_before,
+        "nothing reached the ledger without the proxy"
+    );
+
     // Config load already refuses the key without a proxy to ride.
     let without = text.replace(&format!("socks_proxy = \"{}\"\n", proxy.proxy_url()), "");
     assert!(

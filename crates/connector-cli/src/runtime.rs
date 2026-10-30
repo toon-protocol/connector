@@ -260,6 +260,10 @@ pub enum RuntimeError {
         balance_drops: u64,
         reserve_drops: u64,
     },
+    /// `server_info` reports no validated ledger's base reserve (the endpoint
+    /// is still syncing), so the settlement account's funding cannot be
+    /// checked (ADR 0087 decision 5). Refused rather than assumed.
+    XrplReserveUnreported { table: String },
 }
 
 impl fmt::Display for RuntimeError {
@@ -485,6 +489,12 @@ impl fmt::Display for RuntimeError {
                 "[settlement.{table}]'s settlement account {address} holds {balance_drops} drops, \
                  below the ledger's base reserve of {reserve_drops}. It could not sign the \
                  transaction that lands a voucher: fund it (ADR 0087 decision 5)"
+            ),
+            RuntimeError::XrplReserveUnreported { table } => write!(
+                f,
+                "[settlement.{table}]'s rpc_url reports no validated ledger, so its base reserve \
+                 is unknown and the settlement account's funding cannot be checked: point it at \
+                 a synced server (ADR 0087 decision 5)"
             ),
         }
     }
@@ -805,8 +815,8 @@ fn check_xrpl_accounts_are_distinct(config: &Config) -> Result<(), RuntimeError>
 ///
 /// Refused by name, before the backend is built: an endpoint that cannot be
 /// read, a `server_info.network_id` that is not the table's key, a settlement
-/// account the ledger does not hold, and one below the base reserve (decision
-/// 5). It never checks the PayChan amendment, which a testnet reports
+/// account the ledger does not hold, one below the base reserve, and an
+/// endpoint with no validated ledger to read that reserve from (decision 5). It never checks the PayChan amendment, which a testnet reports
 /// disabled while its channels work.
 async fn build_xrpl_batch_settlement(
     settlement: &XrplSettlementConfig,
@@ -834,15 +844,16 @@ async fn build_xrpl_batch_settlement(
     let Some(account) = rpc.account_info(&address).await.map_err(unreadable)? else {
         return Err(RuntimeError::XrplAccountMissing { table, address });
     };
-    if let Some(reserve_drops) = info.reserve_base_drops {
-        if account.balance_drops < reserve_drops {
-            return Err(RuntimeError::XrplAccountUnderfunded {
-                table,
-                address,
-                balance_drops: account.balance_drops,
-                reserve_drops,
-            });
-        }
+    let Some(reserve_drops) = info.reserve_base_drops else {
+        return Err(RuntimeError::XrplReserveUnreported { table });
+    };
+    if account.balance_drops < reserve_drops {
+        return Err(RuntimeError::XrplAccountUnderfunded {
+            table,
+            address,
+            balance_drops: account.balance_drops,
+            reserve_drops,
+        });
     }
     let backend = XrplBatchSettlement::connect(
         transport.clone(),

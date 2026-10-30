@@ -326,7 +326,8 @@ refuses, by name, two XRPL tables whose keys are one account.
 
 **At boot** the node asks the table's `rpc_url` for `server_info` and refuses, by name: a
 `network_id` that is not the table's key; a settlement account the ledger does not hold; an account
-holding less than the base reserve. It never checks the PayChan amendment: testnet reports it
+holding less than the base reserve; an endpoint with no validated ledger yet, whose reserve cannot
+be read. It never checks the PayChan amendment: testnet reports it
 disabled while its channels work. Fund the account before the first boot.
 
 A channel holds XRP, so every XRPL peering is a dealing boundary

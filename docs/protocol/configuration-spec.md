@@ -459,7 +459,8 @@ above the settlement port's 901 s floor), `redemption_safety_secs` (default 60, 
 asset is `xrpl:<id>/slip44:144` in `[[tokens]]`, `[[rates]]` and the greeting. A bare `[settlement.xrpl]`,
 a key written inline, an unknown key and every `<chain>:native` asset spelling are refused at load by
 name. Boot refuses, by name, a `network_id` the endpoint does not serve, a missing settlement
-account, one below the base reserve, and two tables resolving to one account (a claim binds no
+account, one below the base reserve, an endpoint reporting no validated ledger to read that reserve
+from, and two tables resolving to one account (a claim binds no
 network, so an account may be on one).
 
 **A chain's x402 terms sit in its settlement table** ([ADR 0074](../adr/0074-a-client-may-pay-over-an-x402-batch-settlement-channel.md)

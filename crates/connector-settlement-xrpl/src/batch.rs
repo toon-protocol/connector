@@ -105,10 +105,13 @@ impl XrplBatchSettlement {
                  fund it with at least the base reserve"
             )));
         };
-        if let Some(reserve) = info
-            .reserve_base_drops
-            .filter(|r| account.balance_drops < *r)
-        {
+        let Some(reserve) = info.reserve_base_drops else {
+            return Err(BatchSettlementError::Backend(format!(
+                "XRPL network {network_id}'s endpoint reports no validated ledger, so the \
+                 settlement account's base reserve cannot be checked"
+            )));
+        };
+        if account.balance_drops < reserve {
             return Err(BatchSettlementError::Backend(format!(
                 "the settlement account {address} holds {} drops, below the base reserve of \
                  {reserve} on XRPL network {network_id}: fund it",

@@ -288,8 +288,8 @@ impl XrplRpc {
             validated_ledger: info["validated_ledger"]["seq"]
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok()),
-            // `reserve_base_xrp` is XRP, whole or fractional: drops are
-            // read off it rather than trusting a float's last digit.
+            // `reserve_base_xrp` is XRP, whole or fractional: scaled to
+            // drops and rounded, so a float's last digit cannot lose one.
             reserve_base_drops: info["validated_ledger"]["reserve_base_xrp"]
                 .as_f64()
                 .filter(|xrp| xrp.is_finite() && *xrp >= 0.0)
