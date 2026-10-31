@@ -13,9 +13,9 @@
 //! - [`successor`]: the successor state, composed from zk_toon's charge, anchor and state
 //!   message. The state key that signs it is `connector-signer`'s, never read or held here.
 //! - [`tiers`]: the operator's published tiers, validated against zk_toon's.
-//! - [`request`]: the request proof's public inputs, until zk_toon#29 adds a Rust
-//!   `RequestPublic`.
-//! - [`evidence`]: the evidence file's bytes, until zk_toon#29's `zk-evidence` crate exists.
+//! - [`request`]: the request proof as the payer sends it, read strictly around zk_toon's
+//!   `RequestPublic`, and the binding tag the zk edge expects of it.
+//! - [`evidence`]: zk_toon's `zk-evidence` format, re-exported for the file the connector writes.
 //!
 //! Pure: no I/O, no clock, no dependency on any connector crate.
 
@@ -34,8 +34,8 @@ pub use zk_note::balance::{Commitment, Scalar};
 /// The Pallas base field, the field every value in a zk note lives in.
 pub use zk_note::Field;
 
-/// A field element as 32 bytes, little-endian: the encoding zk_toon#29 fixes for the evidence
-/// file, and the one the journal stores.
+/// A field element as 32 bytes, little-endian: the evidence file's encoding (zk_toon#29), and the
+/// one the journal stores.
 #[must_use]
 pub fn field_to_le_bytes(field: Field) -> [u8; 32] {
     use ark_ff::{BigInteger, PrimeField};

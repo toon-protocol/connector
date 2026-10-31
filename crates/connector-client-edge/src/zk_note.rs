@@ -354,8 +354,7 @@ pub mod contract {
     mod tests {
         use super::*;
         use connector_zk_note::note::balance::generator_g;
-        use connector_zk_note::request::{json_proof_for, RequestPublic};
-        use connector_zk_note::CompressedPubKey;
+        use connector_zk_note::request::{json_proof_for, Point, RequestPublic};
 
         fn proof(bytes: &str) -> RequestProof {
             subsidy_proof(bytes, false, 0, 0)
@@ -368,18 +367,19 @@ pub mod contract {
             period_nullifier: u64,
         ) -> RequestProof {
             let public = RequestPublic {
-                vault: CompressedPubKey {
-                    x: Field::from(1u64),
-                    is_odd: false,
-                },
+                vault_x: Field::from(1u64),
+                vault_is_odd: false,
                 root: Field::from(11u64),
                 request_time: 1,
                 tier: 10_000_000,
                 nullifier: Field::from(99u64),
                 tag: Field::from(3u64),
-                commitment: generator_g(),
+                commitment: Point {
+                    x: generator_g().x,
+                    y: generator_g().y,
+                },
                 subsidised,
-                period: Field::from(period),
+                period,
                 period_nullifier: Field::from(period_nullifier),
             };
             RequestProof::parse(&json_proof_for(&public, bytes)).expect("a proof")

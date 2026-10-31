@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use connector_zk_note::evidence::{evidence_hash, frame, header, scan, EvidenceError};
+use connector_zk_note::evidence::{evidence_hash, frame, scan, write_header, FileError};
 
 /// The file's name under `state_dir`.
 pub const EVIDENCE_FILE: &str = "zk-note-evidence.bin";
@@ -31,8 +31,21 @@ pub const EVIDENCE_FILE: &str = "zk-note-evidence.bin";
 pub enum EvidenceFileError {
     #[error("the zk-note evidence file could not be read or written: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the zk-note evidence file is unreadable: {0}")]
-    Format(#[from] EvidenceError),
+    #[error("the zk-note evidence file is unreadable: {}", describe(.0))]
+    Format(FileError),
+}
+
+/// `zk-evidence`'s refusal, in words: it carries no `Display` of its own.
+fn describe(error: &FileError) -> String {
+    match error {
+        FileError::TruncatedHeader => "its header is incomplete".into(),
+        FileError::BadMagic => "it does not start with its magic".into(),
+        FileError::UnsupportedVersion(version) => format!(
+            "it is format version {version}; this build reads only version {}",
+            connector_zk_note::evidence::VERSION
+        ),
+        FileError::Corrupt { offset } => format!("it is corrupt at byte {offset}"),
+    }
 }
 
 /// What the evidence file is written through: a [`File`], or in this
@@ -130,23 +143,31 @@ impl EvidenceFile {
             .open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let read = scan(&bytes)?;
-        if read.end < bytes.len() {
-            file.set_len(read.end as u64)?;
+        let header = write_header();
+        // An empty or half-written header is a torn start, not a foreign file:
+        // the crash came before the header was whole, so it is written again.
+        let (valid_len, hashes) = if bytes.len() < header.len() && header.starts_with(&bytes) {
+            (0, HashSet::new())
+        } else {
+            let read = scan(&bytes).map_err(EvidenceFileError::Format)?;
+            let hashes = read
+                .records
+                .iter()
+                .map(|record| evidence_hash(record.payload))
+                .collect();
+            (read.valid_len, hashes)
+        };
+        if valid_len < bytes.len() {
+            file.set_len(valid_len as u64)?;
         }
-        file.seek(SeekFrom::Start(read.end as u64))?;
-        let mut end = read.end as u64;
-        if read.end == 0 {
-            let header = header();
+        file.seek(SeekFrom::Start(valid_len as u64))?;
+        let mut end = valid_len as u64;
+        if valid_len == 0 {
             file.write_all(&header)?;
             end = header.len() as u64;
         }
         file.sync_all()?;
-        Ok(EvidenceFile::over(
-            Box::new(file),
-            end,
-            read.records.iter().map(|p| evidence_hash(p)).collect(),
-        ))
+        Ok(EvidenceFile::over(Box::new(file), end, hashes))
     }
 
     fn over(storage: Box<dyn Storage>, end: u64, hashes: HashSet<[u8; 32]>) -> EvidenceFile {
@@ -250,6 +271,17 @@ mod tests {
     use super::*;
     use connector_zk_note::evidence::scan;
 
+    /// Every whole record's payload in the file at `path`, as zk_toon reads it.
+    fn records(path: &Path) -> Vec<Vec<u8>> {
+        let bytes = std::fs::read(path).unwrap();
+        scan(&bytes)
+            .unwrap()
+            .records
+            .iter()
+            .map(|record| record.payload.to_vec())
+            .collect()
+    }
+
     #[test]
     fn a_new_file_gets_its_header_and_appends_whole_records() {
         let dir = tempfile::tempdir().unwrap();
@@ -257,11 +289,25 @@ mod tests {
         let file = EvidenceFile::open(&path).unwrap();
         let hash = file.append(b"\x02payload").unwrap();
         assert!(file.holds(&hash));
-        let read = scan(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read.records, vec![b"\x02payload".to_vec()]);
+        assert_eq!(records(&path), vec![b"\x02payload".to_vec()]);
         drop(file);
         let reopened = EvidenceFile::open(&path).unwrap();
         assert!(reopened.holds(&hash));
+    }
+
+    /// A crash before the header was whole leaves a prefix of it: a torn
+    /// start, which open writes again, never a foreign file.
+    #[test]
+    fn an_empty_or_half_written_header_is_written_again() {
+        let header = write_header();
+        for len in 0..header.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(EVIDENCE_FILE);
+            std::fs::write(&path, &header[..len]).unwrap();
+            let file = EvidenceFile::open(&path).expect("a torn start");
+            file.append(b"one").unwrap();
+            assert_eq!(records(&path), vec![b"one".to_vec()], "cut at {len}");
+        }
     }
 
     #[test]
@@ -273,9 +319,8 @@ mod tests {
         bytes.extend_from_slice(&[9, 0, 0, 0, b't']);
         std::fs::write(&path, &bytes).unwrap();
         EvidenceFile::open(&path).unwrap().append(b"two").unwrap();
-        let read = scan(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read.records, vec![b"one".to_vec(), b"two".to_vec()]);
-        assert!(!read.torn);
+        assert_eq!(records(&path), vec![b"one".to_vec(), b"two".to_vec()]);
+        assert!(!scan(&std::fs::read(&path).unwrap()).unwrap().torn_tail);
     }
 
     /// One fault, then a healthy disk: a write that takes `tear_after`
@@ -362,9 +407,8 @@ mod tests {
         assert!(file.append(b"a record the disk tears").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         file.append(b"two").unwrap();
-        let read = scan(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read.records, vec![b"one".to_vec(), b"two".to_vec()]);
-        assert!(!read.torn);
+        assert_eq!(records(&path), vec![b"one".to_vec(), b"two".to_vec()]);
+        assert!(!scan(&std::fs::read(&path).unwrap()).unwrap().torn_tail);
     }
 
     /// A record whose fsync fails was never promised: it is cut, not held,
@@ -384,8 +428,7 @@ mod tests {
         let reopened = EvidenceFile::open(&path).unwrap();
         assert!(!reopened.holds(&evidence_hash(b"unsynced")));
         reopened.append(b"two").unwrap();
-        let read = scan(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read.records, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(records(&path), vec![b"one".to_vec(), b"two".to_vec()]);
     }
 
     /// A pending record dropped -- its grant could not be journaled --
@@ -406,8 +449,7 @@ mod tests {
 
         let kept = file.append_pending(b"grant").unwrap().keep();
         assert!(file.holds(&kept));
-        let read = scan(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read.records, vec![b"one".to_vec(), b"grant".to_vec()]);
+        assert_eq!(records(&path), vec![b"one".to_vec(), b"grant".to_vec()]);
     }
 
     #[test]
@@ -419,11 +461,11 @@ mod tests {
         file.append(b"two").unwrap();
         drop(file);
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[header().len() + 4] ^= 0xff;
+        bytes[write_header().len() + 4] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
         assert!(matches!(
             EvidenceFile::open(&path),
-            Err(EvidenceFileError::Format(EvidenceError::Corrupt { .. }))
+            Err(EvidenceFileError::Format(FileError::Corrupt { .. }))
         ));
     }
 }

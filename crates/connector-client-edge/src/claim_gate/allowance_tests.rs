@@ -7,7 +7,7 @@ use chrono::TimeZone;
 use connector_runtime::{FileJournal, TestClock};
 use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::policy::TIERS;
-use connector_zk_note::request::{json_proof_for, RequestPublic};
+use connector_zk_note::request::{json_proof_for, Point, RequestPublic};
 use connector_zk_note::session::{sign_allowance_claim, signature_to_hex};
 use connector_zk_note::{Keypair, Scalar, SecKey};
 
@@ -50,16 +50,21 @@ async fn edge_with_allowance(
     let session_key = session.public.into_compressed();
     let expires = now + 1_000;
     let nullifier = Field::from(77u64);
+    let commitment = commit(Scalar::from(5_000_000_000u64), Scalar::from(17u64));
     let public = RequestPublic {
-        vault: state.clone(),
+        vault_x: state.x,
+        vault_is_odd: state.is_odd,
         root: Field::from(1u64),
         request_time: now,
         tier: TIERS[1],
         nullifier,
         tag: expected_tag(nullifier, &state, &session_key, TIERS[1], expires),
-        commitment: commit(Scalar::from(5_000_000_000u64), Scalar::from(17u64)),
+        commitment: Point {
+            x: commitment.x,
+            y: commitment.y,
+        },
         subsidised: false,
-        period: Field::from(0u64),
+        period: 0,
         period_nullifier: Field::from(0u64),
     };
     let json = json_proof_for(&public, "p");

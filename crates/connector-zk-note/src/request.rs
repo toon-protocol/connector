@@ -1,49 +1,18 @@
-//! The request proof's public inputs, and the proof as the payer sends it.
+//! The request proof as the payer sends it, and the binding tag the zk edge expects of it.
 //!
-//! **Stand-in.** zk_toon has no Rust `RequestPublic` at the pinned commit; it exists only in
-//! o1js (`o1js/src/request.ts`). zk_toon#29 will add `zk_note::RequestPublic`, decodable from a
-//! `JsonProof`'s `publicInput` in o1js's field order. When it lands, this module's
-//! [`RequestPublic`] is replaced by a re-export of that one, and its decoding is dropped.
-//!
-//! The order is o1js's `RequestPublic` struct, flattened as o1js flattens a `Struct`: a
-//! `PublicKey` is `x, isOdd`, a `Group` is `x, y`, a `Bool` is 0 or 1. Twelve field elements.
+//! The public inputs are zk_toon's [`RequestPublic`], decoded by zk_toon in o1js's field order
+//! (zk_toon#29). What the connector adds is the stricter reading of the `JsonProof` around them:
+//! every input a canonical decimal field element, and the commitment a point on Pallas, which
+//! zk_toon leaves unchecked.
 
 use crate::{Commitment, CompressedPubKey, Field};
 use ark_ec::AffineRepr;
-use ark_ff::{BigInteger, PrimeField};
 use std::str::FromStr;
 use zk_note::RequestContext;
 
-/// How many field elements a request proof's public input is.
-pub const PUBLIC_INPUT_LEN: usize = 12;
-
-/// The request proof's public inputs, in o1js order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestPublic {
-    /// The state key whose signature the proof checks: the zk edge's own, or the proof is not
-    /// about a state this zk edge signed.
-    pub vault: CompressedPubKey,
-    /// The vault root the note's leaf is proved under.
-    pub root: Field,
-    /// When the payer says it made the request, in ms. The proof checks the note's expiry only
-    /// against this, so the zk edge bounds it against its own clock.
-    pub request_time: u64,
-    /// The tier: the budget `b` the note covers, in nanomina.
-    pub tier: u64,
-    /// The spent state's nullifier.
-    pub nullifier: Field,
-    /// The authorization tag binding the nullifier to this zk edge, the session key, the tier
-    /// and the allowance expiry.
-    pub tag: Field,
-    /// The re-randomised balance commitment.
-    pub commitment: Commitment,
-    /// A subsidised request. Refused until connector#1581.
-    pub subsidised: bool,
-    /// The subsidy period. Zero unless subsidised.
-    pub period: Field,
-    /// The per-period nullifier. Zero unless subsidised.
-    pub period_nullifier: Field,
-}
+pub use zk_note::request::{
+    Point, RequestPublic, RequestPublicError, SubsidyPeriodError, REQUEST_PUBLIC_FIELDS,
+};
 
 /// Why a request proof's public input is refused as malformed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -52,7 +21,7 @@ pub enum RequestProofError {
     #[error("the request proof is not a JsonProof: {0}")]
     NotJsonProof(String),
     /// Not twelve field elements.
-    #[error("the request proof's public input is {0} field elements, not {PUBLIC_INPUT_LEN}")]
+    #[error("the request proof's public input is {0} field elements, not {REQUEST_PUBLIC_FIELDS}")]
     Length(usize),
     /// A public input that is not a canonical decimal field element.
     #[error("the request proof's public input {0} is not a field element")]
@@ -60,7 +29,7 @@ pub enum RequestProofError {
     /// A flag (`isOdd`, `subsidised`) that is neither 0 nor 1.
     #[error("the request proof's {0} is not a boolean")]
     NotABool(&'static str),
-    /// A time or amount that does not fit 64 bits.
+    /// A time, amount or period that does not fit 64 bits.
     #[error("the request proof's {0} does not fit 64 bits")]
     NotAU64(&'static str),
     /// A commitment that is not a point on Pallas.
@@ -68,54 +37,34 @@ pub enum RequestProofError {
     NotAPoint,
 }
 
-impl RequestPublic {
-    /// Decode twelve field elements in o1js order.
-    ///
-    /// # Errors
-    /// [`RequestProofError`] naming the first input that is not what its position requires.
-    pub fn from_fields(fields: &[Field]) -> Result<RequestPublic, RequestProofError> {
-        if fields.len() != PUBLIC_INPUT_LEN {
-            return Err(RequestProofError::Length(fields.len()));
+impl From<RequestPublicError> for RequestProofError {
+    fn from(error: RequestPublicError) -> Self {
+        match error {
+            RequestPublicError::Length(len) => RequestProofError::Length(len),
+            RequestPublicError::NotBool(name) => RequestProofError::NotABool(name),
+            RequestPublicError::NotU64(name) => RequestProofError::NotAU64(name),
         }
-        let commitment = Commitment::new_unchecked(fields[7], fields[8]);
-        if !commitment.is_on_curve() || commitment.is_zero() {
-            return Err(RequestProofError::NotAPoint);
-        }
-        Ok(RequestPublic {
-            vault: CompressedPubKey {
-                x: fields[0],
-                is_odd: as_bool(fields[1], "vault isOdd")?,
-            },
-            root: fields[2],
-            request_time: as_u64(fields[3], "requestTime")?,
-            tier: as_u64(fields[4], "tier")?,
-            nullifier: fields[5],
-            tag: fields[6],
-            commitment,
-            subsidised: as_bool(fields[9], "subsidised")?,
-            period: fields[10],
-            period_nullifier: fields[11],
-        })
     }
+}
 
-    /// The twelve field elements, in o1js order.
-    #[must_use]
-    pub fn to_fields(&self) -> Vec<Field> {
-        vec![
-            self.vault.x,
-            Field::from(u64::from(self.vault.is_odd)),
-            self.root,
-            Field::from(self.request_time),
-            Field::from(self.tier),
-            self.nullifier,
-            self.tag,
-            self.commitment.x,
-            self.commitment.y,
-            Field::from(u64::from(self.subsidised)),
-            self.period,
-            self.period_nullifier,
-        ]
-    }
+/// The twelve field elements of `public`, in o1js order: the inverse of
+/// [`RequestPublic::from_fields`].
+#[must_use]
+pub fn public_input(public: &RequestPublic) -> Vec<Field> {
+    vec![
+        public.vault_x,
+        Field::from(u64::from(public.vault_is_odd)),
+        public.root,
+        Field::from(public.request_time),
+        Field::from(public.tier),
+        public.nullifier,
+        public.tag,
+        public.commitment.x,
+        public.commitment.y,
+        Field::from(u64::from(public.subsidised)),
+        Field::from(public.period),
+        public.period_nullifier,
+    ]
 }
 
 /// The binding tag a zk edge whose state key is `edge` expects for this nullifier, session key,
@@ -147,6 +96,7 @@ pub fn expected_tag(
 pub struct RequestProof {
     json: Vec<u8>,
     public: RequestPublic,
+    commitment: Commitment,
 }
 
 impl RequestProof {
@@ -173,9 +123,15 @@ impl RequestProof {
                     .ok_or(RequestProofError::NotAField(i))
             })
             .collect::<Result<Vec<Field>, _>>()?;
+        let public = RequestPublic::from_fields(&fields)?;
+        let commitment = Commitment::new_unchecked(public.commitment.x, public.commitment.y);
+        if !commitment.is_on_curve() || commitment.is_zero() {
+            return Err(RequestProofError::NotAPoint);
+        }
         Ok(RequestProof {
             json: json.to_vec(),
-            public: RequestPublic::from_fields(&fields)?,
+            public,
+            commitment,
         })
     }
 
@@ -190,14 +146,28 @@ impl RequestProof {
     pub fn public(&self) -> &RequestPublic {
         &self.public
     }
+
+    /// The state key whose signature the proof checks: the zk edge's own, or the proof is not
+    /// about a state this zk edge signed.
+    #[must_use]
+    pub fn vault(&self) -> CompressedPubKey {
+        CompressedPubKey {
+            x: self.public.vault_x,
+            is_odd: self.public.vault_is_odd,
+        }
+    }
+
+    /// The re-randomised balance commitment, checked to be a point on Pallas.
+    pub fn commitment(&self) -> Commitment {
+        self.commitment
+    }
 }
 
 /// A `JsonProof` carrying `public` and a placeholder proof: what a test sends where a payer
 /// would send o1js's output. The format does not depend on the proof being valid.
 #[must_use]
 pub fn json_proof_for(public: &RequestPublic, proof: &str) -> Vec<u8> {
-    let inputs: Vec<String> = public
-        .to_fields()
+    let inputs: Vec<String> = public_input(public)
         .into_iter()
         .map(zk_note::field_to_string)
         .collect();
@@ -221,24 +191,4 @@ fn decimal_field(text: &str) -> Option<Field> {
     }
     let field = Field::from_str(text).ok()?;
     (zk_note::field_to_string(field) == text).then_some(field)
-}
-
-fn as_bool(field: Field, name: &'static str) -> Result<bool, RequestProofError> {
-    if field == Field::from(0u64) {
-        Ok(false)
-    } else if field == Field::from(1u64) {
-        Ok(true)
-    } else {
-        Err(RequestProofError::NotABool(name))
-    }
-}
-
-fn as_u64(field: Field, name: &'static str) -> Result<u64, RequestProofError> {
-    let bytes = field.into_bigint().to_bytes_le();
-    if bytes[8..].iter().any(|b| *b != 0) {
-        return Err(RequestProofError::NotAU64(name));
-    }
-    let mut low = [0u8; 8];
-    low.copy_from_slice(&bytes[..8]);
-    Ok(u64::from_le_bytes(low))
 }

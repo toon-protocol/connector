@@ -18,7 +18,7 @@ use connector_signer::ZkStateSigner;
 use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::field_to_string;
 use connector_zk_note::note::policy::TIERS;
-use connector_zk_note::request::{expected_tag, json_proof_for, RequestPublic};
+use connector_zk_note::request::{expected_tag, json_proof_for, Point, RequestPublic};
 use connector_zk_note::session::{
     allowance_claim_fields, allowance_close_fields, sign_allowance_claim, sign_allowance_close,
     signature_to_hex,
@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 /// The zk_toon commit every value in this section was generated at: the
 /// `rev` `crates/connector-zk-note/Cargo.toml` pins.
-pub const ZK_TOON_COMMIT: &str = "7b399412ffd70966c5e5d35a139928a697460ca7";
+pub const ZK_TOON_COMMIT: &str = "0d6b10c332558caf7d8d6350e14b19d68f443f2c";
 
 #[derive(Debug, Serialize)]
 pub struct ZkNoteVectors {
@@ -97,15 +97,19 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     // proof's, bound by its tag to this edge, session key, tier and expiry.
     // Its `proof` is a placeholder: the o1js proof fixture is #1514's.
     let public = RequestPublic {
-        vault: state_key.clone(),
+        vault_x: state_key.x,
+        vault_is_odd: state_key.is_odd,
         root: Field::from(0x726f_6f74u64),
         request_time: REQUEST_TIME_MS,
         tier,
         nullifier,
         tag: expected_tag(nullifier, &state_key, &session_key, tier, EXPIRES_AT_MS),
-        commitment,
+        commitment: Point {
+            x: commitment.x,
+            y: commitment.y,
+        },
         subsidised: false,
-        period: Field::from(0u64),
+        period: 0,
         period_nullifier: Field::from(0u64),
     };
     let proof: Value = serde_json::from_slice(&json_proof_for(&public, "placeholder"))
@@ -203,9 +207,9 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
             EXPIRES_AT_MS,
         ),
         subsidised: true,
-        period: Field::from(SUBSIDY_PERIOD),
+        period: SUBSIDY_PERIOD,
         period_nullifier: Field::from(0x7065_7269_6f64u64),
-        ..public.clone()
+        ..public
     };
     let subsidised_proof: Value =
         serde_json::from_slice(&json_proof_for(&subsidised_public, "placeholder"))
