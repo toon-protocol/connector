@@ -58,6 +58,29 @@ services:
       retries: 30
       start_period: 15s
 
+  # ── The XRPL leg (ADR 0087) ────────────────────────────────────────────────
+  # The test harness's chain, run as a container: `rippleci/xrpld`, stand-alone,
+  # at network id 1000, from the SAME digest-pinned image
+  # (`connector_settlement_xrpl::test_support::IMAGE`; a test holds the two
+  # equal). No healthcheck: the image is not known to carry a client, so
+  # local/keys.sh waits for `server_info` from the host instead, and closes the
+  # ledgers -- a stand-alone chain closes one only when told to. Published on
+  # loopback 5005, where keys.sh funds the node's account from genesis.
+  xrpld:
+    image: rippleci/xrpld:3.4.1@sha256:e77ed5a956a32842929d0a2f2c581cab88e2e72e1d9af7df7330938231364d03
+    profiles: [solo]
+    command: ['-a', '--start', '--conf', '/etc/xrpld/xrpld.cfg']
+    volumes:
+      - ./local/solo/xrpld.cfg:/etc/xrpld/xrpld.cfg:ro
+    ports:
+      - '127.0.0.1:5005:5005'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
   # ── The payment-oblivious app ──────────────────────────────────────────────
   # The connector image's second binary. Not published: only the connector
   # dials it, which is what makes "an unpaid packet never reaches the app"
@@ -107,6 +130,8 @@ services:
         condition: service_healthy
       solana-validator:
         condition: service_healthy
+      xrpld:
+        condition: service_started
       stub-app:
         condition: service_started
     restart: unless-stopped
@@ -173,6 +198,17 @@ services:
             exit 1
           fi
         done
+        # The XRPL leg: no channel to read (the node opens none on it), but
+        # the greeting must carry the entry -- the node booted on the stand-alone
+        # ledger, read its network id and its funded account, and published them.
+        case "$$GREETING" in
+          *'"network":"xrpl:1000"'*) ;;
+          *)
+            echo "NO NETWORK: the greeting offers no x402 entry on xrpl:1000" >&2
+            echo "$$GREETING" >&2
+            exit 1
+            ;;
+        esac
         A=$$(cat /app/networks/31337)
         B=$$(cat /app/networks/31338)
         evm_channel_holds "$$A" "$$DEPOSIT" eip155:31337 http://anvil:8545

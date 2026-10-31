@@ -201,10 +201,12 @@ LOCAL_NODES = $(LOCAL_NODES_$(LOCAL_TOPOLOGY))
 
 # The chains a topology runs beyond the shared `anvil` and `solana-validator`,
 # started and waited on with them -- before local/keys.sh funds anything on
-# them. Only solo has one: its second anvil, on chain id 31338 (ADR 0086
-# decision 15), the same seeded chain on another network.
-# `local_topologies_load.rs` holds this list to keys.sh's EVM_NETWORKS.
-LOCAL_CHAINS_solo := anvil-31338
+# them. Only solo has any: its second anvil, on chain id 31338 (ADR 0086
+# decision 15), the same seeded chain on another network, and its stand-alone
+# `xrpld` (ADR 0087), which keys.sh funds from genesis.
+# `local_topologies_load.rs` holds this list to keys.sh's EVM_NETWORKS and
+# XRPL_NETWORKS.
+LOCAL_CHAINS_solo := anvil-31338 xrpld
 LOCAL_CHAINS = $(LOCAL_CHAINS_$(LOCAL_TOPOLOGY))
 
 # The image the topologies run. Built from this working tree, deliberately: the
@@ -248,8 +250,8 @@ local-up: local-preflight local-build
 	@$(LOCAL_COMPOSE) up -d --wait anvil solana-validator $(LOCAL_CHAINS) || { \
 		echo ""; \
 		echo "ERROR: the chains did not come up. Compose's own message is above:"; \
-		echo "         'address already in use'  -- something else already holds 8545, 8546"; \
-		echo "                                      or 8899. 'ss -tlnp | grep 8545' names it."; \
+		echo "         'address already in use'  -- something else already holds 8545, 8546,"; \
+		echo "                                      8899 or 5005. 'ss -tlnp | grep 8545' names it."; \
 		echo "         'is unhealthy'            -- the container started but never passed"; \
 		echo "                                      its gate. anvil's gate is 'the seed's"; \
 		echo "                                      last contract has code', so an"; \

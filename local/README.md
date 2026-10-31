@@ -81,6 +81,17 @@ committed bytes the tier-3 tests place:
   copied. p-token is there because the bundled SPL Token refuses the `Batch` a
   two-payout `distribute` sends (#1358).
 
+- **`xrpld`** (`solo` only) — XRPL needs nothing deployed: a channel is the
+  ledger's own `PayChannel` (ADR 0087). `local/solo/compose.yml` runs the
+  **same digest-pinned `rippleci/xrpld` image** the test harness spawns
+  (`connector_settlement_xrpl::test_support`), stand-alone, at the stand-alone
+  network id **1000** from `local/solo/xrpld.cfg` — the harness's config, with
+  the network's real reserves (1 XRP base, 0.2 XRP owner). A stand-alone chain
+  closes a ledger only when told to, so `keys.sh` closes them itself after
+  funding; nothing else needs one closed, because the node only reads the
+  ledger at boot. The container has no healthcheck (the image is not known to
+  carry a client), so `keys.sh` waits for `server_info` from the host.
+
 **No TOON deployment is left on either chain.** A node boots only where the
 x402 contract or program is deployed, and refuses by name where it is not (ADR
 0075 decision 1, #1385), so anvil carries no `TokenNetworkRegistry`,
@@ -97,7 +108,7 @@ healthy, with the reason in its log.
 
 | Topology                       | Nodes | What it proves                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`solo/`](solo/)               | 1     | The image boots on a mounted config with **both** settlement backends live at once, and a real packet reaches the app behind its one route.                                                                                                                                                                                                                                           |
+| [`solo/`](solo/)               | 1     | The image boots on a mounted config with **every** settlement backend live at once (EVM on two networks, Solana, and XRPL on a stand-alone `xrpld`), and a real packet reaches the app behind its one route.                                                                                                                                                                          |
 | [`two-hop/`](two-hop/)         | 2     | Two images peered over ILP-over-HTTP on two x402 channels on anvil. B **prices** the route it terminates; A covers each crossing with a voucher before sending it, and the crossing can only reach B's app in the **peer role**.                                                                                                                                                      |
 | [`mixed-chain/`](mixed-chain/) | 3     | A↔B settles on EVM **over BTP**, B↔C on Solana (`payment-channels`) **over ILP-over-HTTP**, and B holds both backends. One packet crosses two chains _and_ two carriages — the only place a shipped image carries a packet over BTP at all.                                                                                                                                           |
 | [`dealing/`](dealing/)         | 3     | The same three-node, two-chain shape as `mixed-chain`, with the middle node **dealing**: 6-decimal USDC in on the EVM leg, a **9-decimal** mock SPL token out on the Solana leg, converted at a rate B declares and a spread B earns (ADR 0071). The only place a shipped image converts anything, and the only committed fixture here that declares `[[tokens]]`.                    |
@@ -468,7 +479,7 @@ named after that node's compose service; the node's config is
 `local/<topology>/<node>.toml`.
 
 Per node it writes `signer.key`, `settlement.key`, `settlement-solana.key`,
-`settlement-solana-cli.json`, `operator-bearer-token`, `operator-write-keys`
+`settlement-solana-cli.json`, `settlement-xrpl.key` (on `solo`), `operator-bearer-token`, `operator-write-keys`
 and `operator-send.key`. The operator two are a pair: the allowlist holds the
 **public** half (derived by the same binary that will verify, so the two cannot
 disagree), and `connector send` and the `channels` stage hold the private half.
@@ -501,6 +512,17 @@ service and is not part of the connector:
   when it cannot. An SPL mint has one authority, so each node's tokens are a
   `spl-token transfer` out of the treasury that script seeds — with
   `--fund-recipient`, because this runs before any node boots.
+- **XRPL** (`solo`). `settlement-xrpl.key` is an XRPL **family seed**, not 32
+  bytes, and is **random**: `keys.sh` asks the stand-alone `xrpld`'s offline
+  `wallet_propose` for one and keeps it across runs. It is then paid 1000 XRP
+  by a `Payment` from the **genesis account**, whose secret is a constant in
+  `keys.sh` — public by design (the `masterpassphrase` seed in XRPL's own
+  documentation, controlling only an account on a chain thrown away with the
+  container), which is why `check-tracked-secrets.sh` needs no allowlist entry.
+  A node whose account is missing or under the base reserve is refused at boot
+  (ADR 0087 decision 5), so the funding is asserted by the node booting. The
+  sender then requires the greeting to carry the `xrpl:1000` entry. `solo`
+  opens no XRPL channel.
 - **`dealing`'s Solana leg settles in a different token**, so `keys.sh` creates
   and seeds that one itself, under the same authority, and funds the nodes out
   of it instead.
