@@ -645,6 +645,6 @@ async fn two_nodes_peer_over_two_xrpl_channels() {
     let refunded = balance(&rpc, &b.wallet.address).await - before;
     assert!(
         refunded <= DEPOSIT && refunded > DEPOSIT - 1_000,
-        "the payer is refunded its deposit less the two fees: {refunded}"
+        "the payer is refunded its deposit less the two fees"
     );
 }
