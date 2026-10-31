@@ -563,6 +563,28 @@ pub(crate) fn delivered(meta: &Value, channel_hex: &str, drops: u64) -> bool {
     })
 }
 
+/// The drops a closing claim delivered on `channel_hex`, read from the
+/// channel's `DeletedNode`: its final `Balance` less the one before the
+/// transaction, or nothing when the transaction did not change it, which is
+/// how a claim on a channel already past its `Expiration` reads. `None` when
+/// the metadata deletes no such channel.
+pub(crate) fn closed_delivering(meta: &Value, channel_hex: &str) -> Option<u64> {
+    let drops_of = |fields: &Value| fields["Balance"].as_str()?.parse::<u64>().ok();
+    meta["AffectedNodes"].as_array()?.iter().find_map(|node| {
+        let deleted = &node["DeletedNode"];
+        if deleted["LedgerEntryType"].as_str() != Some("PayChannel")
+            || !deleted["LedgerIndex"]
+                .as_str()
+                .is_some_and(|index| index.eq_ignore_ascii_case(channel_hex))
+        {
+            return None;
+        }
+        let after = drops_of(&deleted["FinalFields"])?;
+        let before = drops_of(&deleted["PreviousFields"]).unwrap_or(after);
+        Some(after.saturating_sub(before))
+    })
+}
+
 pub(crate) fn rpc_error(error: XrplRpcError) -> BatchSettlementError {
     match error.refusal() {
         Some(refused) => BatchSettlementError::Refused {
@@ -647,6 +669,33 @@ mod tests {
         ]});
         assert!(!delivered(&deleted, &lower, 300));
         assert!(!delivered(&json!({}), &lower, 300));
+    }
+
+    #[test]
+    fn a_closing_claim_delivers_only_what_its_deletion_advanced() {
+        let deleted = |previous: Value| {
+            json!({"AffectedNodes": [
+                {"DeletedNode": {
+                    "LedgerEntryType": "PayChannel",
+                    "LedgerIndex": CHANNEL,
+                    "FinalFields": {"Balance": "300"},
+                    "PreviousFields": previous,
+                }},
+            ]})
+        };
+        let lower = CHANNEL.to_ascii_lowercase();
+        assert_eq!(
+            closed_delivering(&deleted(json!({"Balance": "100"})), &lower),
+            Some(200)
+        );
+        // A channel already past its Expiration is deleted untouched.
+        assert_eq!(closed_delivering(&deleted(json!({})), &lower), Some(0));
+        // Another channel's deletion, or none at all, is not this close.
+        assert_eq!(
+            closed_delivering(&deleted(json!({})), &"11".repeat(32)),
+            None
+        );
+        assert_eq!(closed_delivering(&json!({}), &lower), None);
     }
 
     /// A backend over an endpoint nothing listens on: `judge` reads no chain.

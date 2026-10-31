@@ -28,7 +28,7 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{verify_xrpl_claim, XRPL_MAX_DROPS};
 
-use crate::batch::{Channel, XrplBatchSettlement};
+use crate::batch::{closed_delivering, Channel, XrplBatchSettlement};
 use crate::tx::{LandClaim, SourceClose};
 
 impl XrplBatchSettlement {
@@ -36,7 +36,9 @@ impl XrplBatchSettlement {
     /// `PaymentChannelClaim`, landing `voucher` first when it is worth
     /// landing: genuine under the channel's key, above what is delivered and
     /// within the deposit. A voucher that is not is left out, and the close
-    /// stands alone. Returns the drops delivered by the transaction.
+    /// stands alone. Returns the drops delivered by the transaction, read
+    /// from its metadata: a channel already past its `Expiration` is deleted
+    /// without the voucher landing, and still answers `tesSUCCESS`.
     async fn close_with(
         &self,
         id: &ChannelId,
@@ -114,7 +116,21 @@ impl XrplBatchSettlement {
             }
             Err(other) => return Err(other),
         }
-        Ok(landable.map_or(0, |(drops, _)| drops.saturating_sub(read.balance)))
+        let delivered = closed_delivering(&sent.meta, &id.0).unwrap_or(0);
+        if let Some((drops, _)) = landable {
+            let owed = drops.saturating_sub(read.balance);
+            if delivered < owed {
+                tracing::error!(
+                    channel = %id,
+                    owed,
+                    delivered,
+                    transaction = %sent.hash,
+                    "an XRPL channel was past its Expiration before its latest voucher landed; \
+                     the ledger refunded the payer instead"
+                );
+            }
+        }
+        Ok(delivered)
     }
 }
 
@@ -200,7 +216,7 @@ impl XrplBatchWatcher {
                     tracing::info!(
                         channel = %id,
                         delivered,
-                        "an XRPL payer began to exit; landed its latest voucher with tfClose"
+                        "an XRPL payer began to exit; closed its channel with tfClose"
                     );
                     self.gone.lock().expect("gone").insert(name);
                     closed.push(Closed {

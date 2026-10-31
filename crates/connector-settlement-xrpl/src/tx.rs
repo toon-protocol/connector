@@ -23,8 +23,9 @@ const PAYMENT_CHANNEL_FUND: u16 = 14;
 /// `PaymentChannelClaim`'s transaction type.
 const PAYMENT_CHANNEL_CLAIM: u16 = 15;
 /// `tfClose`: on a source's claim, begins the exit (or ends the channel when
-/// nothing is left unlanded); once `Expiration` has passed, any transaction on
-/// the channel deletes it.
+/// nothing is left unlanded); on a destination's, ends the channel at once,
+/// after landing the claim's `Balance` if it carries one; once `Expiration`
+/// has passed, any transaction on the channel deletes it.
 const TF_CLOSE: u32 = 0x0002_0000;
 /// `tfFullyCanonicalSig`: universal, and what every signature here is.
 const FULLY_CANONICAL_SIG: u32 = 0x8000_0000;
@@ -261,7 +262,9 @@ impl Fund {
 /// A source's `PaymentChannelClaim` with `tfClose` and nothing else: it
 /// begins the exit of a channel with something unlanded, sets `Expiration`
 /// to the ledger's close time plus `SettleDelay`; on a channel already past
-/// its `Expiration` it deletes the channel and refunds the source.
+/// its `Expiration` it deletes the channel and refunds the source. The same
+/// bytes from a channel's destination close it outright: the watcher's answer
+/// to a payer's exit when there is no voucher to land.
 pub struct SourceClose {
     pub account: [u8; 20],
     pub channel: [u8; 32],
