@@ -1357,7 +1357,7 @@ impl BatchChannels {
             .held
             .held_vouchers()
             .into_iter()
-            .find(|held| held.presentation.channel().0 == id)
+            .find(|held| canonical_id(&held.presentation.channel().0) == id)
             .ok_or_else(|| BatchChannelError::NoVoucherHeld(id.clone()))?;
         let chain = chain_of(held.presentation.chain());
         let backend = self.receiver(&held.presentation)?;

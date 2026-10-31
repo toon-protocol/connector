@@ -1407,7 +1407,7 @@ mod tests {
     fn the_committed_client_auth_channel_challenge_vectors_match_the_real_parser() {
         let vectors: serde_json::Value =
             serde_json::from_str(WIRE_VECTORS).expect("the committed vectors parse");
-        for chain in ["evm", "solana"] {
+        for chain in ["evm", "solana", "xrpl"] {
             let cases = vectors["client_auth_channel_challenge"][chain]
                 .as_array()
                 .unwrap_or_else(|| panic!("client_auth_channel_challenge.{chain} is an array"));
