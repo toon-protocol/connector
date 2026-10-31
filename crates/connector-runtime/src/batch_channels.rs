@@ -639,6 +639,22 @@ impl OutboundChannels {
         self.channels().keys().cloned().collect()
     }
 
+    /// The key the channel an operator names `id` is tracked under. An EVM
+    /// id is keyed `0x` and lowercase, but an XRPL id -- 64 hex digits too --
+    /// is keyed bare and lowercase, its port's spelling, so a 64-hex id in
+    /// any spelling is tried both ways.
+    fn key(&self, id: &str) -> String {
+        let canonical = canonical_id(id);
+        let channels = self.channels();
+        if channels.contains_key(&canonical) {
+            return canonical;
+        }
+        match canonical.strip_prefix("0x") {
+            Some(bare) if channels.contains_key(bare) => bare.to_string(),
+            _ => canonical,
+        }
+    }
+
     fn tracked(&self, id: &str) -> Result<Tracked, BatchChannelError> {
         self.channels()
             .get(id)
@@ -668,8 +684,9 @@ impl OutboundChannels {
     /// The network an outbound channel this node journaled is on (ADR
     /// 0086): what every voucher and challenge signed on it names.
     pub fn network(&self, id: &str) -> Option<Network> {
+        let id = self.key(id);
         self.channels()
-            .get(&canonical_id(id))
+            .get(&id)
             .and_then(|tracked| tracked.network.clone())
     }
 
@@ -721,7 +738,7 @@ impl OutboundChannels {
         &self,
         id: &str,
     ) -> Result<(ChannelId, Arc<dyn BatchSettlementPayer>), BatchChannelError> {
-        let id = canonical_id(id);
+        let id = self.key(id);
         let tracked = self.tracked(&id)?;
         if !tracked.restored {
             self.restore_one(&id).await?;
@@ -1036,7 +1053,7 @@ impl OutboundChannels {
     /// signed on the channel since the rejected one -- and holds the
     /// channel's signing lock across the decision and this call.
     pub async fn set_watermark(&self, id: &str, amount: u128) -> Result<u128, BatchChannelError> {
-        let id = canonical_id(id);
+        let id = self.key(id);
         let tracked = self.tracked(&id)?;
         if amount == tracked.signed {
             return Ok(tracked.signed);
@@ -1065,14 +1082,16 @@ impl OutboundChannels {
     /// The channel as its receiver is shown it -- on EVM with the config its
     /// first voucher carries.
     pub fn presentation(&self, id: &str) -> Option<ChannelPresentation> {
+        let id = self.key(id);
         self.channels()
-            .get(&canonical_id(id))
+            .get(&id)
             .map(|tracked| tracked.record.presentation())
     }
 
     /// Whether `id` names an outbound channel this node journaled.
     pub fn knows(&self, id: &str) -> bool {
-        self.channels().contains_key(&canonical_id(id))
+        let id = self.key(id);
+        self.channels().contains_key(&id)
     }
 
     /// Every opened outbound channel that pays `receiver` -- EVM `receiver`,
@@ -1088,12 +1107,11 @@ impl OutboundChannels {
         let (chain, receiver) = match receiver {
             VoucherSigner::Evm(address) => (SettlementChain::Evm, address.to_vec()),
             VoucherSigner::Solana(key) => (SettlementChain::Solana, key.to_vec()),
-            // A channel's receiver is kept as the classic address its
+            // A channel's receiver is kept as the account id its
             // `Destination` names, which the one key behind it derives.
             VoucherSigner::Xrpl(key) => (
                 SettlementChain::Xrpl,
-                connector_signer::xrpl_classic_address(&connector_signer::xrpl_account_id(key))
-                    .into_bytes(),
+                connector_signer::xrpl_account_id(key).to_vec(),
             ),
         };
         self.channels()
@@ -1109,9 +1127,8 @@ impl OutboundChannels {
     /// outbound channel `id`: the watermark the next voucher it signs there
     /// must exceed. `None` for a channel it did not open.
     pub fn signed(&self, id: &str) -> Option<u128> {
-        self.channels()
-            .get(&canonical_id(id))
-            .map(|tracked| tracked.signed)
+        let id = self.key(id);
+        self.channels().get(&id).map(|tracked| tracked.signed)
     }
 
     /// Every outbound channel, read from its chain now.
