@@ -1063,10 +1063,15 @@ xrpl_rpc() {
 }
 
 # One JSON-RPC call to xrpld: `xrpl_call <rpc url> <method> '<params object>'`
-# prints the reply as JSON, for `json_field 'doc["result"]...'` to read.
+# prints the reply as JSON, for `json_field 'doc["result"]...'` to read. An
+# unanswered call is fatal here, with its reason, rather than an empty reply
+# that `set -e` kills the caller over before its own check can say why.
 xrpl_call() {
-  curl -sf -m 20 -X POST "$1" -H 'Content-Type: application/json' \
-    -d "{\"method\":\"$2\",\"params\":[$3]}"
+  curl -sSf -m 20 -X POST "$1" -H 'Content-Type: application/json' \
+    -d "{\"method\":\"$2\",\"params\":[$3]}" || {
+    echo "ERROR: xrpld at $1 did not answer $2." >&2
+    exit 1
+  }
 }
 
 # Wait for the xrpld of network `$1` to answer `server_info` on that network

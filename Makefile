@@ -250,8 +250,8 @@ local-up: local-preflight local-build
 	@$(LOCAL_COMPOSE) up -d --wait anvil solana-validator $(LOCAL_CHAINS) || { \
 		echo ""; \
 		echo "ERROR: the chains did not come up. Compose's own message is above:"; \
-		echo "         'address already in use'  -- something else already holds 8545, 8546"; \
-		echo "                                      or 8899. 'ss -tlnp | grep 8545' names it."; \
+		echo "         'address already in use'  -- something else already holds 8545, 8546,"; \
+		echo "                                      8899 or 5005. 'ss -tlnp | grep 8545' names it."; \
 		echo "         'is unhealthy'            -- the container started but never passed"; \
 		echo "                                      its gate. anvil's gate is 'the seed's"; \
 		echo "                                      last contract has code', so an"; \

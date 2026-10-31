@@ -549,6 +549,38 @@ fn evm_networks(name: &str) -> Vec<TableEvmNetwork> {
         .collect()
 }
 
+/// The xrpld compose service of every XRPL network `local/keys.sh` funds
+/// topology `name`'s nodes on: its `XRPL_NETWORKS`, empty by default.
+fn xrpl_network_services(name: &str) -> Vec<String> {
+    let head = format!("\n  {name})\n");
+    let arm = KEYS_SCRIPT
+        .split_once(&head)
+        .unwrap_or_else(|| panic!("local/keys.sh has no `{name})` arm in its topology table"))
+        .1
+        .split_once("\n    ;;")
+        .expect("a case arm ends in ;;")
+        .0;
+    assert!(
+        KEYS_SCRIPT.contains("\nXRPL_NETWORKS=\"\"\n"),
+        "local/keys.sh defaults XRPL_NETWORKS to empty before its topology table"
+    );
+    arm.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("XRPL_NETWORKS=\""))
+        .unwrap_or("")
+        .trim_end_matches('"')
+        .split_whitespace()
+        .map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            assert!(
+                parts.len() == 4 && parts[0] == "xrpl",
+                "an XRPL_NETWORKS entry is xrpl:<id>:<xrpld service>:<host port>, got {entry}"
+            );
+            parts[2].to_owned()
+        })
+        .collect()
+}
+
 /// The one service block `compose` (named `file` in a failure) declares
 /// under `service`.
 fn compose_service(compose: &'static str, file: &str, service: &str) -> &'static str {
@@ -1470,11 +1502,16 @@ fn solos_xrpl_leg_runs_the_harness_chain_and_is_funded_from_genesis() {
     );
     assert!(xrpld.contains("./local/solo/xrpld.cfg:/etc/xrpld/xrpld.cfg:ro"));
     let cfg = include_str!("../../../local/solo/xrpld.cfg");
-    let network_id = cfg
-        .split_once("[network_id]\n")
-        .and_then(|(_, rest)| rest.lines().next())
-        .expect("xrpld.cfg names a [network_id]");
-    assert_eq!(network_id, STANDALONE_NETWORK_ID.to_string());
+    let body = cfg
+        .split_once("\n\n[server]\n")
+        .map(|(_, rest)| format!("[server]\n{rest}"))
+        .expect("xrpld.cfg opens with its comment, then [server]");
+    assert_eq!(
+        body,
+        connector_settlement_xrpl::test_support::config(),
+        "solo's xrpld.cfg is the harness's config -- network id, port and the network's \
+         reserves -- below its comment"
+    );
 
     let connector = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "connector");
     assert!(
@@ -1646,8 +1683,8 @@ fn local_up_waits_on_every_anvil_keys_sh_funds() {
             .into_iter()
             .map(|network| network.service)
             .filter(|service| service != "anvil")
-            // solo's stand-alone xrpld is started and waited on with them.
-            .chain((*name == "solo").then(|| "xrpld".to_owned()))
+            // ...and every stand-alone xrpld keys.sh funds on.
+            .chain(xrpl_network_services(name))
             .collect();
         let line = format!("LOCAL_CHAINS_{name} := {}", extra.join(" "));
         if extra.is_empty() {
