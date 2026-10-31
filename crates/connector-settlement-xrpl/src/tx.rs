@@ -31,8 +31,9 @@ const FULLY_CANONICAL_SIG: u32 = 0x8000_0000;
 
 /// A destination's `PaymentChannelClaim` that lands a voucher: `Balance` and
 /// `Amount` both name the voucher's cumulative amount, and the claim
-/// signature and channel key are the voucher's. It never sets `tfClose`
-/// (ADR 0087 decision 8: the ordinary land leaves the channel open) or
+/// signature and channel key are the voucher's. It sets `tfClose` only when
+/// `close` is (ADR 0087 decision 8: the ordinary land leaves the channel
+/// open, the watcher's answer to a payer's exit does not) and never
 /// `tfRenew` (only a channel's source may renew).
 pub struct LandClaim {
     /// This node's settlement account.
@@ -44,6 +45,9 @@ pub struct LandClaim {
     pub claim_signature: Vec<u8>,
     /// The channel's `PublicKey`.
     pub channel_key: [u8; 33],
+    /// Whether the claim carries `tfClose`: the voucher is landed and the
+    /// channel deleted in the same transaction (ADR 0087 decision 8).
+    pub close: bool,
     pub fee_drops: u64,
     pub sequence: u32,
     pub last_ledger_sequence: u32,
@@ -78,7 +82,12 @@ impl LandClaim {
         out.extend(PAYMENT_CHANNEL_CLAIM.to_be_bytes());
         // UInt32 Flags (2, 2), Sequence (2, 4), LastLedgerSequence (2, 27)
         out.push(0x22);
-        out.extend(FULLY_CANONICAL_SIG.to_be_bytes());
+        let flags = if self.close {
+            FULLY_CANONICAL_SIG | TF_CLOSE
+        } else {
+            FULLY_CANONICAL_SIG
+        };
+        out.extend(flags.to_be_bytes());
         out.push(0x24);
         out.extend(self.sequence.to_be_bytes());
         out.extend([0x20, 0x1B]);
@@ -315,6 +324,7 @@ mod tests {
             drops: 1_000,
             claim_signature: vec![0x33; 70],
             channel_key: [0x02; 33],
+            close: false,
             fee_drops: 10,
             sequence: 7,
             last_ledger_sequence: 99,

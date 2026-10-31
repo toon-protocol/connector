@@ -85,9 +85,9 @@ pub(crate) struct Outbound {
 }
 
 /// One transaction's outcome: its hash and its result code.
-struct Sent {
-    hash: String,
-    result: String,
+pub(crate) struct Sent {
+    pub(crate) hash: String,
+    pub(crate) result: String,
 }
 
 impl XrplBatchSettlement {
@@ -249,7 +249,7 @@ impl XrplBatchSettlement {
 
     /// Sign at the account's next `Sequence` with `build`, submit and wait
     /// for the ledger's verdict. The caller holds the sequencer.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         build: impl FnOnce(u32, u64, u32) -> SignedTx,
     ) -> Result<Sent, BatchSettlementError> {

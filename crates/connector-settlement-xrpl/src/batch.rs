@@ -188,6 +188,11 @@ impl XrplBatchSettlement {
         hex::encode(self.signer.public_key())
     }
 
+    /// The smallest `SettleDelay` this backend admits, in seconds.
+    pub fn min_settle_delay_secs(&self) -> u64 {
+        self.min_settle_delay_secs
+    }
+
     /// This node's settlement account, the `payTo` the greeting publishes.
     pub fn address(&self) -> &str {
         &self.address
@@ -208,6 +213,17 @@ impl XrplBatchSettlement {
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .ok_or_else(|| BatchSettlementError::ChannelNotFound(channel.clone()))?;
         Ok((ChannelId(hex::encode(bytes)), bytes))
+    }
+
+    /// Every channel this node has admitted or restored in this process.
+    pub(crate) fn admitted_channels(&self) -> Vec<ChannelId> {
+        self.admitted
+            .lock()
+            .expect("admitted")
+            .iter()
+            .cloned()
+            .map(ChannelId)
+            .collect()
     }
 
     fn require_admitted(
@@ -425,6 +441,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
             drops,
             claim_signature: voucher.signature.clone(),
             channel_key: key,
+            close: false,
             fee_drops,
             sequence: account.sequence,
             last_ledger_sequence,

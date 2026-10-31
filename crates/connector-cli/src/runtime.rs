@@ -34,7 +34,7 @@ use connector_settlement::batch::{
 use connector_settlement::watch_interval::watch_interval;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
-use connector_settlement_xrpl::XrplBatchSettlement;
+use connector_settlement_xrpl::{XrplBatchSettlement, XrplBatchWatcher};
 use connector_signer::{LocalSigner, Signer, SignerError, XrplSigner};
 
 use crate::batch_settlement::{
@@ -1980,7 +1980,11 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 ///   check runs only on a watch pass, so a longer watch rounds it up to the
 ///   next pass.
 ///
-/// Neither watch interval is configurable: [`watch_interval`] is the node's
+/// - XRPL: [`XrplBatchWatcher`], one per table, reads every [`watch_interval`]
+///   of the table's `min_settle_delay_secs` and answers a payer's exit by landing
+///   the latest voucher with `tfClose` (ADR 0087 decision 8).
+///
+/// No watch interval is configurable: [`watch_interval`] is the node's
 /// published minimum delay over ninety, clamped to ten seconds..fifteen
 /// minutes, so ninety passes fit inside the shortest delay any admitted
 /// channel can carry and an idle node spends no more RPC than that needs.
@@ -2019,6 +2023,10 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
             watch_interval(backend.min_grace_period_secs()),
             connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
         ));
+    }
+    for (network, backend) in &runtime.batch_settlement_xrpl {
+        let watcher = XrplBatchWatcher::new(Arc::clone(backend), held_on(network));
+        tokio::spawn(watcher.run(watch_interval(backend.min_settle_delay_secs())));
     }
 }
 
