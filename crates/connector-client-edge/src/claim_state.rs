@@ -13,10 +13,12 @@
 //!
 //! **Auth.** Per-channel, not per-request: each entry carries its own
 //! signature by the channel's **voucher signer** (EVM `payerAuthorizer`,
-//! Solana `authorized_signer`, read from the chain, never from the request)
+//! Solana `authorized_signer`, XRPL channel `PublicKey`, read from the chain,
+//! never from the request)
 //! over the voucher claim-state challenge (`connector_signer`'s
 //! `ClaimStateChallenge` under the `x402BatchSettlement` domain on EVM, the
-//! `toon-voucher-claim-state-challenge-v1` message on Solana) -- distinct
+//! `toon-voucher-claim-state-challenge-v1` message on Solana, the network-bound
+//! `toon-xrpl-voucher-claim-state-challenge-v1` message on XRPL) -- distinct
 //! from a voucher's own signature, so neither can be replayed as the other.
 //!
 //! **`scheme` is required** (ADR 0075 decision 8, issue #1384): every entry
@@ -59,7 +61,8 @@ use connector_domain::client_claim::{
 use connector_domain::{AssetChain, Network};
 use connector_signer::{
     evm_voucher_signer, verify_evm_voucher_claim_state_challenge,
-    verify_solana_voucher_claim_state_challenge, BatchChannelConfig,
+    verify_solana_voucher_claim_state_challenge, verify_xrpl_voucher_claim_state_challenge,
+    BatchChannelConfig,
 };
 
 use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
@@ -134,6 +137,18 @@ enum ChannelProofRequest {
     #[serde(rename_all = "camelCase")]
     Solana {
         channel_account: String,
+        expires: u64,
+        signature: String,
+        #[serde(default)]
+        scheme: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
+    },
+    /// An XRPL `PayChannel` (ADR 0087 decision 3): the id is 64 hex, the
+    /// signature hex, and the challenge binds `network`.
+    #[serde(rename_all = "camelCase")]
+    Xrpl {
+        channel_id: String,
         expires: u64,
         signature: String,
         #[serde(default)]
@@ -341,6 +356,23 @@ async fn resolve_channel_proof(
             )
             .await
         }
+        ChannelProofRequest::Xrpl {
+            channel_id,
+            expires,
+            signature,
+            scheme,
+            network,
+        } => {
+            resolve_xrpl(
+                state,
+                channel_id,
+                expires,
+                signature,
+                (scheme, network),
+                now,
+            )
+            .await
+        }
     }
 }
 
@@ -501,6 +533,100 @@ async fn resolve_solana_on(
         },
     )
     .await
+}
+
+async fn resolve_xrpl(
+    state: &ClientEdgeState,
+    channel_id_text: String,
+    expires: u64,
+    signature_text: String,
+    (scheme, network): (Option<String>, Option<String>),
+    now: u64,
+) -> ChannelStateResult {
+    match declared_scheme(scheme.as_deref()) {
+        DeclaredScheme::BatchSettlement => {}
+        DeclaredScheme::ToonChannel => {
+            log_outcome("xrpl", &channel_id_text, "toon_channel_refused");
+            return unverified("xrpl", channel_id_text, TOON_CHANNEL_REFUSED);
+        }
+        DeclaredScheme::Unknown => {
+            log_outcome("xrpl", &channel_id_text, "unknown_scheme");
+            return unverified("xrpl", channel_id_text, "unverified");
+        }
+    }
+    let network = match entry_network(state, "xrpl", AssetChain::Xrpl, &channel_id_text, network) {
+        Ok(network) => network,
+        Err(refused) => return *refused,
+    };
+    resolve_xrpl_on(
+        state,
+        &network,
+        channel_id_text,
+        expires,
+        signature_text,
+        now,
+    )
+    .await
+    .on(&network)
+}
+
+/// [`resolve_xrpl`], once its entry's scheme and network are known good.
+async fn resolve_xrpl_on(
+    state: &ClientEdgeState,
+    network: &Network,
+    channel_id_text: String,
+    expires: u64,
+    signature_text: String,
+    now: u64,
+) -> ChannelStateResult {
+    if expires <= now {
+        log_outcome("xrpl", &channel_id_text, "expired");
+        return unverified("xrpl", channel_id_text, "expired");
+    }
+    let Some(channel_id) = decode_hex_bytes::<32>(&channel_id_text) else {
+        log_outcome("xrpl", &channel_id_text, "malformed_channel_id");
+        return unverified("xrpl", channel_id_text, "unverified");
+    };
+    let Ok(signature) = hex::decode(&signature_text) else {
+        log_outcome("xrpl", &channel_id_text, "malformed_signature");
+        return unverified("xrpl", channel_id_text, "unverified");
+    };
+    let requester = format!("claim-state-challenge:{signature_text}");
+    let channel = match state
+        .claim_gate
+        .xrpl_voucher_channel(network, &channel_id, &requester)
+        .await
+    {
+        Ok(Some(channel)) => channel,
+        Ok(None) => {
+            log_outcome("xrpl", &channel_id_text, "channel_unknown");
+            return unverified("xrpl", channel_id_text, "unverified");
+        }
+        Err(error) => {
+            log_lookup_error("xrpl", &channel_id_text, &error);
+            return unverified("xrpl", channel_id_text, "unverified");
+        }
+    };
+    if !verify_xrpl_voucher_claim_state_challenge(
+        &channel.public_key,
+        &network.to_string(),
+        &channel_id,
+        expires,
+        &signature,
+    ) {
+        log_outcome("xrpl", &channel_id_text, "signature_invalid");
+        return unverified("xrpl", channel_id_text, "unverified");
+    }
+    log_outcome("xrpl", &channel_id_text, "verified");
+    let channel_id_hex = hex_encode(&channel_id);
+    let channel_key = format!("xrpl:{channel_id_hex}");
+    verified_voucher_state(
+        "xrpl",
+        channel_id_hex,
+        state,
+        &channel_key,
+        u128::from(channel.max_cumulative),
+    )
 }
 
 /// A batch-settlement entry's already-decoded proof.
