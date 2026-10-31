@@ -58,6 +58,7 @@ use connector_settlement::ChannelId;
 use connector_signer::{
     decode_xrpl_classic_address, xrpl_channel_id, xrpl_classic_address, XRPL_MAX_DROPS,
 };
+use serde_json::Value;
 
 use crate::batch::{rpc_error, Channel, XrplBatchSettlement, CHAIN};
 use crate::tx::{blob_hash, Create, Fund, SignedTx, SourceClose};
@@ -84,10 +85,11 @@ pub(crate) struct Outbound {
     finished: Option<BatchChannelState>,
 }
 
-/// One transaction's outcome: its hash and its result code.
-struct Sent {
-    hash: String,
-    result: String,
+/// One transaction's outcome: its hash, its result code and its metadata.
+pub(crate) struct Sent {
+    pub(crate) hash: String,
+    pub(crate) result: String,
+    pub(crate) meta: Value,
 }
 
 impl XrplBatchSettlement {
@@ -249,7 +251,7 @@ impl XrplBatchSettlement {
 
     /// Sign at the account's next `Sequence` with `build`, submit and wait
     /// for the ledger's verdict. The caller holds the sequencer.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         build: impl FnOnce(u32, u64, u32) -> SignedTx,
     ) -> Result<Sent, BatchSettlementError> {
@@ -309,10 +311,13 @@ impl XrplBatchSettlement {
         {
             TxFate::KnownNotLanded { .. } => Ok(None),
             TxFate::Landed {
-                transaction_result, ..
+                transaction_result,
+                meta,
+                ..
             } => Ok(Some(Sent {
                 hash: hash.to_string(),
                 result: transaction_result,
+                meta,
             })),
         }
     }

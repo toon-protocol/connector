@@ -1054,6 +1054,7 @@ dependencies = [
  "connector-settlement",
  "connector-settlement-evm",
  "connector-settlement-solana",
+ "connector-settlement-xrpl",
  "connector-signer",
  "ed25519-dalek",
  "ethers",
@@ -1464,6 +1465,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

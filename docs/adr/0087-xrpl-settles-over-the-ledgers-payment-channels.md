@@ -138,6 +138,18 @@ of the spec: an XRPL table adds no payer to the outbound channels, and
 `OutboundChannelRecord::Xrpl` (the signed `PaymentChannelCreate` and its `LastLedgerSequence`, so a
 retried open resumes the journaled channel) exists for them to write.
 
+## Update (issue #1617): the XRPL watcher lands with `tfClose`
+
+`XrplBatchWatcher` is built (decision 8) and the runtime spawns one per `[settlement.xrpl.<id>]`
+table, on a pass every `watch_interval` of the table's `min_settle_delay_secs`. A pass reads every
+channel the claim gate holds a voucher on for that network, and every channel the backend has
+admitted or restored. One with no `Expiration` is left untouched. One with an `Expiration` is
+answered with a single destination `PaymentChannelClaim` carrying `tfClose`: with the held voucher
+when it is genuine, above what is delivered and within the deposit, and without one otherwise. A
+channel the ledger no longer holds reads as `ChannelNotFound` on the receiving half and is
+remembered as done, so the runtime does not retry it. A payer that began an exit and wanted to
+`tfRenew` loses that chance, as decision 8 accepts.
+
 ## Considered options
 
 - **Track PR #2952 loosely.** Rejected by 0085 decision 2.

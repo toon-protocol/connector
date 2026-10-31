@@ -1009,6 +1009,153 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
     );
 }
 
+/// #1615, on a scripted ledger so it runs everywhere: the app is told the
+/// chain and the network, a claim with no `network` or an unconfigured one is
+/// refused by name, and a client that lost its store recovers the node's
+/// watermark from `POST /ilp/claim-state` with an XRPL challenge.
+#[tokio::test]
+async fn a_client_pays_over_xrpl_and_recovers_its_watermark_from_the_node() {
+    let seed = seed(XrplAlgorithm::Secp256k1, 9);
+    let node = signer(&seed);
+    let payer = signer(&self::seed(XrplAlgorithm::Ed25519, 3));
+    let ledger = Ledger::on(1000).with_account(&node.classic_address(), 50 * RESERVE_DROPS);
+    ledger.open_channel(CHANNEL, &node.classic_address(), &payer, 10_000, json!({}));
+    let rpc = ledger.serve().await;
+    let (app_addr, recorded) = spawn_recording_app().await;
+    let files = Files::new();
+    let key = key_file(&seed);
+    let config = files.config(&table(1000, &rpc.url(), key.path(), ""), &app_addr);
+    let runtime = connector_cli::build(&config).await.expect("build");
+    let app = connector_cli::router(&runtime, &config).expect("router");
+    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let id = channel_bytes(CHANNEL);
+    let claim = |network: Option<&str>, drops: u64| {
+        let mut json: Value = serde_json::from_str(&voucher(
+            "xrpl:1000",
+            CHANNEL,
+            drops,
+            &payer.sign_claim(&id, u128::from(drops)).expect("a claim"),
+        ))
+        .expect("JSON");
+        match network {
+            Some(network) => json["network"] = json!(network),
+            None => {
+                json.as_object_mut().expect("an object").remove("network");
+            }
+        }
+        json.to_string()
+    };
+    let refusal = |bytes: axum::body::Bytes| Reject::decode(&bytes).expect("refused").message;
+
+    let answer = post_ilp(
+        &app,
+        &claim(Some("xrpl:1000"), 300),
+        paid_prepare(ROUTE, &receiver),
+    )
+    .await;
+    Fulfill::decode(&answer).expect("the paid write is fulfilled");
+    {
+        let recorded = recorded.lock().unwrap();
+        let write = &recorded[0];
+        assert_eq!(write.header("x-toon-chain"), Some("xrpl"));
+        assert_eq!(write.header("x-toon-network"), Some("xrpl:1000"));
+        assert_eq!(
+            write.header("x-toon-payer"),
+            Some(format!("xrpl:{CHANNEL}").as_str())
+        );
+    }
+
+    let message = refusal(post_ilp(&app, &claim(None, 400), paid_prepare(ROUTE, &receiver)).await);
+    assert!(message.contains("'network'"), "{message}");
+    let message = refusal(
+        post_ilp(
+            &app,
+            &claim(Some("xrpl:1"), 400),
+            paid_prepare(ROUTE, &receiver),
+        )
+        .await,
+    );
+    assert!(
+        message.contains("xrpl:1") && message.contains("settles"),
+        "{message}"
+    );
+
+    let at = refusal(
+        post_ilp(
+            &app,
+            &claim(Some("xrpl:1000"), 300),
+            paid_prepare(ROUTE, &receiver),
+        )
+        .await,
+    );
+    let over = refusal(
+        post_ilp(
+            &app,
+            &claim(Some("xrpl:1000"), 10_001),
+            paid_prepare(ROUTE, &receiver),
+        )
+        .await,
+    );
+    assert!(at.contains("advances value by 0"), "{at}");
+    assert!(over.contains("could never be landed"), "{over}");
+
+    // The client lost its store: the node answers with its watermark.
+    let state = |entry: Value| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ilp/claim-state")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "channels": [entry] }).to_string()))
+                .expect("a request");
+            let response = app.oneshot(request).await.expect("an answer");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(response.into_body())
+                .await
+                .expect("the body");
+            serde_json::from_slice::<Value>(&bytes).expect("JSON")["channels"][0].clone()
+        }
+    };
+    let expires = chrono::Utc::now().timestamp() as u64 + 300;
+    let entry = |who: &XrplSigner, network: &str| {
+        json!({
+            "blockchain": "xrpl",
+            "scheme": "batch-settlement",
+            "network": network,
+            "channelId": CHANNEL,
+            "expires": expires,
+            "signature": hex::encode(
+                who.sign_claim_state_challenge(network, &id, expires).expect("a challenge"),
+            ),
+        })
+    };
+    let restored = state(entry(&payer, "xrpl:1000")).await;
+    assert_eq!(restored["ok"], true, "{restored}");
+    assert_eq!(restored["network"], "xrpl:1000", "{restored}");
+    assert_eq!(restored["cumulativeClaimed"], "300", "{restored}");
+    assert_eq!(restored["maxCumulative"], "10000", "{restored}");
+    assert_eq!(restored["available"], "9700", "{restored}");
+    let stranger = signer(&self::seed(XrplAlgorithm::Secp256k1, 77));
+    let refused = state(entry(&stranger, "xrpl:1000")).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"], "unverified", "{refused}");
+    // A challenge for one network is no proof on another.
+    let mut wrong = entry(&payer, "xrpl:1");
+    wrong["network"] = json!("xrpl:1000");
+    let wrong = state(wrong).await;
+    assert_eq!(wrong["ok"], false, "{wrong}");
+    assert_eq!(wrong["error"], "unverified", "{wrong}");
+    let elsewhere = state(entry(&payer, "xrpl:1")).await;
+    assert_eq!(elsewhere["error"], "network-not-settled", "{elsewhere}");
+    let mut unnamed = entry(&payer, "xrpl:1000");
+    unnamed
+        .as_object_mut()
+        .expect("an object")
+        .remove("network");
+    assert_eq!(state(unnamed).await["error"], "network-missing");
+}
+
 /// A channel the node would not admit is not accepted a voucher on (ADR 0087
 /// decision 9): here, one paying someone else and one with a `CancelAfter`.
 #[tokio::test]

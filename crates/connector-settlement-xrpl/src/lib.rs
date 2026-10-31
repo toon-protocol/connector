@@ -10,14 +10,17 @@
 //!   opens, funds and exits its own channels, at most once per open (issue
 //!   #1613).
 //!
-//! The watcher is a later ticket of the spec.
+//! - [`XrplBatchWatcher`]: answers a payer's exit by landing the latest held
+//!   voucher with `tfClose` (ADR 0087 decision 8, issue #1617).
 
 mod batch;
 mod pay;
 mod tx;
+mod watch;
 
 pub use batch::XrplBatchSettlement;
 pub use connector_chain_rpc::RpcTransport;
+pub use watch::XrplBatchWatcher;
 
 #[cfg(feature = "test-util")]
 pub mod test_support;
