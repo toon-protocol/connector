@@ -191,8 +191,9 @@ fn clear_orphans() {
 /// The config of a stand-alone chain. `[voting]` is explicit because the
 /// code's defaults (10 XRP base reserve, 2 XRP owner reserve) are not the
 /// network's (1 XRP, 0.2 XRP), and a settlement backend's reserve arithmetic
-/// must be tested against the network's.
-fn config() -> String {
+/// must be tested against the network's. Public so `local/solo/xrpld.cfg`,
+/// the same chain run as a compose service, can be held to it.
+pub fn config() -> String {
     format!(
         "\
 [server]

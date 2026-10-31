@@ -198,6 +198,16 @@ OPEN_DEPOSIT=1000000
 # 6-decimal and a 9-decimal mint alike). Ten times CHANNEL_DEPOSIT either way.
 NODE_EVM_USDC=1000000000
 NODE_SOLANA_TOKENS=1000
+# What each node's XRPL account is paid from genesis, in drops (1000 XRP): well
+# over the 1 XRP base reserve a node is refused below at boot (ADR 0087
+# decision 5), and the reserve each channel it opens then locks.
+NODE_XRPL_DROPS=1000000000
+# The stand-alone chain's genesis account and its secret. PUBLIC: the
+# `masterpassphrase` seed printed in XRPL's own documentation, controlling only
+# an account on a chain that is thrown away. `connector_settlement_xrpl::
+# test_support::GENESIS_SECRET` is the same string; a test holds the two equal.
+XRPL_GENESIS_ADDRESS=rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
+XRPL_GENESIS_SECRET=snoPBrXtMeMyMHUVTgbuqAfg1SUTb
 
 # ── The onion topology's placeholder addresses ───────────────────────────────
 # `local/onion/*.toml` are committed with these hosts wherever a daemon's real
@@ -243,6 +253,13 @@ ONION_PLACEHOLDER_B=placeholderplaceholderplaceholderplaceholderplaceholderb.any
 #             published on. Every node is funded on each. Only `solo` writes
 #             one (ADR 0086 decision 15: its second anvil, on 31338); every
 #             other topology keeps the default, the one shared anvil.
+#   XRPL_NETWORKS
+#             `xrpl:<id>:<xrpld service>:<host port>` -- every XRPL network the
+#             topology's configs hold a table for (ADR 0087), the stand-alone
+#             `xrpld` compose started on it, and the host port its admin RPC is
+#             published on. Every node gets a family seed in
+#             `settlement-xrpl.key` and is funded from the genesis account.
+#             Empty for every topology but `solo`.
 #   NETWORK_CHANNELS
 #             `node:eip155:<chainId>` -- an outbound x402 channel `node` opens
 #             and funds on that network itself, with a signed `POST /channels`
@@ -269,12 +286,14 @@ TOPOLOGY_MINT_DECIMALS=6
 TOPOLOGY_MINT_TREASURY=""
 ROUTES=""
 EVM_NETWORKS="eip155:31337:anvil:8545"
+XRPL_NETWORKS=""
 NETWORK_CHANNELS=""
 case "$TOPOLOGY" in
   solo)
     NODES="connector:4:14:3000"
     PEERINGS=""
     EVM_NETWORKS="eip155:31337:anvil:8545 eip155:31338:anvil-31338:8546"
+    XRPL_NETWORKS="xrpl:1000:xrpld:5005"
     NETWORK_CHANNELS="connector:eip155:31337 connector:eip155:31338"
     ;;
   two-hop)
@@ -1028,6 +1047,65 @@ rm -rf "$KEYS/peerings" "$KEYS/networks"
 
 resolve_solana_mint
 
+# ── XRPL (ADR 0087) ──────────────────────────────────────────────────────────
+# The host-side admin RPC of XRPL network `$1` (`xrpl:<id>`), from XRPL_NETWORKS.
+xrpl_rpc() {
+  local xrpl namespace id _service port
+  for xrpl in $XRPL_NETWORKS; do
+    IFS=':' read -r namespace id _service port <<<"$xrpl"
+    if [[ "$namespace:$id" == "$1" ]]; then
+      echo "http://$CHAIN_HOST:$port"
+      return
+    fi
+  done
+  echo "ERROR: '$TOPOLOGY' starts no xrpld on $1 (XRPL_NETWORKS: $XRPL_NETWORKS)." >&2
+  exit 1
+}
+
+# One JSON-RPC call to xrpld: `xrpl_call <rpc url> <method> '<params object>'`
+# prints the reply as JSON, for `json_field 'doc["result"]...'` to read. An
+# unanswered call is fatal here, with its reason, rather than an empty reply
+# that `set -e` kills the caller over before its own check can say why.
+xrpl_call() {
+  curl -sSf -m 20 -X POST "$1" -H 'Content-Type: application/json' \
+    -d "{\"method\":\"$2\",\"params\":[$3]}" || {
+    echo "ERROR: xrpld at $1 did not answer $2." >&2
+    exit 1
+  }
+}
+
+# Wait for the xrpld of network `$1` to answer `server_info` on that network
+# id. `docker compose up --wait` returns as soon as the container runs -- the
+# service has no healthcheck -- so this is the readiness gate.
+xrpl_wait() {
+  local rpc id answered attempt
+  rpc="$(xrpl_rpc "$1")"
+  id="${1#xrpl:}"
+  for attempt in $(seq 1 60); do
+    answered="$(xrpl_call "$rpc" server_info '{}' 2>/dev/null \
+      | json_field 'doc["result"]["info"]["network_id"]' || true)"
+    [[ "$answered" == "$id" ]] && return
+    sleep 1
+  done
+  echo "ERROR: $rpc answered network id '${answered:-nothing}', and '$TOPOLOGY' settles on" >&2
+  echo "       $1 there. Is the compose xrpld service up, configured with [network_id] $id?" >&2
+  exit 1
+}
+
+# Pay `$3` drops from genesis to `$2` on the xrpld at `$1`, and close the
+# ledger so the payment is validated -- a stand-alone chain closes one only
+# when told to. `sign`-and-`submit` in one call, which xrpld allows on its
+# admin port with a secret in the request.
+xrpl_fund() {
+  local rpc="$1" address="$2" drops="$3" result
+  result="$(xrpl_call "$rpc" submit "{\"secret\":\"$XRPL_GENESIS_SECRET\",\"tx_json\":{\"TransactionType\":\"Payment\",\"Account\":\"$XRPL_GENESIS_ADDRESS\",\"Destination\":\"$address\",\"Amount\":\"$drops\"}}")"
+  if [[ "$(echo "$result" | json_field 'doc["result"]["engine_result"]')" != "tesSUCCESS" ]]; then
+    echo "ERROR: funding $address on $rpc: $result" >&2
+    exit 1
+  fi
+  xrpl_call "$rpc" ledger_accept '{}' >/dev/null
+}
+
 # ── Keys, per node ───────────────────────────────────────────────────────────
 for entry in $NODES; do
   IFS=':' read -r node evm_index solana_index _port <<<"$entry"
@@ -1067,6 +1145,23 @@ for entry in $NODES; do
   derived_key "$evm_index" >"$dir/settlement.key"
   derived_key "$solana_index" >"$dir/settlement-solana.key"
   chmod 600 "$dir/settlement.key" "$dir/settlement-solana.key"
+
+  # The XRPL family seed (ADR 0087), for a topology with an XRPL table: asked
+  # of the stand-alone xrpld's own `wallet_propose` -- offline key generation,
+  # which touches no ledger -- so the seed's shape is the one the node's
+  # reader accepts. Random, and kept across runs like the operator keys.
+  if [[ -n "$XRPL_NETWORKS" && ! -s "$dir/settlement-xrpl.key" ]]; then
+    IFS=':' read -r _namespace xrpl_id _service _port <<<"${XRPL_NETWORKS%% *}"
+    xrpl_wait "xrpl:$xrpl_id"
+    xrpl_call "$(xrpl_rpc "xrpl:$xrpl_id")" wallet_propose '{}' \
+      | json_field 'doc["result"]["master_seed"]' >"$dir/settlement-xrpl.key"
+    if [[ ! -s "$dir/settlement-xrpl.key" ]]; then
+      echo "ERROR: xrpld's wallet_propose gave no seed for $node." >&2
+      exit 1
+    fi
+    chmod 600 "$dir/settlement-xrpl.key"
+    echo "$node: generated settlement-xrpl.key"
+  fi
 
   # The Solana CLI's own keypair file, built from the derived seed -- so the
   # account this script airdrops to is provably the account the connector
@@ -1210,6 +1305,24 @@ for entry in $NODES; do
   spl-token transfer --config "$SOLANA_SPL_CONFIG" --fund-recipient \
     "$SOLANA_MINT" "$NODE_SOLANA_TOKENS" "$solana_address" >/dev/null
   echo "  100 SOL + $NODE_SOLANA_TOKENS of $SOLANA_MINT (${TOPOLOGY_MINT_DECIMALS}dp)"
+
+  for xrpl in $XRPL_NETWORKS; do
+    IFS=':' read -r _namespace xrpl_id _service _port <<<"$xrpl"
+    rpc="$(xrpl_rpc "xrpl:$xrpl_id")"
+    xrpl_wait "xrpl:$xrpl_id"
+    # The address is read back from the seed by the chain's own tooling, so the
+    # account this pays is the account the node's reader derives from the file.
+    xrpl_address="$(xrpl_call "$rpc" wallet_propose \
+      "{\"seed\":\"$(cat "$dir/settlement-xrpl.key")\"}" \
+      | json_field 'doc["result"]["account_id"]')"
+    if [[ -z "$xrpl_address" ]]; then
+      echo "ERROR: xrpld could not derive an account from $node's settlement-xrpl.key." >&2
+      exit 1
+    fi
+    echo "$node: funding XRPL settlement account $xrpl_address on xrpl:$xrpl_id"
+    xrpl_fund "$rpc" "$xrpl_address" "$NODE_XRPL_DROPS"
+    echo "  $NODE_XRPL_DROPS drops, from genesis; ledger closed"
+  done
 done
 
 # ── The addresses the daemons generate, copied where the operator would ──────
