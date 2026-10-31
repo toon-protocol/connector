@@ -769,7 +769,11 @@ fn every_local_settlement_table_is_an_x402_one_on_the_seeded_chain() {
                     );
                 }
                 SettlementConfig::Xrpl(xrpl) => {
-                    panic!("{name} commits an XRPL table, {}", xrpl.table_name())
+                    assert_eq!(
+                        (name, xrpl.rpc_url()),
+                        ("local/solo/connector.toml", "http://xrpld:5005"),
+                        "only solo commits an XRPL table, on its compose `xrpld` service"
+                    );
                 }
             }
         }
@@ -1311,9 +1315,9 @@ fn the_solo_topologys_committed_config_loads() {
         .collect();
     assert_eq!(
         networks,
-        ["eip155:31337", "eip155:31338", "solana"],
+        ["eip155:31337", "eip155:31338", "solana", "xrpl:1000"],
         "the point of the solo topology is BOTH settlement backends attached at once, the EVM \
-         one on TWO networks (ADR 0086 decision 15)"
+         one on TWO networks (ADR 0086 decision 15), and XRPL beside them (ADR 0087)"
     );
     assert!(topology("solo").peerings.is_empty());
     assert_eq!(
@@ -1442,6 +1446,64 @@ fn the_solo_rehearsal_reads_each_evm_network_back_off_its_own_anvil() {
         }
     }
     assert!(sender.contains("--expect-fulfill"));
+}
+
+// ─── XRPL ────────────────────────────────────────────────────────────────────
+
+/// **Solo's `xrpld` is the harness's chain, and keys.sh funds the node on it**
+/// (ADR 0087, #1618).
+///
+/// The compose service runs the digest-pinned image `Xrpld::spawn` runs, with
+/// a config at the same stand-alone network id the node's table is keyed by;
+/// `keys.sh` generates the seed the table names and pays it from the harness's
+/// genesis account. The rehearsal requires the greeting to carry the entry.
+#[test]
+fn solos_xrpl_leg_runs_the_harness_chain_and_is_funded_from_genesis() {
+    use connector_settlement_xrpl::test_support::{
+        GENESIS_ADDRESS, GENESIS_SECRET, IMAGE, STANDALONE_NETWORK_ID,
+    };
+
+    let xrpld = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "xrpld");
+    assert!(
+        xrpld.contains(&format!("image: {IMAGE}")),
+        "solo's xrpld must run the image the test harness runs, by the same digest"
+    );
+    assert!(xrpld.contains("./local/solo/xrpld.cfg:/etc/xrpld/xrpld.cfg:ro"));
+    let cfg = include_str!("../../../local/solo/xrpld.cfg");
+    let network_id = cfg
+        .split_once("[network_id]\n")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("xrpld.cfg names a [network_id]");
+    assert_eq!(network_id, STANDALONE_NETWORK_ID.to_string());
+
+    let connector = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "connector");
+    assert!(
+        connector.contains("      xrpld:\n        condition: service_started"),
+        "the node reads the ledger at boot, so xrpld starts first"
+    );
+
+    let raw: toml::Value = toml::from_str(SOLO_CONFIG).expect("local/solo/connector.toml parses");
+    let table = &raw["settlement"]["xrpl"][STANDALONE_NETWORK_ID.to_string()];
+    assert_eq!(table["rpc_url"].as_str(), Some("http://xrpld:5005"));
+    assert_eq!(
+        table["key"]["key_file"].as_str(),
+        Some("/app/data/settlement-xrpl.key"),
+        "the file local/keys.sh writes into the node's mounted key directory"
+    );
+
+    let script = code(KEYS_SCRIPT);
+    assert!(script.contains(&format!(
+        "XRPL_NETWORKS=\"xrpl:{STANDALONE_NETWORK_ID}:xrpld:5005\""
+    )));
+    assert!(script.contains(&format!("XRPL_GENESIS_ADDRESS={GENESIS_ADDRESS}")));
+    assert!(script.contains(&format!("XRPL_GENESIS_SECRET={GENESIS_SECRET}")));
+    assert!(xrpld.contains("'127.0.0.1:5005:5005'"));
+
+    let sender = compose_service(SOLO_COMPOSE, "local/solo/compose.yml", "sender");
+    assert!(
+        sender.contains(&format!("'\"network\":\"xrpl:{STANDALONE_NETWORK_ID}\"'")),
+        "the solo sender requires the greeting to carry the XRPL entry"
+    );
 }
 
 // ─── the EVM networks ────────────────────────────────────────────────────────
@@ -1584,6 +1646,8 @@ fn local_up_waits_on_every_anvil_keys_sh_funds() {
             .into_iter()
             .map(|network| network.service)
             .filter(|service| service != "anvil")
+            // solo's stand-alone xrpld is started and waited on with them.
+            .chain((*name == "solo").then(|| "xrpld".to_owned()))
             .collect();
         let line = format!("LOCAL_CHAINS_{name} := {}", extra.join(" "));
         if extra.is_empty() {

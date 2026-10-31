@@ -201,10 +201,12 @@ LOCAL_NODES = $(LOCAL_NODES_$(LOCAL_TOPOLOGY))
 
 # The chains a topology runs beyond the shared `anvil` and `solana-validator`,
 # started and waited on with them -- before local/keys.sh funds anything on
-# them. Only solo has one: its second anvil, on chain id 31338 (ADR 0086
-# decision 15), the same seeded chain on another network.
-# `local_topologies_load.rs` holds this list to keys.sh's EVM_NETWORKS.
-LOCAL_CHAINS_solo := anvil-31338
+# them. Only solo has any: its second anvil, on chain id 31338 (ADR 0086
+# decision 15), the same seeded chain on another network, and its stand-alone
+# `xrpld` (ADR 0087), which keys.sh funds from genesis.
+# `local_topologies_load.rs` holds this list to keys.sh's EVM_NETWORKS and
+# XRPL_NETWORKS.
+LOCAL_CHAINS_solo := anvil-31338 xrpld
 LOCAL_CHAINS = $(LOCAL_CHAINS_$(LOCAL_TOPOLOGY))
 
 # The image the topologies run. Built from this working tree, deliberately: the
