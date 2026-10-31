@@ -1225,6 +1225,7 @@ impl Connector {
             let chain = match binding {
                 RuntimePeerChannel::EvmVoucher { .. } => SettlementChain::Evm,
                 RuntimePeerChannel::SolanaVoucher { .. } => SettlementChain::Solana,
+                RuntimePeerChannel::XrplVoucher { .. } => SettlementChain::Xrpl,
                 RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => continue,
             };
             let key = crate::batch_channels::journal_key(
@@ -1233,7 +1234,8 @@ impl Connector {
             );
             let network = match binding {
                 RuntimePeerChannel::EvmVoucher { network, .. }
-                | RuntimePeerChannel::SolanaVoucher { network, .. } => {
+                | RuntimePeerChannel::SolanaVoucher { network, .. }
+                | RuntimePeerChannel::XrplVoucher { network, .. } => {
                     network.parse::<connector_domain::Network>().ok()
                 }
                 _ => None,
@@ -1390,7 +1392,7 @@ impl Connector {
     /// whose `claim-state` is the watermark authority on restore.
     ///
     /// Anything but an x402 binding ([`RuntimePeerChannel::EvmVoucher`],
-    /// [`RuntimePeerChannel::SolanaVoucher`]) registers nothing.
+    /// [`RuntimePeerChannel::SolanaVoucher`], [`RuntimePeerChannel::XrplVoucher`]) registers nothing.
     ///
     /// The claim-state ask leaves on the node's `socks_proxy` when the
     /// peer's client edge is an onion host (ADR 0070), by the one host rule
@@ -1411,6 +1413,10 @@ impl Connector {
             ..
         }
         | RuntimePeerChannel::SolanaVoucher {
+            outbound_channel_id,
+            ..
+        }
+        | RuntimePeerChannel::XrplVoucher {
             outbound_channel_id,
             ..
         }) = binding
@@ -1668,6 +1674,11 @@ impl Connector {
                 network,
                 ..
             } => (SettlementChain::Solana, voucher_signer, network),
+            RuntimePeerChannel::XrplVoucher {
+                voucher_signer,
+                network,
+                ..
+            } => (SettlementChain::Xrpl, voucher_signer, network),
             RuntimePeerChannel::Evm { .. } | RuntimePeerChannel::Solana { .. } => return Ok(()),
         };
         let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {

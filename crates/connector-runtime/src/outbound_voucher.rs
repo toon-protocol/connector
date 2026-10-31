@@ -43,6 +43,11 @@ use crate::batch_channels::hex;
 /// operators' hosts.
 pub const PEER_CHALLENGE_TTL_SECS: u64 = 60;
 
+/// Bare lowercase hex, which is how an XRPL signature is spelled on the wire.
+fn bare_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
     serde_json::json!({
         "payer": hex(&config.payer),
@@ -103,7 +108,20 @@ pub fn voucher_json(
             "expiresAt": 0,
             "signature": bs58::encode(&voucher.signature).into_string(),
         }),
-        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
+        // ADR 0087 decision 2: the channel id in bare hex and the signature in
+        // hex (DER for a secp256k1 key, raw for an Ed25519 one).
+        ChannelPresentation::Xrpl { channel } => serde_json::json!({
+            "version": "1.0",
+            "blockchain": "xrpl",
+            "network": network.to_string(),
+            "scheme": "batch-settlement",
+            "messageId": message_id,
+            "timestamp": timestamp,
+            "senderId": sender_id,
+            "channelId": channel.0,
+            "maxClaimableAmount": amount,
+            "signature": bare_hex(&voucher.signature),
+        }),
     }
     .to_string()
 }
@@ -139,7 +157,14 @@ pub fn challenge_entry(
             "expires": expires,
             "signature": BASE64.encode(signature),
         }),
-        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
+        ChannelPresentation::Xrpl { channel } => serde_json::json!({
+            "blockchain": "xrpl",
+            "network": network.to_string(),
+            "scheme": "batch-settlement",
+            "channelId": channel.0,
+            "expires": expires,
+            "signature": bare_hex(signature),
+        }),
     }
 }
 

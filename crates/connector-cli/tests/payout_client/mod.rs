@@ -253,6 +253,10 @@ pub fn payout_of(transfer: &Frame) -> (serde_json::Value, ChannelPresentation, V
                 .unwrap();
             (ChannelPresentation::Solana { channel }, signature)
         }
+        "xrpl" => (
+            ChannelPresentation::Xrpl { channel },
+            hex(&json["signature"]),
+        ),
         other => panic!("unexpected chain {other}"),
     };
     assert!(
