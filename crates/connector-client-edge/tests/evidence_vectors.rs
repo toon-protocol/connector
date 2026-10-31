@@ -60,9 +60,10 @@ fn path(dir: &tempfile::TempDir) -> std::path::PathBuf {
 
 #[test]
 fn the_vectors_are_the_ones_this_pin_was_reviewed_against() {
-    let digest = Sha256::digest(VECTORS.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, VECTORS_SHA256);
+    assert_eq!(
+        hex::encode(Sha256::digest(VECTORS.as_bytes())),
+        VECTORS_SHA256
+    );
 }
 
 #[test]

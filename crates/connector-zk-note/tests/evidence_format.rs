@@ -22,10 +22,6 @@ fn grant() -> Grant {
     }
 }
 
-fn header() -> Vec<u8> {
-    write_header()
-}
-
 /// CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`), bit by bit: the framing's checksum,
 /// computed independently of the code under test.
 fn crc32c(bytes: &[u8]) -> u32 {
@@ -61,7 +57,7 @@ fn grant_payload() -> Vec<u8> {
 
 #[test]
 fn the_header_is_the_magic_and_version_one() {
-    assert_eq!(header(), b"TOONZKEV\x01\x00".to_vec());
+    assert_eq!(write_header(), b"TOONZKEV\x01\x00".to_vec());
 }
 
 #[test]
@@ -112,7 +108,7 @@ fn payloads(scan: &connector_zk_note::evidence::Scan<'_>) -> Vec<Vec<u8>> {
 }
 
 fn file_of(payloads: &[Vec<u8>]) -> Vec<u8> {
-    let mut file = header();
+    let mut file = write_header();
     for p in payloads {
         file.extend_from_slice(&frame(p));
     }
@@ -161,16 +157,16 @@ fn a_torn_final_record_is_ignored_and_the_end_is_before_it() {
 fn a_crc_failure_before_the_end_is_corruption() {
     let a = grant_payload();
     let mut file = file_of(&[a.clone(), a]);
-    file[header().len() + 4] ^= 0xff;
+    file[write_header().len() + 4] ^= 0xff;
     assert!(matches!(scan(&file), Err(FileError::Corrupt { .. })));
 }
 
 #[test]
 fn an_unknown_version_or_magic_is_refused() {
-    let mut file = header();
+    let mut file = write_header();
     file[8] = 2;
     assert_eq!(scan(&file), Err(FileError::UnsupportedVersion(2)));
-    let mut file = header();
+    let mut file = write_header();
     file[0] = b'X';
     assert_eq!(scan(&file), Err(FileError::BadMagic));
 }
@@ -179,8 +175,11 @@ fn an_unknown_version_or_magic_is_refused() {
 /// it as a torn start and writes the header again (`evidence_file.rs`).
 #[test]
 fn an_empty_or_half_written_header_is_truncated() {
-    for len in 0..header().len() {
-        assert_eq!(scan(&header()[..len]), Err(FileError::TruncatedHeader));
+    for len in 0..write_header().len() {
+        assert_eq!(
+            scan(&write_header()[..len]),
+            Err(FileError::TruncatedHeader)
+        );
     }
 }
 

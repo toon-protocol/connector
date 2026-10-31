@@ -69,7 +69,7 @@ use connector_domain::client_claim::{AllowanceClaim, AllowanceId};
 use connector_domain::AllowanceSubsidy;
 use connector_domain::{allowance_close_charge, validate_allowance_claim};
 use connector_runtime::Clock;
-use connector_zk_note::evidence::{evidence_hash, Close, Grant, Record};
+use connector_zk_note::evidence::{decode_error_message, evidence_hash, Close, Grant, Record};
 use connector_zk_note::note::policy;
 use connector_zk_note::note::state::StateMessage;
 use connector_zk_note::request::{expected_tag, RequestProof};
@@ -658,6 +658,14 @@ impl ClientClaimGate {
         // Structure.
         let proof = RequestProof::parse(&request.proof)
             .map_err(|error| AllowanceRefusal::Malformed(error.to_string()))?;
+        // The evidence file frames a proof with a `u32` length, which
+        // `zk-evidence` does not check: a longer one is refused here, not
+        // truncated there.
+        if u32::try_from(proof.json().len()).is_err() {
+            return Err(AllowanceRefusal::Malformed(
+                "the request proof is too long to record as evidence".into(),
+            ));
+        }
         if decompress(&request.session_key).is_none() {
             return Err(AllowanceRefusal::Malformed(
                 "the session key is not a point on Pallas".into(),
@@ -779,7 +787,7 @@ impl ClientClaimGate {
             granted_at: now,
         })
         .encode()
-        .map_err(|error| AllowanceRefusal::Malformed(format!("{error:?}")))?;
+        .map_err(|error| AllowanceRefusal::Malformed(decode_error_message(&error)))?;
         // Pending until the journal holds the grant: a grant the journal
         // refuses is cut back out of the evidence file, so a retry writes
         // the only grant record for this nullifier. The file stays locked
@@ -1430,7 +1438,11 @@ impl ZkParts {
         {
             Ok(payload) => payload,
             Err(error) => {
-                tracing::error!(allowance = %id, ?error, "a close record could not be encoded");
+                tracing::error!(
+                    allowance = %id,
+                    error = %decode_error_message(&error),
+                    "a close record could not be encoded"
+                );
                 return;
             }
         };

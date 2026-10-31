@@ -47,6 +47,15 @@ impl From<RequestPublicError> for RequestProofError {
     }
 }
 
+/// A commitment as zk_toon's [`RequestPublic`] holds it: its affine coordinates.
+#[must_use]
+pub fn point(commitment: Commitment) -> Point {
+    Point {
+        x: commitment.x,
+        y: commitment.y,
+    }
+}
+
 /// The twelve field elements of `public`, in o1js order: the inverse of
 /// [`RequestPublic::from_fields`].
 #[must_use]

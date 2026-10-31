@@ -354,7 +354,7 @@ pub mod contract {
     mod tests {
         use super::*;
         use connector_zk_note::note::balance::generator_g;
-        use connector_zk_note::request::{json_proof_for, Point, RequestPublic};
+        use connector_zk_note::request::{json_proof_for, point, RequestPublic};
 
         fn proof(bytes: &str) -> RequestProof {
             subsidy_proof(bytes, false, 0, 0)
@@ -374,10 +374,7 @@ pub mod contract {
                 tier: 10_000_000,
                 nullifier: Field::from(99u64),
                 tag: Field::from(3u64),
-                commitment: Point {
-                    x: generator_g().x,
-                    y: generator_g().y,
-                },
+                commitment: point(generator_g()),
                 subsidised,
                 period,
                 period_nullifier: Field::from(period_nullifier),

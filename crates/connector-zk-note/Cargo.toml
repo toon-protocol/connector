@@ -12,9 +12,9 @@ description = "The connector's zk-note boundary (ADR 0080 decision 12): re-expor
 #
 # Every proof-systems crate is spelled exactly as zk_toon spells it (git URL, rev ab84160f,
 # default-features off), so Cargo resolves one source and there is one Fp type, not two.
-# zk_toon moved from tag 0.7.0 to that rev, the spike's (#1512), which is code-identical to
-# the tag the live Mina daemon pins for Mesa. No JavaScript prover dependency may appear
-# here (ADR 0080's falsifiers).
+# That rev is the commit the live Mina daemon 4.0.0-mainnet-mesa pins (the spike's, #1512);
+# tag 0.7.0, which zk_toon spelled before, is it plus a release commit with no Rust source
+# change. No JavaScript prover dependency may appear here (ADR 0080's falsifiers).
 [dependencies]
 zk-note = { git = "https://github.com/toon-protocol/zk_toon", rev = "0d6b10c332558caf7d8d6350e14b19d68f443f2c" }
 zk-evidence = { git = "https://github.com/toon-protocol/zk_toon", rev = "0d6b10c332558caf7d8d6350e14b19d68f443f2c" }

@@ -18,7 +18,7 @@ use connector_signer::ZkStateSigner;
 use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::field_to_string;
 use connector_zk_note::note::policy::TIERS;
-use connector_zk_note::request::{expected_tag, json_proof_for, Point, RequestPublic};
+use connector_zk_note::request::{expected_tag, json_proof_for, point, RequestPublic};
 use connector_zk_note::session::{
     allowance_claim_fields, allowance_close_fields, sign_allowance_claim, sign_allowance_close,
     signature_to_hex,
@@ -104,10 +104,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         tier,
         nullifier,
         tag: expected_tag(nullifier, &state_key, &session_key, tier, EXPIRES_AT_MS),
-        commitment: Point {
-            x: commitment.x,
-            y: commitment.y,
-        },
+        commitment: point(commitment),
         subsidised: false,
         period: 0,
         period_nullifier: Field::from(0u64),

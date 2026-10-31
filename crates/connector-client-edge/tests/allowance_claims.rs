@@ -24,7 +24,7 @@ use connector_zk_note::note::balance::{commit, Commitment};
 use connector_zk_note::note::policy::{subsidy_period, SUBSIDY_PERIOD_MS, TIERS};
 use connector_zk_note::note::state::verify_state;
 use connector_zk_note::request::{
-    expected_tag, json_proof_for, Point, RequestProof, RequestPublic,
+    expected_tag, json_proof_for, point, RequestProof, RequestPublic,
 };
 use connector_zk_note::session::{
     sign_allowance_claim, sign_allowance_close, signature_to_be_bytes, signature_to_hex,
@@ -222,10 +222,7 @@ impl Payer {
                     self.expires_at_ms,
                 )
             }),
-            commitment: Point {
-                x: self.commitment.x,
-                y: self.commitment.y,
-            },
+            commitment: point(self.commitment),
             subsidised: self.subsidised,
             period: self.period,
             period_nullifier: self.period_nullifier,

@@ -21,7 +21,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use connector_zk_note::evidence::{evidence_hash, frame, scan, write_header, FileError};
+use connector_zk_note::evidence::{
+    evidence_hash, file_error_message, frame, scan, write_header, FileError,
+};
 
 /// The file's name under `state_dir`.
 pub const EVIDENCE_FILE: &str = "zk-note-evidence.bin";
@@ -31,21 +33,8 @@ pub const EVIDENCE_FILE: &str = "zk-note-evidence.bin";
 pub enum EvidenceFileError {
     #[error("the zk-note evidence file could not be read or written: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the zk-note evidence file is unreadable: {}", describe(.0))]
+    #[error("the zk-note evidence file is unreadable: {}", file_error_message(.0))]
     Format(FileError),
-}
-
-/// `zk-evidence`'s refusal, in words: it carries no `Display` of its own.
-fn describe(error: &FileError) -> String {
-    match error {
-        FileError::TruncatedHeader => "its header is incomplete".into(),
-        FileError::BadMagic => "it does not start with its magic".into(),
-        FileError::UnsupportedVersion(version) => format!(
-            "it is format version {version}; this build reads only version {}",
-            connector_zk_note::evidence::VERSION
-        ),
-        FileError::Corrupt { offset } => format!("it is corrupt at byte {offset}"),
-    }
 }
 
 /// What the evidence file is written through: a [`File`], or in this
@@ -146,7 +135,12 @@ impl EvidenceFile {
         let header = write_header();
         // An empty or half-written header is a torn start, not a foreign file:
         // the crash came before the header was whole, so it is written again.
-        let (valid_len, hashes) = if bytes.len() < header.len() && header.starts_with(&bytes) {
+        // Shorter than a header and not its prefix is a foreign file, which
+        // `zk-evidence` would call merely truncated.
+        let (valid_len, hashes) = if bytes.len() < header.len() {
+            if !header.starts_with(&bytes) {
+                return Err(EvidenceFileError::Format(FileError::BadMagic));
+            }
             (0, HashSet::new())
         } else {
             let read = scan(&bytes).map_err(EvidenceFileError::Format)?;
@@ -308,6 +302,18 @@ mod tests {
             file.append(b"one").unwrap();
             assert_eq!(records(&path), vec![b"one".to_vec()], "cut at {len}");
         }
+    }
+
+    #[test]
+    fn a_foreign_file_shorter_than_a_header_is_refused_as_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EVIDENCE_FILE);
+        std::fs::write(&path, b"XY").unwrap();
+        assert!(matches!(
+            EvidenceFile::open(&path),
+            Err(EvidenceFileError::Format(FileError::BadMagic))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"XY", "left as found");
     }
 
     #[test]

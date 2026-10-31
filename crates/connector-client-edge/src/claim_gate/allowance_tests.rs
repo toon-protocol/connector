@@ -7,7 +7,7 @@ use chrono::TimeZone;
 use connector_runtime::{FileJournal, TestClock};
 use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::policy::TIERS;
-use connector_zk_note::request::{json_proof_for, Point, RequestPublic};
+use connector_zk_note::request::{json_proof_for, point, RequestPublic};
 use connector_zk_note::session::{sign_allowance_claim, signature_to_hex};
 use connector_zk_note::{Keypair, Scalar, SecKey};
 
@@ -59,10 +59,7 @@ async fn edge_with_allowance(
         tier: TIERS[1],
         nullifier,
         tag: expected_tag(nullifier, &state, &session_key, TIERS[1], expires),
-        commitment: Point {
-            x: commitment.x,
-            y: commitment.y,
-        },
+        commitment: point(commitment),
         subsidised: false,
         period: 0,
         period_nullifier: Field::from(0u64),
