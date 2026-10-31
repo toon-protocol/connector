@@ -196,9 +196,6 @@ pub enum EstablishPeeringError {
         theirs: String,
         ours: String,
     },
-    /// A channel on a chain whose peering is not built yet (XRPL, ADR 0087).
-    #[error("a {chain} channel cannot be bound to a peering yet")]
-    ChainNotPeerable { chain: String },
     /// The counterparty publishes no voucher signer for the chain (ADR 0075
     /// decision 10), so its channel toward this node could never be bound
     /// to the peering, and its packets would never prove the peer role.
@@ -398,7 +395,21 @@ impl Connector {
             }
         }
         let pay_to = shared.pay_to();
-        let receiver = parse_chain_key(chain, pay_to).ok_or_else(|| unreadable(pay_to))?;
+        let receiver = match &signer {
+            // A channel pays an account, and the one key this node's peer
+            // signs with is that account's (ADR 0087): a `payTo` its
+            // published signer does not derive is no account this node can
+            // match a channel to.
+            VoucherSigner::Xrpl(key)
+                if connector_signer::xrpl_classic_address(&connector_signer::xrpl_account_id(
+                    key,
+                )) == pay_to =>
+            {
+                signer
+            }
+            VoucherSigner::Xrpl(_) => return Err(unreadable(pay_to)),
+            _ => parse_chain_key(chain, pay_to).ok_or_else(|| unreadable(pay_to))?,
+        };
         let outbound = self
             .outbound_channels()
             .ok_or(BatchChannelError::NoBackend(chain))?;
@@ -435,13 +446,11 @@ impl Connector {
                 voucher_signer: bs58::encode(signer).into_string(),
                 network: network.to_string(),
             },
-            // The peer-route store has no XRPL binding yet: an XRPL peering
-            // is the backend tickets' to build (ADR 0087, #1596).
-            VoucherSigner::Xrpl(_) => {
-                return Err(EstablishPeeringError::ChainNotPeerable {
-                    chain: chain.name().to_string(),
-                })
-            }
+            VoucherSigner::Xrpl(signer) => RuntimePeerChannel::XrplVoucher {
+                outbound_channel_id: channel_id.clone(),
+                voucher_signer: hex_lower(&signer),
+                network: network.to_string(),
+            },
         };
         Ok((
             binding,

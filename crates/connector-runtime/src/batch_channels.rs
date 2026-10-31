@@ -420,8 +420,8 @@ fn place_on_networks(
                     // channel this node pays from.
                     AssetChain::Mina => None,
                     // An XRPL network is placed on its exact payer, if the
-                    // node has one: none is built yet (ADR 0087), so a record
-                    // naming one is refused by name below.
+                    // node has one; a record naming another is refused by
+                    // name below (ADR 0087).
                     AssetChain::Xrpl => configured().find(|network| **network == journaled),
                 };
                 let Some(placed) = placed else {
@@ -1088,7 +1088,13 @@ impl OutboundChannels {
         let (chain, receiver) = match receiver {
             VoucherSigner::Evm(address) => (SettlementChain::Evm, address.to_vec()),
             VoucherSigner::Solana(key) => (SettlementChain::Solana, key.to_vec()),
-            VoucherSigner::Xrpl(key) => (SettlementChain::Xrpl, key.to_vec()),
+            // A channel's receiver is kept as the classic address its
+            // `Destination` names, which the one key behind it derives.
+            VoucherSigner::Xrpl(key) => (
+                SettlementChain::Xrpl,
+                connector_signer::xrpl_classic_address(&connector_signer::xrpl_account_id(key))
+                    .into_bytes(),
+            ),
         };
         self.channels()
             .iter()
