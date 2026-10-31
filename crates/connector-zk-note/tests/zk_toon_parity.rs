@@ -6,15 +6,15 @@
 use connector_zk_note::note::balance::{charge, commit, Commitment, Scalar};
 use connector_zk_note::note::state::{sign_state, verify_state, verify_state_on, StateMessage};
 use connector_zk_note::note::{field_to_string, next_anchor, policy, Field, VECTORS_JSON};
-use connector_zk_note::request::{expected_tag, RequestPublic};
+use connector_zk_note::request::{expected_tag, public_input, RequestProof};
 use connector_zk_note::session::{sign_fields, verify_fields};
 use connector_zk_note::{CompressedPubKey, Keypair, NetworkId, SecKey, Signature};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
-/// SHA-256 of `test-vectors/zk-note.json` at zk_toon `7b399412`.
-const VECTORS_SHA256: &str = "69b4130ef59d00ad40330e4f54b071ccd93effdd5c76bcc4cb29c0d7e76fa47e";
+/// SHA-256 of `test-vectors/zk-note.json` at zk_toon `0d6b10c3`.
+const VECTORS_SHA256: &str = "8b2f8d92646e96e7ae3ea538249774b6f4e5c0e63d84847a35e54ccf8617c753";
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS_JSON).expect("zk_toon's vectors are JSON")
@@ -88,54 +88,83 @@ fn the_binding_tag_the_zk_edge_expects_is_zk_toons() {
     }
 }
 
+/// A `JsonProof` around a vector's `publicInput`: what a payer sends, minus a real proof, which
+/// the connector's parse does not read.
+fn json_proof(public_input: &Value) -> Vec<u8> {
+    serde_json::json!({ "publicInput": public_input, "proof": "unread" })
+        .to_string()
+        .into_bytes()
+}
+
 #[test]
-fn a_request_proofs_public_inputs_decode_in_o1js_order_and_bind() {
+fn a_request_proofs_public_inputs_decode_through_the_connectors_parse_and_bind() {
     let v = vectors();
     let cases = v["requestProofs"].as_array().expect("requestProofs");
-    assert!(!cases.is_empty());
+    assert!(cases.iter().any(|e| bit(&e["public"]["subsidised"])));
+    assert!(cases.iter().any(|e| !bit(&e["public"]["subsidised"])));
     for e in cases {
         let p = &e["public"];
-        // o1js flattens `RequestPublic` field by field: a `PublicKey` is `x, isOdd`, a `Group`
-        // is `x, y`, a `Bool` is 0 or 1.
-        let flat: Vec<Field> = vec![
-            f(&p["vault"]["x"]),
-            Field::from(u64::from(bit(&p["vault"]["isOdd"]))),
-            f(&p["root"]),
-            f(&p["requestTime"]),
-            f(&p["tier"]),
-            f(&p["nullifier"]),
-            f(&p["tag"]),
-            f(&p["commitment"]["x"]),
-            f(&p["commitment"]["y"]),
-            Field::from(u64::from(bit(&p["subsidised"]))),
-            f(&p["period"]),
-            f(&p["periodNullifier"]),
-        ];
-        let public = RequestPublic::from_fields(&flat).expect("decodes");
-        assert_eq!(public.to_fields(), flat);
-        assert_eq!(public.vault.x, f(&p["vault"]["x"]));
+        let proof = RequestProof::parse(&json_proof(&e["publicInput"])).expect("parses");
+        let public = proof.public();
+        assert_eq!(
+            public_input(public),
+            e["publicInput"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(f)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(proof.vault().x, f(&p["vault"]["x"]));
+        assert_eq!(proof.vault().is_odd, bit(&p["vault"]["isOdd"]));
         assert_eq!(public.root, f(&p["root"]));
         assert_eq!(public.request_time, u(&p["requestTime"]));
         assert_eq!(public.tier, u(&p["tier"]));
         assert_eq!(public.nullifier, f(&p["nullifier"]));
-        assert_eq!(public.commitment, pt(&p["commitment"]));
-        assert!(!public.subsidised);
+        assert_eq!(proof.commitment(), pt(&p["commitment"]));
+        assert_eq!(public.subsidised, bit(&p["subsidised"]));
+        assert_eq!(public.period, u(&p["period"]));
+        assert_eq!(public.period_nullifier, f(&p["periodNullifier"]));
 
         // The tag the zk edge recomputes, with `edge` = the state key's x, is the proof's.
         let ctx = &e["private"]["context"];
-        assert_eq!(f(&ctx["edge"]), public.vault.x);
+        assert_eq!(f(&ctx["edge"]), proof.vault().x);
         let session = CompressedPubKey {
             x: f(&ctx["sessionKeyX"]),
             is_odd: bit(&ctx["sessionKeyIsOdd"]),
         };
         let tag = expected_tag(
             public.nullifier,
-            &public.vault,
+            &proof.vault(),
             &session,
             public.tier,
             u(&ctx["expiry"]),
         );
         assert_eq!(tag, public.tag);
+
+        // A subsidised proof's period holds against the vault it was proven for.
+        if let Some(creation) = e["private"].get("vaultCreation") {
+            assert_eq!(public.check_subsidy_period(u(creation)), Ok(()));
+        }
+    }
+}
+
+#[test]
+fn a_subsidy_period_binds_to_the_vaults_creation() {
+    let v = vectors();
+    let cases = v["subsidyPeriods"].as_array().expect("subsidyPeriods");
+    assert!(cases.iter().any(|e| e["passes"] == Value::Bool(true)));
+    assert!(cases.iter().any(|e| e["passes"] == Value::Bool(false)));
+    for e in cases {
+        let proof = RequestProof::parse(&json_proof(&e["publicInput"])).expect("parses");
+        assert_eq!(
+            proof
+                .public()
+                .check_subsidy_period(u(&e["vaultCreation"]))
+                .is_ok(),
+            e["passes"].as_bool().expect("a bool"),
+            "{e}"
+        );
     }
 }
 

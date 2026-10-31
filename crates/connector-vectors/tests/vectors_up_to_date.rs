@@ -789,7 +789,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
     let body = &zk["allowance_request"]["body"];
     let proof = RequestProof::parse(body["proof"].to_string().as_bytes()).expect("a JsonProof");
     let public = proof.public();
-    assert_eq!(public.vault, state.public.into_compressed());
+    assert_eq!(proof.vault(), state.public.into_compressed());
     assert_eq!(
         CompressedPubKey::from_address(&text(&body["sessionKey"])).unwrap(),
         session_key
@@ -799,7 +799,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         public.tag,
         expected_tag(
             public.nullifier,
-            &public.vault,
+            &proof.vault(),
             &session_key,
             public.tier,
             expires_at
@@ -820,7 +820,7 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
     )
     .expect("a point");
     assert_eq!(field(&next["nullifier"]), public.nullifier);
-    assert_eq!(commitment, public.commitment);
+    assert_eq!(commitment, proof.commitment());
     let charge = text(&next["charge"]).parse::<u64>().unwrap();
     assert_eq!(
         charge, claim.cumulative_amount,
@@ -1061,7 +1061,7 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
     );
     assert_eq!(
         public.period,
-        Field::from(text(&request["subsidy_period"]).parse::<u64>().unwrap())
+        text(&request["subsidy_period"]).parse::<u64>().unwrap()
     );
     assert_ne!(public.period_nullifier, Field::from(0u64));
     let session_key =
@@ -1070,7 +1070,7 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
         public.tag,
         expected_tag(
             public.nullifier,
-            &public.vault,
+            &proof.vault(),
             &session_key,
             public.tier,
             text(&body["expiresAt"]).parse().unwrap()

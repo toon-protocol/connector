@@ -1527,6 +1527,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
+ "zk-evidence",
  "zk-note",
 ]
 
@@ -1637,6 +1638,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -3548,8 +3558,8 @@ dependencies = [
 
 [[package]]
 name = "mina-curves"
-version = "0.7.0"
-source = "git+https://github.com/o1-labs/proof-systems?tag=0.7.0#36a8b510cd34b9bd350e04989c87280f99e21e37"
+version = "0.6.0"
+source = "git+https://github.com/o1-labs/proof-systems?rev=ab84160fa2c22290a8506a7742ac1378879fc386#ab84160fa2c22290a8506a7742ac1378879fc386"
 dependencies = [
  "ark-bn254 0.5.0",
  "ark-ec 0.5.0",
@@ -3560,8 +3570,8 @@ dependencies = [
 
 [[package]]
 name = "mina-hasher"
-version = "0.7.0"
-source = "git+https://github.com/o1-labs/proof-systems?tag=0.7.0#36a8b510cd34b9bd350e04989c87280f99e21e37"
+version = "0.6.0"
+source = "git+https://github.com/o1-labs/proof-systems?rev=ab84160fa2c22290a8506a7742ac1378879fc386#ab84160fa2c22290a8506a7742ac1378879fc386"
 dependencies = [
  "ark-ff 0.5.0",
  "bitvec",
@@ -3573,8 +3583,8 @@ dependencies = [
 
 [[package]]
 name = "mina-poseidon"
-version = "0.7.0"
-source = "git+https://github.com/o1-labs/proof-systems?tag=0.7.0#36a8b510cd34b9bd350e04989c87280f99e21e37"
+version = "0.6.0"
+source = "git+https://github.com/o1-labs/proof-systems?rev=ab84160fa2c22290a8506a7742ac1378879fc386#ab84160fa2c22290a8506a7742ac1378879fc386"
 dependencies = [
  "ark-ec 0.5.0",
  "ark-ff 0.5.0",
@@ -3590,8 +3600,8 @@ dependencies = [
 
 [[package]]
 name = "mina-signer"
-version = "0.7.0"
-source = "git+https://github.com/o1-labs/proof-systems?tag=0.7.0#36a8b510cd34b9bd350e04989c87280f99e21e37"
+version = "0.6.0"
+source = "git+https://github.com/o1-labs/proof-systems?rev=ab84160fa2c22290a8506a7742ac1378879fc386#ab84160fa2c22290a8506a7742ac1378879fc386"
 dependencies = [
  "ark-ec 0.5.0",
  "ark-ff 0.5.0",
@@ -3789,8 +3799,8 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "o1-utils"
-version = "0.7.0"
-source = "git+https://github.com/o1-labs/proof-systems?tag=0.7.0#36a8b510cd34b9bd350e04989c87280f99e21e37"
+version = "0.6.0"
+source = "git+https://github.com/o1-labs/proof-systems?rev=ab84160fa2c22290a8506a7742ac1378879fc386#ab84160fa2c22290a8506a7742ac1378879fc386"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-poly 0.5.0",
@@ -7503,9 +7513,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zk-evidence"
+version = "0.1.0"
+source = "git+https://github.com/toon-protocol/zk_toon?rev=0d6b10c332558caf7d8d6350e14b19d68f443f2c#0d6b10c332558caf7d8d6350e14b19d68f443f2c"
+dependencies = [
+ "ark-ff 0.5.0",
+ "crc32c",
+ "serde_json",
+ "sha2 0.10.9",
+ "zk-note",
+]
+
+[[package]]
 name = "zk-note"
 version = "0.1.0"
-source = "git+https://github.com/toon-protocol/zk_toon?rev=7b399412ffd70966c5e5d35a139928a697460ca7#7b399412ffd70966c5e5d35a139928a697460ca7"
+source = "git+https://github.com/toon-protocol/zk_toon?rev=0d6b10c332558caf7d8d6350e14b19d68f443f2c#0d6b10c332558caf7d8d6350e14b19d68f443f2c"
 dependencies = [
  "ark-ec 0.5.0",
  "ark-ff 0.5.0",

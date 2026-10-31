@@ -23,7 +23,9 @@ use connector_zk_note::evidence::{evidence_hash, scan, Record};
 use connector_zk_note::note::balance::{commit, Commitment};
 use connector_zk_note::note::policy::{subsidy_period, SUBSIDY_PERIOD_MS, TIERS};
 use connector_zk_note::note::state::verify_state;
-use connector_zk_note::request::{expected_tag, json_proof_for, RequestProof, RequestPublic};
+use connector_zk_note::request::{
+    expected_tag, json_proof_for, point, RequestProof, RequestPublic,
+};
 use connector_zk_note::session::{
     sign_allowance_claim, sign_allowance_close, signature_to_be_bytes, signature_to_hex,
 };
@@ -146,9 +148,13 @@ impl Edge {
     }
 
     fn evidence(&self) -> Vec<Vec<u8>> {
-        scan(&std::fs::read(self.dir.path().join(EVIDENCE_FILE)).expect("evidence"))
+        let bytes = std::fs::read(self.dir.path().join(EVIDENCE_FILE)).expect("evidence");
+        scan(&bytes)
             .expect("evidence")
             .records
+            .iter()
+            .map(|record| record.payload.to_vec())
+            .collect()
     }
 }
 
@@ -163,7 +169,7 @@ struct Payer {
     expires_at_ms: u64,
     request_time: u64,
     subsidised: bool,
-    period: Field,
+    period: u64,
     period_nullifier: Field,
     /// The state key the proof is about; the edge's own unless spoiled.
     vault: CompressedPubKey,
@@ -187,7 +193,7 @@ impl Payer {
             expires_at_ms: edge.now_ms() + HOUR_MS / 2,
             request_time: edge.now_ms(),
             subsidised: false,
-            period: Field::from(0u64),
+            period: 0,
             period_nullifier: Field::from(0u64),
             vault: edge.state_key(),
             tag_override: None,
@@ -201,7 +207,8 @@ impl Payer {
     fn public(&self) -> RequestPublic {
         let session = self.session.public.into_compressed();
         RequestPublic {
-            vault: self.vault.clone(),
+            vault_x: self.vault.x,
+            vault_is_odd: self.vault.is_odd,
             root: self.root,
             request_time: self.request_time,
             tier: self.tier,
@@ -215,7 +222,7 @@ impl Payer {
                     self.expires_at_ms,
                 )
             }),
-            commitment: self.commitment,
+            commitment: point(self.commitment),
             subsidised: self.subsidised,
             period: self.period,
             period_nullifier: self.period_nullifier,
@@ -228,7 +235,7 @@ impl Payer {
         Payer {
             tier: TIERS[0],
             subsidised: true,
-            period: Field::from(edge.period()),
+            period: edge.period(),
             period_nullifier: self.nullifier + Field::from(1_000_000u64),
             ..self
         }
@@ -305,16 +312,18 @@ async fn a_grant_is_evidence_before_it_is_an_answer() {
     // The evidence file holds the proof verbatim, and the allowance's terms.
     let records = edge.evidence();
     assert_eq!(records.len(), 1);
-    let Record::Grant(record) = Record::from_payload(&records[0]).expect("a record") else {
+    let Record::Grant(record) = Record::decode(&records[0]).expect("a record") else {
         panic!("a grant record");
     };
-    assert_eq!(record.proof_json, payer.request().proof);
+    assert_eq!(record.proof, payer.request().proof);
     assert_eq!(
         record.allowance_id,
         granted.allowance_id.as_bytes().to_vec()
     );
-    assert_eq!(record.session_key, payer.session.public.into_compressed());
-    assert_eq!(record.expiry, payer.expires_at_ms);
+    let session_key = payer.session.public.into_compressed();
+    assert_eq!(record.session_key_x, session_key.x);
+    assert_eq!(record.session_key_is_odd, session_key.is_odd);
+    assert_eq!(record.expires_at, payer.expires_at_ms);
     assert_eq!(record.granted_at, edge.now_ms());
 
     // The journal names that record by its hash, with the spent nullifier
@@ -438,7 +447,7 @@ async fn each_cheap_refusal_is_named_and_asks_the_vault_nothing() {
         (
             "a period on an unsubsidised proof",
             Payer {
-                period: Field::from(3u64),
+                period: 3,
                 ..base.clone()
             }
             .request(),
@@ -580,7 +589,7 @@ async fn a_grant_the_journal_refuses_leaves_no_evidence_and_a_retry_writes_one()
     let granted = grant(&gate, &payer).await;
     let records = edge.evidence();
     assert_eq!(records.len(), 1, "one grant for one nullifier");
-    let Record::Grant(record) = Record::from_payload(&records[0]).expect("a record") else {
+    let Record::Grant(record) = Record::decode(&records[0]).expect("a record") else {
         panic!("a grant record");
     };
     assert_eq!(
@@ -1048,7 +1057,7 @@ async fn the_charge_is_written_once_and_the_successor_is_idempotent() {
     let closes: Vec<_> = edge
         .evidence()
         .iter()
-        .filter_map(|payload| match Record::from_payload(payload).unwrap() {
+        .filter_map(|payload| match Record::decode(payload).unwrap() {
             Record::Close(close) => Some((close.nullifier, close.allowance_id, close.charge)),
             Record::Grant(_) => None,
         })
@@ -1686,7 +1695,7 @@ async fn a_subsidised_allowance_is_granted_and_charges_the_note_nothing() {
     let charges: Vec<u64> = edge
         .evidence()
         .iter()
-        .filter_map(|payload| match Record::from_payload(payload).unwrap() {
+        .filter_map(|payload| match Record::decode(payload).unwrap() {
             Record::Close(close) => Some(close.charge),
             Record::Grant(_) => None,
         })
@@ -1718,7 +1727,7 @@ async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
         (
             "the previous period",
             Payer {
-                period: Field::from(period - 1),
+                period: period - 1,
                 ..base(62)
             },
             "subsidy_period_not_current",
@@ -1726,7 +1735,7 @@ async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
         (
             "the next period",
             Payer {
-                period: Field::from(period + 1),
+                period: period + 1,
                 ..base(63)
             },
             "subsidy_period_not_current",
@@ -1748,6 +1757,61 @@ async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
     }
     assert_eq!(edge.evidence().len(), evidence, "nothing was written");
     assert_eq!(edge.entries().len(), entries, "nothing was journaled");
+}
+
+/// zk_toon binds a subsidised proof's period to its own `requestTime`
+/// (`RequestPublic::check_subsidy_period`), which the circuit cannot: it
+/// takes the vault's creation time as a private input. Just past a period
+/// boundary a fresh request can still be from the last period; a proof that
+/// claims the edge's current period for it was proven with another creation
+/// time, and is refused as not current.
+#[tokio::test]
+async fn a_subsidy_period_must_be_the_request_times_not_just_the_edges() {
+    let edge = Edge::with_subsidy(10 * TIERS[0]);
+    let creation = edge.vault_creation_ms();
+    // One minute into the next period, by the edge's clock.
+    let boundary = creation + (edge.period() + 1) * SUBSIDY_PERIOD_MS;
+    edge.clock.advance(TimeDelta::milliseconds(
+        i64::try_from(boundary + 60_000 - edge.now_ms()).unwrap(),
+    ));
+    let current = edge.period();
+    // Five minutes ago, inside the freshness window, and in the last period.
+    let request_time = edge.now_ms() - 5 * 60_000;
+    assert_eq!(subsidy_period(creation, request_time), Some(current - 1));
+
+    let forged = Payer {
+        request_time,
+        period: current,
+        ..Payer::new(&edge, 80).subsidised(&edge)
+    }
+    .provable(&edge);
+    let gate = edge.gate();
+    let (evidence, entries) = (edge.evidence().len(), edge.entries().len());
+    let refusal = gate
+        .admit_allowance(forged.request())
+        .await
+        .expect_err("a period its request time is not in");
+    assert_eq!(refusal.name(), "subsidy_period_not_current", "{refusal}");
+    assert_eq!(edge.evidence().len(), evidence, "nothing was written");
+    assert_eq!(edge.entries().len(), entries, "nothing was journaled");
+
+    // The same request, proven for the period its request time is in, is
+    // the edge's last period, not its current one: refused too.
+    let last = Payer {
+        request_time,
+        period: current - 1,
+        ..Payer::new(&edge, 81).subsidised(&edge)
+    }
+    .provable(&edge);
+    let refusal = gate.admit_allowance(last.request()).await.unwrap_err();
+    assert_eq!(refusal.name(), "subsidy_period_not_current", "{refusal}");
+
+    // A request made in the current period is granted.
+    grant(
+        &gate,
+        &Payer::new(&edge, 82).subsidised(&edge).provable(&edge),
+    )
+    .await;
 }
 
 #[tokio::test]
