@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use connector_domain::{AssetChain, AssetId, AssetNamespace, Network};
+use connector_domain::{AssetChain, AssetId, AssetNamespace, Network, XrplNetwork};
 use serde::Deserialize;
 use url::Url;
 
@@ -63,9 +63,36 @@ pub(crate) struct RawKeyedSettlementConfig {
     eip155: Option<BTreeMap<String, RawEvmSettlementTable>>,
     #[serde(default)]
     solana: Option<RawSolanaSettlementTable>,
+    /// `[settlement.xrpl.<id>]` (ADR 0087): read as bare TOML so a table
+    /// written without a network (`[settlement.xrpl]` holding `rpc_url`
+    /// directly) is refused by name, which a typed map could only fail as
+    /// a type error.
+    #[serde(default)]
+    xrpl: Option<toml::Table>,
     #[serde(default)]
     #[allow(dead_code)]
     evm: Option<toml::Value>,
+}
+
+/// `[settlement.xrpl.<id>]`: this node's x402 `batch-settlement` terms on
+/// one XRPL network (ADR 0087 decisions 5 and 9). There is no contract,
+/// program or token to name: the binding is the ledger's own `PayChannel`,
+/// and a channel holds XRP and nothing else.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawXrplSettlementTable {
+    rpc_url: String,
+    key: RawSettlementKeyConfig,
+    /// ADR 0073: dial this table's `rpc_url` through the root
+    /// `socks_proxy`. See [`XrplSettlementConfig::rpc_via_socks_proxy`].
+    #[serde(default)]
+    rpc_via_socks_proxy: bool,
+    #[serde(default)]
+    min_settle_delay_secs: Option<u64>,
+    #[serde(default)]
+    redemption_safety_secs: Option<u64>,
+    #[serde(default)]
+    max_fee_drops: Option<u64>,
 }
 
 /// `[settlement.eip155.<chainId>]`: this node's x402 `batch-settlement`
@@ -158,9 +185,8 @@ pub(crate) struct RawSettlementKeyConfig {
 pub enum SettlementChain {
     Evm,
     Solana,
-    /// The ledger's own `PayChannel` (ADR 0087). A voucher signer and a
-    /// channel can name it from this build; its `[settlement.xrpl.<id>]` table
-    /// is read by the backend ticket that follows (#1596).
+    /// The ledger's own `PayChannel` (ADR 0087), one table per network:
+    /// `[settlement.xrpl.<id>]`.
     Xrpl,
 }
 
@@ -230,8 +256,9 @@ impl std::str::FromStr for SettlementChain {
 }
 
 /// The settlement table heading a refusal about `chain` tells an operator to
-/// write: `[settlement.eip155.<chainId>]` for EVM, which has one table per
-/// network (ADR 0086), and `[settlement.solana]`. Takes the chain's name in
+/// write: `[settlement.eip155.<chainId>]` for EVM and `[settlement.xrpl.<id>]`
+/// for XRPL, which have one table per network (ADR 0086, ADR 0087), and
+/// `[settlement.solana]`. Takes the chain's name in
 /// any of the workspace's spellings of it (`SettlementChain`, `AssetChain`,
 /// or the bare `"evm"`/`"solana"`), since the refusals carry all three.
 pub(crate) fn settlement_heading(chain: impl std::fmt::Display) -> &'static str {
@@ -436,6 +463,103 @@ fn cluster_hint_for_rpc_url(rpc_url: &str) -> Option<&'static str> {
     }
 }
 
+/// The default `max_fee_drops`: 0.1 XRP, ten thousand times the reference fee.
+/// A fee the open ledger escalates past it is refused, not paid.
+pub const DEFAULT_XRPL_MAX_FEE_DROPS: u64 = 100_000;
+
+/// The default `min_settle_delay_secs`: one day, as the other chains' (ADR
+/// 0074 decision 5).
+pub const DEFAULT_XRPL_MIN_SETTLE_DELAY_SECS: u64 = crate::DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS;
+
+/// The default `redemption_safety_secs`: how long before a payer's
+/// `Expiration` this node treats a held voucher as due (x402 PR #2952's
+/// example figure).
+pub const DEFAULT_XRPL_REDEMPTION_SAFETY_SECS: u64 = 60;
+
+/// The settlement port's floor under a published minimum delay: a channel
+/// one second short of the minimum must still be one the ledger lets exist
+/// (`connector_settlement::batch::contract::BatchContractFixture`). The
+/// minimum has to exceed it.
+pub const XRPL_MIN_SETTLE_DELAY_FLOOR_SECS: u64 = 901;
+
+/// A fully validated `[settlement.xrpl.<id>]` table (ADR 0087): which XRPL
+/// network it is for, its RPC endpoint, where its signing key lives and its
+/// x402 `batch-settlement` terms. A channel holds XRP, so there is no token,
+/// decimals or contract to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrplSettlementConfig {
+    network: XrplNetwork,
+    rpc_url: String,
+    key: SecretLocation,
+    rpc_via_socks_proxy: bool,
+    min_settle_delay_secs: u64,
+    redemption_safety_secs: u64,
+    max_fee_drops: u64,
+}
+
+impl XrplSettlementConfig {
+    /// The network this table is for, from its table key. **Declared and
+    /// asserted**: boot checks it against the endpoint's
+    /// `server_info.network_id` and refuses a mismatch by name (ADR 0087
+    /// decision 5).
+    pub fn network(&self) -> XrplNetwork {
+        self.network
+    }
+
+    /// The table's name as an operator wrote it, `xrpl.<id>`.
+    pub fn table_name(&self) -> String {
+        xrpl_table_name(self.network)
+    }
+
+    /// The RPC endpoint this node reaches the ledger through.
+    pub fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    /// Where this node's XRPL signing key material lives: a family seed
+    /// file, secp256k1 or Ed25519. It pays fees, signs transactions and is
+    /// the key a channel toward this node names as its `Destination`.
+    pub fn key(&self) -> &SecretLocation {
+        &self.key
+    }
+
+    /// Whether this table's `rpc_url` is dialed through the root
+    /// `socks_proxy`, on this network's own circuit (ADR 0073, ADR 0087).
+    pub fn rpc_via_socks_proxy(&self) -> bool {
+        self.rpc_via_socks_proxy
+    }
+
+    /// The shortest `SettleDelay` a channel may carry and still be admitted,
+    /// in seconds: above the port's 901 s floor, a day unless the table says
+    /// otherwise. Published as `extra.minSettleDelay`.
+    pub fn min_settle_delay_secs(&self) -> u64 {
+        self.min_settle_delay_secs
+    }
+
+    /// How long before a channel's `Expiration` this node treats a held
+    /// voucher as due, in seconds. Published as
+    /// `extra.redemptionSafetySeconds`; below `min_settle_delay_secs`.
+    pub fn redemption_safety_secs(&self) -> u64 {
+        self.redemption_safety_secs
+    }
+
+    /// The most this node will pay in fee for one transaction, in drops.
+    pub fn max_fee_drops(&self) -> u64 {
+        self.max_fee_drops
+    }
+
+    /// XRP on this table's network, `xrpl:<id>/slip44:144`: the one asset a
+    /// channel here can hold, and what a `[[tokens]]` row declares for it.
+    pub fn asset(&self) -> AssetId {
+        AssetId::xrp(self.network)
+    }
+}
+
+/// `xrpl.<id>`: an XRPL table's name after `settlement.`.
+pub(crate) fn xrpl_table_name(network: XrplNetwork) -> String {
+    format!("xrpl.{}", network.network_id())
+}
+
 /// One fully validated per-chain settlement table -- typed by chain (issue
 /// #628), since an EVM table and a Solana table name genuinely different
 /// on-chain facts and a single shared shape would either force one to fake
@@ -444,6 +568,7 @@ fn cluster_hint_for_rpc_url(rpc_url: &str) -> Option<&'static str> {
 pub enum SettlementConfig {
     Evm(EvmSettlementConfig),
     Solana(SolanaSettlementConfig),
+    Xrpl(XrplSettlementConfig),
 }
 
 impl SettlementConfig {
@@ -452,6 +577,7 @@ impl SettlementConfig {
         match self {
             SettlementConfig::Evm(_) => SettlementChain::Evm,
             SettlementConfig::Solana(_) => SettlementChain::Solana,
+            SettlementConfig::Xrpl(_) => SettlementChain::Xrpl,
         }
     }
 
@@ -480,6 +606,8 @@ impl SettlementConfig {
                     && asset.namespace() == AssetNamespace::Token
                     && asset.token() == solana.token_address
             }
+            // A channel holds XRP and nothing else (ADR 0087 decision 6).
+            SettlementConfig::Xrpl(xrpl) => *asset == xrpl.asset(),
         }
     }
 
@@ -495,16 +623,19 @@ impl SettlementConfig {
             SettlementConfig::Solana(solana) => {
                 format!("solana:<genesis prefix>/token:{}", solana.token_address)
             }
+            SettlementConfig::Xrpl(xrpl) => xrpl.asset().to_string(),
         }
     }
 
     /// The network this table is for, when config can say: an EVM table's
-    /// `eip155:<chainId>` from its key. `None` for Solana, whose CAIP-2
-    /// reference is its cluster's genesis hash, which only the chain knows.
+    /// `eip155:<chainId>` or an XRPL table's `xrpl:<id>` from its key. `None`
+    /// for Solana, whose CAIP-2 reference is its cluster's genesis hash,
+    /// which only the chain knows.
     pub fn network(&self) -> Option<Network> {
         match self {
             SettlementConfig::Evm(evm) => Some(evm.network().clone()),
             SettlementConfig::Solana(_) => None,
+            SettlementConfig::Xrpl(xrpl) => Some(Network::Xrpl(xrpl.network())),
         }
     }
 
@@ -514,6 +645,7 @@ impl SettlementConfig {
         match self {
             SettlementConfig::Evm(evm) => evm.table_name(),
             SettlementConfig::Solana(_) => SettlementChain::Solana.name().to_string(),
+            SettlementConfig::Xrpl(xrpl) => xrpl.table_name(),
         }
     }
 
@@ -522,6 +654,7 @@ impl SettlementConfig {
         match self {
             SettlementConfig::Evm(evm) => evm.rpc_url(),
             SettlementConfig::Solana(solana) => solana.rpc_url(),
+            SettlementConfig::Xrpl(xrpl) => xrpl.rpc_url(),
         }
     }
 
@@ -530,6 +663,7 @@ impl SettlementConfig {
         match self {
             SettlementConfig::Evm(evm) => evm.rpc_via_socks_proxy(),
             SettlementConfig::Solana(solana) => solana.rpc_via_socks_proxy(),
+            SettlementConfig::Xrpl(xrpl) => xrpl.rpc_via_socks_proxy(),
         }
     }
 }
@@ -616,6 +750,8 @@ pub(crate) struct SettlementTables {
     /// Each EVM table's chain id, in table order (ascending).
     eip155: Vec<u64>,
     solana: bool,
+    /// Each XRPL table's network, in table order (ascending).
+    xrpl: Vec<XrplNetwork>,
 }
 
 impl SettlementTables {
@@ -628,12 +764,19 @@ impl SettlementTables {
                 .iter()
                 .filter_map(|settlement| match settlement {
                     SettlementConfig::Evm(evm) => Some(evm.chain_id()),
-                    SettlementConfig::Solana(_) => None,
+                    SettlementConfig::Solana(_) | SettlementConfig::Xrpl(_) => None,
                 })
                 .collect(),
             solana: settlements
                 .iter()
                 .any(|settlement| settlement.chain() == SettlementChain::Solana),
+            xrpl: settlements
+                .iter()
+                .filter_map(|settlement| match settlement {
+                    SettlementConfig::Xrpl(xrpl) => Some(xrpl.network()),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
@@ -646,6 +789,16 @@ impl SettlementTables {
         SettlementTables {
             eip155: if evm { vec![8453] } else { Vec::new() },
             solana,
+            xrpl: Vec::new(),
+        }
+    }
+
+    /// [`Self::for_tests`] with XRPL tables on `xrpl` as well.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_xrpl(evm: bool, solana: bool, xrpl: &[XrplNetwork]) -> Self {
+        SettlementTables {
+            xrpl: xrpl.to_vec(),
+            ..Self::for_tests(evm, solana)
         }
     }
 
@@ -658,8 +811,7 @@ impl SettlementTables {
         match chain {
             SettlementChain::Evm => !self.eip155.is_empty(),
             SettlementChain::Solana => self.solana,
-            // No `[settlement.xrpl.<id>]` table is read yet (ADR 0087, #1596).
-            SettlementChain::Xrpl => false,
+            SettlementChain::Xrpl => !self.xrpl.is_empty(),
         }
     }
 
@@ -677,16 +829,27 @@ impl SettlementTables {
         written: Option<&str>,
     ) -> Result<Option<Network>, ConfigError> {
         let Some(written) = written else {
-            return match (chain, self.eip155.as_slice()) {
-                (SettlementChain::Solana | SettlementChain::Xrpl, _)
-                | (SettlementChain::Evm, []) => Ok(None),
-                (SettlementChain::Evm, [only]) => Ok(Some(Network::Eip155(*only))),
-                (SettlementChain::Evm, many) => Err(ConfigError::ChannelRowNetworkAmbiguous {
+            return match (chain, self.eip155.as_slice(), self.xrpl.as_slice()) {
+                (SettlementChain::Solana, ..)
+                | (SettlementChain::Evm, [], _)
+                | (SettlementChain::Xrpl, _, []) => Ok(None),
+                (SettlementChain::Evm, [only], _) => Ok(Some(Network::Eip155(*only))),
+                (SettlementChain::Xrpl, _, [only]) => Ok(Some(Network::Xrpl(*only))),
+                (SettlementChain::Evm, many, _) => Err(ConfigError::ChannelRowNetworkAmbiguous {
                     table,
                     peer_id: peer_id.to_string(),
                     networks: many
                         .iter()
                         .map(|id| format!("eip155:{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }),
+                (SettlementChain::Xrpl, _, many) => Err(ConfigError::ChannelRowNetworkAmbiguous {
+                    table,
+                    peer_id: peer_id.to_string(),
+                    networks: many
+                        .iter()
+                        .map(|network| network.caip2())
                         .collect::<Vec<_>>()
                         .join(", "),
                 }),
@@ -715,6 +878,13 @@ impl SettlementTables {
                     network: network.to_string(),
                 })
             }
+            Network::Xrpl(id) if !self.xrpl.contains(id) => {
+                Err(ConfigError::ChannelRowNetworkUnsettled {
+                    table,
+                    peer_id: peer_id.to_string(),
+                    network: network.to_string(),
+                })
+            }
             _ => Ok(Some(network)),
         }
     }
@@ -731,6 +901,7 @@ impl SettlementTables {
 pub(crate) struct SettledNetworks {
     eip155: Vec<u64>,
     solana: bool,
+    xrpl: Vec<XrplNetwork>,
 }
 
 impl SettledNetworks {
@@ -741,12 +912,19 @@ impl SettledNetworks {
                 .iter()
                 .filter_map(|settlement| match settlement {
                     SettlementConfig::Evm(evm) => Some(evm.chain_id()),
-                    SettlementConfig::Solana(_) => None,
+                    SettlementConfig::Solana(_) | SettlementConfig::Xrpl(_) => None,
                 })
                 .collect(),
             solana: settlements
                 .iter()
                 .any(|settlement| settlement.chain() == SettlementChain::Solana),
+            xrpl: settlements
+                .iter()
+                .filter_map(|settlement| match settlement {
+                    SettlementConfig::Xrpl(xrpl) => Some(xrpl.network()),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
@@ -757,6 +935,7 @@ impl SettledNetworks {
         SettledNetworks {
             eip155: eip155.to_vec(),
             solana,
+            xrpl: Vec::new(),
         }
     }
 
@@ -767,9 +946,7 @@ impl SettledNetworks {
             Network::Solana(_) => self.solana,
             // No settlement backend holds MINA (ADR 0080 decision 7).
             Network::Mina(_) => false,
-            // Nor does one hold XRP yet: no `[settlement.xrpl.<id>]` table is
-            // read until the XRPL backend lands (ADR 0087, #1596).
-            Network::Xrpl(_) => false,
+            Network::Xrpl(network) => self.xrpl.contains(network),
         }
     }
 }
@@ -911,6 +1088,101 @@ fn resolve_solana_fields(
     })
 }
 
+/// Resolve `[settlement.xrpl]`: one table per network (ADR 0087 decision 5),
+/// in network-id order. Each is refused by name when it is not a table of a
+/// known network, writes its key inline, or breaks a bound on its terms; an
+/// unknown key is refused by `deny_unknown_fields`, naming the key.
+fn resolve_xrpl_tables(raw: toml::Table) -> Result<Vec<XrplSettlementConfig>, ConfigError> {
+    if raw.is_empty() {
+        return Err(ConfigError::SettlementXrplEmpty);
+    }
+    // `[settlement.xrpl] rpc_url = ...` and `[settlement.xrpl.key]`: a table
+    // with no network, whose entries are a network table's own keys where
+    // its networks would be.
+    const TABLE_KEYS: [&str; 6] = [
+        "rpc_url",
+        "key",
+        "rpc_via_socks_proxy",
+        "min_settle_delay_secs",
+        "redemption_safety_secs",
+        "max_fee_drops",
+    ];
+    if let Some((key, _)) = raw
+        .iter()
+        .find(|(key, value)| !value.is_table() || TABLE_KEYS.contains(&key.as_str()))
+    {
+        return Err(ConfigError::SettlementXrplBareTable { key: key.clone() });
+    }
+    let mut tables = Vec::with_capacity(raw.len());
+    for (key, value) in raw {
+        let toml::Value::Table(table) = value else {
+            unreachable!("a non-table entry was refused above");
+        };
+        let network = key
+            .parse::<XrplNetwork>()
+            .map_err(|_| ConfigError::SettlementXrplUnknownNetwork { key: key.clone() })?;
+        let name = xrpl_table_name(network);
+        if table
+            .get("key")
+            .is_some_and(|key| !matches!(key, toml::Value::Table(_)))
+        {
+            return Err(ConfigError::SettlementXrplInlineKey { table: name });
+        }
+        let parsed: RawXrplSettlementTable =
+            table
+                .try_into()
+                .map_err(|source| ConfigError::SettlementXrplTableInvalid {
+                    table: name.clone(),
+                    source: Box::new(source),
+                })?;
+        tables.push(resolve_xrpl_fields(network, parsed)?);
+    }
+    tables.sort_by_key(|table| table.network().network_id());
+    Ok(tables)
+}
+
+fn resolve_xrpl_fields(
+    network: XrplNetwork,
+    table: RawXrplSettlementTable,
+) -> Result<XrplSettlementConfig, ConfigError> {
+    let name = xrpl_table_name(network);
+    let rpc_url = resolve_rpc_url(table.rpc_url)?;
+    let key = resolve_settlement_key(table.key)?;
+    let min_settle_delay_secs = table
+        .min_settle_delay_secs
+        .unwrap_or(DEFAULT_XRPL_MIN_SETTLE_DELAY_SECS);
+    if min_settle_delay_secs <= XRPL_MIN_SETTLE_DELAY_FLOOR_SECS {
+        return Err(ConfigError::SettlementXrplSettleDelayBelowFloor {
+            table: name,
+            value: min_settle_delay_secs,
+            floor: XRPL_MIN_SETTLE_DELAY_FLOOR_SECS,
+        });
+    }
+    let redemption_safety_secs = table
+        .redemption_safety_secs
+        .unwrap_or(DEFAULT_XRPL_REDEMPTION_SAFETY_SECS);
+    if redemption_safety_secs == 0 || redemption_safety_secs >= min_settle_delay_secs {
+        return Err(ConfigError::SettlementXrplRedemptionSafetyOutOfRange {
+            table: name,
+            value: redemption_safety_secs,
+            min_settle_delay_secs,
+        });
+    }
+    let max_fee_drops = table.max_fee_drops.unwrap_or(DEFAULT_XRPL_MAX_FEE_DROPS);
+    if max_fee_drops == 0 {
+        return Err(ConfigError::SettlementXrplZeroMaxFee { table: name });
+    }
+    Ok(XrplSettlementConfig {
+        network,
+        rpc_url,
+        key,
+        rpc_via_socks_proxy: table.rpc_via_socks_proxy,
+        min_settle_delay_secs,
+        redemption_safety_secs,
+        max_fee_drops,
+    })
+}
+
 /// Validate an optional `[settlement]` section. Presence configures one
 /// x402 settlement backend per table; absence is a node that settles on no
 /// chain, and so takes no claim at all (every claim is a voucher, ADR
@@ -934,7 +1206,7 @@ pub(crate) fn resolve_settlement(
             if raw.evm.is_some() {
                 return Err(ConfigError::SettlementEvmTableRemoved);
             }
-            if raw.eip155.is_none() && raw.solana.is_none() {
+            if raw.eip155.is_none() && raw.solana.is_none() && raw.xrpl.is_none() {
                 return Err(ConfigError::SettlementSectionEmpty);
             }
             let mut out = Vec::new();
@@ -955,6 +1227,11 @@ pub(crate) fn resolve_settlement(
             }
             if let Some(solana) = raw.solana {
                 out.push(SettlementConfig::Solana(resolve_solana_fields(solana)?));
+            }
+            if let Some(xrpl) = raw.xrpl {
+                for table in resolve_xrpl_tables(xrpl)? {
+                    out.push(SettlementConfig::Xrpl(table));
+                }
             }
             Ok(out)
         }
@@ -1436,12 +1713,278 @@ key_file = "{key}"
         ));
     }
 
+    /// A complete `[settlement.xrpl.<id>]` table, with `extra` appended to it
+    /// before its key sub-table.
+    fn xrpl_table_on(id: &str, extra: &str, key_file: &Path) -> String {
+        format!(
+            r#"
+[xrpl.{id}]
+rpc_url = "http://127.0.0.1:5005"
+{extra}
+
+[xrpl.{id}.key]
+key_file = "{key}"
+"#,
+            key = key_file.display()
+        )
+    }
+
+    fn single_xrpl(settlements: Vec<SettlementConfig>) -> XrplSettlementConfig {
+        match settlements.as_slice() {
+            [SettlementConfig::Xrpl(xrpl)] => xrpl.clone(),
+            other => panic!("expected one XRPL table, got {other:?}"),
+        }
+    }
+
+    /// ADR 0087 decisions 5 and 9: one table per network, keyed by the
+    /// ledger's `network_id`, with the three terms defaulted.
+    #[test]
+    fn a_complete_xrpl_table_resolves_with_its_defaults() {
+        let key_file = temp_key_file();
+        let xrpl = single_xrpl(resolve(&xrpl_table_on("1000", "", key_file.path())).unwrap());
+
+        assert_eq!(xrpl.network(), XrplNetwork::Standalone);
+        assert_eq!(xrpl.table_name(), "xrpl.1000");
+        assert_eq!(xrpl.rpc_url(), "http://127.0.0.1:5005");
+        assert_eq!(
+            xrpl.key(),
+            &SecretLocation::File(key_file.path().to_path_buf())
+        );
+        assert!(!xrpl.rpc_via_socks_proxy());
+        assert_eq!(xrpl.min_settle_delay_secs(), 86_400);
+        assert_eq!(xrpl.redemption_safety_secs(), 60);
+        assert_eq!(xrpl.max_fee_drops(), DEFAULT_XRPL_MAX_FEE_DROPS);
+        assert_eq!(xrpl.asset().to_string(), "xrpl:1000/slip44:144");
+    }
+
+    #[test]
+    fn an_xrpl_table_carries_the_terms_it_writes() {
+        let key_file = temp_key_file();
+        let xrpl = single_xrpl(
+            resolve(&xrpl_table_on(
+                "1",
+                "rpc_via_socks_proxy = true\nmin_settle_delay_secs = 3600\n\
+                 redemption_safety_secs = 120\nmax_fee_drops = 5000",
+                key_file.path(),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(xrpl.network(), XrplNetwork::Testnet);
+        assert!(xrpl.rpc_via_socks_proxy());
+        assert_eq!(xrpl.min_settle_delay_secs(), 3600);
+        assert_eq!(xrpl.redemption_safety_secs(), 120);
+        assert_eq!(xrpl.max_fee_drops(), 5000);
+    }
+
+    /// Tables load in network-id order beside the others, and each holds XRP
+    /// on its own network and nothing else.
+    #[test]
+    fn xrpl_tables_follow_the_others_and_hold_xrp_on_their_own_network() {
+        let key_file = temp_key_file();
+        let resolved = resolve(&format!(
+            "{}{}{}{}",
+            xrpl_table_on("1000", "", key_file.path()),
+            evm_table("", key_file.path()),
+            xrpl_table_on("1", "", key_file.path()),
+            solana_table("", key_file.path()),
+        ))
+        .unwrap();
+        let chains: Vec<_> = resolved.iter().map(SettlementConfig::chain).collect();
+        assert_eq!(
+            chains,
+            [
+                SettlementChain::Evm,
+                SettlementChain::Solana,
+                SettlementChain::Xrpl,
+                SettlementChain::Xrpl
+            ]
+        );
+        let testnet = &resolved[2];
+        assert_eq!(testnet.table_name(), "xrpl.1");
+        assert_eq!(testnet.asset_spelling(), "xrpl:1/slip44:144");
+        assert!(testnet.holds(&"xrpl:1/slip44:144".parse().unwrap()));
+        assert!(!testnet.holds(&"xrpl:1000/slip44:144".parse().unwrap()));
+        assert_eq!(testnet.network(), Some(Network::Xrpl(XrplNetwork::Testnet)));
+    }
+
+    /// ADR 0087 decision 5: a table with no network is refused by name, not
+    /// read as some network's.
+    #[test]
+    fn a_bare_xrpl_table_is_refused_by_name() {
+        let key_file = temp_key_file();
+        let error = resolve(&format!(
+            r#"
+[xrpl]
+rpc_url = "http://127.0.0.1:5005"
+
+[xrpl.key]
+key_file = "{}"
+"#,
+            key_file.path().display()
+        ))
+        .expect_err("a table with no network");
+        assert!(matches!(
+            error,
+            ConfigError::SettlementXrplBareTable { ref key } if key == "key"
+        ));
+        assert!(
+            error.to_string().contains("[settlement.xrpl.<id>]"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_xrpl_network_this_build_has_no_row_for_is_refused_by_name() {
+        let key_file = temp_key_file();
+        for key in ["7", "mainnet", "01"] {
+            let error = resolve(&xrpl_table_on(key, "", key_file.path()))
+                .expect_err("no row in the network table");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::SettlementXrplUnknownNetwork { key: ref named } if named == key
+                ),
+                "{key}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_xrpl_key_written_inline_is_refused_by_name() {
+        let body = r#"
+[xrpl.1000]
+rpc_url = "http://127.0.0.1:5005"
+key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
+"#;
+        let error = resolve(body).expect_err("a key is never a value");
+        assert!(matches!(
+            error,
+            ConfigError::SettlementXrplInlineKey { ref table } if table == "xrpl.1000"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_key_in_an_xrpl_table_is_refused_naming_it() {
+        let key_file = temp_key_file();
+        let error = resolve(&xrpl_table_on("1000", "network_id = 1000", key_file.path()))
+            .expect_err("deny_unknown_fields");
+        assert!(matches!(
+            error,
+            ConfigError::SettlementXrplTableInvalid { ref table, .. } if table == "xrpl.1000"
+        ));
+        assert!(error.to_string().contains("network_id"), "{error}");
+    }
+
+    #[test]
+    fn an_xrpl_table_missing_its_rpc_url_or_key_is_refused() {
+        let key_file = temp_key_file();
+        let body = xrpl_table_on("1000", "", key_file.path());
+        let without_rpc = body.replace("rpc_url = \"http://127.0.0.1:5005\"", "");
+        assert!(matches!(
+            resolve(&without_rpc),
+            Err(ConfigError::SettlementXrplTableInvalid { .. })
+        ));
+        let without_key =
+            body.replace(&format!("key_file = \"{}\"", key_file.path().display()), "");
+        assert!(matches!(
+            resolve(&without_key),
+            Err(ConfigError::SettlementKeyLocationAmbiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_xrpl_heading_is_refused() {
+        assert!(matches!(
+            resolve("[xrpl]\n"),
+            Err(ConfigError::SettlementXrplEmpty)
+        ));
+    }
+
+    /// The minimum delay has to exceed the port's 901 s floor.
+    #[test]
+    fn an_xrpl_settle_delay_at_or_below_the_floor_is_refused() {
+        let key_file = temp_key_file();
+        for value in [0, 900, 901] {
+            let error = resolve(&xrpl_table_on(
+                "1000",
+                &format!("min_settle_delay_secs = {value}"),
+                key_file.path(),
+            ))
+            .expect_err("at or below the floor");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::SettlementXrplSettleDelayBelowFloor { value: v, floor: 901, .. } if v == value
+                ),
+                "{value}: {error:?}"
+            );
+        }
+        let ok = single_xrpl(
+            resolve(&xrpl_table_on(
+                "1000",
+                "min_settle_delay_secs = 902",
+                key_file.path(),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(ok.min_settle_delay_secs(), 902);
+    }
+
+    #[test]
+    fn an_xrpl_redemption_safety_must_sit_inside_the_delay() {
+        let key_file = temp_key_file();
+        for extra in [
+            "redemption_safety_secs = 0",
+            "min_settle_delay_secs = 1000\nredemption_safety_secs = 1000",
+            "min_settle_delay_secs = 1000\nredemption_safety_secs = 5000",
+        ] {
+            assert!(
+                matches!(
+                    resolve(&xrpl_table_on("1000", extra, key_file.path())),
+                    Err(ConfigError::SettlementXrplRedemptionSafetyOutOfRange { .. })
+                ),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_xrpl_fee_ceiling_is_refused() {
+        let key_file = temp_key_file();
+        assert!(matches!(
+            resolve(&xrpl_table_on("1000", "max_fee_drops = 0", key_file.path())),
+            Err(ConfigError::SettlementXrplZeroMaxFee { .. })
+        ));
+    }
+
+    #[test]
+    fn an_xrpl_rpc_url_is_held_to_the_same_checks_as_the_others() {
+        let key_file = temp_key_file();
+        let body = xrpl_table_on("1000", "", key_file.path())
+            .replace("http://127.0.0.1:5005", "ws://127.0.0.1:6006");
+        assert!(matches!(
+            resolve(&body),
+            Err(ConfigError::SettlementUnsupportedRpcScheme { .. })
+        ));
+    }
+
+    /// The `evm` and the unknown-chain guards still stand beside it.
+    #[test]
+    fn xrpl_alone_is_a_section() {
+        let key_file = temp_key_file();
+        let resolved = resolve(&xrpl_table_on("0", "", key_file.path())).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].chain(), SettlementChain::Xrpl);
+        assert_eq!(resolved[0].table_name(), "xrpl.0");
+    }
+
     #[test]
     fn an_empty_keyed_settlement_section_is_rejected() {
         let result = resolve_settlement(Some(RawSettlementSection::Keyed(Box::new(
             RawKeyedSettlementConfig {
                 eip155: None,
                 solana: None,
+                xrpl: None,
                 evm: None,
             },
         ))));

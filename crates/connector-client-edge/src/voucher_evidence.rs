@@ -43,7 +43,8 @@ use connector_peer_btp::role_gate::{PeerVoucherVerdict, VoucherCheck, VoucherEvi
 use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, VoucherSigner};
 use connector_signer::{
     evm_voucher_signer, verify_evm_voucher, verify_evm_voucher_claim_state_challenge,
-    verify_solana_voucher, verify_solana_voucher_claim_state_challenge, BatchChannelConfig,
+    verify_solana_voucher, verify_solana_voucher_claim_state_challenge, verify_xrpl_claim,
+    verify_xrpl_voucher_claim_state_challenge, BatchChannelConfig,
 };
 
 use crate::channels::{decode_base58_bytes, decode_hex_bytes};
@@ -102,6 +103,14 @@ enum EvmMessage {
 /// As [`EvmMessage`], on Solana.
 enum SolanaMessage {
     Voucher { cumulative: u64 },
+    Challenge { expires: u64 },
+}
+
+/// As [`EvmMessage`], on XRPL: a claim's drops, or a challenge's expiry, each
+/// under its own domain (ADR 0087 decision 3), so a signature over one is
+/// never a signature over the other.
+enum XrplMessage {
+    Voucher { drops: u128 },
     Challenge { expires: u64 },
 }
 
@@ -196,6 +205,45 @@ impl ClientClaimGate {
     }
 }
 
+impl ClientClaimGate {
+    /// Resolve XRPL channel `channel_id` on `network` and check `signature`
+    /// over `message` against its ledger-recorded `PublicKey`.
+    async fn check_xrpl(
+        &self,
+        network: &Network,
+        channel_id: [u8; 32],
+        message: XrplMessage,
+        signature: &[u8],
+        requester: &str,
+    ) -> VoucherCheck {
+        let Ok(Some(channel)) = self
+            .xrpl_voucher_channel(network, &channel_id, requester)
+            .await
+        else {
+            return VoucherCheck::Unresolved;
+        };
+        let key = channel.public_key;
+        let verified = match message {
+            XrplMessage::Voucher { drops } => {
+                verify_xrpl_claim(&key, &channel_id, drops, signature)
+            }
+            XrplMessage::Challenge { expires } => verify_xrpl_voucher_claim_state_challenge(
+                &key,
+                &network.to_string(),
+                &channel_id,
+                expires,
+                signature,
+            ),
+        };
+        let signer = VoucherSigner::Xrpl(key);
+        if verified {
+            VoucherCheck::Verified(signer)
+        } else {
+            VoucherCheck::SignatureInvalid(signer)
+        }
+    }
+}
+
 #[async_trait]
 impl VoucherEvidence for ClientClaimGate {
     async fn check_voucher(&self, voucher: &ClientClaim) -> VoucherCheck {
@@ -250,8 +298,24 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
-            // `settles_on` refused it above: no XRPL table is read yet.
-            ClientClaim::XrplVoucher(_) => VoucherCheck::Unresolved,
+            ClientClaim::XrplVoucher(voucher) => {
+                let (Some(channel_id), Some(signature)) = (
+                    decode_hex_bytes::<32>(&voucher.channel_id),
+                    hex::decode(&voucher.signature).ok(),
+                ) else {
+                    return VoucherCheck::Unresolved;
+                };
+                self.check_xrpl(
+                    &voucher.network,
+                    channel_id,
+                    XrplMessage::Voucher {
+                        drops: voucher.max_claimable_amount,
+                    },
+                    &signature,
+                    &requester(&voucher.signature),
+                )
+                .await
+            }
         }
     }
 
@@ -323,8 +387,21 @@ impl VoucherEvidence for ClientClaimGate {
                 )
                 .await
             }
-            // `settles_on` refused it above: no XRPL table is read yet.
-            PeerRoleChallenge::Xrpl { .. } => VoucherCheck::Unresolved,
+            PeerRoleChallenge::Xrpl {
+                network,
+                channel_id,
+                expires,
+                signature,
+            } => {
+                self.check_xrpl(
+                    network,
+                    *channel_id,
+                    XrplMessage::Challenge { expires: *expires },
+                    signature,
+                    &requester(&hex::encode(signature)),
+                )
+                .await
+            }
         }
     }
 }

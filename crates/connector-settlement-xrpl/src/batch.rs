@@ -38,6 +38,11 @@ use crate::tx::LandClaim;
 /// The chain this backend answers for, in the port's spelling.
 pub(crate) const CHAIN: &str = "xrpl";
 
+/// The fee ceiling a backend starts with, until the table's own is applied:
+/// 0.1 XRP. Mirrors `connector_config::DEFAULT_XRPL_MAX_FEE_DROPS`, which this
+/// crate cannot name.
+const DEFAULT_MAX_FEE_DROPS: u64 = 100_000;
+
 /// How many ledgers past the open one a landing may still be included in:
 /// `LastLedgerSequence`, which bounds every wait (ADR 0087 decision 9).
 pub(crate) const LAST_LEDGER_WINDOW: u32 = 20;
@@ -45,9 +50,6 @@ pub(crate) const LAST_LEDGER_WINDOW: u32 = 20;
 /// How many ledgers a prepared open may wait to be sent: longer than a
 /// landing's, since the caller journals between preparing and sending.
 const OPEN_LAST_LEDGER_WINDOW: u32 = 100;
-
-/// The most a transaction's fee may be unless the table says otherwise.
-const DEFAULT_MAX_FEE_DROPS: u64 = 1_000;
 
 /// The receiving half of the settlement port on one XRPL network.
 ///
@@ -114,15 +116,23 @@ impl XrplBatchSettlement {
                         .to_string())
             )));
         }
-        if rpc
-            .account_info(&address)
-            .await
-            .map_err(rpc_error)?
-            .is_none()
-        {
+        let Some(account) = rpc.account_info(&address).await.map_err(rpc_error)? else {
             return Err(BatchSettlementError::Backend(format!(
                 "the settlement account {address} does not exist on XRPL network {network_id}: \
                  fund it with at least the base reserve"
+            )));
+        };
+        let Some(reserve) = info.reserve_base_drops else {
+            return Err(BatchSettlementError::Backend(format!(
+                "XRPL network {network_id}'s endpoint reports no validated ledger, so the \
+                 settlement account's base reserve cannot be checked"
+            )));
+        };
+        if account.balance_drops < reserve {
+            return Err(BatchSettlementError::Backend(format!(
+                "the settlement account {address} holds {} drops, below the base reserve of \
+                 {reserve} on XRPL network {network_id}: fund it",
+                account.balance_drops
             )));
         }
         Ok(XrplBatchSettlement {
@@ -146,7 +156,7 @@ impl XrplBatchSettlement {
 
     /// The most a transaction's fee may be, in drops. A ledger whose open
     /// ledger fee has escalated past it refuses the send, naming the fee,
-    /// rather than spending it. The default is 1,000 drops.
+    /// rather than spending it. The default is 100,000 drops (0.1 XRP).
     #[must_use]
     pub fn with_max_fee_drops(mut self, max_fee_drops: u64) -> XrplBatchSettlement {
         self.max_fee_drops = max_fee_drops;
@@ -168,6 +178,14 @@ impl XrplBatchSettlement {
     pub fn with_wait(mut self, wait: TxWait) -> XrplBatchSettlement {
         self.wait = wait;
         self
+    }
+
+    /// The settlement key's public key as the ledger spells a channel
+    /// `PublicKey`'s peer: 33 bytes, lowercase hex, secp256k1 compressed or
+    /// `ED`-prefixed Ed25519. What the self-description's `voucherSigners`
+    /// publishes for this network (ADR 0087 decision 9).
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.signer.public_key())
     }
 
     /// This node's settlement account, the `payTo` the greeting publishes.
@@ -392,6 +410,14 @@ impl BatchSettlementBackend for XrplBatchSettlement {
                 ))
             })?;
         let fee = self.rpc.fee().await.map_err(rpc_error)?;
+        let fee_drops = fee.open_ledger_fee_drops.max(fee.base_fee_drops);
+        if fee_drops > self.max_fee_drops {
+            return Err(BatchSettlementError::Backend(format!(
+                "the ledger asks {fee_drops} drops to land a PaymentChannelClaim, above this \
+                 table's max_fee_drops of {}: nothing was signed",
+                self.max_fee_drops
+            )));
+        }
         let last_ledger_sequence = fee.ledger_current_index + LAST_LEDGER_WINDOW;
         let signed = LandClaim {
             account: self.signer.account_id(),
@@ -399,7 +425,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
             drops,
             claim_signature: voucher.signature.clone(),
             channel_key: key,
-            fee_drops: fee.open_ledger_fee_drops.max(fee.base_fee_drops),
+            fee_drops,
             sequence: account.sequence,
             last_ledger_sequence,
         }

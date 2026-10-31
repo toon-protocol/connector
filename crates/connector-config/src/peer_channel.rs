@@ -259,6 +259,90 @@ mod tests {
         format!("peer_id = \"store\"\nvoucher_signer = \"{signer}\"")
     }
 
+    /// An XRPL channel key, 33 bytes of bare hex (ADR 0087 decision 2).
+    const XRPL_SIGNER: &str = "0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020";
+    const XRPL_CHANNEL: &str = "5DB01B7FFED6B67E6B0414DED11E051D2EE2B7619CE0EAA6286D67A3A4D5BDB3";
+
+    fn resolve_on(
+        xrpl: &[connector_domain::XrplNetwork],
+        rows: &[&str],
+    ) -> Result<Vec<PeerChannelConfig>, ConfigError> {
+        resolve_peer_channels(
+            rows.iter().map(|text| parse(text)).collect(),
+            &SettlementTables::for_tests_with_xrpl(false, false, xrpl),
+        )
+    }
+
+    /// ADR 0087: an XRPL row is a channel key and a channel id in bare hex,
+    /// canonicalised to lower case, on the one XRPL table the node has.
+    #[test]
+    fn an_xrpl_row_resolves_to_its_one_table() {
+        use connector_domain::XrplNetwork;
+        let rows = resolve_on(
+            &[XrplNetwork::Standalone],
+            &[&format!(
+                "{}\ninbound_channel = \"{XRPL_CHANNEL}\"",
+                row(XRPL_SIGNER)
+            )],
+        )
+        .expect("an XRPL row");
+        assert_eq!(rows[0].chain(), SettlementChain::Xrpl);
+        assert_eq!(
+            rows[0].network(),
+            Some(&Network::Xrpl(XrplNetwork::Standalone))
+        );
+        assert_eq!(rows[0].voucher_signer(), XRPL_SIGNER.to_ascii_lowercase());
+        assert_eq!(
+            rows[0].inbound_channel(),
+            Some(XRPL_CHANNEL.to_ascii_lowercase().as_str())
+        );
+    }
+
+    /// ADR 0086 decision 8 for XRPL: with several tables the row names its
+    /// network, and one for a table the node lacks is refused by name.
+    #[test]
+    fn an_xrpl_row_names_its_network_when_there_are_several_tables() {
+        use connector_domain::XrplNetwork;
+        let both = [XrplNetwork::Testnet, XrplNetwork::Standalone];
+        assert!(matches!(
+            resolve_on(&both, &[&row(XRPL_SIGNER)]),
+            Err(ConfigError::ChannelRowNetworkAmbiguous { .. })
+        ));
+        let rows = resolve_on(
+            &both,
+            &[&format!("{}\nnetwork = \"xrpl:1\"", row(XRPL_SIGNER))],
+        )
+        .expect("a named network");
+        assert_eq!(
+            rows[0].network(),
+            Some(&Network::Xrpl(XrplNetwork::Testnet))
+        );
+        assert!(matches!(
+            resolve_on(
+                &[XrplNetwork::Testnet],
+                &[&format!("{}\nnetwork = \"xrpl:1000\"", row(XRPL_SIGNER))],
+            ),
+            Err(ConfigError::ChannelRowNetworkUnsettled { .. })
+        ));
+        assert!(matches!(
+            resolve_on(
+                &both,
+                &[&format!("{}\nnetwork = \"eip155:1\"", row(XRPL_SIGNER))],
+            ),
+            Err(ConfigError::ChannelRowNetworkInvalid { .. })
+        ));
+    }
+
+    /// An XRPL row on a node with no XRPL table is a channel it can neither
+    /// admit a voucher on nor sign one on.
+    #[test]
+    fn an_xrpl_row_needs_an_xrpl_table() {
+        assert!(matches!(
+            resolve_on(&[], &[&row(XRPL_SIGNER)]),
+            Err(ConfigError::PeerChannelWithoutX402 { chain: "xrpl", .. })
+        ));
+    }
+
     #[test]
     fn an_evm_row_names_a_voucher_signer_and_is_canonicalized() {
         let channels = resolve(&[&format!(

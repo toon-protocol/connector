@@ -130,7 +130,9 @@ connector-settlement-xrpl        XRPL settlement (spec #1596, ADR 0087)
   ├─ batch.rs                    the receiving half of the batch-settlement port on the
   │                               ledger's own `PayChannel`: admission, the channel's state,
   │                               and landing a voucher with a destination
-  │                               `PaymentChannelClaim`, judged from its metadata
+  │                               `PaymentChannelClaim`, judged from its metadata. A node
+  │                               binds one per `[settlement.xrpl.<id>]` table at boot
+  │                               (`connector-cli`'s `build_xrpl_batch_settlement`, #1614)
   ├─ pay.rs                      the paying half: opens at most once (a signed
   │                               `PaymentChannelCreate` journaled and resubmitted), funds,
   │                               exits with `tfClose`, one sequence allocator per account,

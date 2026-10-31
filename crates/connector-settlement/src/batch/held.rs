@@ -27,6 +27,16 @@ pub trait HeldVouchers: Send + Sync {
     /// One entry per channel, carrying that channel's highest accepted
     /// voucher. A channel with no accepted voucher is absent.
     fn held_vouchers(&self) -> Vec<HeldVoucher>;
+
+    /// The CAIP-2 network the held channel `channel` is on, when this
+    /// source knows it by something other than the presentation. An XRPL
+    /// channel id binds no network, so a node with several XRPL tables
+    /// cannot read one off the presentation (ADR 0087 decision 2); the claim
+    /// gate recorded the network its voucher named. `None` leaves the
+    /// presentation to answer.
+    fn network_of(&self, _channel: &crate::ChannelId) -> Option<String> {
+        None
+    }
 }
 
 /// A plain list is a [`HeldVouchers`]: what a test hands a watcher in place

@@ -428,7 +428,9 @@ price = {PRICE}
         .batch_settlement_offers()
         .find_map(|offer| match &offer.extra {
             X402BatchSettlementExtra::Solana(extra) => Some((offer, extra)),
-            X402BatchSettlementExtra::Evm(_) | X402BatchSettlementExtra::ZkNote(_) => None,
+            X402BatchSettlementExtra::Evm(_)
+            | X402BatchSettlementExtra::Xrpl(_)
+            | X402BatchSettlementExtra::ZkNote(_) => None,
         })
         .expect("a node opted in on Solana offers a Solana batch-settlement entry");
     assert_eq!(offer.scheme, "batch-settlement");

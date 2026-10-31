@@ -102,7 +102,8 @@ pub mod zk_note;
 mod zk_note_http;
 pub use batch_settlement::{
     first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
-    AdmittedSolanaVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
+    AdmittedSolanaVoucherChannel, AdmittedXrplVoucherChannel, BatchSettlementChannels,
+    JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
@@ -817,8 +818,8 @@ async fn route_price(
 /// paths its callers already use keep working.
 pub use connector_domain::x402::{
     X402BatchSettlementEvmTerms, X402BatchSettlementOption, X402BatchSettlementSolanaTerms,
-    X402BatchSettlementTerms, X402Extensions, X402PaymentRequired, X402Resource, X402ToonExtension,
-    X402ToonTerms, X402_VERSION,
+    X402BatchSettlementTerms, X402BatchSettlementXrplTerms, X402Extensions, X402PaymentRequired,
+    X402Resource, X402ToonExtension, X402ToonTerms, X402_VERSION,
 };
 
 /// Answer an unpaid request to `destination` with terms instead of doing

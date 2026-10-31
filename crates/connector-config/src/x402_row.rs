@@ -25,13 +25,29 @@ pub(crate) struct ChainSpelled {
     pub(crate) value: String,
 }
 
-/// `value` as a voucher signer: an EVM address (`0x` + 40 hex) or a Solana
-/// public key (base58 of 32 bytes). `None` for anything else.
+/// `value` as an XRPL spelling: `bytes` of hex with no prefix, lower-cased.
+/// A hex string of that length is never base58 of 32 bytes (at most 44
+/// characters) and never `0x`-prefixed, so it is read as no other chain's.
+fn bare_hex(value: &str, bytes: usize) -> Option<String> {
+    (value.len() == bytes * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+/// `value` as a voucher signer: an EVM address (`0x` + 40 hex), a Solana
+/// public key (base58 of 32 bytes) or an XRPL channel key (66 bare hex
+/// characters: a compressed secp256k1 point or `ED` and an Ed25519 key, ADR
+/// 0087 decision 2). `None` for anything else.
 pub(crate) fn parse_voucher_signer(value: &str) -> Option<ChainSpelled> {
     if value.starts_with("0x") || value.starts_with("0X") {
         return parse_hex_bytes::<20>(value).map(|bytes| ChainSpelled {
             chain: SettlementChain::Evm,
             value: to_hex(&bytes),
+        });
+    }
+    if let Some(key) = bare_hex(value, 33) {
+        return matches!(&key[..2], "02" | "03" | "ed").then_some(ChainSpelled {
+            chain: SettlementChain::Xrpl,
+            value: key,
         });
     }
     is_base58_32_bytes(value).then(|| ChainSpelled {
@@ -41,13 +57,20 @@ pub(crate) fn parse_voucher_signer(value: &str) -> Option<ChainSpelled> {
 }
 
 /// `value` as an x402 channel: an EVM `x402BatchSettlement` channel id
-/// (`0x` and 64 hex) or a Solana `payment-channels` channel account (base58
-/// of 32 bytes). `None` for anything else.
+/// (`0x` and 64 hex), a Solana `payment-channels` channel account (base58
+/// of 32 bytes) or an XRPL `PayChannel` id (64 bare hex characters, ADR 0087
+/// decision 2). `None` for anything else.
 pub(crate) fn parse_x402_channel(value: &str) -> Option<ChainSpelled> {
     if value.starts_with("0x") || value.starts_with("0X") {
         return parse_hex_bytes::<32>(value).map(|bytes| ChainSpelled {
             chain: SettlementChain::Evm,
             value: to_hex(&bytes),
+        });
+    }
+    if let Some(id) = bare_hex(value, 32) {
+        return Some(ChainSpelled {
+            chain: SettlementChain::Xrpl,
+            value: id,
         });
     }
     is_base58_32_bytes(value).then(|| ChainSpelled {

@@ -286,6 +286,55 @@ code at its fixed address (EVM), or that `payment-channels` is deployed and the 
 Token mint (Solana). It refuses a chain it is missing from, by name. A Solana key with no lamports
 is refused too. Fund both keys before the first boot.
 
+### `[settlement.xrpl.<id>]`
+
+XRPL settles over the ledger's own `PayChannel` ([ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)):
+nothing to deploy, no token to name, and a channel holds XRP and nothing else. One table per
+network, keyed by the ledger's `server_info` `network_id` (`0` mainnet, `1` testnet, `2` devnet,
+`1000` the stand-alone harness and `local/`). A bare `[settlement.xrpl]` is refused by name.
+
+```toml
+[settlement.xrpl.1]
+rpc_url                = "https://s.altnet.rippletest.net:51234"
+# min_settle_delay_secs  = 86400
+# redemption_safety_secs = 60
+# max_fee_drops          = 100000
+# rpc_via_socks_proxy    = false
+
+[settlement.xrpl.1.key]
+key_file = "/app/data/settlement-xrpl.key"
+```
+
+| Key                          | Default         | Refused at load when                                                         | Published as                                                                |
+| ---------------------------- | --------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| table key `<id>`             | required        | not a network this build has a row for                                       | `network` (`xrpl:<id>`)                                                     |
+| `rpc_url`                    | required        | empty, not a URL, or not `http`/`https`                                      | nothing                                                                     |
+| `min_settle_delay_secs`      | `86400` (a day) | `901` or less                                                                | `extra.minSettleDelay`                                                      |
+| `redemption_safety_secs`     | `60`            | `0`, or not below `min_settle_delay_secs`                                    | `extra.redemptionSafetySeconds`                                             |
+| `max_fee_drops`              | `100000`        | `0`                                                                          | nothing: no landing pays more                                               |
+| `rpc_via_socks_proxy`        | `false`         | `true` with no root `socks_proxy`                                            | nothing                                                                     |
+| `[settlement.xrpl.<id>.key]` | required        | written inline, or not exactly one of `key_file`/`kms_key_id`, or not a file | `payTo` (the r-address), `voucherSigners[].signer` (the 33-byte public key) |
+
+The key file holds an XRPL **family seed** as `wallet_propose` emits it: `s…` for secp256k1, `sEd…`
+for Ed25519. The asset is always `xrpl:<id>/slip44:144`, and `extra.binding` is `xrpl-paychan-v1`.
+There is no facilitator: [ADR 0076](../adr/0076-the-operator-names-the-facilitator-and-pays-its-gas.md)
+stays EVM-only, and each party pays its own fees and its own reserve in XRP.
+
+**Use a different account on each network.** A voucher binds no network, so one signed for a
+testnet channel is redeemable on mainnet by anyone holding a channel with the same id there. A node
+refuses, by name, two XRPL tables whose keys are one account.
+
+**At boot** the node asks the table's `rpc_url` for `server_info` and refuses, by name: a
+`network_id` that is not the table's key; a settlement account the ledger does not hold; an account
+holding less than the base reserve; an endpoint with no validated ledger yet, whose reserve cannot
+be read. It never checks the PayChan amendment: testnet reports it
+disabled while its channels work. Fund the account before the first boot.
+
+A channel holds XRP, so every XRPL peering is a dealing boundary
+([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)): declare
+`xrpl:<id>/slip44:144` in `[[tokens]]` and give it a `[[rates]]` row. `xrpl:native` and every other
+`<chain>:native` spelling are refused by name.
+
 ### When the settlement RPC is unreachable
 
 The two moments differ, on purpose:

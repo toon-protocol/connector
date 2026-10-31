@@ -278,6 +278,9 @@ pub fn toon_extension_schema() -> serde_json::Value {
 pub enum X402BatchSettlementTerms {
     Evm(X402BatchSettlementEvmTerms),
     Solana(X402BatchSettlementSolanaTerms),
+    /// The ledger's own `PayChannel` (ADR 0087). Last, and told apart from
+    /// the others by `minSettleDelay`, which neither of them carries.
+    Xrpl(X402BatchSettlementXrplTerms),
 }
 
 /// What a stock `@x402/evm` client needs to build a `ChannelConfig` and
@@ -449,6 +452,39 @@ pub struct X402BatchSettlementSolanaTerms {
     pub sponsor_endpoint: String,
 }
 
+/// The binding an XRPL `batch-settlement` entry names in `extra.binding`
+/// (ADR 0087 decision 1): x402 PR #2952's `xrpl-paychan-v1`, pinned at one
+/// commit. Not the 0085 decision 3 constant of a voucher's binding, which is
+/// empty on XRPL.
+pub const XRPL_PAYCHAN_BINDING: &str = "xrpl-paychan-v1";
+
+/// The XRPL twin of [`X402BatchSettlementEvmTerms`] (ADR 0087 decision 9).
+/// A channel holds XRP and nothing else, so `asset` is the network's one
+/// native coin, `xrpl:<id>/slip44:144`, and there is no facilitator: ADR
+/// 0076 stays EVM-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementXrplTerms {
+    /// `xrpl:<id>` (CAIP-2), the table's key, asserted against the
+    /// endpoint's `server_info.network_id` at boot.
+    pub network: String,
+    /// `xrpl:<id>/slip44:144` (CAIP-19): XRP on `network`.
+    pub asset: String,
+    /// This node's classic `r…` settlement address: the `Destination` a
+    /// channel toward it must name.
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    /// [`XRPL_PAYCHAN_BINDING`].
+    pub binding: String,
+    /// The shortest `SettleDelay` a channel may carry and still be admitted,
+    /// in seconds -- `[settlement.xrpl.<id>] min_settle_delay_secs`.
+    #[serde(rename = "minSettleDelay")]
+    pub min_settle_delay_secs: u64,
+    /// How long before a channel's `Expiration` this node lands its latest
+    /// voucher -- `[settlement.xrpl.<id>] redemption_safety_secs`.
+    #[serde(rename = "redemptionSafetySeconds")]
+    pub redemption_safety_secs: u64,
+}
+
 /// The greeting's own `batch-settlement` `accepts[]` entry (ADR 0074
 /// decision 8): [`X402BatchSettlementTerms`] plus the fields that describe
 /// *this* request rather than this node's standing terms -- `scheme`,
@@ -479,6 +515,9 @@ pub struct X402BatchSettlementOption {
 pub enum X402BatchSettlementExtra {
     Evm(X402BatchSettlementEvmExtra),
     Solana(X402BatchSettlementSolanaExtra),
+    /// XRPL's (ADR 0087 decision 9): `binding`, `minSettleDelay` and
+    /// `redemptionSafetySeconds`, none of which either chain above carries.
+    Xrpl(X402BatchSettlementXrplExtra),
     /// A `zk-note` entry's (ADR 0080): it carries none of either chain's
     /// required fields, nor they its.
     ZkNote(X402ZkNoteExtra),
@@ -633,6 +672,17 @@ pub struct X402BatchSettlementSolanaExtra {
     pub sponsor_endpoint: String,
 }
 
+/// ADR 0087 decision 9: what an XRPL entry's `extra` carries, beside the
+/// top-level `network`, `asset` and `payTo`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct X402BatchSettlementXrplExtra {
+    pub binding: String,
+    #[serde(rename = "minSettleDelay")]
+    pub min_settle_delay: u64,
+    #[serde(rename = "redemptionSafetySeconds")]
+    pub redemption_safety_seconds: u64,
+}
+
 /// Project [`X402BatchSettlementTerms`] into the greeting's own
 /// `accepts[]` entry shape, quoting `amount` for the request being
 /// answered. The one place that builds an [`X402BatchSettlementOption`], so
@@ -672,6 +722,19 @@ fn batch_settlement_accept(
                 token_program: solana.token_program.clone(),
                 min_deposit: solana.min_deposit.clone(),
                 sponsor_endpoint: solana.sponsor_endpoint.clone(),
+            }),
+        },
+        X402BatchSettlementTerms::Xrpl(xrpl) => X402BatchSettlementOption {
+            scheme: BATCH_SETTLEMENT_SCHEME.to_string(),
+            network: xrpl.network.clone(),
+            amount,
+            asset: xrpl.asset.clone(),
+            pay_to: xrpl.pay_to.clone(),
+            max_timeout_seconds: X402_MAX_TIMEOUT_SECONDS,
+            extra: X402BatchSettlementExtra::Xrpl(X402BatchSettlementXrplExtra {
+                binding: xrpl.binding.clone(),
+                min_settle_delay: xrpl.min_settle_delay_secs,
+                redemption_safety_seconds: xrpl.redemption_safety_secs,
             }),
         },
     }
@@ -1368,6 +1431,86 @@ mod tests {
                 "assetTransferMethod": "eip2612"
             }));
         assert!(result.is_err());
+    }
+
+    fn xrpl_batch_settlement_fact() -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Xrpl(X402BatchSettlementXrplTerms {
+            network: "xrpl:1".to_string(),
+            asset: "xrpl:1/slip44:144".to_string(),
+            pay_to: "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string(),
+            binding: XRPL_PAYCHAN_BINDING.to_string(),
+            min_settle_delay_secs: 86_400,
+            redemption_safety_secs: 60,
+        })
+    }
+
+    /// ADR 0087 decision 9: an XRPL node greets with one entry whose `extra`
+    /// is the binding and the two figures, beside the other chains', and no
+    /// facilitator.
+    #[test]
+    fn an_xrpl_entry_greets_with_its_binding_and_no_facilitator() {
+        let facts = NodeFacts {
+            batch_settlements: vec![
+                evm_batch_settlement_fact(),
+                solana_batch_settlement_fact(),
+                xrpl_batch_settlement_fact(),
+            ],
+            ..Default::default()
+        };
+        let body = terms_body(&GreetingTerms {
+            destination: "g.toon.ario",
+            price: Price::flat(1000),
+            node: Some(&facts),
+            ..Default::default()
+        });
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let accepts = value["accepts"].as_array().unwrap();
+        assert_eq!(accepts.len(), 3);
+        assert_eq!(
+            accepts[2],
+            serde_json::json!({
+                "scheme": "batch-settlement",
+                "network": "xrpl:1",
+                "amount": "1000",
+                "asset": "xrpl:1/slip44:144",
+                "payTo": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                "maxTimeoutSeconds": 60,
+                "extra": {
+                    "binding": "xrpl-paychan-v1",
+                    "minSettleDelay": 86400,
+                    "redemptionSafetySeconds": 60
+                }
+            })
+        );
+        // Parsed back, each entry's extra is its own chain's.
+        let terms = parse_greeting(&body).expect("well-formed");
+        let extras: Vec<_> = terms
+            .batch_settlement_offers()
+            .map(|offer| match &offer.extra {
+                X402BatchSettlementExtra::Evm(_) => "evm",
+                X402BatchSettlementExtra::Solana(_) => "solana",
+                X402BatchSettlementExtra::Xrpl(_) => "xrpl",
+                X402BatchSettlementExtra::ZkNote(_) => "zk-note",
+            })
+            .collect();
+        assert_eq!(extras, ["evm", "solana", "xrpl"]);
+    }
+
+    /// The self-description's untagged terms tell the three chains apart by
+    /// the fields only each carries.
+    #[test]
+    fn the_three_chains_terms_round_trip_untagged() {
+        for fact in [
+            evm_batch_settlement_fact(),
+            solana_batch_settlement_fact(),
+            xrpl_batch_settlement_fact(),
+        ] {
+            let json = serde_json::to_string(&fact).unwrap();
+            assert_eq!(
+                serde_json::from_str::<X402BatchSettlementTerms>(&json).unwrap(),
+                fact
+            );
+        }
     }
 
     /// A greeting round-trips through JSON: the untagged `extra` has to

@@ -894,6 +894,88 @@ pub enum ConfigError {
     #[error("the [settlement.solana] section's token_address is empty")]
     SettlementMissingSolanaTokenAddress,
 
+    /// `[settlement.xrpl]` holding no network (ADR 0087 decision 5).
+    #[error(
+        "[settlement.xrpl] names no network: add a [settlement.xrpl.<id>] table under it, \
+         where <id> is the server_info network_id of the ledger its rpc_url answers (0 \
+         mainnet, 1 testnet, 2 devnet, 1000 stand-alone), or remove the heading (ADR 0087)"
+    )]
+    SettlementXrplEmpty,
+
+    /// A bare `[settlement.xrpl]` table, written with its keys directly under
+    /// it and no network (ADR 0087 decision 5): a claim binds no network, so
+    /// every table says which one it is.
+    #[error(
+        "[settlement.xrpl] has '{key}' directly under it, but XRPL settlement is one table \
+         per network: write [settlement.xrpl.<id>] and [settlement.xrpl.<id>.key], where <id> \
+         is the server_info network_id of the ledger its rpc_url answers (0 mainnet, 1 \
+         testnet, 2 devnet, 1000 stand-alone) (ADR 0087)"
+    )]
+    SettlementXrplBareTable { key: String },
+
+    /// `[settlement.xrpl.<key>]` where this binary's network table has no
+    /// such network (ADR 0087 decision 5).
+    #[error(
+        "[settlement.xrpl.{key}] is not a network this build knows: the XRPL networks are 0 \
+         (mainnet), 1 (testnet), 2 (devnet) and 1000 (the stand-alone harness), keyed by the \
+         ledger's server_info network_id (ADR 0087, ADR 0085). A network with no row is \
+         refused, never guessed"
+    )]
+    SettlementXrplUnknownNetwork { key: String },
+
+    /// `[settlement.xrpl.<id>] key = "..."`: a key is a file, never a value
+    /// (ADR 0009, ADR 0012).
+    #[error(
+        "[settlement.{table}] writes its key inline. A key is referenced by location, never by \
+         value (ADR 0009): write [settlement.{table}.key] with key_file = \"<path>\""
+    )]
+    SettlementXrplInlineKey { table: String },
+
+    /// An `[settlement.xrpl.<id>]` table that does not parse: an unknown key
+    /// (every table is `deny_unknown_fields`), a missing one, or a value of
+    /// the wrong type. The source names which.
+    #[error("[settlement.{table}] is refused: {source}")]
+    SettlementXrplTableInvalid {
+        table: String,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+
+    /// `min_settle_delay_secs` at or below the settlement port's floor (ADR
+    /// 0087 decision 9).
+    #[error(
+        "[settlement.{table}] min_settle_delay_secs = {value} must exceed {floor} seconds, the \
+         settlement port's floor: a channel one second short of the minimum has to be one the \
+         ledger lets exist. Omit the key for the default of one day, the window a delayed \
+         landing still has"
+    )]
+    SettlementXrplSettleDelayBelowFloor {
+        table: String,
+        value: u64,
+        floor: u64,
+    },
+
+    /// `redemption_safety_secs` that is zero or no shorter than the delay it
+    /// is a margin inside.
+    #[error(
+        "[settlement.{table}] redemption_safety_secs = {value} must be above 0 and below \
+         min_settle_delay_secs ({min_settle_delay_secs}): it is how long before a channel's \
+         Expiration a held voucher is treated as due"
+    )]
+    SettlementXrplRedemptionSafetyOutOfRange {
+        table: String,
+        value: u64,
+        min_settle_delay_secs: u64,
+    },
+
+    /// `max_fee_drops = 0`: a ceiling that no transaction could ever pay
+    /// under.
+    #[error(
+        "[settlement.{table}] max_fee_drops is 0, a ceiling no transaction's fee could be under. \
+         Omit the key for the default, or name the most one transaction may cost in drops"
+    )]
+    SettlementXrplZeroMaxFee { table: String },
+
     /// A `[settlement.eip155.<chainId>]` key that tuned the local `TokenNetwork` channel
     /// index (issue #661), deleted with the `toon-channel` client claims it
     /// resolved (ADR 0075 decisions 9 and 12, issue #1384).
