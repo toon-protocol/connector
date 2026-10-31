@@ -137,6 +137,9 @@ connector-settlement-xrpl        XRPL settlement (spec #1596, ADR 0087)
   │                               `PaymentChannelCreate` journaled and resubmitted), funds,
   │                               exits with `tfClose`, one sequence allocator per account,
   │                               a named shortfall before any spend
+  ├─ watch.rs                    `XrplBatchWatcher` (ADR 0087 decision 8): answers a payer's
+  │                               exit by landing the latest held voucher with `tfClose`, or
+  │                               closing with `tfClose` alone; the runtime spawns one per table
   ├─ tx.rs                       the transactions this node signs, in canonical binary,
   │                               with the settlement key: a destination's claim, a
   │                               source's create, fund and close

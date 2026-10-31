@@ -654,6 +654,15 @@ A peering leg whose channel holds only its chain's native coin, such as XRP on X
 ([ADR 0087](docs/adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md) decisions 6–7).
 _Avoid_: native token, `<chain>:native` (the refused spelling)
 
+**XRPL settlement**:
+A node's settlement over the ledger's own `PayChannel`, one `[settlement.xrpl.<id>]` table per network,
+keyed by the ledger's `server_info` `network_id` (`0` mainnet, `1` testnet, `2` devnet, `1000` the
+stand-alone harness and `local/`). A voucher is `CLM\0 ‖ channelId ‖ u64 drops` and binds **no
+network**, so one XRPL account belongs to one network and boot refuses two tables on one account. A
+payer's exit is answered by landing the latest voucher with `tfClose`. Lives in
+`connector-settlement-xrpl`
+([ADR 0087](docs/adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)).
+
 **Minimum delivery** _(retired term, [ADR 0057](docs/adr/0057-minimum-delivery-is-retired-a-claim-bounds-erosion.md), issue #1143)_:
 The amount a packet declared must reach its destination, checked by every hop after its own fee
 and answered with `R01` when it could not be met. Retired: once a packet carries the claim that
