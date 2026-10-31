@@ -85,14 +85,19 @@ At config load:
 - A key written inline rather than as `[settlement.xrpl.<id>.key]`
   (`SettlementXrplInlineKey`), and any unknown or mistyped key
   (`SettlementXrplTableInvalid`).
-- `min_settle_delay_secs` at or below 901, `redemption_safety_secs` of zero or not
-  below the delay, `max_fee_drops = 0`.
-- **`xrpl:native`, and every other `<chain>:native` asset spelling**, wherever an asset
-  id is parsed (`AssetIdError::LegacyNative`). XRP is `xrpl:<id>/slip44:144`
-  (ADR 0087 decision 7).
+- `min_settle_delay_secs` at or below 901 (`SettlementXrplSettleDelayBelowFloor`),
+  `redemption_safety_secs` of zero or not below the delay
+  (`SettlementXrplRedemptionSafetyOutOfRange`), `max_fee_drops = 0`
+  (`SettlementXrplZeroMaxFee`).
+
+Still refused, not new: **`xrpl:native`, and every other `<chain>:native` asset
+spelling**, wherever an asset id is parsed (`AssetIdError::LegacyNative`, since #1607
+and ADR 0086). XRP is `xrpl:<id>/slip44:144` (ADR 0087 decision 7).
 
 At boot, before the node serves:
 
+- A key file that cannot be read or is not an XRPL family seed — 32 random bytes from
+  `openssl rand` is not one (`XrplKeyUnusable`).
 - A table whose `rpc_url` reports a different `network_id` (`XrplNetworkMismatch`).
 - A settlement account that does not exist on the ledger, or holds less than its
   base reserve (`XrplAccountMissing`, `XrplAccountUnderfunded`), or an endpoint with
@@ -127,8 +132,9 @@ The greeting gains one `batch-settlement` entry per XRPL table, `network: xrpl:<
   then wanted to renew loses that chance (ADR 0087 decision 8).
 - **A peering costs each side an owner reserve** (0.2 XRP on 2026-10-28) until its
   channel is deleted, and each party pays its own fees in XRP. There is no sponsor.
-- **Every XRPL leg is a dealing boundary** (ADR 0071): without a `[[rates]]` row there
-  is no forward.
+- **An XRPL leg is a dealing boundary whenever the other side holds anything else**
+  (ADR 0071): without a `[[rates]]` row there is no such forward. A path that holds XRP
+  end to end forwards unconverted (ADR 0087 decision 6.1).
 
 ## For node repositories
 
