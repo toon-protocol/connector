@@ -224,13 +224,14 @@ connector-bin                    bin/connector, bin/stub-app — and the workspa
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
 connector-zk-note                the connector's zk-note boundary (ADR 0080 decision 12):
-                                  re-exports toon-protocol/zk_toon's `zk-note`, pinned by
-                                  commit, which defines every derivation; keeps the allowance
-                                  claim's and close's session-key signatures, the unsigned
-                                  successor composed from zk_toon's charge, anchor and state
-                                  message (the state key that signs it is connector-signer's),
-                                  tier validation, and stand-ins for zk_toon#29's
-                                  RequestPublic and evidence-file bytes.
+                                  re-exports toon-protocol/zk_toon's `zk-note` and
+                                  `zk-evidence`, pinned by one commit, which define every
+                                  derivation, the request proof's public inputs and the
+                                  evidence file's bytes; keeps the allowance claim's and
+                                  close's session-key signatures, the unsigned successor
+                                  composed from zk_toon's charge, anchor and state message
+                                  (the state key that signs it is connector-signer's), tier
+                                  validation, and the strict reading of a request proof.
                                   tests/zk_toon_parity.rs replays zk_toon's vectors. Pure: no
                                   I/O, no clock, no connector crate
 ```

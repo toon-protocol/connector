@@ -69,7 +69,7 @@ use connector_domain::client_claim::{AllowanceClaim, AllowanceId};
 use connector_domain::AllowanceSubsidy;
 use connector_domain::{allowance_close_charge, validate_allowance_claim};
 use connector_runtime::Clock;
-use connector_zk_note::evidence::{evidence_hash, CloseRecord, GrantRecord, Record};
+use connector_zk_note::evidence::{decode_error_message, evidence_hash, Close, Grant, Record};
 use connector_zk_note::note::policy;
 use connector_zk_note::note::state::StateMessage;
 use connector_zk_note::request::{expected_tag, RequestProof};
@@ -658,6 +658,14 @@ impl ClientClaimGate {
         // Structure.
         let proof = RequestProof::parse(&request.proof)
             .map_err(|error| AllowanceRefusal::Malformed(error.to_string()))?;
+        // The evidence file frames a proof with a `u32` length, which
+        // `zk-evidence` does not check: a longer one is refused here, not
+        // truncated there.
+        if u32::try_from(proof.json().len()).is_err() {
+            return Err(AllowanceRefusal::Malformed(
+                "the request proof is too long to record as evidence".into(),
+            ));
+        }
         if decompress(&request.session_key).is_none() {
             return Err(AllowanceRefusal::Malformed(
                 "the session key is not a point on Pallas".into(),
@@ -683,7 +691,7 @@ impl ClientClaimGate {
 
         // What the proof leaves to the zk edge (decision 3, as amended).
         let state_key = edge.state_key();
-        if public.vault != state_key {
+        if proof.vault() != state_key {
             return Err(AllowanceRefusal::ForeignStateKey);
         }
         if !policy::is_request_time_fresh(public.request_time, now) {
@@ -770,15 +778,16 @@ impl ClientClaimGate {
 
         // Evidence, then the journal, then the answer.
         let allowance_id = mint_allowance_id();
-        let payload = Record::Grant(GrantRecord {
-            proof_json: proof.json().to_vec(),
+        let payload = Record::Grant(Grant {
+            proof: proof.json().to_vec(),
             allowance_id: allowance_id.as_bytes().to_vec(),
-            session_key: request.session_key.clone(),
-            expiry: request.expires_at_ms,
+            session_key_x: request.session_key.x,
+            session_key_is_odd: request.session_key.is_odd,
+            expires_at: request.expires_at_ms,
             granted_at: now,
         })
-        .to_payload()
-        .map_err(|error| AllowanceRefusal::Malformed(error.to_string()))?;
+        .encode()
+        .map_err(|error| AllowanceRefusal::Malformed(decode_error_message(&error)))?;
         // Pending until the journal holds the grant: a grant the journal
         // refuses is cut back out of the evidence file, so a retry writes
         // the only grant record for this nullifier. The file stays locked
@@ -818,7 +827,7 @@ impl ClientClaimGate {
                     expires_at_ms: request.expires_at_ms,
                     session_key: request.session_key,
                     nullifier: public.nullifier,
-                    commitment: public.commitment,
+                    commitment: proof.commitment(),
                     state: AllowanceState::Open,
                     subsidy_period: subsidy.map(|(period, _)| period),
                     closing_journaled: false,
@@ -853,9 +862,10 @@ impl ClientClaimGate {
         public: &connector_zk_note::request::RequestPublic,
         now: u64,
     ) -> Result<Option<(u64, [u8; 32])>, AllowanceRefusal> {
-        let zero = Field::from(0u64);
         if !public.subsidised {
-            if public.period != zero || public.period_nullifier != zero {
+            // zk_toon's rule for an unsubsidised proof: no period and no
+            // per-period nullifier. It reads no creation time.
+            if public.check_subsidy_period(0).is_err() {
                 return Err(AllowanceRefusal::Malformed(
                     "an unsubsidised proof states a subsidy period or per-period nullifier".into(),
                 ));
@@ -871,13 +881,22 @@ impl ClientClaimGate {
         let Some(subsidy) = edge.subsidy.as_ref() else {
             return Err(AllowanceRefusal::SubsidyBudgetClosed);
         };
-        // 2. The current period, with no grace at a boundary.
-        let current = subsidy.period(now);
-        let period = current
-            .filter(|current| public.period == Field::from(*current))
-            .ok_or_else(|| AllowanceRefusal::SubsidyPeriodNotCurrent {
-                period: connector_zk_note::note::field_to_string(public.period),
-            })?;
+        // 2. The current period, with no grace at a boundary: the edge's
+        // current period, and -- zk_toon's `check_subsidy_period`, which
+        // the circuit cannot do -- the period the proof's own request time
+        // is in, counted from this vault's creation. Just past a boundary
+        // the two differ, and a proof claiming the edge's period for a
+        // request made in the last one was proven with another creation time.
+        let not_current = || AllowanceRefusal::SubsidyPeriodNotCurrent {
+            period: public.period.to_string(),
+        };
+        let period = subsidy
+            .period(now)
+            .filter(|current| public.period == *current)
+            .ok_or_else(not_current)?;
+        public
+            .check_subsidy_period(subsidy.vault_creation_ms)
+            .map_err(|_| not_current())?;
         // 3. and 4. The budget and the per-period nullifier.
         let period_nullifier = field_to_le_bytes(public.period_nullifier);
         match self
@@ -1410,16 +1429,20 @@ impl ZkParts {
         // subsidised allowance that is nothing (decision 14), and Δ stays the
         // subsidy budget's, in the journal.
         let charge = allowance.note_charge(charge);
-        let payload = match (Record::Close(CloseRecord {
+        let payload = match (Record::Close(Close {
             nullifier: allowance.nullifier,
             allowance_id: id.as_bytes().to_vec(),
             charge,
         }))
-        .to_payload()
+        .encode()
         {
             Ok(payload) => payload,
             Err(error) => {
-                tracing::error!(allowance = %id, %error, "a close record could not be encoded");
+                tracing::error!(
+                    allowance = %id,
+                    error = %decode_error_message(&error),
+                    "a close record could not be encoded"
+                );
                 return;
             }
         };

@@ -1,25 +1,39 @@
-//! The evidence file's bytes, pinned against zk_toon#29's brief (the format is zk_toon's, ADR 0080
-//! decision 12). Every expected value below is spelled out from the brief, not recomputed by the
-//! code under test. When zk_toon's `zk-evidence` crate and its `test-vectors/zk-evidence.json`
-//! land, this file is replaced by a replay of those vectors.
+//! The evidence file's bytes, spelled out byte by byte as the connector wrote them before it
+//! encoded with zk_toon's `zk-evidence` (#1513's stand-in, written to zk_toon#29's brief). Every
+//! expected value is from that brief, not recomputed by the code under test, so these tests are
+//! the promise that an evidence file a zk edge has already written still reads back under
+//! `zk-evidence` -- the format is zk_toon's (ADR 0080 decision 12), and zk_toon's own vectors are
+//! replayed through the connector's file writer in `connector-client-edge`.
 
 use connector_zk_note::evidence::{
-    crc32c, evidence_hash, frame, header, scan, CloseRecord, EvidenceError, GrantRecord, Record,
+    evidence_hash, frame, scan, write_header, Close, DecodeError, FileError, Grant, Record,
 };
-use connector_zk_note::{CompressedPubKey, Field};
+use connector_zk_note::Field;
 use sha2::{Digest, Sha256};
 
-fn grant() -> GrantRecord {
-    GrantRecord {
-        proof_json: br#"{"publicInput":[]}"#.to_vec(),
+fn grant() -> Grant {
+    Grant {
+        proof: br#"{"publicInput":[]}"#.to_vec(),
         allowance_id: vec![0xa1, 0xa2],
-        session_key: CompressedPubKey {
-            x: Field::from(0x0102u64),
-            is_odd: true,
-        },
-        expiry: 0x0807_0605_0403_0201,
+        session_key_x: Field::from(0x0102u64),
+        session_key_is_odd: true,
+        expires_at: 0x0807_0605_0403_0201,
         granted_at: 5,
     }
+}
+
+/// CRC-32C (Castagnoli, reflected polynomial `0x82F63B78`), bit by bit: the framing's checksum,
+/// computed independently of the code under test.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
 }
 
 /// The grant above, byte by byte from the brief: kind `1`, the `JsonProof` with a `u32` LE
@@ -43,7 +57,7 @@ fn grant_payload() -> Vec<u8> {
 
 #[test]
 fn the_header_is_the_magic_and_version_one() {
-    assert_eq!(header(), *b"TOONZKEV\x01\x00");
+    assert_eq!(write_header(), b"TOONZKEV\x01\x00".to_vec());
 }
 
 #[test]
@@ -55,14 +69,14 @@ fn records_are_checksummed_with_crc32c() {
 #[test]
 fn a_grant_record_encodes_as_the_brief_spells_it_and_reads_back() {
     let record = Record::Grant(grant());
-    let payload = record.to_payload().expect("encodes");
+    let payload = record.encode().expect("encodes");
     assert_eq!(payload, grant_payload());
-    assert_eq!(Record::from_payload(&payload), Ok(record));
+    assert_eq!(Record::decode(&payload), Ok(record));
 }
 
 #[test]
 fn a_close_record_encodes_as_the_brief_spells_it_and_reads_back() {
-    let record = Record::Close(CloseRecord {
+    let record = Record::Close(Close {
         nullifier: Field::from(9u64),
         allowance_id: vec![0xbb],
         charge: 300,
@@ -73,9 +87,9 @@ fn a_close_record_encodes_as_the_brief_spells_it_and_reads_back() {
     expected.extend_from_slice(&nullifier);
     expected.extend_from_slice(&[1, 0xbb]);
     expected.extend_from_slice(&300u64.to_le_bytes());
-    let payload = record.to_payload().expect("encodes");
+    let payload = record.encode().expect("encodes");
     assert_eq!(payload, expected);
-    assert_eq!(Record::from_payload(&payload), Ok(record));
+    assert_eq!(Record::decode(&payload), Ok(record));
 }
 
 #[test]
@@ -89,8 +103,12 @@ fn a_record_is_framed_by_length_and_crc_and_hashed_over_its_payload_only() {
     assert_eq!(evidence_hash(&payload), digest);
 }
 
+fn payloads(scan: &connector_zk_note::evidence::Scan<'_>) -> Vec<Vec<u8>> {
+    scan.records.iter().map(|r| r.payload.to_vec()).collect()
+}
+
 fn file_of(payloads: &[Vec<u8>]) -> Vec<u8> {
-    let mut file = header().to_vec();
+    let mut file = write_header();
     for p in payloads {
         file.extend_from_slice(&frame(p));
     }
@@ -100,18 +118,18 @@ fn file_of(payloads: &[Vec<u8>]) -> Vec<u8> {
 #[test]
 fn a_file_reads_back_exactly_its_records() {
     let a = grant_payload();
-    let b = Record::Close(CloseRecord {
+    let b = Record::Close(Close {
         nullifier: Field::from(1u64),
         allowance_id: vec![1],
         charge: 0,
     })
-    .to_payload()
+    .encode()
     .unwrap();
     let file = file_of(&[a.clone(), b.clone()]);
     let read = scan(&file).expect("reads");
-    assert_eq!(read.records, vec![a, b]);
-    assert_eq!(read.end, file.len());
-    assert!(!read.torn);
+    assert_eq!(payloads(&read), vec![a, b]);
+    assert_eq!(read.valid_len, file.len());
+    assert!(!read.torn_tail);
 }
 
 #[test]
@@ -122,43 +140,46 @@ fn a_torn_final_record_is_ignored_and_the_end_is_before_it() {
         let mut file = file_of(&[a.clone(), a.clone()]);
         file.truncate(whole.len() + cut);
         let read = scan(&file).expect("a torn tail is not corruption");
-        assert_eq!(read.records, vec![a.clone()], "cut at {cut}");
-        assert_eq!(read.end, whole.len());
-        assert!(read.torn);
+        assert_eq!(payloads(&read), vec![a.clone()], "cut at {cut}");
+        assert_eq!(read.valid_len, whole.len());
+        assert!(read.torn_tail);
     }
     // A final record whose CRC fails is torn too.
     let mut file = file_of(&[a.clone(), a.clone()]);
     let last = file.len() - 1;
     file[last] ^= 0xff;
     let read = scan(&file).expect("torn");
-    assert_eq!(read.records, vec![a]);
-    assert!(read.torn);
+    assert_eq!(payloads(&read), vec![a]);
+    assert!(read.torn_tail);
 }
 
 #[test]
 fn a_crc_failure_before_the_end_is_corruption() {
     let a = grant_payload();
     let mut file = file_of(&[a.clone(), a]);
-    file[header().len() + 4] ^= 0xff;
-    assert!(matches!(scan(&file), Err(EvidenceError::Corrupt { .. })));
+    file[write_header().len() + 4] ^= 0xff;
+    assert!(matches!(scan(&file), Err(FileError::Corrupt { .. })));
 }
 
 #[test]
 fn an_unknown_version_or_magic_is_refused() {
-    let mut file = header().to_vec();
+    let mut file = write_header();
     file[8] = 2;
-    assert_eq!(scan(&file), Err(EvidenceError::UnknownVersion(2)));
-    let mut file = header().to_vec();
+    assert_eq!(scan(&file), Err(FileError::UnsupportedVersion(2)));
+    let mut file = write_header();
     file[0] = b'X';
-    assert_eq!(scan(&file), Err(EvidenceError::BadMagic));
+    assert_eq!(scan(&file), Err(FileError::BadMagic));
 }
 
+/// A half-written header is zk-evidence's `TruncatedHeader`; the connector's file writer treats
+/// it as a torn start and writes the header again (`evidence_file.rs`).
 #[test]
-fn an_empty_or_half_written_header_is_a_torn_start() {
-    for len in 0..header().len() {
-        let read = scan(&header()[..len]).expect("torn header");
-        assert!(read.records.is_empty());
-        assert_eq!(read.end, 0);
+fn an_empty_or_half_written_header_is_truncated() {
+    for len in 0..write_header().len() {
+        assert_eq!(
+            scan(&write_header()[..len]),
+            Err(FileError::TruncatedHeader)
+        );
     }
 }
 
@@ -169,8 +190,8 @@ fn a_non_canonical_field_element_is_refused() {
     payload.extend_from_slice(&[1, 0xbb]);
     payload.extend_from_slice(&0u64.to_le_bytes());
     assert_eq!(
-        Record::from_payload(&payload),
-        Err(EvidenceError::NonCanonicalField)
+        Record::decode(&payload),
+        Err(DecodeError::NonCanonicalField)
     );
 }
 
@@ -179,7 +200,7 @@ fn an_allowance_id_over_64_bytes_is_refused() {
     let mut long = grant();
     long.allowance_id = vec![0; 65];
     assert_eq!(
-        Record::Grant(long).to_payload(),
-        Err(EvidenceError::AllowanceIdTooLong(65))
+        Record::Grant(long).encode(),
+        Err(DecodeError::AllowanceIdTooLong(65))
     );
 }

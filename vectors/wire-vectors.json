@@ -1258,7 +1258,7 @@
     ]
   },
   "zk_note": {
-    "zk_toon_commit": "7b399412ffd70966c5e5d35a139928a697460ca7",
+    "zk_toon_commit": "0d6b10c332558caf7d8d6350e14b19d68f443f2c",
     "signing": {
       "domain_string": "CodaSignature",
       "network_id": "devnet",
