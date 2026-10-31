@@ -315,9 +315,12 @@ price = {PRICE}
         "{message}"
     );
 
-    // At the watermark, and over the ceiling (the channel holds 5000 drops).
+    // At and below the watermark, and over the ceiling (the channel holds
+    // 5000 drops).
     let at = refusal(pay(voucher(Some(NETWORK), &channel, PRICE, signer)).await);
     assert!(at.contains("advances value by 0"), "{at}");
+    let below = refusal(pay(voucher(Some(NETWORK), &channel, PRICE - 1, signer)).await);
+    assert!(below.contains("does not strictly exceed"), "{below}");
     let over = refusal(pay(voucher(Some(NETWORK), &channel, 5_001, signer)).await);
     assert!(over.contains("could never be landed"), "{over}");
 
@@ -355,7 +358,9 @@ price = {PRICE}
             .sign_claim(&channel_bytes(&channel), 100)
             .expect("a claim")
     ));
-    assert_eq!(claim_state(&app, replayed).await["ok"], false);
+    let state = claim_state(&app, replayed).await;
+    assert_eq!(state["ok"], false, "{state}");
+    assert_eq!(state["error"], "unverified", "{state}");
     // An unconfigured network is refused by name.
     let state = claim_state(&app, proof(signer, "xrpl:0")).await;
     assert_eq!(state["error"], "network-not-settled", "{state}");
@@ -396,7 +401,9 @@ price = {PRICE}
     let (status, failed) = operator_write(&app, &operator, 1_001, &land).await;
     assert!(!status.is_success(), "{status}: {failed}");
     assert!(
-        failed.to_string().contains("delivered nothing"),
+        failed
+            .to_string()
+            .contains("answered tesSUCCESS but delivered nothing"),
         "a land that delivered nothing is reported as one: {failed}"
     );
 }

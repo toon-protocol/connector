@@ -1143,7 +1143,9 @@ async fn a_client_pays_over_xrpl_and_recovers_its_watermark_from_the_node() {
     // A challenge for one network is no proof on another.
     let mut wrong = entry(&payer, "xrpl:1");
     wrong["network"] = json!("xrpl:1000");
-    assert_eq!(state(wrong).await["ok"], false);
+    let wrong = state(wrong).await;
+    assert_eq!(wrong["ok"], false, "{wrong}");
+    assert_eq!(wrong["error"], "unverified", "{wrong}");
     let elsewhere = state(entry(&payer, "xrpl:1")).await;
     assert_eq!(elsewhere["error"], "network-not-settled", "{elsewhere}");
     let mut unnamed = entry(&payer, "xrpl:1000");
