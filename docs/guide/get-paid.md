@@ -1,8 +1,8 @@
 # 3. Get paid
 
 A price makes a route cost something. A **settlement backend** is what lets
-anyone actually pay it. There are two chains, and a node may carry either
-table or both — with both, it accepts vouchers on both at once. Every channel
+anyone actually pay it. There are three families of chain — EVM, Solana and [XRPL](#xrpl) — and a node
+may carry any of their tables, accepting vouchers on all of them at once. Every channel
 is an **x402 `batch-settlement` channel**
 ([ADR 0075](../adr/0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)):
 on EVM that is x402's audited `x402BatchSettlement` contract, and on Solana
@@ -101,6 +101,99 @@ serve (ADR 0075 decision 1). The Solana backend proves the program account
 behaves like `payment-channels`, that `token_address` is an SPL mint, and asks
 the chain its own genesis hash so a voucher declaring the wrong cluster is
 refused.
+
+## XRPL
+
+XRPL is a third family, and the odd one out in three ways: there is **nothing
+to deploy** (a channel is the ledger's own `PayChannel`), a channel holds **XRP
+and nothing else**, and a claim **binds no network**
+([ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)).
+Each network is its own table, keyed by the `network_id` the ledger reports:
+`0` mainnet, `1` testnet, `2` devnet.
+
+```toml
+[settlement.xrpl.1]                      # testnet
+rpc_url = "https://s.altnet.rippletest.net:51234"
+# min_settle_delay_secs  = 86400         # default one day; must exceed 901
+# redemption_safety_secs = 60            # default 60; below the delay
+# max_fee_drops          = 100000        # the most one transaction may pay
+
+[settlement.xrpl.1.key]
+key_file = "/app/data/settlement-xrpl.key"
+```
+
+There is no `token_address`, `decimals` or contract to write. The key file holds
+an XRPL **family seed** (`s…` for secp256k1, `sEd…` for Ed25519), not 32 bytes:
+`openssl rand -hex 32` makes a key the node cannot read here. Generate one with
+any XRPL tool (`rippled`'s `wallet_propose`, or a wallet's "new account"), keep
+it out of git, and mount it like the others. Starting the node does not create
+the account — see funding, next.
+
+**Use a different XRPL account on testnet than on mainnet.** An XRPL claim
+carries no network id, so a voucher signed on testnet verifies on mainnet too
+for anyone who holds a channel there with the same id. The node refuses to boot
+if two of its own `[settlement.xrpl.<id>]` tables resolve to one account, but
+it cannot see another node, nor a key you reused by hand elsewhere. Give every
+network its own seed and never carry a mainnet seed to a testnet box.
+
+**Fund the account before you start.** An XRPL account exists only once
+something pays it, and it is useful only above the ledger's reserves:
+
+- the **base reserve** (read off the ledger, not written in the config) keeps
+  the account alive — a node whose account is missing, or holds less than it, is
+  refused at boot, by name;
+- an **owner reserve** (0.2 XRP on 2026-10-28) is locked for every channel this
+  node opens, until that channel is deleted — one per peering, for you;
+- **fees are paid in XRP**, by the party that sends the transaction. Landing a
+  voucher costs you a fee; nobody sponsors it, and no second coin is needed.
+
+On testnet and devnet the ledger's own faucet funds an account. On mainnet you
+send the XRP.
+
+The node checks the `network_id` its `rpc_url` reports against the table key at
+boot and refuses a mismatch, so a testnet endpoint under `[settlement.xrpl.0]`
+cannot start. It does **not** check the PayChan amendment: testnet reports it
+disabled while channels work.
+
+**Settling XRP in a peering needs a rate.** A channel holds XRP, so a leg on
+XRPL is a dealing boundary ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md); `local/dealing` is a worked one)
+whenever the other side holds anything else. Declare the asset in `[[tokens]]`
+under its CAIP-19 name, `xrpl:<id>/slip44:144`, and give the pair a static
+`[[rates]]` row; XRPL has no rate source, and with no rate there is no forward:
+
+```toml
+[[tokens]]
+asset     = "eip155:84532/erc20:0x0C996d7c934c79a6255254875607Fe69df25C0E1"
+numeraire = true
+
+[[tokens]]
+asset = "xrpl:1/slip44:144"
+
+# 1 drop is 1e-6 XRP; the figure is a mid over base units, as every row is.
+[[rates]]
+from = "eip155:84532/erc20:0x0C996d7c934c79a6255254875607Fe69df25C0E1"
+to   = "xrpl:1/slip44:144"
+rate = { numerator = 2, denominator = 1 }
+
+# Required as a set once any [[rates]] row exists: the spread is what dealing
+# earns you, and it is also your cover against XRP moving after you declared.
+[rate_guards]
+spread    = { numerator = 1, denominator = 100 }
+ttl_secs  = 300
+max_move  = { numerator = 5, denominator = 100 }
+```
+
+`xrpl:native`, and every other `<chain>:native` spelling, is refused by name.
+XRP on testnet is a different asset from XRP on mainnet, so a forward between two
+XRPL tables needs a row too.
+
+**What a payer's exit does.** When a payer sets an `Expiration` to leave, your
+node lands its latest voucher _and closes the channel_ in one transaction, so
+you are paid and the payer refunded before its delay can run out on you. A payer
+that began an exit and then wanted to renew loses that chance. A channel that
+carries a `CancelAfter`, an `Expiration` already set, a `SettleDelay` below your
+minimum, or a `Destination` that is not your account is refused on its first
+voucher.
 
 **You do not list the channels your payers will use, and you could not** — a
 client's channel does not exist until that client opens it toward you, long
