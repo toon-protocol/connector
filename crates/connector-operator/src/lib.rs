@@ -707,7 +707,7 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
 ///   connector will forward to `id` in one packet, refused `T04` above it.
 ///   Omitted -- or zero -- keeps `DEFAULT_MAX_PACKET_AMOUNT`; no value
 ///   here removes the bound.
-/// * `network` (CAIP-2, `eip155:8453` or `solana:<genesis prefix>`) chooses
+/// * `network` (CAIP-2, `eip155:8453`, `solana:<genesis prefix>` or `xrpl:0`) chooses
 ///   the one network the peering is on -- both of its channels (ADR 0086
 ///   decisions 11 and 12). Left out, a single shared network is used and
 ///   several are refused as `AmbiguousNetwork`, naming them, rather than
@@ -782,7 +782,6 @@ fn establish_peering_error_response(error: EstablishPeeringError) -> Response {
         | EstablishPeeringError::UnreadableSettlementAddress { .. }
         | EstablishPeeringError::NetworkMismatch { .. }
         | EstablishPeeringError::NoVoucherSigner { .. }
-        | EstablishPeeringError::ChainNotPeerable { .. }
         | EstablishPeeringError::InvalidTerms { .. } => {
             (StatusCode::BAD_GATEWAY, error.to_string()).into_response()
         }

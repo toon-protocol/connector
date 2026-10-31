@@ -102,8 +102,9 @@ impl ClientChannelAssets {
     /// admitted.
     ///
     /// On a chain where this node holds several networks -- several EVM
-    /// tables (ADR 0086) -- the key alone does not say which, and this
-    /// answers `None`: ask [`Self::asset_on`] with the channel's network.
+    /// tables (ADR 0086), or several XRPL ones (ADR 0087) -- the key alone
+    /// does not say which, and this answers `None`: ask [`Self::asset_on`]
+    /// with the channel's network.
     ///
     /// On a zk edge, an allowance's key (`zk-note:<allowance id>`) resolves
     /// to the vault's asset (ADR 0080 decision 7, as amended), whatever the
@@ -114,7 +115,8 @@ impl ClientChannelAssets {
 
     /// [`Self::asset`], for a channel on `network` when it is known: the
     /// network the channel was verified on picks the table among several
-    /// of the key's chain. A Solana channel is matched by chain alone, since
+    /// of the key's chain (EVM or XRPL: XRP on one XRPL network is another
+    /// asset than XRP on the next). A Solana channel is matched by chain alone, since
     /// a node holds one Solana table and config cannot know its cluster's
     /// genesis prefix. `None` for a network this node resolved nothing on,
     /// and for an unknown network on a chain with several tables.
@@ -133,7 +135,7 @@ impl ClientChannelAssets {
             // One table on the key's chain: it is the channel's, as it
             // always was.
             ([only], _, _) => Some(only),
-            (several, AssetChain::Evm, Some(network)) => several
+            (several, AssetChain::Evm | AssetChain::Xrpl, Some(network)) => several
                 .iter()
                 .find(|asset| asset.network() == network)
                 .copied(),
@@ -291,6 +293,33 @@ mod tests {
             Some(&asset(USDC_BASE))
         );
         assert_eq!(resolved.asset_on(&key, Some(&Network::Eip155(1))), None);
+    }
+
+    /// ADR 0087 decision 6.5: two XRPL tables are two networks and two XRP
+    /// assets, and the channel's network says which -- the key alone never
+    /// does, or a forward between them would read as one asset, which is a
+    /// pass-through where a conversion is owed.
+    #[test]
+    fn two_xrpl_networks_answer_by_the_channels_network() {
+        let resolved = assets(&[
+            (SettlementChain::Xrpl, "xrpl:1/slip44:144"),
+            (SettlementChain::Xrpl, "xrpl:0/slip44:144"),
+        ]);
+        let key = format!("xrpl:{}", "ab".repeat(32));
+
+        assert_eq!(resolved.asset(&key), None, "never guessed");
+        assert_eq!(
+            resolved.asset_on(&key, Some(&"xrpl:0".parse().expect("a network"))),
+            Some(&asset("xrpl:0/slip44:144"))
+        );
+        assert_eq!(
+            resolved.asset_on(&key, Some(&"xrpl:1".parse().expect("a network"))),
+            Some(&asset("xrpl:1/slip44:144"))
+        );
+        assert_eq!(
+            resolved.asset_on(&key, Some(&"xrpl:2".parse().expect("a network"))),
+            None
+        );
     }
 
     /// A node that declares no tokens, and a key in a namespace no

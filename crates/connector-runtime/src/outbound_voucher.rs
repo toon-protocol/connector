@@ -34,6 +34,7 @@ use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 
 use crate::batch_channels::hex;
+use crate::connector::hex_lower;
 
 /// How long a challenge this node signs is valid for, in seconds. Short on
 /// purpose: within it a challenge is a bearer proof for zero-value traffic
@@ -103,7 +104,20 @@ pub fn voucher_json(
             "expiresAt": 0,
             "signature": bs58::encode(&voucher.signature).into_string(),
         }),
-        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
+        // ADR 0087 decision 2: the channel id in bare hex and the signature in
+        // hex (DER for a secp256k1 key, raw for an Ed25519 one).
+        ChannelPresentation::Xrpl { channel } => serde_json::json!({
+            "version": "1.0",
+            "blockchain": "xrpl",
+            "network": network.to_string(),
+            "scheme": "batch-settlement",
+            "messageId": message_id,
+            "timestamp": timestamp,
+            "senderId": sender_id,
+            "channelId": channel.0,
+            "maxClaimableAmount": amount,
+            "signature": hex_lower(&voucher.signature),
+        }),
     }
     .to_string()
 }
@@ -139,7 +153,14 @@ pub fn challenge_entry(
             "expires": expires,
             "signature": BASE64.encode(signature),
         }),
-        ChannelPresentation::Xrpl { .. } => unreachable!("no payer settles on XRPL yet"),
+        ChannelPresentation::Xrpl { channel } => serde_json::json!({
+            "blockchain": "xrpl",
+            "network": network.to_string(),
+            "scheme": "batch-settlement",
+            "channelId": channel.0,
+            "expires": expires,
+            "signature": hex_lower(signature),
+        }),
     }
 }
 

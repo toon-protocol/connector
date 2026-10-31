@@ -327,6 +327,33 @@ mod tests {
         assert_eq!(resolved.boundary_between("in", "out"), None);
     }
 
+    /// ADR 0087 decision 6.5, ADR 0086 decision 13: XRP on testnet is never
+    /// XRP on mainnet, so a forward between two XRPL networks is a forward
+    /// between two assets -- a boundary at a declared rate in each direction,
+    /// and never a pass-through.
+    #[test]
+    fn a_forward_between_two_xrpl_networks_is_a_boundary() {
+        let resolved = assets(&[
+            ("testnet", "xrpl:1/slip44:144"),
+            ("mainnet", "xrpl:0/slip44:144"),
+            ("also-testnet", "xrpl:1/slip44:144"),
+        ]);
+
+        assert_eq!(
+            resolved.boundary_between("testnet", "mainnet"),
+            Some((&asset("xrpl:1/slip44:144"), &asset("xrpl:0/slip44:144")))
+        );
+        assert_eq!(
+            resolved.boundary_between("mainnet", "testnet"),
+            Some((&asset("xrpl:0/slip44:144"), &asset("xrpl:1/slip44:144")))
+        );
+        assert_eq!(
+            resolved.boundary_between("testnet", "also-testnet"),
+            None,
+            "XRP on one network is one asset"
+        );
+    }
+
     /// A peering this table never resolved -- one established at runtime
     /// (ADR 0058), or every peering of a node that declares no tokens.
     #[test]

@@ -187,6 +187,21 @@ pub enum RuntimePeerChannel {
         /// The CAIP-2 network the two share, `solana:<genesis prefix>`.
         network: String,
     },
+    /// An x402 XRPL peering (ADR 0087, ADR 0075 decisions 4 and 6): this
+    /// node's outbound `PayChannel` toward the peer, and the peer's voucher
+    /// signer.
+    #[serde(rename = "xrpl-voucher")]
+    XrplVoucher {
+        /// This node's outbound channel toward the peer, 64 lowercase hex:
+        /// the channel every forward to the peer is covered on.
+        outbound_channel_id: String,
+        /// The peer's voucher signer as its self-description published it
+        /// (its 33-byte channel key), hex: a channel toward this node whose
+        /// `PublicKey` it is, is the peer's.
+        voucher_signer: String,
+        /// The CAIP-2 network the two share, `xrpl:<id>`.
+        network: String,
+    },
 }
 
 impl RuntimePeerChannel {
@@ -202,6 +217,10 @@ impl RuntimePeerChannel {
                 ..
             }
             | RuntimePeerChannel::SolanaVoucher {
+                outbound_channel_id,
+                ..
+            }
+            | RuntimePeerChannel::XrplVoucher {
                 outbound_channel_id,
                 ..
             } => outbound_channel_id,
@@ -224,7 +243,8 @@ impl RuntimePeerChannel {
                 counterparty_key, ..
             } => counterparty_key,
             RuntimePeerChannel::EvmVoucher { voucher_signer, .. }
-            | RuntimePeerChannel::SolanaVoucher { voucher_signer, .. } => voucher_signer,
+            | RuntimePeerChannel::SolanaVoucher { voucher_signer, .. }
+            | RuntimePeerChannel::XrplVoucher { voucher_signer, .. } => voucher_signer,
         }
     }
 }

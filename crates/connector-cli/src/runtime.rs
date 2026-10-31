@@ -1063,8 +1063,8 @@ pub struct Runtime {
     pub batch_settlement_solana: Option<Arc<SolanaBatchSettlement>>,
     /// The XRPL twin of [`Self::batch_settlement_evm`] (ADR 0087): the
     /// receiving half over each `[settlement.xrpl.<id>]` table, keyed by its
-    /// CAIP-2 network. No paying half is built on XRPL yet, so none is among
-    /// the outbound channels' payers.
+    /// CAIP-2 network, which is also that network's payer among the outbound
+    /// channels'.
     pub batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
     /// over the paying half of the backends above and journaled to
@@ -1594,12 +1594,15 @@ async fn restore_outbound_channels(
             Arc::clone(solana) as Arc<dyn BatchSettlementPayer>,
         ));
     }
-    // An XRPL table has no paying half yet (ADR 0087), so it adds no payer
-    // -- but a node that settles on XRPL alone still has the channels the
-    // operator surface lists, which hang off this record, and a journal that
-    // holds an outbound channel it can no longer pay from is refused by name
-    // rather than forgotten.
-    if payers.is_empty() && xrpl.is_empty() {
+    // ADR 0087: each XRPL table's backend is its network's payer as well as
+    // its receiver.
+    payers.extend(xrpl.iter().map(|(network, backend)| {
+        (
+            network.clone(),
+            Arc::clone(backend) as Arc<dyn BatchSettlementPayer>,
+        )
+    }));
+    if payers.is_empty() {
         return Ok(None);
     }
     let (journal, path): (Arc<dyn Journal>, PathBuf) = match config.state_dir() {

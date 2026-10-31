@@ -150,6 +150,28 @@ channel the ledger no longer holds reads as `ChannelNotFound` on the receiving h
 remembered as done, so the runtime does not retry it. A payer that began an exit and wanted to
 `tfRenew` loses that chance, as decision 8 accepts.
 
+## Update (issue #1616): peering, payouts and dealing over XRPL
+
+An XRPL table is its network's payer as well as its receiver. `POST /peers` toward a peer that
+publishes an XRPL entry opens this node's outbound `PayChannel` by its own submission
+(`PaymentChannelCreate` under the settlement key; there is no sponsor endpoint), binds the peer's
+published channel key as the voucher signer of the peering's inbound half, and records the peering as
+`RuntimePeerChannel::XrplVoucher`. A peering's two channels share one network: the peer's entry is
+chosen by `network: xrpl:<id>` when several are shared (0086 decisions 11-12). A channel's receiver is
+kept as the classic address its `Destination` names, so "a channel toward this party" is matched by
+the address the party's one key derives, which is also how a client payout finds the channel toward a
+client's account. `/fund`, `/withdraw` and a peer's `claim-state` ask are the chain-generic paths; a
+voucher and a claim-state challenge ride a peer carriage in the receiving half's own JSON.
+
+A forward between two XRPL networks is a forward between two assets (decision 6.5): a channel's
+network picks its table's asset among several XRPL tables, exactly as it does among EVM ones, so such
+a forward reads as a denomination boundary and needs a `[[rates]]` row, never a pass-through.
+
+The tests that hold it, against a spawned `xrpld` (and an anvil for dealing), are
+`xrpl_peering.rs`, `client_payout_xrpl.rs` and `xrpl_dealing.rs` in `connector-cli`. The `/withdraw`
+test uses a channel toward a bare account: a peer node's own watcher answers the exit with `tfClose`
+at once (decision 8), which ends the channel before its payer's second call.
+
 ## Considered options
 
 - **Track PR #2952 loosely.** Rejected by 0085 decision 2.
