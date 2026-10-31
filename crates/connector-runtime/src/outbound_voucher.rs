@@ -34,6 +34,7 @@ use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 
 use crate::batch_channels::hex;
+use crate::connector::hex_lower;
 
 /// How long a challenge this node signs is valid for, in seconds. Short on
 /// purpose: within it a challenge is a bearer proof for zero-value traffic
@@ -42,11 +43,6 @@ use crate::batch_channels::hex;
 /// (`peer-carriage-spec.md` §1.2), which absorbs clock skew between two
 /// operators' hosts.
 pub const PEER_CHALLENGE_TTL_SECS: u64 = 60;
-
-/// Bare lowercase hex, which is how an XRPL signature is spelled on the wire.
-fn bare_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 
 fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
     serde_json::json!({
@@ -120,7 +116,7 @@ pub fn voucher_json(
             "senderId": sender_id,
             "channelId": channel.0,
             "maxClaimableAmount": amount,
-            "signature": bare_hex(&voucher.signature),
+            "signature": hex_lower(&voucher.signature),
         }),
     }
     .to_string()
@@ -163,7 +159,7 @@ pub fn challenge_entry(
             "scheme": "batch-settlement",
             "channelId": channel.0,
             "expires": expires,
-            "signature": bare_hex(signature),
+            "signature": hex_lower(signature),
         }),
     }
 }

@@ -102,8 +102,9 @@ impl ClientChannelAssets {
     /// admitted.
     ///
     /// On a chain where this node holds several networks -- several EVM
-    /// tables (ADR 0086), or several XRPL ones (ADR 0087) -- the key alone does not say which, and this
-    /// answers `None`: ask [`Self::asset_on`] with the channel's network.
+    /// tables (ADR 0086), or several XRPL ones (ADR 0087) -- the key alone
+    /// does not say which, and this answers `None`: ask [`Self::asset_on`]
+    /// with the channel's network.
     ///
     /// On a zk edge, an allowance's key (`zk-note:<allowance id>`) resolves
     /// to the vault's asset (ADR 0080 decision 7, as amended), whatever the

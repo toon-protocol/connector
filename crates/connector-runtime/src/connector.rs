@@ -1392,7 +1392,8 @@ impl Connector {
     /// whose `claim-state` is the watermark authority on restore.
     ///
     /// Anything but an x402 binding ([`RuntimePeerChannel::EvmVoucher`],
-    /// [`RuntimePeerChannel::SolanaVoucher`], [`RuntimePeerChannel::XrplVoucher`]) registers nothing.
+    /// [`RuntimePeerChannel::SolanaVoucher`],
+    /// [`RuntimePeerChannel::XrplVoucher`]) registers nothing.
     ///
     /// The claim-state ask leaves on the node's `socks_proxy` when the
     /// peer's client edge is an onion host (ADR 0070), by the one host rule
