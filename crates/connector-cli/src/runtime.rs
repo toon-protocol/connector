@@ -4060,7 +4060,10 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 &evm_key,
                 &format!(
                     "{}{}\n[settlement.xrpl.1000]\nrpc_url = \"{}\"\n\n\
-                     [settlement.xrpl.1000.key]\nkey_file = \"{}\"\n",
+                     [settlement.xrpl.1000.key]\nkey_file = \"{}\"\n\n\
+                     [[tokens]]\nasset = \"xrpl:1000/slip44:144\"\n\n\
+                     [[tokens]]\nasset = \"eip155:31337/erc20:{token:#x}\"\n\n\
+                     [[tokens]]\nasset = \"solana:LocaLSoLanaVaLidatorGenesis11111/token:{token_mint}\"\n",
                     evm_table(&anvil.rpc_url, token, 6, &evm_key),
                     solana_table(
                         &validator.rpc_url,

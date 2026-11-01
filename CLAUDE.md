@@ -123,8 +123,8 @@ runs four of them: `solo` (one node, EVM, Solana and XRPL backends live at once)
 nodes, EVM on one leg and Solana on the other, with the middle node holding both
 backends) and `dealing` (ADR 0071 — `mixed-chain`'s shape with the middle node
 **dealing**: 6-decimal mock USDC in, a 9-decimal mock SPL token out, converted at
-a rate it declares, and the only committed config here that declares
-`[[tokens]]`). The fifth is `onion` (ADR 0070): two nodes, each with a real `anon`
+a rate it declares, and the only committed config here that declares a rate;
+`solo` declares `[[tokens]]` only because an XRPL table requires them). The fifth is `onion` (ADR 0070): two nodes, each with a real `anon`
 sidecar, on separate docker networks with **no route between them**, so that a
 fulfilled packet is evidence of a circuit rather than of a docker network. It is
 deliberately **off** the CI gate and must stay off it — a gate that goes red when

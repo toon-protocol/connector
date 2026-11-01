@@ -46,7 +46,8 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 /// [`PeeringAssets`](crate::PeeringAssets): a node that declares no
 /// `[[tokens]]` resolves nothing here, gains no required key and no new
 /// refusal, and forwards a client arrival exactly as it did before ADR
-/// 0071.
+/// 0071. XRPL is the exception: a node with an XRPL table must declare
+/// tokens ([`ConfigError::XrplSettlementWithoutTokens`], #1636).
 ///
 /// A pure function of loaded config, read on the forwarding path for every
 /// forward, where there is no I/O to do and no chain to ask.
@@ -75,9 +76,8 @@ impl ClientChannelAssets {
     }
 
     /// Whether this node resolved no client channel at all -- `true` for
-    /// every node that declares no `[[tokens]]`, which is every config this
-    /// repository ships. The question a caller asks before any other, since
-    /// `true` means no forward out of a client arrival can be a conversion.
+    /// every node that declares no `[[tokens]]`. The question a caller asks
+    /// before any other, since `true` means no forward out of a client arrival can be a conversion.
     pub fn is_empty(&self) -> bool {
         self.assets.is_empty()
     }

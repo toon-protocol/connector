@@ -111,7 +111,7 @@ healthy, with the reason in its log.
 | [`solo/`](solo/)               | 1     | The image boots on a mounted config with **every** settlement backend live at once (EVM on two networks, Solana, and XRPL on a stand-alone `xrpld`), and a real packet reaches the app behind its one route.                                                                                                                                                                          |
 | [`two-hop/`](two-hop/)         | 2     | Two images peered over ILP-over-HTTP on two x402 channels on anvil. B **prices** the route it terminates; A covers each crossing with a voucher before sending it, and the crossing can only reach B's app in the **peer role**.                                                                                                                                                      |
 | [`mixed-chain/`](mixed-chain/) | 3     | A↔B settles on EVM **over BTP**, B↔C on Solana (`payment-channels`) **over ILP-over-HTTP**, and B holds both backends. One packet crosses two chains _and_ two carriages — the only place a shipped image carries a packet over BTP at all.                                                                                                                                           |
-| [`dealing/`](dealing/)         | 3     | The same three-node, two-chain shape as `mixed-chain`, with the middle node **dealing**: 6-decimal USDC in on the EVM leg, a **9-decimal** mock SPL token out on the Solana leg, converted at a rate B declares and a spread B earns (ADR 0071). The only place a shipped image converts anything, and the only committed fixture here that declares `[[tokens]]`.                    |
+| [`dealing/`](dealing/)         | 3     | The same three-node, two-chain shape as `mixed-chain`, with the middle node **dealing**: 6-decimal USDC in on the EVM leg, a **9-decimal** mock SPL token out on the Solana leg, converted at a rate B declares and a spread B earns (ADR 0071). The only place a shipped image converts anything, and the only committed fixture here that declares a rate.                          |
 | [`onion/`](onion/)             | 2     | The peering rides a **real onion network**: each node is reachable only at a `.anyone` address its `anon` sidecar generates, and the two connectors are on separate docker networks with **no route between them**, so a direct dial is impossible rather than merely unobserved. The only topology where an endpoint's HOST decides how it is dialed (ADR 0070). Not on the CI gate. |
 | [`anyone/`](anyone/)           | 1     | The **client edge** over the same overlay, with the real payer: [`toon-client`](https://github.com/toon-protocol/toon-client) discovering, pricing and paying this node over a circuit. Needs that repository built, so it is run by its own `run.sh` rather than by `LOCAL_TOPOLOGY`. Not on the CI gate.                                                                            |
 
@@ -251,8 +251,9 @@ that stopped covering is also refused on the wire.
 ## The dealing topology
 
 `dealing` is the only stack in this repository where a **shipped image converts
-an amount**, and the only committed config here that declares `[[tokens]]` at
-all. Its middle node holds a 6-decimal USDC channel on anvil and a
+an amount**, and the only committed config here that declares a rate. (`solo`
+declares `[[tokens]]` too, one per table, because an XRPL table refuses to boot
+without them; it holds no peering and converts nothing.) Its middle node holds a 6-decimal USDC channel on anvil and a
 **9-decimal** mock SPL channel on the local validator — two genuinely different
 tokens — so every forward across it sits on a **denomination boundary** and is
 refused unless a rate for that ordered pair has been declared (ADR 0071

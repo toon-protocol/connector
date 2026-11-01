@@ -190,6 +190,13 @@ An `entryNotFound` is not a deletion when the validated ledger it was answered f
 - **Accepted cost.** A channel really deleted inside the open window (100 ledgers, about six minutes) by anything but this node's own landed `tfClose` reads as inconclusive until the bound passes — after a restart, and in process too when the receiver deleted it: a retryable error, not a second channel or a voucher refused for good.
 - **Not covered.** The receiving half and the watcher have no record to bound by (#1640).
 
+## Update (issue #1636): a node with an XRPL table must declare `[[tokens]]`
+
+- **The gap.** Decision 6.4 says an XRPL peering forces the XRP asset into `[[tokens]]`, but that rule only held a node that already declared tokens. With none, every peering's asset resolved to nothing and no forward was a crossing. Run against real anvil and `xrpld`, 10,000 USDC base units reached the payee as 9,700 drops: par, less the 300-drop fee, where the declared-rate test expects 19,500.
+- **The decision (owner, 2026-11-01).** `Config::load` refuses a config with a `[settlement.xrpl.<id>]` table and no `[[tokens]]`, by name (`XrplSettlementWithoutTokens`), before any value moves. This covers peerings made at runtime as well as those in config.
+- **No carve-out.** A node on one network holding only XRP is refused too. It adds one row, and the rule needs no check of whether a config can cross assets.
+- **What it does not require.** No numeraire, rate or guard: a missing rate stays a per-forward `F02`. Once any token is declared, `ClientChannelTokenNotDeclared` already requires one per settlement table, so `local/solo` declares four. A node with no XRPL table keeps [0086](0086-a-node-settles-on-more-than-one-evm-network.md) decision 13's pass-through.
+
 ## Considered options
 
 - **Track PR #2952 loosely.** Rejected by 0085 decision 2.

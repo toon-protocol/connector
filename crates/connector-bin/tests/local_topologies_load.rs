@@ -1522,6 +1522,21 @@ fn solos_xrpl_leg_runs_the_harness_chain_and_is_funded_from_genesis() {
     let raw: toml::Value = toml::from_str(SOLO_CONFIG).expect("local/solo/connector.toml parses");
     let table = &raw["settlement"]["xrpl"][STANDALONE_NETWORK_ID.to_string()];
     assert_eq!(table["rpc_url"].as_str(), Some("http://xrpld:5005"));
+    let tokens: Vec<&str> = raw["tokens"]
+        .as_array()
+        .expect("an XRPL table refuses to boot with no [[tokens]] (#1636)")
+        .iter()
+        .map(|row| row["asset"].as_str().expect("an asset"))
+        .collect();
+    assert!(
+        tokens.contains(&format!("xrpl:{STANDALONE_NETWORK_ID}/slip44:144").as_str()),
+        "{tokens:?}"
+    );
+    assert_eq!(tokens.len(), 4, "one per settlement table: {tokens:?}");
+    assert!(
+        raw.get("rates").is_none() && raw.get("rate_guards").is_none(),
+        "solo declares what its tables hold and converts nothing"
+    );
     assert_eq!(
         table["key"]["key_file"].as_str(),
         Some("/app/data/settlement-xrpl.key"),

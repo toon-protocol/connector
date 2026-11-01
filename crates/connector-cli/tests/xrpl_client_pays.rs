@@ -252,6 +252,9 @@ redemption_safety_secs = 90
 [settlement.xrpl.{STANDALONE_NETWORK_ID}.key]
 key_file = "{node_key}"
 
+[[tokens]]
+asset = "xrpl:{STANDALONE_NETWORK_ID}/slip44:144"
+
 [[routes]]
 prefix = "{ROUTE}"
 handler_url = "http://{app_addr}"

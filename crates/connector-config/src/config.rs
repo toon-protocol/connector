@@ -553,6 +553,22 @@ impl Config {
             &SettledNetworks::of(&settlements),
             zk_note.as_ref().map(ZkNoteConfig::asset).as_ref(),
         )?;
+        // ADR 0087 decision 6 (#1636): every XRPL leg is a dealing boundary,
+        // and a node that declares no token resolves no peering, so it would
+        // cross that boundary unconverted. Refused here, before any value
+        // moves. Which tokens it must declare is
+        // `resolve_client_channel_assets`'s rule below, once it declares any.
+        if !denomination.declares_tokens() {
+            if let Some(xrpl) = settlements.iter().find_map(|settlement| match settlement {
+                SettlementConfig::Xrpl(xrpl) => Some(xrpl),
+                _ => None,
+            }) {
+                return Err(ConfigError::XrplSettlementWithoutTokens {
+                    table: format!("[settlement.{}]", xrpl.table_name()),
+                    asset: xrpl.asset().to_string(),
+                });
+            }
+        }
         // ADR 0080 decision 7, as amended: a zk edge prices in MINA, and a
         // forward out of it is paid in a settlement asset, so it crosses a
         // denomination at a rate the operator declared -- no TWAP source
@@ -3663,6 +3679,96 @@ controller_keys_file = "{}"
         let error = result.expect_err("expected this config to be refused at load");
         assert!(predicate(&error), "wrong error variant: {error:?}");
         error.to_string()
+    }
+
+    /// A complete `[settlement.xrpl.<network>]` table, its key file named but
+    /// never read at load.
+    fn xrpl_settlement(network: u32, key_path: &Path) -> String {
+        format!(
+            r#"
+[settlement.xrpl.{network}]
+rpc_url = "http://127.0.0.1:5005"
+
+[settlement.xrpl.{network}.key]
+key_file = "{key}"
+"#,
+            key = key_path.display(),
+        )
+    }
+
+    /// A node with `tables` and nothing else that could be refused. Load
+    /// only checks that `state_dir` is named, and creates nothing there.
+    fn node_settling_on(key_path: &Path, tables: &str) -> String {
+        format!(
+            r#"
+client_edge_addr = "127.0.0.1:3000"
+state_dir = "{state_dir}"
+
+[signer]
+key_file = "{key}"
+{tables}
+"#,
+            state_dir = std::env::temp_dir().display(),
+            key = key_path.display(),
+        )
+    }
+
+    /// ADR 0087 decision 6: every XRPL leg is a dealing boundary. With no
+    /// `[[tokens]]` no forward would ever be a crossing, and testnet XRP
+    /// would reach mainnet XRP at par (#1636). There is no carve-out for a
+    /// node on one network holding only XRP: this is that node, the simplest
+    /// shape there is, and it adds one row.
+    #[test]
+    fn an_xrpl_table_with_no_tokens_is_refused_by_name() {
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let tables = xrpl_settlement(1000, key_file.path());
+
+        let message = expect_error(
+            load_text(&node_settling_on(key_file.path(), &tables)),
+            |error| {
+                matches!(
+                    error,
+                    ConfigError::XrplSettlementWithoutTokens { table, asset }
+                        if table == "[settlement.xrpl.1000]"
+                            && asset == "xrpl:1000/slip44:144"
+                )
+            },
+        );
+        assert!(
+            message.contains("[settlement.xrpl.1000]")
+                && message.contains("[[tokens]]")
+                && message.contains("xrpl:1000/slip44:144"),
+            "got: {message}"
+        );
+
+        // The one row is the whole of the fix: no numeraire, rate or guard.
+        let config = load_text(&node_settling_on(
+            key_file.path(),
+            &format!("{tables}{}", declaring(&["xrpl:1000/slip44:144"])),
+        ))
+        .expect("XRP declared");
+        assert!(config.denomination().declares_tokens());
+        assert_eq!(config.denomination().numeraire(), None);
+    }
+
+    /// The refusal is XRPL's alone: ADR 0086 decision 13's pass-through
+    /// stands on every other chain.
+    #[test]
+    fn a_node_with_no_xrpl_table_still_loads_with_no_tokens() {
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let config = load_text(&node_settling_on(
+            key_file.path(),
+            &both_settlements(key_file.path()),
+        ))
+        .expect("no XRPL table, so nothing to declare");
+        assert_eq!(config.settlements().len(), 2);
+        assert!(!config.denomination().declares_tokens());
     }
 
     #[test]

@@ -53,7 +53,8 @@ rpc_url = "https://s.altnet.rippletest.net:51234"
 [settlement.xrpl.1.key]
 key_file = "/app/data/settlement-xrpl.key" # an XRPL family seed, NOT 32 bytes
 
-# Only if this node peers over XRPL with a leg that holds anything else:
+# Required on every node with an XRPL table, one row per settlement table.
+# `numeraire` is not required; this node sets one for its rate below:
 [[tokens]]
 asset     = "eip155:84532/erc20:0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 numeraire = true
@@ -61,6 +62,7 @@ numeraire = true
 [[tokens]]
 asset = "xrpl:1/slip44:144"
 
+# Only if this node forwards between XRP and anything else:
 [[rates]]
 from = "eip155:84532/erc20:0x0C996d7c934c79a6255254875607Fe69df25C0E1"
 to   = "xrpl:1/slip44:144"
@@ -132,6 +134,10 @@ The greeting gains one `batch-settlement` entry per XRPL table, `network: xrpl:<
   then wanted to renew loses that chance (ADR 0087 decision 8).
 - **A peering costs each side an owner reserve** (0.2 XRP on 2026-10-28) until its
   channel is deleted, and each party pays its own fees in XRP. There is no sponsor.
+- **A node with an XRPL table must declare `[[tokens]]`.** Boot refuses it by name
+  otherwise (`XrplSettlementWithoutTokens`), even on one network holding only XRP. Declare
+  `xrpl:<id>/slip44:144`, and a token for every other settlement table the node holds. No
+  rate is needed at boot.
 - **An XRPL leg is a dealing boundary whenever the other side holds anything else**
   (ADR 0071): without a `[[rates]]` row there is no such forward. A path that holds XRP
   end to end forwards unconverted (ADR 0087 decision 6.1).

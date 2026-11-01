@@ -264,6 +264,9 @@ redemption_safety_secs = 90
 
 [settlement.xrpl.{STANDALONE_NETWORK_ID}.key]
 key_file = "{settlement_key}"
+
+[[tokens]]
+asset = "xrpl:{STANDALONE_NETWORK_ID}/slip44:144"
 "#,
             state_dir = state_dir.path().display(),
             signer_key = signer_key.path().display(),
