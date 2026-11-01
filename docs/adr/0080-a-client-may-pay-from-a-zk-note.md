@@ -1,6 +1,6 @@
 # A client may pay from a zk note
 
-**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. **Amended 2026-10-28** (owner decision, #1555): decision 12 makes toon-protocol/zk_toon's `zk-note` crate the definition of every zk-note derivation, and decision 3 gains the checks that crate's request proof leaves to the zk edge. **Amended 2026-10-28** (owner decision, #1556): decision 13 adds the mutual close, the zk edge's clearance and the ownership proof it is given against. **Amended 2026-10-28** (owner decision, #1581): decision 14 admits subsidised allowances (zk_toon's ADR 0001), paid from the zk edge's subsidy budget. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, the signed successor state, and the clearance request, answer and signed bytes all become vectors.
+**Status:** Accepted (owner decision, 2026-10-16, #1511). **Spike #1512 answered yes** (2026-10-16, [research note](../research/zk-note-verifier-spike.md)), so the condition is met and the record stands. **Amended 2026-10-28** (owner decision, #1513): decision 7 names the asset and its rate, and the vault holds one asset with no merge or top-up of notes. **Amended 2026-10-28** (owner decision, #1555): decision 12 makes toon-protocol/zk_toon's `zk-note` crate the definition of every zk-note derivation, and decision 3 gains the checks that crate's request proof leaves to the zk edge. **Amended 2026-10-28** (owner decision, #1556): decision 13 adds the mutual close, the zk edge's clearance and the ownership proof it is given against. **Amended 2026-10-28** (owner decision, #1581): decision 14 admits subsidised allowances (zk_toon's ADR 0001), paid from the zk edge's subsidy budget. **Amended 2026-11-01** (owner decision, #1514): decision 15 says how the Mina adapter reads the vault, where its verification key comes from and how its verifier is packaged, and amends decision 9's one transport per table. Nothing is built. It **amends** [0040](0040-a-verified-payment-is-stated-to-the-app.md): the payer is stated only when it is known. It **adds a note to** [0033](0033-the-exposure-machinery-is-retired-not-restated.md): the risk that record retired comes back at a zk edge, under a cap, as the **open budget**. It leaves [0002](0002-drop-mina-from-the-rust-connector.md) and [0065-mina](0065-mina-leaves-the-repository.md) standing, and the sections below explain why. It disturbs [0021](0021-vectors-are-normative-prose-is-not.md): the allowance claim, the allowance request and answer, the signed successor state, and the clearance request, answer and signed bytes all become vectors.
 
 **Scope:** protocol law. It adds a claim scheme, a greeting entry and three client-edge endpoints that every implementation of a zk edge must speak. Where the proof is verified and how the journal records it are connector architecture. See the [ADR index](README.md).
 
@@ -213,6 +213,27 @@ closes, which zkAPI cannot say.
       out of them, as the asset does.
     - **Known leak, accepted.** The zk edge sees that an allowance is subsidised, so it learns
       that the payer's note is at least 7 days old.
+15. **The adapter reads two endpoints and verifies under a key it was built with.** _Added
+    2026-11-01 (owner decision, #1514)._
+    - **Two endpoints, one circuit.** The vault keeps a ring of recent roots and its creation time
+      in its account, so a daemon read answers those. It keeps only the root of its nullifier set,
+      so "used on chain" needs the vault's actions from an archive node. The table therefore names
+      `graphql_url` and a required `archive_url`. This amends decision 9: each endpoint gets its
+      own `RpcTransport`, and both share the `toon-zk-note-mina` circuit and its rules.
+    - **A lagging archive is a failed read.** The zk edge checks the actions it read against the
+      account's latest action state. If they don't match, the read is unavailable and refuses that
+      one allowance, because a stale archive would otherwise report a spent nullifier as unused.
+      A nullifier in any close or escape action on the canonical chain counts as used, reduced or
+      not.
+    - **The key is compiled in.** The request program's key isn't on chain, and a verifier build
+      serves one Mina era anyway. The binary carries zk_toon's published request key, pinned by
+      hash, and a table whose `verification_key_hash` differs refuses to boot by name.
+    - **The verifier is vendored.** One crate holds the verifier subset of `toon-protocol/mina-rust`
+      at the commit zk_toon pins, under its Apache-2.0 licence, with everything node-only dropped
+      (no OpenSSL, no GraphQL server, no workspace-wide `num-bigint` patch). The connector
+      maintains that copy.
+    - **A zk edge may ship before clearances.** Until #1556 is built, its payers can leave only by
+      escape (decision 13). The operator's guide and the release note say so.
 
 ## Why this does not undo 0002 or 0065-mina
 
