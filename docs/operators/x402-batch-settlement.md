@@ -330,9 +330,10 @@ holding less than the base reserve; an endpoint with no validated ledger yet, wh
 be read. It never checks the PayChan amendment: testnet reports it
 disabled while its channels work. Fund the account before the first boot.
 
-A channel holds XRP, so every XRPL peering is a dealing boundary
-([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)): declare
-`xrpl:<id>/slip44:144` in `[[tokens]]` and give it a `[[rates]]` row. `xrpl:native` and every other
+A channel holds XRP, so every XRPL leg is a dealing boundary
+([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)): a node with an XRPL
+table and no `[[tokens]]` refuses to boot, so declare `xrpl:<id>/slip44:144` there, and give it a
+`[[rates]]` row for any forward to or from another asset. `xrpl:native` and every other
 `<chain>:native` spelling are refused by name.
 
 ### When the settlement RPC is unreachable

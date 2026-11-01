@@ -224,8 +224,17 @@ price = {PRICE}
     }
 }
 
-/// A `[settlement.xrpl.<network>]` table.
+/// A `[settlement.xrpl.<network>]` table, and the `[[tokens]]` row that boot
+/// requires beside it (#1636).
 fn table(network: u32, rpc_url: &str, key_file: &std::path::Path, extra: &str) -> String {
+    format!(
+        "{}\n[[tokens]]\nasset = \"xrpl:{network}/slip44:144\"\n",
+        bare_table(network, rpc_url, key_file, extra)
+    )
+}
+
+/// [`table`] with no `[[tokens]]` row, for a test declaring its own.
+fn bare_table(network: u32, rpc_url: &str, key_file: &std::path::Path, extra: &str) -> String {
     format!(
         r#"
 [settlement.xrpl.{network}]
@@ -724,7 +733,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
 fn config_load_refuses_every_native_spelling() {
     let files = Files::new();
     let key = key_file(&seed(XrplAlgorithm::Secp256k1, 9));
-    let tables = table(1000, "http://127.0.0.1:5005", key.path(), "");
+    let tables = bare_table(1000, "http://127.0.0.1:5005", key.path(), "");
     for native in [
         "xrpl:native",
         "eip155:1:native",
@@ -779,7 +788,7 @@ numeraire = true
     let with_table = format!(
         "{}{}",
         files.text(
-            &table(1000, "http://127.0.0.1:5005", key.path(), ""),
+            &bare_table(1000, "http://127.0.0.1:5005", key.path(), ""),
             "127.0.0.1:1"
         ),
         tokens("xrpl:1000/slip44:144")
@@ -792,7 +801,7 @@ numeraire = true
     let elsewhere = format!(
         "{}{}",
         files.text(
-            &table(1000, "http://127.0.0.1:5005", key.path(), ""),
+            &bare_table(1000, "http://127.0.0.1:5005", key.path(), ""),
             "127.0.0.1:1"
         ),
         tokens("xrpl:1/slip44:144")
@@ -814,8 +823,8 @@ fn a_dealing_node_must_declare_the_xrp_each_xrpl_table_holds() {
     let second = key_file(&seed(XrplAlgorithm::Secp256k1, 2));
     let tables = format!(
         "{}{}",
-        table(1, "http://127.0.0.1:5005", first.path(), ""),
-        table(1000, "http://127.0.0.1:5006", second.path(), "")
+        bare_table(1, "http://127.0.0.1:5005", first.path(), ""),
+        bare_table(1000, "http://127.0.0.1:5006", second.path(), "")
     );
     let tokens = |declared: &[&str]| {
         declared

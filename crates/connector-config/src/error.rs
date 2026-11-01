@@ -1702,6 +1702,23 @@ pub enum ConfigError {
         asset: String,
     },
 
+    /// An XRPL table on a node that declares no `[[tokens]]` (ADR 0087
+    /// decision 6, #1636). No forward on such a node is a crossing, so it
+    /// would pass one network's XRP to another's at par, and any other asset
+    /// to XRP at one base unit per drop.
+    #[error(
+        "{table} settles XRP, but this node declares no [[tokens]]: every XRPL leg is a dealing \
+         boundary (ADR 0087), and with nothing declared a forward would cross it unconverted. \
+         Declare it with a [[tokens]] row, asset = \"{asset}\", and one for every other \
+         settlement table this node holds"
+    )]
+    XrplSettlementWithoutTokens {
+        /// The table as an operator wrote it, `[settlement.xrpl.<id>]`.
+        table: String,
+        /// The asset to declare, `xrpl:<id>/slip44:144`.
+        asset: String,
+    },
+
     // -- [zk_note] (ADR 0080, issue #1522) --
     /// The vault is not a Mina address.
     #[error(

@@ -541,11 +541,16 @@ derived from this key: scale is not price, and nothing about a market lives in a
 is checked instead, against the token's own `decimals()` at startup, and a disagreement names both and
 refuses to boot (CF-25). Zero is refused outright.
 
-**Declaring a denomination is optional, and declaring none costs nothing.** `[[tokens]]`, `[[rates]]`
+**Declaring a denomination is optional, except on XRPL, and declaring none elsewhere costs nothing.** `[[tokens]]`, `[[rates]]`
 and `[rate_guards]` are how an operator says which tokens their node **deals**, what each is worth
 against one **numeraire**, and under what guards
 ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) decisions 3 and 5). A
-node that writes none of the three loads, serves and forwards exactly as it did before they existed.
+node that writes none of the three loads, serves and forwards exactly as it did before they existed,
+unless it has a `[settlement.xrpl.<id>]` table: every XRPL leg is a dealing boundary, so that node is
+refused at load by name (`XrplSettlementWithoutTokens`,
+[ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)) until it declares a token for
+each of its settlement tables. A rate is not required at load; with none, a forward across a boundary
+is refused when it arrives.
 Every asset id in the file — a `[[tokens]]` row's `asset`, a `[[rates]]` row's `from` and `to`, a
 quote leg's `quote_token` — is **CAIP-19** and so names its network
 ([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision 2):

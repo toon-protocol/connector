@@ -632,8 +632,7 @@ pub struct Connector {
     /// 0071 decision 1, issue #1292) -- the fact that decides whether a
     /// forward crosses a **denomination boundary** at all.
     ///
-    /// Empty on every node that declares no `[[tokens]]`, which is every
-    /// config this repository ships: nothing resolves, no forward can be a
+    /// Empty on every node that declares no `[[tokens]]`: nothing resolves, no forward can be a
     /// crossing, and [`Self::forward_via_peer_route`] runs the one
     /// subtraction it ran before ADR 0071 existed.
     ///
@@ -1213,7 +1212,9 @@ impl Connector {
     /// binding, for an ambiguous peering, and for every peer id on a node
     /// that declares no `[[tokens]]` -- the same "empty is a whole answer"
     /// rule `peering_assets` and `client_channel_assets` both keep, since
-    /// `client_channel_assets` is what this falls through to.
+    /// `client_channel_assets` is what this falls through to. A node with an
+    /// XRPL table never reaches that last case: boot requires it to declare
+    /// tokens (#1636).
     fn peer_asset(&self, peer_id: &str) -> Option<&AssetId> {
         if let Some(asset) = self.peering_assets.asset(peer_id) {
             return Some(asset);
@@ -5914,6 +5915,31 @@ mod tests {
         assert!(
             peer.carried().is_empty(),
             "an unconverted pass-through here is wrong by 10^12 and must not happen"
+        );
+    }
+
+    /// ADR 0087 decision 6.5 and #1636: XRP on one XRPL network is another
+    /// asset than XRP on the next, so with no rate there is no forward
+    /// between them. Held here because the harness's `xrpld` serves one
+    /// network id (ADR 0087 decision 5 keeps it off 0, 1 and 2).
+    #[tokio::test]
+    async fn a_forward_between_two_xrpl_networks_with_no_rate_is_refused() {
+        let (hop, peer, _clock) = dealing_hop(
+            &[
+                (UPSTREAM, "xrpl:1/slip44:144"),
+                ("second-hop", "xrpl:2/slip44:144"),
+            ],
+            0,
+            u64::MAX,
+            None,
+        );
+
+        let reject = refusal(arrives_from_upstream(&hop, 1_000_000).await);
+
+        assert_eq!(reject.code.as_str(), "F02");
+        assert!(
+            peer.carried().is_empty(),
+            "XRP on one network must not reach XRP on another at par"
         );
     }
 

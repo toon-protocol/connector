@@ -13,9 +13,12 @@
 //! * a forward the other way, XRP→USDC, has no `[[rates]]` row and is
 //!   refused rather than passed through at par.
 //!
+//! * a node declaring a token per table and no rate at all refuses USDC→XRP
+//!   rather than passing it at one base unit per drop (#1636).
+//!
 //! A forward between two XRPL networks is a forward between two assets
 //! (ADR 0087 decision 6.5): the stand-alone harness serves one network id
-//! only, so that is held in `connector-config`'s own tests instead.
+//! only, so that is held in `connector-runtime`'s forwarding tests instead.
 //!
 //! A missing Docker or anvil fails CI and skips locally.
 
@@ -321,6 +324,13 @@ key_file = "{xrpl_key}"
                 xrpl_key = xrpl_file.path().display(),
             ));
         }
+        // A node on XRPL alone still declares its XRP (#1636); B's `dealing`
+        // declares its own.
+        if settles == Settles::Xrpl {
+            settlement.push_str(&format!(
+                "\n[[tokens]]\nasset = \"xrpl:{STANDALONE_NETWORK_ID}/slip44:144\"\n"
+            ));
+        }
         let config = support::load_config(&format!(
             r#"
 client_edge_addr = "127.0.0.1:0"
@@ -596,4 +606,71 @@ max_move = {{ numerator = 5, denominator = 100 }}
         credited,
         "nothing reached A"
     );
+}
+
+/// #1636: what a node with no `[[tokens]]` used to do, 10,000 USDC base units
+/// reaching the payee as 9,700 drops, is refused once it declares its tokens,
+/// as boot now requires. Tokens alone name the boundary; the missing rate is
+/// the per-forward refusal.
+#[tokio::test]
+async fn a_usdc_to_xrp_forward_with_declared_tokens_and_no_rate_is_refused() {
+    if !require_anvil() || !require_xrpld() {
+        return;
+    }
+    let chains = Chains::spawn().await;
+    let b_wallet = chains.xrpld.funded_wallet(&chains.rpc, XRP_FUNDED).await;
+    let c_wallet = chains.xrpld.funded_wallet(&chains.rpc, XRP_FUNDED).await;
+    let usdc = format!("{:#x}", chains.token);
+    let tokens = format!(
+        "\n[[tokens]]\nasset = \"eip155:31337/erc20:{usdc}\"\n\n\
+         [[tokens]]\nasset = \"xrpl:{STANDALONE_NETWORK_ID}/slip44:144\"\n"
+    );
+    let a = Node::boot(
+        "nodea",
+        0x61,
+        Settles::Evm,
+        DEPLOYER_PRIVATE_KEY,
+        None,
+        &chains,
+        "",
+    )
+    .await;
+    let b = Node::boot(
+        "nodeb",
+        0x62,
+        Settles::Both,
+        COUNTERPARTY_PRIVATE_KEY,
+        Some(&b_wallet),
+        &chains,
+        &tokens,
+    )
+    .await;
+    let c = Node::boot(
+        "nodec",
+        0x63,
+        Settles::Xrpl,
+        "",
+        Some(&c_wallet),
+        &chains,
+        "",
+    )
+    .await;
+
+    let evm = "eip155:31337";
+    b.peer_with(&a, 0, evm, USDC_DEPOSIT).await;
+    a.peer_with(&b, 0, evm, USDC_DEPOSIT).await;
+    c.peer_with(&b, 0, NETWORK, DROPS_DEPOSIT).await;
+    let b_to_c = channel_of(&b.peer_with(&c, B_C_FEE, NETWORK, DROPS_DEPOSIT).await);
+    a.route_to(&b, "g.example.nodec", AMOUNT).await;
+    b.route_to(&c, "g.example.nodec", AMOUNT).await;
+
+    let reject = a
+        .originate(&c, AMOUNT)
+        .await
+        .expect_err("no rate, no forward");
+    assert!(
+        reject.message.contains("declares no rate"),
+        "refused for want of a rate, not for another reason: {reject:?}"
+    );
+    assert_eq!(c.inbound_watermark(&b_to_c).await, 0, "nothing reached C");
 }

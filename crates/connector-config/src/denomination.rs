@@ -259,7 +259,8 @@ impl RateRow {
 /// any pair, and behaves exactly as it did before this section existed.
 /// Nothing downstream needs to ask whether the operator meant to deal --
 /// [`DenominationConfig::declares_tokens`] is the question, and `false` is
-/// every node that predates ADR 0071.
+/// every node that predates ADR 0071. A node with an XRPL table may not be
+/// empty ([`ConfigError::XrplSettlementWithoutTokens`], #1636).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DenominationConfig {
     tokens: Vec<DeclaredToken>,

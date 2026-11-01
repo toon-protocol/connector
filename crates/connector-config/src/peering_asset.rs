@@ -23,7 +23,10 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 /// new refusal, nothing on the packet path that was not there before. A
 /// node that *does* declare tokens is held to the rule instead: every one
 /// of its peerings resolves to exactly one declared token, or
-/// [`Config::load`](crate::Config::load) refuses by name.
+/// [`Config::load`](crate::Config::load) refuses by name. XRPL is the
+/// exception (ADR 0087 decision 6, #1636): a node with an XRPL table must
+/// declare tokens, or
+/// [`ConfigError::XrplSettlementWithoutTokens`] refuses it.
 ///
 /// A pure function of loaded config, and deliberately so: this is read on
 /// the forwarding path, for every forward, where there is no I/O to do and
@@ -38,9 +41,8 @@ pub struct PeeringAssets {
 
 impl PeeringAssets {
     /// Whether this node resolved no peering at all -- `true` for every
-    /// node that declares no `[[tokens]]`, which is every config this
-    /// repository ships. The question a caller asks before any other,
-    /// since `true` means no forward this node makes can be a conversion.
+    /// node that declares no `[[tokens]]`. The question a caller asks
+    /// before any other, since `true` means no forward this node makes can be a conversion.
     pub fn is_empty(&self) -> bool {
         self.peerings.is_empty()
     }

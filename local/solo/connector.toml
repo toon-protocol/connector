@@ -147,3 +147,23 @@ rpc_url = "http://xrpld:5005"
 
 [settlement.xrpl.1000.key]
 key_file = "/app/data/settlement-xrpl.key"
+
+# ── What each table holds (ADR 0087 decision 6, #1636) ───────────────────────
+# An XRPL table refuses to boot with no `[[tokens]]`, and a node that declares
+# any must declare the token of every settlement table, so all four are here.
+# Nothing else is: no numeraire, rate or guard. This node holds no peering and
+# converts nothing. Its one route terminates here.
+#
+# As in `local/dealing`, the Solana prefix is a fixed label: the local validator
+# starts from a fresh genesis, and a table matches a Solana asset by its mint.
+[[tokens]]
+asset = "eip155:31337/erc20:0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+
+[[tokens]]
+asset = "eip155:31338/erc20:0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
+
+[[tokens]]
+asset = "solana:LocaLSoLanaVaLidatorGenesis11111/token:H8HSreUF2s8r8hem4qMttE3bWYCpFuh71jbuos5bA77H"
+
+[[tokens]]
+asset = "xrpl:1000/slip44:144"

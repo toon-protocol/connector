@@ -21,11 +21,12 @@
 //!
 //! A node that declares none of it loads and behaves exactly as it does
 //! today. [`a_config_declaring_no_tokens_declares_nothing`] is that as a
-//! unit, and [`every_committed_fixture_loads_and_only_one_deals`] is that
+//! unit, and [`every_committed_fixture_loads_and_only_two_declare_tokens`] is that
 //! over every config file this repository ships -- asserted by loading
-//! them, not by reading them. Exactly one of them deals, and it is named:
+//! them, not by reading them. Exactly two declare tokens, and they are named:
 //! the middle node of `local/dealing`, the topology issue #1299 added to
-//! prove a crossing against real chains.
+//! prove a crossing against real chains, and `local/solo`, whose XRPL table
+//! requires them (#1636) and which declares no rate.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -591,8 +592,8 @@ fn a_config_declaring_no_tokens_declares_nothing() {
     );
 }
 
-/// The one committed fixture in this repository that deals, by name, and
-/// every other one asserted to declare nothing — by **loading** each rather
+/// The two committed fixtures in this repository that declare tokens, by
+/// name, and every other one asserted to declare nothing — by **loading** each rather
 /// than by reading it.
 ///
 /// The walk is over the tree rather than over a hand-kept list, for the
@@ -610,7 +611,8 @@ fn a_config_declaring_no_tokens_declares_nothing() {
 /// update is not to exempt a directory: it is to name the one file that
 /// deals and go on asserting the rule over everything else, so a second
 /// fixture that starts declaring tokens still fails here and has to say why
-/// in this test rather than in silence. What the original check was
+/// in this test rather than in silence. `local/solo` joined it with #1636,
+/// because an XRPL table refuses to boot without tokens. What the original check was
 /// protecting is untouched — ADR 0071 costs a node that declares none of it
 /// nothing, and every fleet and deploy fixture still declares none of it.
 ///
@@ -626,7 +628,7 @@ fn a_config_declaring_no_tokens_declares_nothing() {
 /// here. Every other line, `[settlement]` values included, is the literal
 /// committed content.
 #[test]
-fn every_committed_fixture_loads_and_only_one_deals() {
+fn every_committed_fixture_loads_and_only_two_declare_tokens() {
     let fixtures = committed_config_fixtures();
     assert!(
         fixtures.len() >= 10,
@@ -636,14 +638,14 @@ fn every_committed_fixture_loads_and_only_one_deals() {
     );
 
     let sandbox = Sandbox::new();
-    let mut dealers = Vec::new();
+    let mut declaring = Vec::new();
     for path in fixtures {
         let text = sandbox.rewrite(&std::fs::read_to_string(&path).expect("read a fixture"));
         let config_file = write_config(&text);
         let config = Config::load(config_file.path())
             .unwrap_or_else(|error| panic!("{} must still load: {error}", path.display()));
         if config.denomination().declares_tokens() {
-            dealers.push(named(&path));
+            declaring.push(named(&path));
             continue;
         }
         assert_eq!(
@@ -657,13 +659,17 @@ fn every_committed_fixture_loads_and_only_one_deals() {
     }
 
     assert_eq!(
-        dealers,
-        vec!["dealing/connector-b.toml".to_string()],
-        "exactly one committed fixture deals, and it is `local/dealing`'s middle node -- the \
-         hop that topology exists to put on a denomination boundary. Everything else this \
-         repository ships, the two devnet fixtures and every deploy template included, \
+        declaring,
+        vec![
+            "dealing/connector-b.toml".to_string(),
+            "solo/connector.toml".to_string()
+        ],
+        "two committed fixtures declare tokens. `local/dealing`'s middle node is the hop that \
+         topology exists to put on a denomination boundary; `local/solo` holds an XRPL table, \
+         which refuses to boot without them (#1636), and declares no rate. Everything else \
+         this repository ships, the two devnet fixtures and every deploy template included, \
          declares nothing and runs the code it ran before ADR 0071. A new name in this list \
-         is a config that has started dealing; add it here deliberately, with the reason, \
+         is a config that has started declaring tokens; add it here deliberately, with the reason, \
          rather than widening the check."
     );
 }

@@ -155,6 +155,15 @@ boot and refuses a mismatch, so a testnet endpoint under `[settlement.xrpl.0]`
 cannot start. It does **not** check the PayChan amendment: testnet reports it
 disabled while channels work.
 
+**Every XRPL node declares its tokens.** A node with a `[settlement.xrpl.<id>]` table and no
+`[[tokens]]` refuses to start, even on one network holding only XRP. Add a row per settlement table;
+for an XRP-only node, that is one:
+
+```toml
+[[tokens]]
+asset = "xrpl:1/slip44:144"
+```
+
 **Settling XRP in a peering needs a rate.** A channel holds XRP, so a leg on
 XRPL is a dealing boundary ([ADR 0071](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md); `local/dealing` is a worked one)
 whenever the other side holds anything else. Declare the asset in `[[tokens]]`

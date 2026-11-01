@@ -27,7 +27,8 @@
 //!
 //! A node that declares no `[[tokens]]` resolves no peering, gains no
 //! required key and no new refusal, and loads exactly as it did before ADR
-//! 0071. [`a_peering_config_that_declares_no_tokens_resolves_nothing`] is
+//! 0071, unless it has an XRPL table, which boot refuses (#1636).
+//! [`a_peering_config_that_declares_no_tokens_resolves_nothing`] is
 //! that as a unit; `local_topologies_load.rs` and `devnet_configs_load.rs`
 //! are it over every config this repository ships, and neither needed a
 //! line changed for this work.

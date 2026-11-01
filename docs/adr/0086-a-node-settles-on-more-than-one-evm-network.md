@@ -103,7 +103,8 @@ it is already parsed on those rows only to be refused.
     `AmbiguousNetwork`.
 13. **A forward between networks is a forward between assets** (amending 0071 decision 2). USDC on
     Base and USDC on Arbitrum are different asset ids. A node that declares no `[[tokens]]` forwards
-    them unconverted, as `mixed-chain` forwards Base to Solana today. A node that declares tokens
+    them unconverted, as `mixed-chain` forwards Base to Solana today (XRPL is the exception: a node with
+    an XRPL table must declare tokens, [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md)'s update for #1636). A node that declares tokens
     needs a declared rate for the pair, and 1:1 or a spread is the operator's statement of what
     holding its USDC on the other network is worth. 0071 decision 2's sentence calling USDC on Base
     and on Solana a same-asset pair is replaced by this one, which is what the code already does

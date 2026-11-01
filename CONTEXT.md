@@ -617,7 +617,8 @@ absent, and absence is the safety rule: a pair this node declared nothing for is
 final **`F02`** rather than passed through at an implied 1:1, and a rate whose observation has
 aged out past its ttl with a retryable **`T00`** rather than dealt on dead. Nothing ever converts
 silently. A node that declares no tokens resolves no denomination, crosses no boundary and
-forwards unconverted at the flat fee — which is every node this repository ships today; a node
+forwards unconverted at the flat fee — except that a node with an XRPL table must declare them, and
+is refused at boot otherwise (ADR 0087); a node
 that declares them is held to the rule on every ordered pair it can resolve, same asset or not,
 because USDC on two chains is two of them. An operator who wants such a pair carried at par says
 so in a row: there is no 1:1 rate to fall back on, deliberately. A rate is one connector's own
