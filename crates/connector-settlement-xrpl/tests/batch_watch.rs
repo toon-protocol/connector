@@ -216,11 +216,13 @@ async fn an_exit_with_no_voucher_is_closed_and_the_payer_refunded_in_full() {
 /// `ledger_entry` reads lag: while pinned, such a read is answered from the
 /// pinned ledger, and the node's own answer names that ledger. Every other
 /// call, and every unpinned one, goes straight through. It also counts the
-/// `ledger_entry` requests it forwards.
+/// `ledger_entry` requests it forwards, and the pinned ones the node answered
+/// `entryNotFound`, so a test can see the lag really read as an absence.
 struct LagProxy {
     url: String,
     pin: Arc<AtomicU32>,
     entry_reads: Arc<AtomicUsize>,
+    lagged_absences: Arc<AtomicUsize>,
 }
 
 const UNPINNED: u32 = u32::MAX;
@@ -232,6 +234,7 @@ impl LagProxy {
             upstream: String,
             pin: Arc<AtomicU32>,
             entry_reads: Arc<AtomicUsize>,
+            lagged_absences: Arc<AtomicUsize>,
             client: reqwest::Client,
         }
         async fn forward(
@@ -239,13 +242,15 @@ impl LagProxy {
             axum::Json(mut request): axum::Json<serde_json::Value>,
         ) -> axum::Json<serde_json::Value> {
             let pin = shared.pin.load(Ordering::SeqCst);
+            let mut pinned = false;
             if request["method"] == "ledger_entry" {
                 shared.entry_reads.fetch_add(1, Ordering::SeqCst);
                 if pin != UNPINNED && request["params"][0]["ledger_index"] == "validated" {
                     request["params"][0]["ledger_index"] = serde_json::json!(pin);
+                    pinned = true;
                 }
             }
-            let response = shared
+            let response: serde_json::Value = shared
                 .client
                 .post(&shared.upstream)
                 .json(&request)
@@ -255,18 +260,26 @@ impl LagProxy {
                 .json()
                 .await
                 .expect("a JSON answer");
+            if pinned && response["result"]["error"] == "entryNotFound" {
+                shared.lagged_absences.fetch_add(1, Ordering::SeqCst);
+            }
             axum::Json(response)
         }
 
         let pin = Arc::new(AtomicU32::new(UNPINNED));
         let entry_reads = Arc::new(AtomicUsize::new(0));
+        let lagged_absences = Arc::new(AtomicUsize::new(0));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
         let addr = listener.local_addr().expect("the proxy's address");
         let app = Router::new().route("/", post(forward)).with_state(Shared {
             upstream: upstream.to_string(),
             pin: pin.clone(),
             entry_reads: entry_reads.clone(),
-            client: reqwest::Client::new(),
+            lagged_absences: lagged_absences.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("the proxy's client"),
         });
         tokio::spawn(async move {
             let _ = axum::Server::from_tcp(listener)
@@ -278,6 +291,7 @@ impl LagProxy {
             url: format!("http://{addr}"),
             pin,
             entry_reads,
+            lagged_absences,
         }
     }
 
@@ -291,6 +305,10 @@ impl LagProxy {
 
     fn reads(&self) -> usize {
         self.entry_reads.load(Ordering::SeqCst)
+    }
+
+    fn lagged_absences(&self) -> usize {
+        self.lagged_absences.load(Ordering::SeqCst)
     }
 }
 
@@ -357,6 +375,11 @@ async fn a_watcher_behind_a_channels_creation_still_answers_its_exit() {
         assert!(watcher.tick().await.expect("tick").is_empty());
         world.next_ledger().await;
     }
+    assert_eq!(
+        proxy.lagged_absences(),
+        2,
+        "every lagged pass read the channel as absent"
+    );
     proxy.catch_up();
     world.payer.start_withdrawal(&channel).await.expect("exit");
 
@@ -387,6 +410,11 @@ async fn an_absence_below_the_floor_proves_nothing() {
         assert!(watcher.tick().await.expect("tick").is_empty());
         world.next_ledger().await;
     }
+    assert_eq!(
+        proxy.lagged_absences(),
+        2,
+        "every lagged pass read the channel as absent"
+    );
     proxy.catch_up();
     world.payer.start_withdrawal(&channel).await.expect("exit");
 

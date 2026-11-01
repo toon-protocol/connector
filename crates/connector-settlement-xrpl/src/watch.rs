@@ -215,7 +215,7 @@ impl XrplBatchWatcher {
                 Ok(Seen::Absent(ledger)) => {
                     let floor = self.floors.lock().expect("floors").get(&name).copied();
                     if matches!((floor, ledger), (Some(floor), Some(ledger)) if ledger >= floor) {
-                        self.gone.lock().expect("gone").insert(name);
+                        self.done(name);
                     }
                     continue;
                 }
@@ -238,7 +238,7 @@ impl XrplBatchWatcher {
                         delivered,
                         "an XRPL payer began to exit; closed its channel with tfClose"
                     );
-                    self.gone.lock().expect("gone").insert(name);
+                    self.done(name);
                     closed.push(Closed {
                         channel: id,
                         delivered,
@@ -248,6 +248,12 @@ impl XrplBatchWatcher {
             }
         }
         Ok(closed)
+    }
+
+    /// Remember `name` as done: it is never read again, so its floor goes.
+    fn done(&self, name: String) {
+        self.floors.lock().expect("floors").remove(&name);
+        self.gone.lock().expect("gone").insert(name);
     }
 
     /// Log `error`, unless it is a refusal, which [`RefusalLog`] says once.

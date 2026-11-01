@@ -146,7 +146,7 @@ channel the claim gate holds a voucher on for that network, and every channel th
 admitted or restored. One with no `Expiration` is left untouched. One with an `Expiration` is
 answered with a single destination `PaymentChannelClaim` carrying `tfClose`: with the held voucher
 when it is genuine, above what is delivered and within the deposit, and without one otherwise. A
-channel the ledger no longer holds reads as `ChannelNotFound` on the receiving half; whether the
+channel the ledger no longer holds reads as absent on the receiving half; whether the
 watcher remembers it as done is decided by the floor rule of "Update (issue #1640)". A payer that began an exit and wanted to
 `tfRenew` loses that chance, as decision 8 accepts.
 
