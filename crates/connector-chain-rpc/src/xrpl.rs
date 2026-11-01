@@ -62,6 +62,10 @@ pub enum XrplRpcError {
         method: String,
         error: String,
         message: String,
+        /// The ledger the node says it answered from, when it says: an
+        /// `entryNotFound` carries it, so an absence can be judged against
+        /// the very ledger that produced it.
+        ledger_index: Option<u32>,
     },
     /// The endpoint kept answering while its validated ledger stood still,
     /// so `LastLedgerSequence` can never be passed. The transaction's fate
@@ -98,6 +102,14 @@ impl AsRefused for XrplRpcError {
             _ => None,
         }
     }
+}
+
+/// The `ledger_index` an answer names, when it is a usable sequence.
+fn ledger_index_of(result: &Value) -> Option<u32> {
+    result["ledger_index"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
 }
 
 impl XrplRpcError {
@@ -294,6 +306,7 @@ impl XrplRpc {
                 method: method.to_string(),
                 error: str_field(&result, "error").unwrap_or_default(),
                 message: str_field(&result, "error_message").unwrap_or_default(),
+                ledger_index: ledger_index_of(&result),
             }),
             other => Err(unreadable(format!("unknown status {other:?}"))),
         }
@@ -368,6 +381,35 @@ impl XrplRpc {
         {
             Ok(mut result) => Ok(Some(result["node"].take())),
             Err(e) if e.node_error() == Some("entryNotFound") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The ledger object at `index` from the validated ledger, and the index
+    /// of the ledger the *same response* says it was read from: `None` when
+    /// the answer names none, which proves nothing about an absence. No
+    /// second call is paired with it, since a load-balanced endpoint can
+    /// answer two calls from different servers.
+    pub async fn ledger_entry_answered_at(
+        &self,
+        index: &str,
+    ) -> Result<(Option<Value>, Option<u32>), XrplRpcError> {
+        match self
+            .call(
+                "ledger_entry",
+                json!({ "index": index, "ledger_index": "validated" }),
+            )
+            .await
+        {
+            Ok(mut result) => {
+                let ledger = ledger_index_of(&result);
+                Ok((Some(result["node"].take()), ledger))
+            }
+            Err(XrplRpcError::Rpc {
+                error,
+                ledger_index,
+                ..
+            }) if error == "entryNotFound" => Ok((None, ledger_index)),
             Err(e) => Err(e),
         }
     }

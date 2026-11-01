@@ -474,8 +474,9 @@ fn presentation(channel: JournaledBatchChannel) -> ChannelPresentation {
 /// afresh, under this node's current terms, before it accepts one.
 ///
 /// Best effort, channel by channel, and never a refusal to start: a channel
-/// that cannot be restored now is logged and left, and the watchers try
-/// again from the same record. A channel whose chain has since been opted
+/// that cannot be restored now is logged and left, unadmitted. Whether
+/// anything tries again is the backend's to say (XRPL's: ADR 0087, the
+/// #1641 update). A channel whose chain has since been opted
 /// out of is logged too: its vouchers can no longer be accepted here, and
 /// whatever it still holds unlanded is the operator's to collect.
 ///
@@ -512,8 +513,9 @@ pub(crate) async fn restore_journaled_channels(
             tracing::warn!(
                 %channel,
                 %error,
-                "could not restore a batch-settlement channel the client-edge journal holds \
-                 vouchers on; the watchers try again"
+                "could not restore a batch-settlement channel the client-edge journal records; \
+                 it is not admitted in this process, and only a backend that watches it \
+                 will try again"
             );
         }
     }

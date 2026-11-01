@@ -32,3 +32,7 @@ connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl", "te
 connector-settlement = { path = "../connector-settlement", features = ["test-util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+# The lag proxy of tests/batch_watch.rs: a real HTTP server in front of the
+# spawned `xrpld` that pins validated `ledger_entry` reads to an earlier ledger.
+axum = "0.6"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }

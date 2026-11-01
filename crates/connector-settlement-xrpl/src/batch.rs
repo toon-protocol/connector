@@ -51,6 +51,13 @@ pub(crate) const LAST_LEDGER_WINDOW: u32 = 20;
 /// landing's, since the caller journals between preparing and sending.
 const OPEN_LAST_LEDGER_WINDOW: u32 = 100;
 
+/// What one validated read of a channel found, and the ledger its response
+/// named (`None` when it named none).
+pub(crate) enum Seen {
+    Found(Channel, Option<u32>),
+    Absent(Option<u32>),
+}
+
 /// The receiving half of the settlement port on one XRPL network.
 ///
 /// **One key, one account.** The key is this node's `[settlement.xrpl.<id>]`
@@ -66,6 +73,9 @@ pub struct XrplBatchSettlement {
     min_settle_delay_secs: u64,
     pub(crate) wait: TxWait,
     admitted: Mutex<HashSet<String>>,
+    // Channels whose restore failed on a read error: watched, never admitted.
+    // The watcher's read on each pass is the retry.
+    unrestored: Mutex<HashSet<String>>,
     // The one sequence allocator of this node's account. A transaction signs
     // with the account's next `Sequence` and waits for the ledger to
     // validate it, and **every** transaction this node sends from the
@@ -146,6 +156,7 @@ impl XrplBatchSettlement {
                 give_up_after: Duration::from_secs(60),
             },
             admitted: Mutex::new(HashSet::new()),
+            unrestored: Mutex::new(HashSet::new()),
             sequencer: tokio::sync::Mutex::new(()),
             reserved: Mutex::new(BTreeSet::new()),
             outbound: Mutex::new(HashMap::new()),
@@ -215,15 +226,13 @@ impl XrplBatchSettlement {
         Ok((ChannelId(hex::encode(bytes)), bytes))
     }
 
-    /// Every channel this node has admitted or restored in this process.
-    pub(crate) fn admitted_channels(&self) -> Vec<ChannelId> {
-        self.admitted
-            .lock()
-            .expect("admitted")
-            .iter()
-            .cloned()
-            .map(ChannelId)
-            .collect()
+    /// Every channel the watcher reads: those admitted or restored, and
+    /// those whose restore failed on a read error. The second set is never
+    /// admitted -- [`Self::require_admitted`] does not look at it.
+    pub(crate) fn watched_channels(&self) -> Vec<ChannelId> {
+        let mut names: HashSet<String> = self.admitted.lock().expect("admitted").clone();
+        names.extend(self.unrestored.lock().expect("unrestored").iter().cloned());
+        names.into_iter().map(ChannelId).collect()
     }
 
     fn require_admitted(
@@ -251,6 +260,22 @@ impl XrplBatchSettlement {
             .map_err(rpc_error)?
             .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))?;
         Channel::from_entry(&node).ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))
+    }
+
+    /// The channel from the validated ledger, with the ledger the *same
+    /// response* names, for a caller that judges absence by it (the
+    /// watcher). Absent, or an entry of another type, is [`Seen::Absent`]:
+    /// not an error, since what it proves depends on the ledger.
+    pub(crate) async fn read_seen(&self, id: &ChannelId) -> Result<Seen, BatchSettlementError> {
+        let (node, ledger) = self
+            .rpc
+            .ledger_entry_answered_at(&id.0)
+            .await
+            .map_err(rpc_error)?;
+        Ok(match node.as_ref().and_then(Channel::from_entry) {
+            Some(channel) => Seen::Found(channel, ledger),
+            None => Seen::Absent(ledger),
+        })
     }
 
     /// The outbound channel from the validated ledger, where absence counts
@@ -363,6 +388,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
         let channel = self.read(&id).await?;
         self.judge(&id, &channel)?;
         let state = Self::state_of(&id, &channel)?;
+        self.unrestored.lock().expect("unrestored").remove(&id.0);
         self.admitted.lock().expect("admitted").insert(id.0);
         Ok(state)
     }
@@ -372,8 +398,18 @@ impl BatchSettlementBackend for XrplBatchSettlement {
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
         let (id, _) = Self::presented(&presentation)?;
-        let channel = self.read(&id).await?;
-        let state = Self::state_of(&id, &channel)?;
+        let state = match self.read(&id).await {
+            Ok(channel) => Self::state_of(&id, &channel)?,
+            Err(error) => {
+                // Anything but an absence leaves the channel watched; an
+                // absent one is not (ADR 0087, the #1641 update).
+                if !matches!(error, BatchSettlementError::ChannelNotFound(_)) {
+                    self.unrestored.lock().expect("unrestored").insert(id.0);
+                }
+                return Err(error);
+            }
+        };
+        self.unrestored.lock().expect("unrestored").remove(&id.0);
         self.admitted.lock().expect("admitted").insert(id.0);
         Ok(state)
     }
@@ -736,6 +772,7 @@ mod tests {
                 give_up_after: Duration::from_secs(1),
             },
             admitted: Mutex::new(HashSet::new()),
+            unrestored: Mutex::new(HashSet::new()),
             sequencer: tokio::sync::Mutex::new(()),
             reserved: Mutex::new(BTreeSet::new()),
             outbound: Mutex::new(HashMap::new()),
