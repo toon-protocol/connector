@@ -3,7 +3,7 @@
 //! voucher with `tfClose`, in one transaction, and a channel with nothing worth
 //! landing is closed alone. The watcher is driven one pass at a time.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -223,6 +223,8 @@ struct LagProxy {
     pin: Arc<AtomicU32>,
     entry_reads: Arc<AtomicUsize>,
     lagged_absences: Arc<AtomicUsize>,
+    down: Arc<AtomicBool>,
+    submits: Arc<AtomicUsize>,
 }
 
 const UNPINNED: u32 = u32::MAX;
@@ -235,6 +237,8 @@ impl LagProxy {
             pin: Arc<AtomicU32>,
             entry_reads: Arc<AtomicUsize>,
             lagged_absences: Arc<AtomicUsize>,
+            down: Arc<AtomicBool>,
+            submits: Arc<AtomicUsize>,
             client: reqwest::Client,
         }
         async fn forward(
@@ -243,8 +247,16 @@ impl LagProxy {
         ) -> axum::Json<serde_json::Value> {
             let pin = shared.pin.load(Ordering::SeqCst);
             let mut pinned = false;
+            if request["method"] == "submit" {
+                shared.submits.fetch_add(1, Ordering::SeqCst);
+            }
             if request["method"] == "ledger_entry" {
                 shared.entry_reads.fetch_add(1, Ordering::SeqCst);
+                if shared.down.load(Ordering::SeqCst) {
+                    // Unwinding out of the handler ends hyper's connection
+                    // task, so the socket closes with no answer at all.
+                    std::panic::resume_unwind(Box::new("the proxy is down"));
+                }
                 if pin != UNPINNED && request["params"][0]["ledger_index"] == "validated" {
                     request["params"][0]["ledger_index"] = serde_json::json!(pin);
                     pinned = true;
@@ -266,6 +278,8 @@ impl LagProxy {
             axum::Json(response)
         }
 
+        let down = Arc::new(AtomicBool::new(false));
+        let submits = Arc::new(AtomicUsize::new(0));
         let pin = Arc::new(AtomicU32::new(UNPINNED));
         let entry_reads = Arc::new(AtomicUsize::new(0));
         let lagged_absences = Arc::new(AtomicUsize::new(0));
@@ -276,6 +290,8 @@ impl LagProxy {
             pin: pin.clone(),
             entry_reads: entry_reads.clone(),
             lagged_absences: lagged_absences.clone(),
+            down: down.clone(),
+            submits: submits.clone(),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
@@ -292,7 +308,15 @@ impl LagProxy {
             pin,
             entry_reads,
             lagged_absences,
+            down,
+            submits,
         }
+    }
+
+    /// While down, every `ledger_entry` request's connection is dropped
+    /// unanswered.
+    fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
     }
 
     fn lag_at(&self, ledger: u32) {
@@ -307,8 +331,19 @@ impl LagProxy {
         self.entry_reads.load(Ordering::SeqCst)
     }
 
+    /// Every transaction sent through the proxy.
+    fn submits(&self) -> usize {
+        self.submits.load(Ordering::SeqCst)
+    }
+
     fn lagged_absences(&self) -> usize {
         self.lagged_absences.load(Ordering::SeqCst)
+    }
+}
+
+fn presentation(channel: &ChannelId) -> ChannelPresentation {
+    ChannelPresentation::Xrpl {
+        channel: channel.clone(),
     }
 }
 
@@ -324,27 +359,38 @@ impl World {
     /// A watcher whose every `ledger_entry` read goes through `proxy`, over
     /// a backend that has admitted `channels`, reading the same held vouchers.
     async fn proxied_watcher(&self, proxy: &LagProxy, channels: &[&ChannelId]) -> XrplBatchWatcher {
-        let backend = XrplBatchSettlement::connect(
-            RpcTransport::direct(&proxy.url).expect("rpc transport"),
-            STANDALONE_NETWORK_ID,
-            XrplSigner::from_family_seed(&self.receiver_wallet.seed).expect("a family seed"),
-            SETTLE_DELAY,
-        )
-        .await
-        .expect("connect through the proxy")
-        .with_wait(WAIT);
+        let (backend, watcher) = self.bare_proxied_watcher(proxy).await;
         for channel in channels {
             backend
-                .admit(ChannelPresentation::Xrpl {
-                    channel: (*channel).clone(),
-                })
+                .admit(presentation(channel))
                 .await
                 .expect("admit through the proxy");
         }
-        XrplBatchWatcher::new(
-            Arc::new(backend),
+        watcher
+    }
+
+    /// A watcher over a backend reached through `proxy` that has admitted
+    /// nothing; `restore` is how a test hands it a channel.
+    async fn bare_proxied_watcher(
+        &self,
+        proxy: &LagProxy,
+    ) -> (Arc<XrplBatchSettlement>, XrplBatchWatcher) {
+        let backend = Arc::new(
+            XrplBatchSettlement::connect(
+                RpcTransport::direct(&proxy.url).expect("rpc transport"),
+                STANDALONE_NETWORK_ID,
+                XrplSigner::from_family_seed(&self.receiver_wallet.seed).expect("a family seed"),
+                SETTLE_DELAY,
+            )
+            .await
+            .expect("connect through the proxy")
+            .with_wait(WAIT),
+        );
+        let watcher = XrplBatchWatcher::new(
+            Arc::clone(&backend),
             Arc::clone(&self.held) as Arc<dyn HeldVouchers>,
-        )
+        );
+        (backend, watcher)
     }
 
     async fn next_ledger(&self) {
@@ -460,4 +506,125 @@ async fn a_deleted_channel_is_read_no_more_only_with_a_floor() {
             "with no floor the channel is read every pass"
         );
     }
+}
+
+/// A restore that fails on a read error leaves the channel watched, though
+/// not admitted: once the endpoint recovers and the payer exits, the channel
+/// with no voucher is closed and the payer refunded in full, no restart.
+#[tokio::test]
+async fn a_restore_that_failed_on_a_read_error_leaves_the_channel_watched() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let channel = world.channel().await;
+    let (backend, watcher) = world.bare_proxied_watcher(&proxy).await;
+
+    proxy.set_down(true);
+    let error = backend
+        .restore(presentation(&channel))
+        .await
+        .expect_err("the endpoint is down");
+    assert!(!matches!(error, BatchSettlementError::ChannelNotFound(_)));
+    proxy.set_down(false);
+
+    assert!(
+        matches!(
+            backend.channel_state(&channel).await,
+            Err(BatchSettlementError::ChannelNotAdmitted(_))
+        ),
+        "watched is not admitted"
+    );
+
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+    let payer_before = world.drops(world.payer.address()).await;
+    let closed = watcher.tick().await.expect("tick");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].channel, channel);
+    assert_eq!(
+        world.rpc.ledger_entry(&channel.0).await.expect("read"),
+        None
+    );
+    assert_eq!(
+        world.drops(world.payer.address()).await,
+        payer_before + DEPOSIT as u64,
+        "the payer is refunded in full"
+    );
+    assert!(matches!(
+        backend.channel_state(&channel).await,
+        Err(BatchSettlementError::ChannelNotAdmitted(_))
+    ));
+}
+
+/// A restore the ledger answered `ChannelNotFound` is not watched: later
+/// passes do not read the channel.
+#[tokio::test]
+async fn a_restore_answered_not_found_is_not_watched() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let channel = world.channel().await;
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+    assert_eq!(world.watcher.tick().await.expect("tick").len(), 1);
+    let (backend, watcher) = world.bare_proxied_watcher(&proxy).await;
+
+    assert!(matches!(
+        backend.restore(presentation(&channel)).await,
+        Err(BatchSettlementError::ChannelNotFound(_))
+    ));
+    let before = proxy.reads();
+    for _ in 0..3 {
+        assert!(watcher.tick().await.expect("tick").is_empty());
+    }
+    assert_eq!(proxy.reads(), before, "the channel is never read");
+}
+
+/// A channel kept watched by a failed restore is closed only if this node is
+/// its destination.
+#[tokio::test]
+async fn a_watched_channel_payable_to_another_account_is_not_closed() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let other = chain.funded_wallet(&world.rpc, 1_000_000_000).await;
+    let opened = world
+        .payer
+        .open(
+            ReceiverTerms::Xrpl(XrplReceiverTerms {
+                receiver: other.address.clone(),
+                min_settle_delay_secs: SETTLE_DELAY,
+            }),
+            DEPOSIT,
+        )
+        .await
+        .expect("open");
+    let channel = opened.presentation.channel().clone();
+    let (backend, watcher) = world.bare_proxied_watcher(&proxy).await;
+
+    proxy.set_down(true);
+    backend
+        .restore(presentation(&channel))
+        .await
+        .expect_err("the endpoint is down");
+    proxy.set_down(false);
+
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+    let before = proxy.reads();
+    assert!(watcher.tick().await.expect("tick").is_empty());
+    assert!(proxy.reads() > before, "the channel is read");
+    assert_eq!(proxy.submits(), 0, "no close is even attempted");
+    assert!(world
+        .rpc
+        .ledger_entry(&channel.0)
+        .await
+        .expect("read")
+        .is_some());
 }
