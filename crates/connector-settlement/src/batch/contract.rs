@@ -843,10 +843,13 @@ where
     // it. There is nothing on chain to restore; the node that restarts
     // opens exactly the journaled channel, not another.
     let restarted = restart().await;
-    assert_eq!(
-        restarted.restore_outbound(&record, 0).await.unwrap_err(),
-        BatchSettlementError::ChannelNotFound(journaled.clone()),
-        "an open never sent is not on chain to restore"
+    // XRPL answers `ReadInconclusive`: its validated ledger is not yet past the
+    // open's bound, so absence does not say whether the open ever landed.
+    let refused = restarted.restore_outbound(&record, 0).await.unwrap_err();
+    assert!(
+        refused == BatchSettlementError::ChannelNotFound(journaled.clone())
+            || refused == BatchSettlementError::ReadInconclusive(journaled.clone()),
+        "an open never sent is not on chain to restore, got {refused:?}"
     );
     let opened = restarted
         .open_prepared(&record)

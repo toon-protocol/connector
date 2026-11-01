@@ -372,6 +372,39 @@ impl XrplRpc {
         }
     }
 
+    /// The ledger object at `index` and the validated ledger the answer is
+    /// from, so an absence can be judged against a ledger index (a deleted
+    /// object, or one not yet reached). The index is read first and the
+    /// entry then asked of that explicit ledger, so both come from one
+    /// ledger even behind a load-balanced endpoint: "a validated read at or
+    /// past this index" holds either way.
+    pub async fn ledger_entry_at_validated(
+        &self,
+        index: &str,
+    ) -> Result<(Option<Value>, u32), XrplRpcError> {
+        let validated =
+            self.server_info()
+                .await?
+                .validated_ledger
+                .ok_or_else(|| XrplRpcError::Unreadable {
+                    endpoint: self.transport.endpoint(),
+                    status: 200,
+                    reason: "server_info reports no validated ledger".to_string(),
+                    body: String::new(),
+                })?;
+        match self
+            .call(
+                "ledger_entry",
+                json!({ "index": index, "ledger_index": validated }),
+            )
+            .await
+        {
+            Ok(mut result) => Ok((Some(result["node"].take()), validated)),
+            Err(e) if e.node_error() == Some("entryNotFound") => Ok((None, validated)),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Every payment channel `account` is the source of, optionally only
     /// those to `destination`, following the node's paging marker.
     pub async fn account_channels(

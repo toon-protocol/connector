@@ -253,6 +253,31 @@ impl XrplBatchSettlement {
         Channel::from_entry(&node).ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))
     }
 
+    /// The outbound channel from the validated ledger, where absence counts
+    /// as deletion only once that ledger is past `bound`, the
+    /// `LastLedgerSequence` of the open that made the channel: a channel that
+    /// landed did so at or before it. Absent at or below it, the read proves
+    /// nothing and answers
+    /// [`ReadInconclusive`](BatchSettlementError::ReadInconclusive). The
+    /// ledger index and the entry come from the same ledger.
+    pub(crate) async fn read_bounded(
+        &self,
+        id: &ChannelId,
+        bound: u32,
+    ) -> Result<Channel, BatchSettlementError> {
+        let (node, validated) = self
+            .rpc
+            .ledger_entry_at_validated(&id.0)
+            .await
+            .map_err(rpc_error)?;
+        match node {
+            Some(node) => Channel::from_entry(&node)
+                .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone())),
+            None if validated > bound => Err(BatchSettlementError::ChannelNotFound(id.clone())),
+            None => Err(BatchSettlementError::ReadInconclusive(id.clone())),
+        }
+    }
+
     pub(crate) fn state_of(
         id: &ChannelId,
         channel: &Channel,

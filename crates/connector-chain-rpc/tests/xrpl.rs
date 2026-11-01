@@ -189,3 +189,21 @@ async fn an_endpoint_that_never_answers_ends_the_wait_with_its_error_not_a_hang(
         "{ended:?}"
     );
 }
+
+#[tokio::test]
+async fn an_entry_is_read_from_the_very_ledger_server_info_named() {
+    let fake = FakeRpc::spawn(|call| match call.method.as_str() {
+        "server_info" => server_info(9),
+        "ledger_entry" => {
+            assert_eq!(call.params[0]["ledger_index"], json!(9));
+            error("entryNotFound")
+        }
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    let (node, ledger) = client(&fake)
+        .ledger_entry_at_validated(&"0".repeat(64))
+        .await
+        .unwrap();
+    assert_eq!((node, ledger), (None, 9));
+}
