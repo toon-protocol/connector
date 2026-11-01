@@ -262,13 +262,16 @@ impl From<JournalError> for BatchChannelError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WithdrawStep {
-    /// EVM `initiateWithdraw`, Solana `request_close`: the receiver now has
-    /// the delay in which to land its latest voucher.
+    /// EVM `initiateWithdraw`, Solana `request_close`, XRPL a source
+    /// `tfClose`: the receiver now has the delay in which to land its latest
+    /// voucher. An XRPL channel with nothing unlanded is deleted at once.
     Started,
-    /// EVM `finalizeWithdraw`, Solana `distribute`: what the receiver had
+    /// EVM `finalizeWithdraw`, Solana `distribute`, XRPL a second source
+    /// `tfClose`: what the receiver had
     /// not landed is back in this node's settlement account.
     Finished,
-    /// An open channel holding nothing this node could take back.
+    /// An open channel holding nothing this node could take back. Never on
+    /// XRPL, where a fully landed channel still holds an owner reserve.
     NothingToWithdraw,
 }
 
@@ -312,7 +315,7 @@ fn canonical_id(id: &str) -> String {
 }
 
 fn chain_of(name: &str) -> SettlementChain {
-    SettlementChain::from_str(name).expect("the settlement port names only evm and solana")
+    SettlementChain::from_str(name).expect("the settlement port names only a chain this node knows")
 }
 
 /// The network among `networks` that the channel `presentation` is on (ADR
@@ -475,9 +478,12 @@ fn spell(chain: SettlementChain, bytes: &[u8]) -> String {
     match chain {
         SettlementChain::Evm => hex(bytes),
         SettlementChain::Solana => bs58::encode(bytes).into_string(),
-        // A receiver is spelled as its classic address, whose bytes the
-        // record keeps as UTF-8.
-        SettlementChain::Xrpl => String::from_utf8_lossy(bytes).into_owned(),
+        // A receiver is spelled as its classic address; the record keeps its
+        // 20-byte account id.
+        SettlementChain::Xrpl => <[u8; 20]>::try_from(bytes).map_or_else(
+            |_| hex(bytes),
+            |id| connector_signer::xrpl_classic_address(&id),
+        ),
     }
 }
 
@@ -814,7 +820,11 @@ impl OutboundChannels {
         let receiver = match &terms {
             ReceiverTerms::Evm(evm) => evm.receiver.to_vec(),
             ReceiverTerms::Solana(solana) => solana.receiver.to_vec(),
-            ReceiverTerms::Xrpl(xrpl) => xrpl.receiver.as_bytes().to_vec(),
+            // Undecodable terms have no pending record: `prepare` refuses them.
+            ReceiverTerms::Xrpl(xrpl) => {
+                connector_signer::decode_xrpl_classic_address(&xrpl.receiver)
+                    .map_or_else(|_| Vec::new(), |id| id.to_vec())
+            }
         };
         // The same open: same chain, same receiver, same deposit. A request
         // that differs is a different open, so a stale pending record --
@@ -926,17 +936,30 @@ impl OutboundChannels {
         Ok(payer.top_up(&channel, increment).await?)
     }
 
-    /// Start a withdrawal (EVM) or request a close (Solana) on an outbound
+    /// Start a withdrawal (EVM) or request a close (Solana, XRPL) on an outbound
     /// channel, or finish the one started once it is due (ADR 0075
     /// decision 11): one lever, whose next step the chain decides.
     pub async fn withdraw(
         &self,
         id: &str,
     ) -> Result<(WithdrawStep, OutboundChannelState), BatchChannelError> {
-        let (channel, payer) = self.ready(id).await?;
+        let chain = self.tracked(&self.key(id))?.chain;
+        let (channel, payer) = match self.ready(id).await {
+            // An XRPL channel opened, and deleted from the ledger across a
+            // restart (ADR 0087 decision 10).
+            Err(BatchChannelError::Settlement(BatchSettlementError::ChannelNotFound(channel)))
+                if chain == SettlementChain::Xrpl =>
+            {
+                return Err(BatchSettlementError::NoWithdrawalPending(channel).into())
+            }
+            other => other?,
+        };
         let state = payer.outbound_state(&channel).await?;
+        // A fully landed XRPL channel still holds its payer's owner reserve
+        // (ADR 0087 decision 6), and its exit deletes it at once.
+        let holds_nothing = state.on_chain.collateral == 0 && chain != SettlementChain::Xrpl;
         match state.on_chain.status {
-            BatchChannelStatus::Open if state.on_chain.collateral == 0 => {
+            BatchChannelStatus::Open if holds_nothing => {
                 Ok((WithdrawStep::NothingToWithdraw, state))
             }
             BatchChannelStatus::Open => Ok((
@@ -1003,7 +1026,8 @@ impl OutboundChannels {
     /// highest signed watermark answers, so a repeat finds the channel the
     /// peering has been paying on. A channel whose chain cannot be read now
     /// is not live, and an error is never mistaken for an absence -- it
-    /// answers `Err`.
+    /// answers `Err`. The one absence that counts is an XRPL channel's, whose
+    /// ledger entry is deleted on exit.
     ///
     /// Narrows [`Self::opened_toward`], the journal's own "channels toward
     /// this party", to the ones on `network` the chain still shows open: one
@@ -1025,7 +1049,18 @@ impl OutboundChannels {
             .collect();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
         for (id, _) in candidates {
-            let (channel, payer) = self.ready(&id).await?;
+            let (channel, payer) = match self.ready(&id).await {
+                // Opened, and gone from the ledger across a restart: a peer's
+                // watcher deletes an XRPL channel on every exit.
+                Err(BatchChannelError::Settlement(BatchSettlementError::ChannelNotFound(_)))
+                    if self
+                        .tracked(&id)
+                        .is_ok_and(|tracked| tracked.chain == SettlementChain::Xrpl) =>
+                {
+                    continue
+                }
+                other => other?,
+            };
             if payer.outbound_state(&channel).await?.on_chain.status == BatchChannelStatus::Open {
                 return Ok(Some(id));
             }
@@ -1389,7 +1424,7 @@ impl BatchChannels {
             .land(held.presentation.channel(), held.voucher.clone())
             .await?;
         let view = BatchChannelView {
-            id,
+            id: held.presentation.channel().0.clone(),
             scheme: BATCH_SETTLEMENT.to_string(),
             chain: chain.name().to_string(),
             network: self.network_of(&held.presentation),

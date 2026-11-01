@@ -1297,8 +1297,9 @@ struct WithdrawnChannel {
 /// `POST /channels/:id/withdraw`: wind down an outbound x402 channel (ADR
 /// 0075 decision 11). One lever with two steps, which the chain decides:
 /// on an open channel it **starts** -- EVM `initiateWithdraw`, Solana
-/// `request_close` -- and once that is due it **finishes** -- EVM
-/// `finalizeWithdraw`, Solana `distribute`. Between them the receiver has
+/// `request_close`, XRPL a source `tfClose` -- and once that is due it
+/// **finishes** -- EVM `finalizeWithdraw`, Solana `distribute`, XRPL a second
+/// source `tfClose`. Between them the receiver has
 /// the channel's delay in which to land its latest voucher, which is what
 /// protects it. Called too early, it answers `409` with the seconds left.
 /// No request body.

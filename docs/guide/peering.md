@@ -107,7 +107,8 @@ each node recognises the other's channel by the `voucherSigners` key the other
 publishes — so no identifier is ever exchanged. Both nodes need that chain's
 `[settlement.<chain>]` table configured. On Solana your node opens its channel
 **through their sponsor endpoint**, so they hold the `payee` seat and can always
-land your latest voucher, even after you ask to close. There is no shared secret
+land your latest voucher, even after you ask to close. On XRPL there is no sponsor:
+your node signs and submits its own `PaymentChannelCreate`. There is no shared secret
 either — a peer's role is proved per packet by its voucher signature
 ([ADR 0060](../adr/0060-a-claim-proves-a-peering-and-the-shared-secret-is-deleted.md)).
 
@@ -142,7 +143,8 @@ Your node fetches that URL, picks the carriage from their endpoint's scheme,
 finds the settlement chain you share, and **opens and funds your own outbound
 x402 channel toward them** with `deposit` (base units of the shared token) — on
 Solana by posting the payer-signed `open` to their sponsor endpoint, through
-your `socks_proxy` if they are an onion host — or finds the one you already have
+your `socks_proxy` if they are an onion host, on XRPL by submitting its own
+transaction — or finds the one you already have
 open, spending nothing. `"channel"`
 is that channel, and `"status"` says which branch it took — `"created"` or
 `"found"` — so an unintended second channel shows up in your own output rather
@@ -222,7 +224,7 @@ A peering still referenced by a runtime route is refused until the route goes.
 > A peering committed to a **config file** is the same two channels, recorded
 > differently: `[[peers]]`; a `[[peer_channels]]` row naming the key the peer
 > signs its vouchers with (its settlement address on EVM, its settlement key on
-> Solana), which binds its channel toward you at boot; and — for a peering you
+> Solana and XRPL), which binds its channel toward you at boot; and — for a peering you
 > forward to — a `[[pay_channels]]` row naming the outbound x402 channel you
 > opened toward it beforehand with `POST /channels`, and its client edge's URL.
 > Config always wins a collision: it refuses the runtime write outright rather

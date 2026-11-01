@@ -141,6 +141,37 @@ async fn a_failed_poll_does_not_end_the_wait_for_a_transaction_that_may_land() {
 }
 
 #[tokio::test]
+async fn an_endpoint_that_answers_while_its_ledger_stands_still_ends_the_wait() {
+    // Every read answers, and the validated ledger never reaches the bound.
+    let fake = FakeRpc::spawn(|call| match call.method.as_str() {
+        "server_info" => server_info(7),
+        "tx" => error("txnNotFound"),
+        other => panic!("unexpected {other}"),
+    })
+    .await;
+    let wait = TxWait {
+        poll: Duration::from_millis(1),
+        give_up_after: Duration::from_millis(50),
+    };
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        client(&fake).wait_for_tx("AB", 12, wait),
+    )
+    .await
+    .expect("the wait gives up rather than hanging");
+    assert!(
+        matches!(
+            ended,
+            Err(XrplRpcError::LedgerStalled {
+                validated: Some(7),
+                ..
+            })
+        ),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test]
 async fn an_endpoint_that_never_answers_ends_the_wait_with_its_error_not_a_hang() {
     let fake = FakeRpc::spawn(|_| RpcReply::Drop).await;
     let wait = TxWait {

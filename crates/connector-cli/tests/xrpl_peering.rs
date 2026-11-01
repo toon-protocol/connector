@@ -35,11 +35,15 @@ use axum::routing::post;
 use axum::Router;
 use chrono::{Duration as ChronoDuration, Utc};
 use connector_chain_rpc::xrpl::XrplRpc;
-use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
+use connector_chain_rpc::RpcTransport;
+use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, JournalEntry, Prepare, Reject};
 use connector_operator::test_support::sign_request;
+use connector_runtime::{FileJournal, Journal};
+use connector_settlement::batch::{BatchSettlementPayer, ReceiverTerms, XrplReceiverTerms};
 use connector_settlement_xrpl::test_support::{
     require_xrpld, LedgerCloser, Wallet, Xrpld, STANDALONE_NETWORK_ID,
 };
+use connector_settlement_xrpl::XrplBatchSettlement;
 use connector_signer::giftwrap::{open_response, seal_request};
 use connector_signer::{PublicKeyBytes, XrplSigner};
 use ed25519_dalek::Keypair;
@@ -204,6 +208,18 @@ struct Node {
 
 impl Node {
     async fn boot(name: &'static str, seed: u8, rpc_url: &str, wallet: Wallet, app: &str) -> Node {
+        Node::boot_with(name, seed, rpc_url, wallet, app, "").await
+    }
+
+    /// A node whose XRPL table also holds `table_keys`.
+    async fn boot_with(
+        name: &'static str,
+        seed: u8,
+        rpc_url: &str,
+        wallet: Wallet,
+        app: &str,
+        table_keys: &str,
+    ) -> Node {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the node");
         let addr = listener.local_addr().expect("the node's address");
         let operator = Keypair::generate(&mut OsRng);
@@ -241,6 +257,7 @@ price = {APP_PRICE}
 rpc_url = "{rpc_url}"
 min_settle_delay_secs = {SETTLE_DELAY}
 redemption_safety_secs = 90
+{table_keys}
 
 [settlement.xrpl.{STANDALONE_NETWORK_ID}.key]
 key_file = "{settlement_key}"
@@ -570,6 +587,17 @@ async fn two_nodes_peer_over_two_xrpl_channels() {
         .write(Method::POST, &fund, json!({ "amount": 5_000 }))
         .await;
     assert_eq!(funded["collateral"], DEPOSIT + 5_000, "{funded}");
+    let row = b
+        .channel_row(&b_to_a, "outbound")
+        .await
+        .expect("GET /channels lists the outbound channel");
+    assert_eq!(row["chain"], "xrpl", "{row}");
+    assert_eq!(row["network"], NETWORK, "{row}");
+    assert_eq!(row["counterparty"], a.wallet.address.as_str(), "{row}");
+    assert_eq!(row["status"], "open", "{row}");
+    assert_eq!(row["collateral"], DEPOSIT + 5_000, "{row}");
+    assert_eq!(row["landed"], 0, "{row}");
+    assert_eq!(row["watermark"], 2 * APP_PRICE, "{row}");
     let on_chain = ledger_channel(&rpc, &b_to_a).await.expect("the channel");
     assert_eq!(on_chain["Amount"], (DEPOSIT + 5_000).to_string());
     let (status, refused) = b
@@ -646,5 +674,171 @@ async fn two_nodes_peer_over_two_xrpl_channels() {
     assert!(
         refunded <= DEPOSIT && refunded > DEPOSIT - 1_000,
         "the payer is refunded its deposit less the two fees"
+    );
+}
+
+/// A channel fully landed still holds its payer's reserve: its exit deletes
+/// it at once. Once it is gone, and across a restart that forgets it was ever
+/// there, it answers as a deleted channel does and does not stand in the way
+/// of a new peering (ADR 0087 decision 10).
+#[tokio::test]
+async fn a_fully_landed_channel_exits_at_once_and_a_restart_gets_past_it() {
+    if !require_xrpld() {
+        return;
+    }
+    let World {
+        rpc,
+        a,
+        mut b,
+        chain: _chain,
+        _closer,
+    } = world().await;
+    let established = b
+        .write(
+            Method::POST,
+            "/peers",
+            Node::peer_body(&a, PEER_FEE, Some(APP_PRICE)),
+        )
+        .await;
+    let id = channel_of(&established);
+    a.peer_with(&b, PEER_FEE).await;
+    b.route_to(&a).await;
+    b.originate(&a, AMOUNT, b"all of it")
+        .await
+        .unwrap_or_else(|reject| panic!("B→A: {reject:?}"));
+    let landed = a
+        .write(Method::POST, &format!("/channels/{id}/land"), json!({}))
+        .await;
+    assert_eq!(landed["landed"], APP_PRICE, "{landed}");
+    assert_eq!(landed["collateral"], 0, "{landed}");
+
+    let withdraw = format!("/channels/{id}/withdraw");
+    let exited = b.write(Method::POST, &withdraw, json!({})).await;
+    assert_eq!(exited["step"], "started", "{exited}");
+    assert!(
+        ledger_channel(&rpc, &id).await.is_none(),
+        "nothing unlanded: the close deleted the entry"
+    );
+
+    b.restart().await;
+    let (status, refused) = b.write_answer(Method::POST, &withdraw, json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(
+        refused.to_string().contains("no withdrawal"),
+        "the deleted channel's own answer: {refused}"
+    );
+    let row = b.channel_row(&id, "outbound").await.expect("still listed");
+    assert_eq!(row["status"], "unreadable", "{row}");
+
+    let again = b.peer_with(&a, PEER_FEE).await;
+    assert_eq!(again["channel"]["status"], "created", "{again}");
+    assert_ne!(channel_of(&again), id, "a new channel, not the deleted one");
+}
+
+/// The table's `max_fee_drops` reaches the backend: a cap below the ledger's
+/// fee refuses the open by name, and nothing lands.
+#[tokio::test]
+async fn the_tables_fee_cap_refuses_an_open_above_it() {
+    if !require_xrpld() {
+        return;
+    }
+    let World {
+        chain,
+        rpc,
+        a,
+        b: _b,
+        _closer,
+    } = world().await;
+    let wallet = chain.funded_wallet(&rpc, FUNDED).await;
+    let address = wallet.address.clone();
+    let capped = Node::boot_with(
+        "nodec",
+        0x63,
+        &chain.rpc_url,
+        wallet,
+        &spawn_app(),
+        "max_fee_drops = 1",
+    )
+    .await;
+    let (status, refused) = capped
+        .write_answer(
+            Method::POST,
+            "/peers",
+            Node::peer_body(&a, PEER_FEE, Some(DEPOSIT)),
+        )
+        .await;
+    assert!(!status.is_success(), "{status}: {refused}");
+    assert!(refused.to_string().contains("max_fee_drops"), "{refused}");
+    let channels = rpc
+        .call("account_channels", json!({ "account": address }))
+        .await
+        .expect("account_channels");
+    assert_eq!(channels["channels"], json!([]), "{channels}");
+}
+
+/// Crash with an open sent and not yet landed, which lands after the restart
+/// looked: the retried open finds that record, one channel and one deposit,
+/// rather than building a second at the account's next `Sequence` (ADR 0075
+/// decision 8).
+#[tokio::test]
+async fn a_retried_open_after_a_crash_resumes_the_journaled_channel() {
+    if !require_xrpld() {
+        return;
+    }
+    let World {
+        chain,
+        rpc,
+        a,
+        mut b,
+        _closer,
+    } = world().await;
+    let crashed = XrplBatchSettlement::connect(
+        RpcTransport::direct(&chain.rpc_url).expect("rpc transport"),
+        STANDALONE_NETWORK_ID,
+        XrplSigner::from_family_seed(&b.wallet.seed).expect("a family seed"),
+        SETTLE_DELAY,
+    )
+    .await
+    .expect("connect");
+    let record = crashed
+        .prepare_open(
+            ReceiverTerms::Xrpl(XrplReceiverTerms {
+                receiver: a.wallet.address.clone(),
+                min_settle_delay_secs: SETTLE_DELAY,
+            }),
+            DEPOSIT.into(),
+        )
+        .await
+        .expect("prepare");
+    FileJournal::open(b.outbound_journal())
+        .expect("B's outbound journal")
+        .append(&JournalEntry::OutboundChannelOpening {
+            channel_id: format!("xrpl:{}", record.channel().0),
+            record: record.encode_on(NETWORK),
+        })
+        .expect("journal");
+    b.restart().await;
+    crashed
+        .open_prepared(&record)
+        .await
+        .expect("the open lands");
+
+    let terms = serde_json::to_value(&a.runtime.batch_settlements[0]).expect("A's terms");
+    let opened = b
+        .write(
+            Method::POST,
+            "/channels",
+            json!({ "terms": terms, "deposit": DEPOSIT }),
+        )
+        .await;
+    assert_eq!(opened["id"], record.channel().0.as_str(), "{opened}");
+    let channels = rpc
+        .call("account_channels", json!({ "account": b.wallet.address }))
+        .await
+        .expect("account_channels");
+    assert_eq!(
+        channels["channels"].as_array().map(Vec::len),
+        Some(1),
+        "one channel, one deposit: {channels}"
     );
 }
