@@ -445,6 +445,15 @@ impl Xrpld {
         }))
     }
 
+    /// Close `count` ledgers at once: how a test moves the validated ledger
+    /// past a bound counted in ledgers, such as a prepared open's
+    /// `LastLedgerSequence`.
+    pub async fn close_ledgers(&self, rpc: &XrplRpc, count: u32) {
+        for _ in 0..count {
+            rpc.ledger_accept().await.expect("ledger_accept");
+        }
+    }
+
     /// Close ledgers until the validated ledger's close time is `secs` past
     /// what it was, the stand-alone chain's way of letting a `SettleDelay`
     /// run out (#1610: a close moves close time at least a second, so this

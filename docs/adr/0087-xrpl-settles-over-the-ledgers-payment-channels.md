@@ -177,7 +177,18 @@ at once (decision 8), which ends the channel before its payer's second call.
 - **The auth-channel challenge shares the claim-state tag.** Decision 3 says "a different tag"; the committed vectors and the live check use one message under one tag, the vectors win (0021), and [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) has `channelChallenge` carry exactly the claim-state object on every chain, so this is kept. Replaying a captured signature before it expires gains nothing: it teaches a session the signer's own key as payee, and a payout still pays only that key. A second tag would not stop a captured auth challenge being replayed as itself.
 - **A wait is bounded even when the ledger stands still.** `LastLedgerSequence` bounds nothing if no validated ledger advances, so `wait_for_tx` gives up after `give_up_after` without an advance, `LedgerStalled`, naming the hash. Its fate is unknown, not known-not-landed.
 - **A fully landed channel can exit.** Its `Amount` equals its `Balance`, but it still holds an owner reserve, so `POST /channels/:id/withdraw` sends the `tfClose` that deletes it rather than answering `nothing_to_withdraw`.
-- **A deleted outbound channel across a restart.** The paying half's cache lives in memory, so after a restart decision 10's cached answer is not available. `/withdraw` answers `NoWithdrawalPending`, `/peers` opens a new channel past it, and `GET /channels` lists it `unreadable`.
+- **A deleted outbound channel across a restart.** The paying half's cache lives in memory, so after a restart decision 10's cached answer is not available. `/withdraw` answers `NoWithdrawalPending`, `/peers` opens a new channel past it, and `GET /channels` lists it `unreadable`. This holds only once the read's validated ledger is past the open's `LastLedgerSequence`; before that, see the update for #1637.
+
+## Update (issue #1637): an absent outbound channel is deleted only past its open's bound
+
+An `entryNotFound` is not a deletion when the validated ledger it was answered from may predate the channel's creation: a lagging or load-balanced endpoint made the paying half record a live channel as finished for the process lifetime, and after a restart made `/peers` open and fund a second one.
+
+- **The rule.** A channel that landed did so at or before its record's `LastLedgerSequence`. An outbound channel's entry that is absent counts as deleted only if the validated ledger the read was answered from is past that bound. At or below it the read answers the new `BatchSettlementError::ReadInconclusive`, records nothing, and the next read that finds the channel carries on normally. The ledger index and the absence come from one ledger: `XrplRpc::ledger_entry_at_validated` reads `server_info`'s validated index, then asks `ledger_entry` for that explicit index.
+- **The paying half keeps the bound** (`Outbound.last_ledger_sequence`), set on both open and restore. No journal or wire format changes.
+- **A node's own exit stays conclusive.** When this node's `tfClose` has landed, `start_withdrawal` and `finish_withdrawal` treat an absent channel as finished even inside the bound.
+- **Callers.** `restore_one` reads the error as `StillOpening` for a channel not yet opened, as it does `ChannelNotFound`; for an opened one it propagates. `live_toward` propagates it, so `POST /peers` answers an error and opens nothing; a channel really deleted past the bound is still skipped. `withdraw` still answers `NoWithdrawalPending` past the bound. The operator API answers `502`.
+- **Accepted cost.** A channel really deleted inside the open window (100 ledgers, about six minutes) reads as inconclusive after a restart until the bound passes: a retryable error, not a second channel.
+- **Not covered.** The receiving half and the watcher have no record to bound by (#1640).
 
 ## Considered options
 

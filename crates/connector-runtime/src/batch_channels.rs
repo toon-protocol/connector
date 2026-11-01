@@ -718,9 +718,10 @@ impl OutboundChannels {
             .restore_outbound(&tracked.record, tracked.signed)
             .await
         {
-            Err(BatchSettlementError::ChannelNotFound(_)) if !tracked.opened => {
-                return Err(BatchChannelError::StillOpening(id.to_string()))
-            }
+            Err(
+                BatchSettlementError::ChannelNotFound(_)
+                | BatchSettlementError::ReadInconclusive(_),
+            ) if !tracked.opened => return Err(BatchChannelError::StillOpening(id.to_string())),
             other => other?,
         };
         if !tracked.opened {

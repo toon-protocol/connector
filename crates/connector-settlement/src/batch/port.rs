@@ -852,6 +852,15 @@ pub enum BatchSettlementError {
     #[error("the open of batch-settlement channel '{0}' lapsed: the chain never took it")]
     OpenLapsed(ChannelId),
 
+    /// XRPL: the chain's answer does not say whether this channel exists. A
+    /// read found no entry, but the validated ledger it was answered from is
+    /// not yet past the `LastLedgerSequence` of the open that made the
+    /// channel, so the channel may simply not have reached that ledger. The
+    /// read proves nothing: it records nothing, and a retry that finds the
+    /// channel carries on normally. EVM and Solana never return it.
+    #[error("the chain does not yet say whether batch-settlement channel '{0}' exists: a lagging read, retry")]
+    ReadInconclusive(ChannelId),
+
     /// Boot found no x402 contract (EVM) or program (Solana) at the address
     /// the binary fixes: a chain x402 has not deployed to, which this node
     /// refuses to settle on (ADR 0075 decision 1). Names what was looked for
