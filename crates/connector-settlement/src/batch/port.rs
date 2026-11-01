@@ -1086,6 +1086,11 @@ pub trait BatchSettlementPayer: Send + Sync {
     /// ([`ChannelNotFound`](BatchSettlementError::ChannelNotFound): an open
     /// never sent, or not yet landed), and one naming a channel this node is
     /// not the payer of ([`NotOutbound`](BatchSettlementError::NotOutbound)).
+    /// On XRPL, a channel absent from a validated ledger not yet past its
+    /// open's `LastLedgerSequence` is
+    /// [`ReadInconclusive`](BatchSettlementError::ReadInconclusive) rather
+    /// than `ChannelNotFound`: the read says neither that it landed nor that
+    /// it is gone.
     /// Restoring a channel already known sets its watermark to that figure,
     /// lowering it when `signed` is lower than the one held: the caller
     /// decides, because a voucher a receiver never admitted is not owed.

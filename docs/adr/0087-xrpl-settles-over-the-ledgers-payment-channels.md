@@ -187,7 +187,7 @@ An `entryNotFound` is not a deletion when the validated ledger it was answered f
 - **The paying half keeps the bound** (`Outbound.last_ledger_sequence`), set on both open and restore. No journal or wire format changes.
 - **A node's own exit stays conclusive.** When this node's `tfClose` has landed, `start_withdrawal` and `finish_withdrawal` treat an absent channel as finished even inside the bound.
 - **Callers.** `restore_one` reads the error as `StillOpening` for a channel not yet opened, as it does `ChannelNotFound`; for an opened one it propagates. `live_toward` propagates it, so `POST /peers` answers an error and opens nothing; a channel really deleted past the bound is still skipped. `withdraw` still answers `NoWithdrawalPending` past the bound. The operator API answers `502`.
-- **Accepted cost.** A channel really deleted inside the open window (100 ledgers, about six minutes) reads as inconclusive after a restart until the bound passes: a retryable error, not a second channel.
+- **Accepted cost.** A channel really deleted inside the open window (100 ledgers, about six minutes) by anything but this node's own landed `tfClose` reads as inconclusive until the bound passes — after a restart, and in process too when the receiver deleted it: a retryable error, not a second channel or a voucher refused for good.
 - **Not covered.** The receiving half and the watcher have no record to bound by (#1640).
 
 ## Considered options
