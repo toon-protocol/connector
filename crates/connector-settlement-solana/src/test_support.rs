@@ -418,8 +418,8 @@ static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 /// ports so tests spawning one concurrently don't collide.
 pub struct SolanaValidator {
     child: Child,
-    // Never read after construction -- kept only so its directory outlives
-    // the validator process using it and is removed on drop.
+    // Read only for its path while `spawn` waits on the validator -- kept so
+    // its directory outlives the validator process using it and is removed on drop.
     _ledger: tempfile::TempDir,
     pub rpc_url: String,
 }
@@ -455,7 +455,11 @@ impl SolanaValidator {
             .args(["--ledger"])
             .arg(ledger.path())
             .args(["--rpc-port", &rpc_port.to_string()])
-            .args(["--faucet-port", &(rpc_port + 1).to_string()])
+            // rpc_port + 1 is the RPC websocket; the faucet and gossip sit past the
+            // dynamic range, inside the same 50-port block. 3.1.x binds gossip to a
+            // fixed 8000 unless told otherwise, so concurrent validators collide.
+            .args(["--faucet-port", &(rpc_port + 42).to_string()])
+            .args(["--gossip-port", &(rpc_port + 41).to_string()])
             .args([
                 "--dynamic-port-range",
                 &format!("{}-{}", rpc_port + 2, rpc_port + 40),
@@ -480,6 +484,15 @@ impl SolanaValidator {
                 "spawn solana-test-validator (is it on PATH? see \
                  https://docs.anza.xyz/cli/install)",
             );
+        // Owned by `Self` from here, so every panic below kills the validator on
+        // unwind instead of leaving it holding this instance's ports.
+        let mut validator = Self {
+            child,
+            _ledger: ledger,
+            rpc_url,
+        };
+        let rpc_url = validator.rpc_url.clone();
+        let ledger = validator._ledger.path().to_path_buf();
 
         let rpc = RpcClient::new(rpc_url.clone());
         let mut ready = false;
@@ -488,11 +501,18 @@ impl SolanaValidator {
                 ready = true;
                 break;
             }
+            if let Ok(Some(status)) = validator.child.try_wait() {
+                panic!(
+                    "solana-test-validator exited at startup ({status}) before serving {rpc_url}\n{}",
+                    validator_log_tail(&ledger)
+                );
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(
             ready,
-            "solana-test-validator did not become ready at {rpc_url}"
+            "solana-test-validator did not become ready at {rpc_url}\n{}",
+            validator_log_tail(&ledger)
         );
         let served = served_program(&rpc, &spl_token::id()).await;
         assert!(
@@ -502,11 +522,22 @@ impl SolanaValidator {
              refuses `Batch`"
         );
 
-        Self {
-            child,
-            _ledger: ledger,
-            rpc_url,
+        validator
+    }
+}
+
+/// The tail of the validator's own `validator.log` in `ledger`, or a plain
+/// statement that there is none to show.
+fn validator_log_tail(ledger: &std::path::Path) -> String {
+    let path = ledger.join("validator.log");
+    match std::fs::read_to_string(&path) {
+        Ok(log) if !log.trim().is_empty() => {
+            let lines: Vec<&str> = log.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(40)..];
+            format!("tail of {}:\n{}", path.display(), tail.join("\n"))
         }
+        Ok(_) => format!("{} is empty", path.display()),
+        Err(e) => format!("{} could not be read: {e}", path.display()),
     }
 }
 
