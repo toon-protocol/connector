@@ -158,7 +158,7 @@ publishes an XRPL entry opens this node's outbound `PayChannel` by its own submi
 published channel key as the voucher signer of the peering's inbound half, and records the peering as
 `RuntimePeerChannel::XrplVoucher`. A peering's two channels share one network: the peer's entry is
 chosen by `network: xrpl:<id>` when several are shared (0086 decisions 11-12). A channel's receiver is
-kept as the classic address its `Destination` names, so "a channel toward this party" is matched by
+kept as the account id its `Destination` names, so "a channel toward this party" is matched by
 the address the party's one key derives, which is also how a client payout finds the channel toward a
 client's account. `/fund`, `/withdraw` and a peer's `claim-state` ask are the chain-generic paths; a
 voucher and a claim-state challenge ride a peer carriage in the receiving half's own JSON.
@@ -171,6 +171,13 @@ The tests that hold it, against a spawned `xrpld` (and an anvil for dealing), ar
 `xrpl_peering.rs`, `client_payout_xrpl.rs` and `xrpl_dealing.rs` in `connector-cli`. The `/withdraw`
 test uses a channel toward a bare account: a peer node's own watcher answers the exit with `tfClose`
 at once (decision 8), which ends the channel before its payer's second call.
+
+## Update (issue #1596): what the spec's audit changed
+
+- **The auth-channel challenge shares the claim-state tag.** Decision 3 says "a different tag"; the committed vectors and the live check use one message under one tag, the vectors win (0021), and [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) has `channelChallenge` carry exactly the claim-state object on every chain, so this is kept. Replaying a captured signature before it expires gains nothing: it teaches a session the signer's own key as payee, and a payout still pays only that key. A second tag would not stop a captured auth challenge being replayed as itself.
+- **A wait is bounded even when the ledger stands still.** `LastLedgerSequence` bounds nothing if no validated ledger advances, so `wait_for_tx` gives up after `give_up_after` without an advance, `LedgerStalled`, naming the hash. Its fate is unknown, not known-not-landed.
+- **A fully landed channel can exit.** Its `Amount` equals its `Balance`, but it still holds an owner reserve, so `POST /channels/:id/withdraw` sends the `tfClose` that deletes it rather than answering `nothing_to_withdraw`.
+- **A deleted outbound channel across a restart.** The paying half's cache lives in memory, so after a restart decision 10's cached answer is not available. `/withdraw` answers `NoWithdrawalPending`, `/peers` opens a new channel past it, and `GET /channels` lists it `unreadable`.
 
 ## Considered options
 

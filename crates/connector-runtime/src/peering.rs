@@ -756,6 +756,17 @@ mod tests {
         })
     }
 
+    fn xrpl_batch(network: &str) -> X402BatchSettlementTerms {
+        X402BatchSettlementTerms::Xrpl(connector_domain::x402::X402BatchSettlementXrplTerms {
+            asset: format!("{network}/slip44:144"),
+            network: network.to_string(),
+            pay_to: "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string(),
+            binding: connector_domain::x402::XRPL_PAYCHAN_BINDING.to_string(),
+            min_settle_delay_secs: 3_600,
+            redemption_safety_secs: 90,
+        })
+    }
+
     fn document(
         btp: Option<&str>,
         http: Option<&str>,
@@ -886,6 +897,30 @@ mod tests {
             }
             other => panic!("expected a network mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_peering_across_several_xrpl_networks_is_on_the_one_it_names() {
+        let both = document(
+            None,
+            Some("https://peer.example/ilp"),
+            vec![xrpl_batch("xrpl:0"), xrpl_batch("xrpl:1")],
+            Vec::new(),
+        );
+        let ours = ["xrpl:0", "xrpl:1"];
+        assert!(matches!(
+            shared_settlement_of(&both, &ours, None, &url()),
+            Err(EstablishPeeringError::AmbiguousNetwork { .. })
+        ));
+        let named = shared_settlement_of(&both, &ours, Some(&network("xrpl:1")), &url())
+            .expect("the request named one");
+        assert_eq!(named.network(), "xrpl:1");
+        assert_eq!(named.chain(), SettlementChain::Xrpl);
+        // One shared chain with no shared network is no peering.
+        assert!(matches!(
+            shared_settlement_of(&both, &["xrpl:2"], None, &url()),
+            Err(EstablishPeeringError::NetworkMismatch { .. })
+        ));
     }
 
     /// ADR 0086 decision 12: two nodes sharing several networks have no

@@ -779,8 +779,8 @@ pub enum BatchSettlementError {
     /// before anything is signed, never left to the ledger's `tecUNFUNDED`
     /// (ADR 0087 decision 6).
     #[error(
-        "the settlement account is {shortfall} drops short: {required} drops needed (deposit, \
-         reserve and fee) against {spendable} spendable"
+        "the settlement account is {shortfall} drops short: {required} drops needed (deposit \
+         and fee) against {spendable} spendable above its reserve"
     )]
     Underfunded {
         required: u128,

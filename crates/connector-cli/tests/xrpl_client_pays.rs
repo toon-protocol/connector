@@ -373,6 +373,11 @@ price = {PRICE}
     assert_eq!(status, StatusCode::OK, "{landed}");
     assert_eq!(landed["landed"], 3 * PRICE, "{landed}");
     assert_eq!(landed["status"], "open", "{landed}");
+    assert_eq!(
+        landed["id"],
+        channel.as_str(),
+        "the spelling /channels lists"
+    );
     let on_chain = world
         .rpc
         .call("ledger_entry", json!({ "index": channel }))

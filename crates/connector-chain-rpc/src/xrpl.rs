@@ -17,8 +17,8 @@
 //! A transaction carries the last ledger it may land in, and the ledger
 //! itself says when that has passed, so the wait ends in [`TxFate::Landed`]
 //! or [`TxFate::KnownNotLanded`] and never in a hang. A failed poll does not
-//! end it; an endpoint that answers nothing for [`TxWait::give_up_after`]
-//! does. This is the answer to "did my send land?" that EVM gets from a
+//! end it; a validated ledger that does not advance for
+//! [`TxWait::give_up_after`], answered or not, does. This is the answer to "did my send land?" that EVM gets from a
 //! receipt and a nonce.
 
 use std::time::{Duration, Instant};
@@ -62,6 +62,19 @@ pub enum XrplRpcError {
         method: String,
         error: String,
         message: String,
+    },
+    /// The endpoint kept answering while its validated ledger stood still,
+    /// so `LastLedgerSequence` can never be passed. The transaction's fate
+    /// is unknown: it may yet land.
+    #[error(
+        "{endpoint}'s validated ledger has not advanced for {waited_secs} s (last seen: \
+         {validated:?}), so the fate of transaction {hash} is unknown: read it before resending"
+    )]
+    LedgerStalled {
+        endpoint: String,
+        hash: String,
+        validated: Option<u32>,
+        waited_secs: u64,
     },
     /// The body was not an XRPL JSON-RPC response this client can read.
     #[error("{endpoint} answered HTTP {status} with a body this client cannot read: {reason}. Body: {body}")]
@@ -174,8 +187,8 @@ pub struct TxStatus {
 pub struct TxWait {
     /// The wait between polls while the endpoint answers.
     pub poll: Duration,
-    /// How long the endpoint may stay unreadable before the wait gives up
-    /// and returns the last error.
+    /// How long the wait may go with no validated ledger advancing, the
+    /// endpoint unreadable or answering, before it gives up with an error.
     pub give_up_after: Duration,
 }
 
@@ -487,18 +500,22 @@ impl XrplRpc {
     ///
     /// A failed read does not end the wait (ADR 0073 decision 5): the
     /// transaction may still land, so the loop backs off and polls again.
-    /// Only when nothing has answered for `wait.give_up_after` does it
-    /// return the last error, the one honest "I do not know"; the caller
-    /// holds the hash and can ask again.
+    /// Only when the validated ledger has not advanced for
+    /// `wait.give_up_after` does it give up, with the last read's error or
+    /// [`XrplRpcError::LedgerStalled`], the one honest "I do not know": a
+    /// bound on the ledger means nothing while the ledger stands still. The
+    /// caller holds the hash and can ask again.
     pub async fn wait_for_tx(
         &self,
         hash: &str,
         last_ledger_sequence: u32,
         wait: TxWait,
     ) -> Result<TxFate, XrplRpcError> {
-        // The last time any read answered: `give_up_after` is measured from
-        // here, so it means nothing could be read for that long.
-        let mut last_answer = Instant::now();
+        // The last time the validated ledger advanced: `give_up_after` is
+        // measured from here, so an endpoint that answers without progress
+        // ends the wait as surely as one that does not answer.
+        let mut last_progress = Instant::now();
+        let mut validated = None;
         let mut failures = 0u32;
         loop {
             let polled = async {
@@ -507,8 +524,11 @@ impl XrplRpc {
             };
             match polled.await {
                 Ok((validated_before, status)) => {
-                    last_answer = Instant::now();
                     failures = 0;
+                    if validated_before > validated {
+                        validated = validated_before;
+                        last_progress = Instant::now();
+                    }
                     if let Some(TxStatus {
                         validated: true,
                         ledger_index: Some(ledger_index),
@@ -527,9 +547,17 @@ impl XrplRpc {
                             last_ledger_sequence,
                         });
                     }
+                    if last_progress.elapsed() >= wait.give_up_after {
+                        return Err(XrplRpcError::LedgerStalled {
+                            endpoint: self.transport.endpoint(),
+                            hash: hash.to_string(),
+                            validated,
+                            waited_secs: wait.give_up_after.as_secs(),
+                        });
+                    }
                 }
                 Err(error) => {
-                    if last_answer.elapsed() >= wait.give_up_after {
+                    if last_progress.elapsed() >= wait.give_up_after {
                         return Err(error);
                     }
                     failures += 1;

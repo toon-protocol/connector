@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 A multi-chain ILP connector: one Rust binary that forwards packets for payment and
-settles on EVM and Solana. `docs/architecture/source-tree.md` is the map of the
+settles on EVM, Solana and XRPL. `docs/architecture/source-tree.md` is the map of the
 repository and `CONTEXT.md` is the vocabulary; `README.md` is the landing page
 and `docs/guide/` the operator's guide, written for someone deploying a node, not
 changing one. This file covers what an agent working here needs that none of those
@@ -102,7 +102,7 @@ or one container, a chain that runs the deployed program unmodified. A public
 testnet never counts toward the gate. No chain uses the shared tier yet; Mina's
 #1554 builds it.
 
-Install Foundry (`anvil`, `cast`) and the Solana CLI to run the full gate
+Install Foundry (`anvil`, `cast`), the Solana CLI and Docker (for `xrpld`) to run the full gate
 locally.
 
 ### What the containers ARE for
@@ -118,7 +118,7 @@ PRs touching the crates, the Dockerfile, the compose files, the chain seeding (`
 cannot break it and the image build is the expensive part.
 
 There are five topologies, chosen with `LOCAL_TOPOLOGY` (default `solo`), and CI
-runs four of them: `solo` (one node, both settlement backends live at once),
+runs four of them: `solo` (one node, EVM, Solana and XRPL backends live at once),
 `two-hop` (two nodes peered over ILP-over-HTTP on anvil), `mixed-chain` (three
 nodes, EVM on one leg and Solana on the other, with the middle node holding both
 backends) and `dealing` (ADR 0071 — `mixed-chain`'s shape with the middle node
@@ -259,6 +259,10 @@ a treasury from `infra/solana/usdc-authority.json`. That script refuses any RPC 
 containing "mainnet" — it mints unlimited supply of a mock token from a committed
 keypair and has no mainnet-shaped mode. In tests, funding is
 `test_support::fund()`, a plain `request_airdrop`.
+
+**Local XRPL.** A stand-alone `xrpld`, network id 1000, pinned by digest. Its genesis
+account's secret is public, and `local/keys.sh` pays each node's account from it; in
+tests, `Xrpld::funded_wallet` does the same. XRP is all an XRPL channel can hold (ADR 0087).
 
 **Devnet** settles on _public_ chains — Base Sepolia and Solana devnet — and is
 funded by the faucet (`infra/linode-faucet/`), not by any of the above. The

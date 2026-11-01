@@ -111,7 +111,7 @@ It is built for an operator who is paid through it, so what it refuses is stated
  │    route  g.example.quotes  ──►  app "quotes"  (plain HTTP)    │
  │    route  g.example.search  ──►  app "search"  (plain HTTP)    │
  │                                                                │
- │    settlement backends:  EVM, Solana  (x402 channels)          │
+ │    settlement backends:  EVM, Solana, XRPL  (x402 channels)    │
  └───────────────▲──────────────────────────────┬─────────────────┘
                  │  callers: a packet,          │  peerings: a fee
                  │  and a voucher for it        ▼  kept per packet
@@ -120,7 +120,7 @@ It is built for an operator who is paid through it, so what it refuses is stated
 
 A **route** with a `handler_url` terminates at your app, and its `price` is what a caller
 pays. A **settlement backend** is what lets anyone actually pay it: every channel is an x402
-`batch-settlement` channel, on EVM or on Solana. A **peering** puts you on paths that start
+`batch-settlement` channel, on EVM, Solana or XRPL. A **peering** puts you on paths that start
 somewhere else: you carry someone's packet one hop further, and keep a fee for doing it.
 [`CONTEXT.md`](CONTEXT.md) is the full glossary.
 
@@ -138,15 +138,15 @@ moving its money, and [operating it](docs/guide/operations.md) day to day.
 
 ## Guides
 
-| Guide                                                             | What it walks through                                                                                                                 |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| [1. Run a node](docs/guide/run-a-node.md)                         | The Docker image and its tags, a build from source, the config, routes and prices, and the self-description                           |
-| [2. Put your app behind it](docs/guide/put-your-app-behind-it.md) | What your app receives, the `X-TOON-*` attribution headers, and what you can charge for                                               |
-| [3. Get paid](docs/guide/get-paid.md)                             | The settlement tables for EVM and Solana, the devnet addresses, how a voucher is checked, how you get paid, and what you are trusting |
-| [4. Peer with another node](docs/guide/peering.md)                | Being peerable, reading the other node's self-description, the three writes, and what to know before a real chain                     |
-| [Try it locally](docs/guide/local-peering-lab.md)                 | Two connectors, one packet, one disposable chain: keys, funding, configs, peering, sending, and proving it was paid for               |
-| [The operator surface](docs/guide/operator-surface.md)            | Read and write authority, every read and write endpoint, the dashboard, and signing a write                                           |
-| [Operating it](docs/guide/operations.md)                          | Logs, releases, devnet and mainnet                                                                                                    |
+| Guide                                                             | What it walks through                                                                                                                       |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [1. Run a node](docs/guide/run-a-node.md)                         | The Docker image and its tags, a build from source, the config, routes and prices, and the self-description                                 |
+| [2. Put your app behind it](docs/guide/put-your-app-behind-it.md) | What your app receives, the `X-TOON-*` attribution headers, and what you can charge for                                                     |
+| [3. Get paid](docs/guide/get-paid.md)                             | The settlement tables for EVM, Solana and XRPL, the devnet addresses, how a voucher is checked, how you get paid, and what you are trusting |
+| [4. Peer with another node](docs/guide/peering.md)                | Being peerable, reading the other node's self-description, the three writes, and what to know before a real chain                           |
+| [Try it locally](docs/guide/local-peering-lab.md)                 | Two connectors, one packet, one disposable chain: keys, funding, configs, peering, sending, and proving it was paid for                     |
+| [The operator surface](docs/guide/operator-surface.md)            | Read and write authority, every read and write endpoint, the dashboard, and signing a write                                                 |
+| [Operating it](docs/guide/operations.md)                          | Logs, releases, devnet and mainnet                                                                                                          |
 
 ## Reference
 
