@@ -13,7 +13,9 @@
 //! wanted to `tfRenew` loses the chance once this node has seen it.
 //!
 //! The channels it looks at are those the claim gate holds a voucher on and
-//! those the backend has admitted or restored. A channel the ledger no longer
+//! those the backend has admitted or restored, plus those whose restore at
+//! boot failed on a read error (never a `ChannelNotFound`): the pass's read
+//! is their retry, and they stay unadmitted. A channel the ledger no longer
 //! holds reads as absent, and only an absence it can trust is the end of it:
 //! the watcher keeps, per channel, a floor in memory -- the highest validated
 //! ledger at which it found the channel -- and remembers a channel as done
@@ -187,7 +189,7 @@ impl XrplBatchWatcher {
             }
         }
         let mut channels: Vec<String> = vouchers.keys().cloned().collect();
-        for admitted in self.backend.admitted_channels() {
+        for admitted in self.backend.watched_channels() {
             if !vouchers.contains_key(&admitted.0) {
                 channels.push(admitted.0);
             }
