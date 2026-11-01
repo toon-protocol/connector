@@ -1096,9 +1096,9 @@ fn batch_channel_error_response(error: BatchChannelError) -> Response {
             | BatchSettlementError::StaleVoucher { .. }
             | BatchSettlementError::ChannelSealed(_)
             | BatchSettlementError::OpenLapsed(_) => StatusCode::CONFLICT,
-            BatchSettlementError::OpenRefused(_) | BatchSettlementError::Backend(_) => {
-                StatusCode::BAD_GATEWAY
-            }
+            BatchSettlementError::OpenRefused(_)
+            | BatchSettlementError::Backend(_)
+            | BatchSettlementError::ReadInconclusive(_) => StatusCode::BAD_GATEWAY,
             BatchSettlementError::NotOutbound(_) | BatchSettlementError::ChannelNotFound(_) => {
                 StatusCode::NOT_FOUND
             }

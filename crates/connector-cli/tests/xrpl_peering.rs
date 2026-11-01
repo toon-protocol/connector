@@ -39,7 +39,10 @@ use connector_chain_rpc::RpcTransport;
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, JournalEntry, Prepare, Reject};
 use connector_operator::test_support::sign_request;
 use connector_runtime::{FileJournal, Journal};
-use connector_settlement::batch::{BatchSettlementPayer, ReceiverTerms, XrplReceiverTerms};
+use connector_settlement::batch::{
+    BatchChannelStatus, BatchSettlementError, BatchSettlementPayer, ChannelPresentation,
+    ReceiverTerms, XrplReceiverTerms,
+};
 use connector_settlement_xrpl::test_support::{
     require_xrpld, LedgerCloser, Wallet, Xrpld, STANDALONE_NETWORK_ID,
 };
@@ -690,7 +693,7 @@ async fn a_fully_landed_channel_exits_at_once_and_a_restart_gets_past_it() {
         rpc,
         a,
         mut b,
-        chain: _chain,
+        chain,
         _closer,
     } = world().await;
     let established = b
@@ -720,6 +723,10 @@ async fn a_fully_landed_channel_exits_at_once_and_a_restart_gets_past_it() {
         "nothing unlanded: the close deleted the entry"
     );
 
+    // An absent entry proves a deletion only once the validated ledger is
+    // past the open's `LastLedgerSequence` (100 ledgers on): before that, a
+    // restarted node cannot tell it from a read that lags the creation.
+    chain.close_ledgers(&rpc, 105).await;
     b.restart().await;
     let (status, refused) = b.write_answer(Method::POST, &withdraw, json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
@@ -841,4 +848,209 @@ async fn a_retried_open_after_a_crash_resumes_the_journaled_channel() {
         Some(1),
         "one channel, one deposit: {channels}"
     );
+}
+
+/// A real proxy in front of the spawned `xrpld` that makes its *validated*
+/// reads lag: while pinned, `server_info` reports at most the pinned ledger
+/// as validated and a `ledger_entry` of the validated ledger is answered from
+/// it. Everything else, and every unpinned call, goes straight through. The
+/// chain is the real one; only what a node is told of how far it has got is
+/// held back, as a lagging server behind a load balancer would.
+struct LagProxy {
+    url: String,
+    pin: Arc<std::sync::atomic::AtomicU32>,
+}
+
+const UNPINNED: u32 = u32::MAX;
+
+impl LagProxy {
+    fn spawn(upstream: &str) -> LagProxy {
+        use axum::extract::State;
+        use std::sync::atomic::Ordering;
+
+        type Shared = (String, Arc<std::sync::atomic::AtomicU32>, reqwest::Client);
+        async fn forward(
+            State((upstream, pin, client)): State<Shared>,
+            axum::Json(mut request): axum::Json<Value>,
+        ) -> axum::Json<Value> {
+            let method = request["method"].as_str().unwrap_or_default().to_string();
+            let pin = pin.load(Ordering::SeqCst);
+            if pin != UNPINNED
+                && method == "ledger_entry"
+                && request["params"][0]["ledger_index"] == "validated"
+            {
+                request["params"][0]["ledger_index"] = json!(pin);
+            }
+            let mut response: Value = client
+                .post(&upstream)
+                .json(&request)
+                .send()
+                .await
+                .expect("the chain answers")
+                .json()
+                .await
+                .expect("a JSON answer");
+            if pin != UNPINNED && method == "server_info" {
+                let seq = &mut response["result"]["info"]["validated_ledger"]["seq"];
+                if seq.as_u64().is_some_and(|seq| seq > u64::from(pin)) {
+                    *seq = json!(pin);
+                }
+            }
+            axum::Json(response)
+        }
+
+        let pin = Arc::new(std::sync::atomic::AtomicU32::new(UNPINNED));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+        let addr = listener.local_addr().expect("the proxy's address");
+        let app = Router::new().route("/", post(forward)).with_state((
+            upstream.to_string(),
+            pin.clone(),
+            reqwest::Client::new(),
+        ));
+        tokio::spawn(async move {
+            let _ = axum::Server::from_tcp(listener)
+                .expect("serve the proxy")
+                .serve(app.into_make_service())
+                .await;
+        });
+        LagProxy {
+            url: format!("http://{addr}"),
+            pin,
+        }
+    }
+
+    /// Report `ledger` as the furthest validated one from now on.
+    fn lag_at(&self, ledger: u32) {
+        self.pin.store(ledger, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn catch_up(&self) {
+        self.lag_at(UNPINNED);
+    }
+}
+
+async fn validated_ledger(rpc: &XrplRpc) -> u32 {
+    rpc.server_info()
+        .await
+        .expect("server_info")
+        .validated_ledger
+        .expect("a validated ledger")
+}
+
+/// A restarted node reading through an endpoint still behind its channel's
+/// creation cannot tell a lagging read from a deleted channel: `POST /peers`
+/// answers a retryable error and opens nothing, and finds the original
+/// channel once the endpoint catches up (#1637).
+#[tokio::test]
+async fn a_restarted_node_behind_the_creation_ledger_opens_no_second_channel() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let rpc = chain.rpc();
+    let _closer = chain.close_ledgers_every(Duration::from_millis(300));
+    let app = spawn_app();
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let a_wallet = chain.funded_wallet(&rpc, FUNDED).await;
+    let b_wallet = chain.funded_wallet(&rpc, FUNDED).await;
+    let a = Node::boot("nodea", 0x61, &chain.rpc_url, a_wallet, &app).await;
+    let mut b = Node::boot("nodeb", 0x62, &proxy.url, b_wallet, &app).await;
+
+    let before_creation = validated_ledger(&rpc).await;
+    let created = b.peer_with(&a, PEER_FEE).await;
+    assert_eq!(created["channel"]["status"], "created", "{created}");
+    let id = channel_of(&created);
+
+    b.restart().await;
+    proxy.lag_at(before_creation);
+    let (status, refused) = b
+        .write_answer(
+            Method::POST,
+            "/peers",
+            Node::peer_body(&a, PEER_FEE, Some(DEPOSIT)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{refused}");
+    assert!(
+        refused.to_string().contains("does not yet say"),
+        "the retryable answer: {refused}"
+    );
+    let channels = rpc
+        .call("account_channels", json!({ "account": b.wallet.address }))
+        .await
+        .expect("account_channels");
+    assert_eq!(
+        channels["channels"].as_array().map(Vec::len),
+        Some(1),
+        "nothing was opened: {channels}"
+    );
+
+    proxy.catch_up();
+    let found = b.peer_with(&a, PEER_FEE).await;
+    assert_eq!(found["channel"]["status"], "found", "{found}");
+    assert_eq!(channel_of(&found), id, "the original channel");
+}
+
+/// A payer whose endpoint lags the creation ledger does not record its
+/// channel as finished: once the endpoint catches up it reads `Open` and signs,
+/// with no restart (#1637). A restore through the same lag is inconclusive,
+/// not "not found".
+#[tokio::test]
+async fn a_lagging_read_does_not_finish_a_channel_in_process() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let rpc = chain.rpc();
+    let _closer = chain.close_ledgers_every(Duration::from_millis(300));
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let payer_wallet = chain.funded_wallet(&rpc, FUNDED).await;
+    let payee = chain.funded_wallet(&rpc, FUNDED).await;
+    let connect = || async {
+        XrplBatchSettlement::connect(
+            RpcTransport::direct(&proxy.url).expect("rpc transport"),
+            STANDALONE_NETWORK_ID,
+            XrplSigner::from_family_seed(&payer_wallet.seed).expect("a family seed"),
+            SETTLE_DELAY,
+        )
+        .await
+        .expect("connect")
+    };
+    let payer = connect().await;
+    let terms = ReceiverTerms::Xrpl(XrplReceiverTerms {
+        receiver: payee.address.clone(),
+        min_settle_delay_secs: SETTLE_DELAY,
+    });
+
+    let before_creation = validated_ledger(&rpc).await;
+    let record = payer
+        .prepare_open(terms, DEPOSIT.into())
+        .await
+        .expect("prepare");
+    let ChannelPresentation::Xrpl { channel } = payer
+        .open_prepared(&record)
+        .await
+        .expect("the open lands")
+        .presentation
+    else {
+        panic!("an XRPL presentation");
+    };
+
+    proxy.lag_at(before_creation);
+    assert!(matches!(
+        payer.outbound_state(&channel).await,
+        Err(BatchSettlementError::ReadInconclusive(_))
+    ));
+    assert!(matches!(
+        connect().await.restore_outbound(&record, 0).await,
+        Err(BatchSettlementError::ReadInconclusive(_))
+    ));
+
+    proxy.catch_up();
+    let state = payer.outbound_state(&channel).await.expect("state");
+    assert_eq!(state.on_chain.status, BatchChannelStatus::Open);
+    payer
+        .sign_voucher(&channel, 1)
+        .await
+        .expect("the channel was never recorded as finished");
 }

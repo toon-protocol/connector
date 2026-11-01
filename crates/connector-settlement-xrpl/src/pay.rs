@@ -83,6 +83,10 @@ pub(crate) struct Outbound {
     last: BatchChannelState,
     /// The channel as it stood once it was gone from the ledger.
     finished: Option<BatchChannelState>,
+    /// The `LastLedgerSequence` of the open that made the channel: one that
+    /// landed did so at or before it, so an absence read from a validated
+    /// ledger not past it proves nothing.
+    last_ledger_sequence: u32,
 }
 
 /// One transaction's outcome: its hash, its result code and its metadata.
@@ -141,6 +145,39 @@ impl XrplBatchSettlement {
             Ok(channel) => Ok(Some(channel)),
             Err(BatchSettlementError::ChannelNotFound(_)) => Ok(None),
             Err(other) => Err(other),
+        }
+    }
+
+    /// The channel in a validated ledger, or `None` once it is gone. Absence
+    /// is conclusive only past the channel's `LastLedgerSequence`; before it
+    /// the read is [`ReadInconclusive`](BatchSettlementError::ReadInconclusive)
+    /// and records nothing.
+    async fn read_outbound(&self, id: &ChannelId) -> Result<Option<Channel>, BatchSettlementError> {
+        let bound = self
+            .outbound_map()
+            .get(&id.0)
+            .map(|entry| entry.last_ledger_sequence)
+            .ok_or_else(|| BatchSettlementError::NotOutbound(id.clone()))?;
+        match self.read_bounded(id, bound).await {
+            Ok(channel) => Ok(Some(channel)),
+            Err(BatchSettlementError::ChannelNotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The channel after this node's own `tfClose` was sent. A close that
+    /// landed makes an absent channel certain whatever ledger the read comes
+    /// from, so a channel opened and exited at once never answers an error;
+    /// one that did not land is judged like any other read.
+    async fn read_after_exit(
+        &self,
+        id: &ChannelId,
+        close: &Sent,
+    ) -> Result<Option<Channel>, BatchSettlementError> {
+        if close.result == "tesSUCCESS" {
+            self.read_channel(id).await
+        } else {
+            self.read_outbound(id).await
         }
     }
 
@@ -533,7 +570,12 @@ impl XrplBatchSettlement {
         id: &ChannelId,
         held: &Channel,
     ) -> Result<OpenedChannel, BatchSettlementError> {
-        let OutboundChannelRecord::Xrpl { receiver, .. } = record else {
+        let OutboundChannelRecord::Xrpl {
+            receiver,
+            last_ledger_sequence,
+            ..
+        } = record
+        else {
             unreachable!("open_locked matched an XRPL record");
         };
         if held.account != self.address
@@ -551,6 +593,7 @@ impl XrplBatchSettlement {
                 backed: backed_by(held),
                 last: state,
                 finished: None,
+                last_ledger_sequence: *last_ledger_sequence,
             });
         Ok(OpenedChannel {
             presentation: ChannelPresentation::Xrpl {
@@ -638,7 +681,12 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         record: &OutboundChannelRecord,
         signed: u128,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
-        let OutboundChannelRecord::Xrpl { channel, .. } = record else {
+        let OutboundChannelRecord::Xrpl {
+            channel,
+            last_ledger_sequence,
+            ..
+        } = record
+        else {
             return Err(BatchSettlementError::WrongChain {
                 presented: record.chain(),
                 backend: CHAIN,
@@ -646,7 +694,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         };
         let (id, _) = Self::parse(channel)
             .map_err(|_| BatchSettlementError::ChannelNotFound(channel.clone()))?;
-        let held = self.read(&id).await?;
+        let held = self.read_bounded(&id, *last_ledger_sequence).await?;
         // The channel key must be this node's settlement key, or no voucher
         // signed for it verifies.
         if held.account != self.address || held.key != Some(self.signer.public_key()) {
@@ -663,6 +711,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
                 backed: backed_by(&held),
                 last: state.clone(),
                 finished: None,
+                last_ledger_sequence: *last_ledger_sequence,
             },
         );
         Ok(OutboundChannelState {
@@ -687,7 +736,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
                 amount: increment,
                 max: XRPL_MAX_DROPS,
             })?;
-        let Some(held) = self.read_channel(&id).await? else {
+        let Some(held) = self.read_outbound(&id).await? else {
             self.observe(&id, None)?;
             return Err(BatchSettlementError::ChannelSealed(id));
         };
@@ -718,7 +767,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
                 sent.hash, sent.result
             )));
         }
-        let held = self.read_channel(&id).await?;
+        let held = self.read_outbound(&id).await?;
         let (state, present) = self.observe(&id, held.as_ref())?;
         if !present {
             return Err(BatchSettlementError::ChannelSealed(id));
@@ -775,7 +824,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         if entry.finished.is_some() {
             return Err(BatchSettlementError::ChannelSealed(id));
         }
-        let Some(held) = self.read_channel(&id).await? else {
+        let Some(held) = self.read_outbound(&id).await? else {
             self.observe(&id, None)?;
             return Err(BatchSettlementError::ChannelSealed(id));
         };
@@ -789,7 +838,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         // the close delete it.
         self.observe(&id, Some(&held))?;
         let sent = self.close(id_bytes).await?;
-        let after = self.read_channel(&id).await?;
+        let after = self.read_after_exit(&id, &sent).await?;
         if sent.result != "tesSUCCESS" && after.is_some() {
             return Err(BatchSettlementError::Backend(format!(
                 "the PaymentChannelClaim {} landed as {} and began no withdrawal",
@@ -813,7 +862,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         if entry.finished.is_some() {
             return Err(BatchSettlementError::NoWithdrawalPending(id));
         }
-        let Some(held) = self.read_channel(&id).await? else {
+        let Some(held) = self.read_outbound(&id).await? else {
             self.observe(&id, None)?;
             return Err(BatchSettlementError::NoWithdrawalPending(id));
         };
@@ -831,7 +880,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
             });
         }
         let sent = self.close(id_bytes).await?;
-        let after = self.read_channel(&id).await?;
+        let after = self.read_after_exit(&id, &sent).await?;
         if after.is_some() {
             return Err(BatchSettlementError::Backend(format!(
                 "the PaymentChannelClaim {} landed as {} and the channel was not deleted",
@@ -850,7 +899,7 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         if let Some(finished) = entry.finished {
             return Ok(self.outbound_state_of(&id, finished));
         }
-        let held = self.read_channel(&id).await?;
+        let held = self.read_outbound(&id).await?;
         let (state, _) = self.observe(&id, held.as_ref())?;
         Ok(self.outbound_state_of(&id, state))
     }

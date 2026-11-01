@@ -638,6 +638,14 @@ async fn a_channel_the_receiver_closed_is_answered_from_the_cache() {
         None
     );
 
+    // Absent proves a deletion only past the open's `LastLedgerSequence`
+    // (#1637): until then the read is inconclusive and records nothing.
+    assert!(matches!(
+        world.payer.outbound_state(&channel).await.unwrap_err(),
+        BatchSettlementError::ReadInconclusive(_)
+    ));
+    world.chain.close_ledgers(&world.rpc, 105).await;
+
     let after = world.payer.outbound_state(&channel).await.expect("cache");
     assert_eq!(after.on_chain.id, channel);
     assert_eq!(after.on_chain.collateral, 0);
