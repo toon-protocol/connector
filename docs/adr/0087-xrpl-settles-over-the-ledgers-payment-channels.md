@@ -146,9 +146,29 @@ channel the claim gate holds a voucher on for that network, and every channel th
 admitted or restored. One with no `Expiration` is left untouched. One with an `Expiration` is
 answered with a single destination `PaymentChannelClaim` carrying `tfClose`: with the held voucher
 when it is genuine, above what is delivered and within the deposit, and without one otherwise. A
-channel the ledger no longer holds reads as `ChannelNotFound` on the receiving half and is
-remembered as done, so the runtime does not retry it. A payer that began an exit and wanted to
+channel the ledger no longer holds reads as absent on the receiving half; whether the
+watcher remembers it as done is decided by the floor rule of "Update (issue #1640)". A payer that began an exit and wanted to
 `tfRenew` loses that chance, as decision 8 accepts.
+
+## Update (issue #1640): the watcher stops on an absence it can trust
+
+A lagging endpoint reads a live channel as `entryNotFound`, and the #1617 update's rule, that a
+channel reading as absent is remembered as done, then left an exit unanswered for the life of the
+process. The watcher now keeps, per channel and in memory, a **floor**: the highest validated
+ledger at which it found the channel. An absent read marks the channel done only when it has a
+floor and the ledger of that read is at or past it. Below the floor the read proves nothing and
+changes nothing; a channel with no floor (a fresh watcher, as after a restart, for a channel
+already deleted) is never remembered as done and is read every pass. A channel this watcher closed
+itself is done at once.
+
+The ledger of a read is the `ledger_index` of the **same response** that carried the answer, found
+or `entryNotFound`, never a paired `server_info`, because a load-balanced endpoint can answer two
+calls from different servers. An answer naming no usable `ledger_index` proves nothing.
+
+The floor is not journaled (owner decision, 2026-11-01). The accepted cost is one more
+`ledger_entry` read per deleted, journaled channel per pass, as often as every 10 seconds, which
+could reach a public endpoint's rate limit on a node with many deleted channels; it has not been
+measured.
 
 ## Update (issue #1616): peering, payouts and dealing over XRPL
 
