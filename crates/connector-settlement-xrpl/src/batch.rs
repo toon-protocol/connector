@@ -388,6 +388,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
         let channel = self.read(&id).await?;
         self.judge(&id, &channel)?;
         let state = Self::state_of(&id, &channel)?;
+        self.unrestored.lock().expect("unrestored").remove(&id.0);
         self.admitted.lock().expect("admitted").insert(id.0);
         Ok(state)
     }
@@ -401,7 +402,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
             Ok(channel) => Self::state_of(&id, &channel)?,
             Err(error) => {
                 // Anything but an absence leaves the channel watched; an
-                // absent one is not (ADR 0087, the update on restore).
+                // absent one is not (ADR 0087, the #1641 update).
                 if !matches!(error, BatchSettlementError::ChannelNotFound(_)) {
                     self.unrestored.lock().expect("unrestored").insert(id.0);
                 }

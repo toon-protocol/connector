@@ -172,9 +172,19 @@ measured.
 
 ## Update (issue #1641): a failed restore leaves the channel watched
 
-A boot-time `restore` that fails on anything other than `ChannelNotFound` leaves the channel **watched** by the watcher, though not admitted: `require_admitted` still refuses it until an `admit` or a successful `restore` in this process. The watcher's read on each pass is the retry, so the runtime gains no retry loop and `HeldVouchers` does not change. The destination check holds as before, and a watched channel that later reads as absent follows decision 8's rule for a channel with no floor, for the life of that process.
+A boot-time `restore` that fails on anything other than `ChannelNotFound` leaves the channel
+**watched** by the watcher, though not admitted: `require_admitted` still refuses it until an
+`admit` or a successful `restore` in this process. The watcher's read on each pass is the retry, so
+the runtime gains no retry loop and `HeldVouchers` does not change. The destination check holds as
+before, and a watched channel that later reads as absent follows decision 8's rule for a channel
+with no floor, for the life of that process.
 
-**The accepted gap.** A restore that answers `ChannelNotFound` is _not_ watched. A deleted orphan fails restore at every boot, a first voucher rolled back on a forwarded route makes orphans free for a payer to create, and the no-floor rule would read each one on every pass for the life of the process. So if an endpoint behind a channel's creation answers absent at boot and the channel holds no voucher, its exit goes unanswered until a later restart restores it, or the payer closes it after the `SettleDelay`. No voucher is at risk: the payer's refund and reserve wait out the delay.
+**The accepted gap.** A restore that answers `ChannelNotFound` is _not_ watched. A deleted orphan
+fails restore at every boot, a first voucher rolled back on a forwarded route makes orphans free for
+a payer to create, and the no-floor rule would read each one on every pass for the life of the
+process. So if an endpoint behind a channel's creation answers absent at boot and the channel holds
+no voucher, its exit goes unanswered until a later restart restores it, or the payer closes it after
+the `SettleDelay`. No voucher is at risk: the payer's refund and reserve wait out the delay.
 
 ## Update (issue #1616): peering, payouts and dealing over XRPL
 

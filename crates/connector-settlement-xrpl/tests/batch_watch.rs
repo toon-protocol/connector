@@ -224,6 +224,7 @@ struct LagProxy {
     entry_reads: Arc<AtomicUsize>,
     lagged_absences: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
+    submits: Arc<AtomicUsize>,
 }
 
 const UNPINNED: u32 = u32::MAX;
@@ -237,19 +238,24 @@ impl LagProxy {
             entry_reads: Arc<AtomicUsize>,
             lagged_absences: Arc<AtomicUsize>,
             down: Arc<AtomicBool>,
+            submits: Arc<AtomicUsize>,
             client: reqwest::Client,
         }
         async fn forward(
             State(shared): State<Shared>,
             axum::Json(mut request): axum::Json<serde_json::Value>,
-        ) -> axum::response::Response {
-            use axum::response::IntoResponse;
+        ) -> axum::Json<serde_json::Value> {
             let pin = shared.pin.load(Ordering::SeqCst);
             let mut pinned = false;
+            if request["method"] == "submit" {
+                shared.submits.fetch_add(1, Ordering::SeqCst);
+            }
             if request["method"] == "ledger_entry" {
                 shared.entry_reads.fetch_add(1, Ordering::SeqCst);
                 if shared.down.load(Ordering::SeqCst) {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    // Unwinding out of the handler ends hyper's connection
+                    // task, so the socket closes with no answer at all.
+                    std::panic::resume_unwind(Box::new("the proxy is down"));
                 }
                 if pin != UNPINNED && request["params"][0]["ledger_index"] == "validated" {
                     request["params"][0]["ledger_index"] = serde_json::json!(pin);
@@ -269,10 +275,11 @@ impl LagProxy {
             if pinned && response["result"]["error"] == "entryNotFound" {
                 shared.lagged_absences.fetch_add(1, Ordering::SeqCst);
             }
-            axum::Json(response).into_response()
+            axum::Json(response)
         }
 
         let down = Arc::new(AtomicBool::new(false));
+        let submits = Arc::new(AtomicUsize::new(0));
         let pin = Arc::new(AtomicU32::new(UNPINNED));
         let entry_reads = Arc::new(AtomicUsize::new(0));
         let lagged_absences = Arc::new(AtomicUsize::new(0));
@@ -284,6 +291,7 @@ impl LagProxy {
             entry_reads: entry_reads.clone(),
             lagged_absences: lagged_absences.clone(),
             down: down.clone(),
+            submits: submits.clone(),
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
@@ -301,10 +309,12 @@ impl LagProxy {
             entry_reads,
             lagged_absences,
             down,
+            submits,
         }
     }
 
-    /// While down, every `ledger_entry` request is answered 503.
+    /// While down, every `ledger_entry` request's connection is dropped
+    /// unanswered.
     fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
     }
@@ -321,8 +331,19 @@ impl LagProxy {
         self.entry_reads.load(Ordering::SeqCst)
     }
 
+    /// Every transaction sent through the proxy.
+    fn submits(&self) -> usize {
+        self.submits.load(Ordering::SeqCst)
+    }
+
     fn lagged_absences(&self) -> usize {
         self.lagged_absences.load(Ordering::SeqCst)
+    }
+}
+
+fn presentation(channel: &ChannelId) -> ChannelPresentation {
+    ChannelPresentation::Xrpl {
+        channel: channel.clone(),
     }
 }
 
@@ -338,27 +359,14 @@ impl World {
     /// A watcher whose every `ledger_entry` read goes through `proxy`, over
     /// a backend that has admitted `channels`, reading the same held vouchers.
     async fn proxied_watcher(&self, proxy: &LagProxy, channels: &[&ChannelId]) -> XrplBatchWatcher {
-        let backend = XrplBatchSettlement::connect(
-            RpcTransport::direct(&proxy.url).expect("rpc transport"),
-            STANDALONE_NETWORK_ID,
-            XrplSigner::from_family_seed(&self.receiver_wallet.seed).expect("a family seed"),
-            SETTLE_DELAY,
-        )
-        .await
-        .expect("connect through the proxy")
-        .with_wait(WAIT);
+        let (backend, watcher) = self.bare_proxied_watcher(proxy).await;
         for channel in channels {
             backend
-                .admit(ChannelPresentation::Xrpl {
-                    channel: (*channel).clone(),
-                })
+                .admit(presentation(channel))
                 .await
                 .expect("admit through the proxy");
         }
-        XrplBatchWatcher::new(
-            Arc::new(backend),
-            Arc::clone(&self.held) as Arc<dyn HeldVouchers>,
-        )
+        watcher
     }
 
     /// A watcher over a backend reached through `proxy` that has admitted
@@ -500,12 +508,6 @@ async fn a_deleted_channel_is_read_no_more_only_with_a_floor() {
     }
 }
 
-fn presentation(channel: &ChannelId) -> ChannelPresentation {
-    ChannelPresentation::Xrpl {
-        channel: channel.clone(),
-    }
-}
-
 /// A restore that fails on a read error leaves the channel watched, though
 /// not admitted: once the endpoint recovers and the payer exits, the channel
 /// with no voucher is closed and the payer refunded in full, no restart.
@@ -618,6 +620,7 @@ async fn a_watched_channel_payable_to_another_account_is_not_closed() {
     let before = proxy.reads();
     assert!(watcher.tick().await.expect("tick").is_empty());
     assert!(proxy.reads() > before, "the channel is read");
+    assert_eq!(proxy.submits(), 0, "no close is even attempted");
     assert!(world
         .rpc
         .ledger_entry(&channel.0)
