@@ -451,11 +451,15 @@ impl SolanaValidator {
         let rpc_url = format!("http://127.0.0.1:{rpc_port}");
         let ledger = tempfile::tempdir().expect("create disposable ledger dir");
 
-        let child = Command::new("solana-test-validator")
+        let mut child = Command::new("solana-test-validator")
             .args(["--ledger"])
             .arg(ledger.path())
             .args(["--rpc-port", &rpc_port.to_string()])
-            .args(["--faucet-port", &(rpc_port + 1).to_string()])
+            // rpc_port + 1 is the RPC websocket; the faucet and gossip sit past the
+            // dynamic range, inside the same 50-port block. 3.1.x binds gossip to a
+            // fixed 8000 unless told otherwise, so concurrent validators collide.
+            .args(["--faucet-port", &(rpc_port + 42).to_string()])
+            .args(["--gossip-port", &(rpc_port + 41).to_string()])
             .args([
                 "--dynamic-port-range",
                 &format!("{}-{}", rpc_port + 2, rpc_port + 40),
@@ -488,11 +492,18 @@ impl SolanaValidator {
                 ready = true;
                 break;
             }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "solana-test-validator exited at startup ({status}) before serving {rpc_url}\n{}",
+                    validator_log_tail(ledger.path())
+                );
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(
             ready,
-            "solana-test-validator did not become ready at {rpc_url}"
+            "solana-test-validator did not become ready at {rpc_url}\n{}",
+            validator_log_tail(ledger.path())
         );
         let served = served_program(&rpc, &spl_token::id()).await;
         assert!(
@@ -507,6 +518,21 @@ impl SolanaValidator {
             _ledger: ledger,
             rpc_url,
         }
+    }
+}
+
+/// The tail of the validator's own `validator.log` in `ledger`, or a plain
+/// statement that there is none to show.
+fn validator_log_tail(ledger: &std::path::Path) -> String {
+    let path = ledger.join("validator.log");
+    match std::fs::read_to_string(&path) {
+        Ok(log) if !log.trim().is_empty() => {
+            let lines: Vec<&str> = log.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(40)..];
+            format!("tail of {}:\n{}", path.display(), tail.join("\n"))
+        }
+        Ok(_) => format!("{} is empty", path.display()),
+        Err(e) => format!("{} could not be read: {e}", path.display()),
     }
 }
 
