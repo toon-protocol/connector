@@ -3,9 +3,13 @@
 //! voucher with `tfClose`, in one transaction, and a channel with nothing worth
 //! landing is closed alone. The watcher is driven one pass at a time.
 
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use axum::extract::State;
+use axum::routing::post;
+use axum::Router;
 use connector_chain_rpc::xrpl::{TxWait, XrplRpc};
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, ChannelPresentation,
@@ -206,4 +210,226 @@ async fn an_exit_with_no_voucher_is_closed_and_the_payer_refunded_in_full() {
         payer_before + (DEPOSIT as u64 - 2_500) + DEPOSIT as u64,
         "the payer is refunded what was not landed"
     );
+}
+
+/// A real proxy in front of the spawned `xrpld` that makes its *validated*
+/// `ledger_entry` reads lag: while pinned, such a read is answered from the
+/// pinned ledger, and the node's own answer names that ledger. Every other
+/// call, and every unpinned one, goes straight through. It also counts the
+/// `ledger_entry` requests it forwards.
+struct LagProxy {
+    url: String,
+    pin: Arc<AtomicU32>,
+    entry_reads: Arc<AtomicUsize>,
+}
+
+const UNPINNED: u32 = u32::MAX;
+
+impl LagProxy {
+    fn spawn(upstream: &str) -> LagProxy {
+        #[derive(Clone)]
+        struct Shared {
+            upstream: String,
+            pin: Arc<AtomicU32>,
+            entry_reads: Arc<AtomicUsize>,
+            client: reqwest::Client,
+        }
+        async fn forward(
+            State(shared): State<Shared>,
+            axum::Json(mut request): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            let pin = shared.pin.load(Ordering::SeqCst);
+            if request["method"] == "ledger_entry" {
+                shared.entry_reads.fetch_add(1, Ordering::SeqCst);
+                if pin != UNPINNED && request["params"][0]["ledger_index"] == "validated" {
+                    request["params"][0]["ledger_index"] = serde_json::json!(pin);
+                }
+            }
+            let response = shared
+                .client
+                .post(&shared.upstream)
+                .json(&request)
+                .send()
+                .await
+                .expect("the chain answers")
+                .json()
+                .await
+                .expect("a JSON answer");
+            axum::Json(response)
+        }
+
+        let pin = Arc::new(AtomicU32::new(UNPINNED));
+        let entry_reads = Arc::new(AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy");
+        let addr = listener.local_addr().expect("the proxy's address");
+        let app = Router::new().route("/", post(forward)).with_state(Shared {
+            upstream: upstream.to_string(),
+            pin: pin.clone(),
+            entry_reads: entry_reads.clone(),
+            client: reqwest::Client::new(),
+        });
+        tokio::spawn(async move {
+            let _ = axum::Server::from_tcp(listener)
+                .expect("serve the proxy")
+                .serve(app.into_make_service())
+                .await;
+        });
+        LagProxy {
+            url: format!("http://{addr}"),
+            pin,
+            entry_reads,
+        }
+    }
+
+    fn lag_at(&self, ledger: u32) {
+        self.pin.store(ledger, Ordering::SeqCst);
+    }
+
+    fn catch_up(&self) {
+        self.lag_at(UNPINNED);
+    }
+
+    fn reads(&self) -> usize {
+        self.entry_reads.load(Ordering::SeqCst)
+    }
+}
+
+async fn validated_ledger(rpc: &XrplRpc) -> u32 {
+    rpc.server_info()
+        .await
+        .expect("server_info")
+        .validated_ledger
+        .expect("a validated ledger")
+}
+
+impl World {
+    /// A watcher whose every `ledger_entry` read goes through `proxy`, over
+    /// a backend that has admitted `channels`, reading the same held vouchers.
+    async fn proxied_watcher(&self, proxy: &LagProxy, channels: &[&ChannelId]) -> XrplBatchWatcher {
+        let backend = XrplBatchSettlement::connect(
+            RpcTransport::direct(&proxy.url).expect("rpc transport"),
+            STANDALONE_NETWORK_ID,
+            XrplSigner::from_family_seed(&self.receiver_wallet.seed).expect("a family seed"),
+            SETTLE_DELAY,
+        )
+        .await
+        .expect("connect through the proxy")
+        .with_wait(WAIT);
+        for channel in channels {
+            backend
+                .admit(ChannelPresentation::Xrpl {
+                    channel: (*channel).clone(),
+                })
+                .await
+                .expect("admit through the proxy");
+        }
+        XrplBatchWatcher::new(
+            Arc::new(backend),
+            Arc::clone(&self.held) as Arc<dyn HeldVouchers>,
+        )
+    }
+
+    async fn next_ledger(&self) {
+        let now = validated_ledger(&self.rpc).await;
+        while validated_ledger(&self.rpc).await <= now {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// An endpoint behind the channel's creation reads it as absent. That is no
+/// reason to stop watching: once it catches up, an exit is answered.
+#[tokio::test]
+async fn a_watcher_behind_a_channels_creation_still_answers_its_exit() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let before_creation = validated_ledger(&world.rpc).await;
+    let channel = world.channel().await;
+    world.hold(&channel, 4_000).await;
+    let watcher = world.proxied_watcher(&proxy, &[&channel]).await;
+
+    proxy.lag_at(before_creation);
+    for _ in 0..2 {
+        assert!(watcher.tick().await.expect("tick").is_empty());
+        world.next_ledger().await;
+    }
+    proxy.catch_up();
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+
+    let closed = watcher.tick().await.expect("tick");
+    assert_eq!(closed.len(), 1, "the exit is answered with no restart");
+    assert_eq!(closed[0].delivered, 4_000);
+}
+
+/// The same when the lag starts after the watcher has found the channel: the
+/// absent read is below the floor, so it proves nothing.
+#[tokio::test]
+async fn an_absence_below_the_floor_proves_nothing() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let before_creation = validated_ledger(&world.rpc).await;
+    let channel = world.channel().await;
+    world.hold(&channel, 4_000).await;
+    let watcher = world.proxied_watcher(&proxy, &[&channel]).await;
+
+    assert!(watcher.tick().await.expect("tick").is_empty());
+    world.next_ledger().await;
+    proxy.lag_at(before_creation);
+    for _ in 0..2 {
+        assert!(watcher.tick().await.expect("tick").is_empty());
+        world.next_ledger().await;
+    }
+    proxy.catch_up();
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+
+    let closed = watcher.tick().await.expect("tick");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].delivered, 4_000);
+}
+
+/// A channel really deleted, read at or past its floor, is not read again; one
+/// a watcher never found (a fresh watcher, as after a restart) is read every
+/// pass, closes nothing, and the pass does not fail.
+#[tokio::test]
+async fn a_deleted_channel_is_read_no_more_only_with_a_floor() {
+    if !require_xrpld() {
+        return;
+    }
+    let chain = Xrpld::spawn().await;
+    let world = world(&chain).await;
+    let proxy = LagProxy::spawn(&chain.rpc_url);
+    let channel = world.channel().await;
+    world.hold(&channel, 4_000).await;
+    let with_floor = world.proxied_watcher(&proxy, &[&channel]).await;
+    let without_floor = world.proxied_watcher(&proxy, &[&channel]).await;
+
+    // Finding the channel sets the floor.
+    assert!(with_floor.tick().await.expect("tick").is_empty());
+
+    // Another watcher answers the exit and deletes the channel.
+    world.payer.start_withdrawal(&channel).await.expect("exit");
+    assert_eq!(world.watcher.tick().await.expect("tick").len(), 1);
+
+    let before = proxy.reads();
+    assert!(with_floor.tick().await.expect("tick").is_empty());
+    assert_eq!(proxy.reads(), before + 1, "the absence is read once");
+    assert!(with_floor.tick().await.expect("tick").is_empty());
+    assert_eq!(proxy.reads(), before + 1, "and then the channel is done");
+
+    for pass in 1..=3 {
+        assert!(without_floor.tick().await.expect("tick").is_empty());
+        assert_eq!(
+            proxy.reads(),
+            before + 1 + pass,
+            "with no floor the channel is read every pass"
+        );
+    }
 }

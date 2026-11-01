@@ -14,10 +14,16 @@
 //!
 //! The channels it looks at are those the claim gate holds a voucher on and
 //! those the backend has admitted or restored. A channel the ledger no longer
-//! holds reads as `ChannelNotFound`, which is the end of it: it is remembered
-//! as done and never read again.
+//! holds reads as absent, and only an absence it can trust is the end of it:
+//! the watcher keeps, per channel, a floor in memory -- the highest validated
+//! ledger at which it found the channel -- and remembers a channel as done
+//! only when an absent read's own ledger (from the same response) is at or
+//! past that floor. An absence below the floor, or from an answer naming no
+//! ledger, proves nothing and the channel is read again next pass; so is one
+//! with no floor, as after a restart for a channel already deleted. A channel
+//! this watcher closed itself is done at once.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +34,7 @@ use connector_settlement::batch::{
 use connector_settlement::ChannelId;
 use connector_signer::{verify_xrpl_claim, XRPL_MAX_DROPS};
 
-use crate::batch::{closed_delivering, Channel, XrplBatchSettlement};
+use crate::batch::{closed_delivering, Channel, Seen, XrplBatchSettlement};
 use crate::tx::{LandClaim, SourceClose};
 
 impl XrplBatchSettlement {
@@ -150,6 +156,9 @@ pub struct XrplBatchWatcher {
     held: Arc<dyn HeldVouchers>,
     /// Channels the ledger no longer holds: never read again.
     gone: Mutex<HashSet<String>>,
+    /// Per channel, the highest validated ledger at which it was found. Not
+    /// journaled: a restart starts with none.
+    floors: Mutex<HashMap<String, u32>>,
     /// Whether the endpoint is refusing, so [`run`](Self::run) says so once.
     refusals: RefusalLog,
 }
@@ -160,6 +169,7 @@ impl XrplBatchWatcher {
             backend,
             held,
             gone: Mutex::new(HashSet::new()),
+            floors: Mutex::new(HashMap::new()),
             refusals: RefusalLog::new(),
         }
     }
@@ -193,10 +203,20 @@ impl XrplBatchWatcher {
             let Ok((_, id_bytes)) = XrplBatchSettlement::parse(&id) else {
                 continue;
             };
-            let read = match self.backend.read(&id).await {
-                Ok(read) => read,
-                Err(BatchSettlementError::ChannelNotFound(_)) => {
-                    self.gone.lock().expect("gone").insert(name);
+            let read = match self.backend.read_seen(&id).await {
+                Ok(Seen::Found(read, ledger)) => {
+                    if let Some(ledger) = ledger {
+                        let mut floors = self.floors.lock().expect("floors");
+                        let floor = floors.entry(name.clone()).or_insert(ledger);
+                        *floor = (*floor).max(ledger);
+                    }
+                    read
+                }
+                Ok(Seen::Absent(ledger)) => {
+                    let floor = self.floors.lock().expect("floors").get(&name).copied();
+                    if matches!((floor, ledger), (Some(floor), Some(ledger)) if ledger >= floor) {
+                        self.gone.lock().expect("gone").insert(name);
+                    }
                     continue;
                 }
                 Err(error) => {

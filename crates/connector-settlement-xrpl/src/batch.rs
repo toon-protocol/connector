@@ -51,6 +51,13 @@ pub(crate) const LAST_LEDGER_WINDOW: u32 = 20;
 /// landing's, since the caller journals between preparing and sending.
 const OPEN_LAST_LEDGER_WINDOW: u32 = 100;
 
+/// What one validated read of a channel found, and the ledger its response
+/// named (`None` when it named none).
+pub(crate) enum Seen {
+    Found(Channel, Option<u32>),
+    Absent(Option<u32>),
+}
+
 /// The receiving half of the settlement port on one XRPL network.
 ///
 /// **One key, one account.** The key is this node's `[settlement.xrpl.<id>]`
@@ -251,6 +258,22 @@ impl XrplBatchSettlement {
             .map_err(rpc_error)?
             .ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))?;
         Channel::from_entry(&node).ok_or_else(|| BatchSettlementError::ChannelNotFound(id.clone()))
+    }
+
+    /// The channel from the validated ledger, with the ledger the *same
+    /// response* names, for a caller that judges absence by it (the
+    /// watcher). Absent, or an entry of another type, is [`Seen::Absent`]:
+    /// not an error, since what it proves depends on the ledger.
+    pub(crate) async fn read_seen(&self, id: &ChannelId) -> Result<Seen, BatchSettlementError> {
+        let (node, ledger) = self
+            .rpc
+            .ledger_entry_answered_at(&id.0)
+            .await
+            .map_err(rpc_error)?;
+        Ok(match node.as_ref().and_then(Channel::from_entry) {
+            Some(channel) => Seen::Found(channel, ledger),
+            None => Seen::Absent(ledger),
+        })
     }
 
     /// The outbound channel from the validated ledger, where absence counts
