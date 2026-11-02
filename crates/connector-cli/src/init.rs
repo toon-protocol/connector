@@ -42,7 +42,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use connector_signer::{derive_evm_address, to_hex, LocalSigner, Signer};
+use connector_signer::{
+    derive_evm_address, to_hex, Ed25519Signer, LocalEd25519Signer, LocalSigner, Signer,
+};
 use rand::RngCore;
 
 /// A settlement chain `init` can scaffold, as `--chain` names it. Not the
@@ -203,8 +205,9 @@ pub static NAMED_NETWORKS: [NamedNetwork; 6] = [
             eip712_version: "1",
             facilitator: None,
             funding_note: Some(
-                "Testnet ETH comes from Robinhood's own testnet faucet, and testnet USDG is \
-                 Paxos's (docs.paxos.com/guides/stablecoin/usdg/testnet); TOON's Base Sepolia \
+                "Testnet ETH: Arbitrum's launch post names Robinhood's faucet \
+                 (faucet.testnet.chain.robinhood.com). Testnet USDG: Paxos's faucet \
+                 (faucet.paxos.com). Check both before you rely on them; TOON's Base Sepolia \
                  faucet does not serve this chain.",
             ),
         }),
@@ -261,7 +264,7 @@ pub static NAMED_NETWORKS: [NamedNetwork; 6] = [
 ];
 
 /// The row for (`chain`, `tier`). Every pair has one.
-pub(crate) fn named_network(chain: Chain, tier: Tier) -> &'static NamedNetwork {
+pub fn named_network(chain: Chain, tier: Tier) -> &'static NamedNetwork {
     NAMED_NETWORKS
         .iter()
         .find(|row| row.chain == chain && row.tier == tier)
@@ -277,6 +280,28 @@ impl RowSettlement {
         }
     }
 
+    fn decimals(&self) -> u8 {
+        match self {
+            RowSettlement::Evm(evm) => evm.decimals,
+            RowSettlement::Solana(solana) => solana.decimals,
+        }
+    }
+
+    /// The token's unit, as a price is stated in: `USDC`, or a mint's name.
+    fn token_unit(&self) -> &'static str {
+        match self {
+            RowSettlement::Evm(evm) => evm.token_symbol,
+            RowSettlement::Solana(solana) => solana.token_name,
+        }
+    }
+
+    fn funding_note(&self) -> Option<&'static str> {
+        match self {
+            RowSettlement::Evm(evm) => evm.funding_note,
+            RowSettlement::Solana(solana) => solana.funding_note,
+        }
+    }
+
     /// Where a scaffold of this family holds its settlement key, relative to
     /// the node's directory. No other family's table reads it.
     fn key_file(&self) -> &'static str {
@@ -288,16 +313,17 @@ impl RowSettlement {
 }
 
 impl NamedNetwork {
-    /// The row `init --devnet` has always written. Its words are older than
-    /// the table, and existing instructions rely on them, so they stay.
-    fn is_the_original(&self) -> bool {
+    /// The row `init --devnet` has always written, whose report and comments are
+    /// pinned byte for byte: existing instructions rely on them, and they are
+    /// older than the table.
+    fn is_base_sepolia(&self) -> bool {
         self.chain == Chain::Base && self.tier == Tier::Devnet
     }
 
     /// The flags that select this row, as a written file's first line quotes
     /// them.
     fn flags(&self) -> String {
-        match (self.is_the_original(), self.tier) {
+        match (self.is_base_sepolia(), self.tier) {
             (true, _) => "--devnet".to_string(),
             (false, Tier::Devnet) => format!("--devnet --chain {}", self.chain.name()),
             (false, Tier::Mainnet) => format!("--mainnet --chain {}", self.chain.name()),
@@ -312,6 +338,17 @@ pub const DEFAULT_IMAGE: &str = "ghcr.io/toon-protocol/connector:rust-main";
 /// What the one route charges on every row: 0.001 of a 6-decimal token, the
 /// devnet store's price.
 const PRICE: u64 = 1000;
+
+/// [`PRICE`] in whole tokens, for a token of `decimals`: `0.001` at 6.
+fn price_in_tokens(decimals: u8) -> String {
+    let decimals = usize::from(decimals);
+    let digits = format!("{PRICE:0>width$}", width = decimals + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - decimals);
+    match fraction.trim_end_matches('0') {
+        "" => whole.to_string(),
+        fraction => format!("{whole}.{fraction}"),
+    }
+}
 
 /// The port the stub app listens on inside the compose network. The same
 /// port spaceturtle expects of any app, so a config written here reads the
@@ -506,29 +543,29 @@ pub fn describe(report: &InitReport) -> String {
     // `fund_first` comes before the command that starts the node, `fund_later`
     // after: only a Solana node cannot boot unfunded.
     let (node, pay, fund_first, fund_later) = match &network.settlement {
-        RowSettlement::Evm(_) if network.is_the_original() => (
+        RowSettlement::Evm(_) if network.is_base_sepolia() => (
             "devnet",
-            original_pay_section(),
+            base_sepolia_pay_section(),
             String::new(),
-            format!("{}\n\n", original_fund_section(report)),
+            format!("{}\n\n", base_sepolia_fund_section(report)),
         ),
         RowSettlement::Evm(evm) => (
             network.name,
             pay_section(evm),
             String::new(),
-            format!("{}\n\n", fund_section(report, evm)),
+            format!("{}\n\n", fund_section(report)),
         ),
         RowSettlement::Solana(solana) => (
             network.name,
             solana_pay_section(network, solana),
-            format!("{}\n\n", solana_fund_section(report, solana)),
+            format!("{}\n\n", solana_fund_section(report)),
             String::new(),
         ),
     };
     format!(
         "Wrote a {node} node to {dir}:\n\
          \n\
-         \x20 config/connector.toml   one route, {address}, at {PRICE} units (0.001 {token})\n\
+         \x20 config/connector.toml   one route, {address}, at {PRICE} units ({figure} {token})\n\
          \x20 data/                   signer, settlement and operator keys, 0600, owned by you\n\
          \x20 state/                  the claim journal; keep it, it is the watermark\n\
          \x20 compose.yml             the connector and the stub app, as your own uid\n\
@@ -547,6 +584,7 @@ pub fn describe(report: &InitReport) -> String {
          \n\
          {fund_later}compose.yml runs {image}. Pin a dated release handle (--image) for a node you keep.",
         address = report.address,
+        figure = price_in_tokens(network.settlement.decimals()),
         token = network.settlement.token_name(),
         image = report.image,
     )
@@ -556,7 +594,7 @@ const CHANNEL_AND_SEND: &str = "\x20 npx toon-client channel open --connector \
      http://127.0.0.1:3000 --deposit 100000\n\
      \x20 npx toon-client send --connector http://127.0.0.1:3000 --body 'hello'";
 
-fn original_pay_section() -> String {
+fn base_sepolia_pay_section() -> String {
     format!(
         "Pay it from another terminal (devnet USDC from the faucet, no ETH needed):\n\
          \n\
@@ -565,7 +603,7 @@ fn original_pay_section() -> String {
     )
 }
 
-fn original_fund_section(report: &InitReport) -> String {
+fn base_sepolia_fund_section(report: &InitReport) -> String {
     format!(
         "Settlement address: {settlement}\n\
          Vouchers are landed on Base Sepolia from this key every ten minutes; give it a little \
@@ -580,25 +618,39 @@ fn pay_section(evm: &EvmRow) -> String {
     format!(
         "Pay it from another terminal. The payer needs {symbol} and its own ETH: nothing relays a \
          deposit on this network, so it pays the gas to open a channel itself.\n\
+         toon-client's EVM presets name only 84532, and paying on this network from it has not \
+         been run.\n\
          \n\
          {CHANNEL_AND_SEND}",
         symbol = evm.token_symbol,
     )
 }
 
-fn fund_section(report: &InitReport, evm: &EvmRow) -> String {
+fn fund_section(report: &InitReport) -> String {
     let network = report.network;
-    let symbol = evm.token_symbol;
-    let mut text = format!(
+    format!(
         "Settlement address: {settlement}\n\
          This key must hold ETH for gas and {symbol} on {name}. Vouchers are landed from it every \
          ten minutes; admission works without them.\n\
-         Prices count {symbol}'s base units: with {decimals} decimals, {PRICE} is 0.001 {symbol}.",
+         {tail}",
         settlement = report.settlement_address,
+        symbol = network.settlement.token_unit(),
         name = network.name,
-        decimals = evm.decimals,
+        tail = fund_section_tail(report),
+    )
+}
+
+/// How prices count, then the row's funding note and mainnet warnings: what
+/// both families' funding sections end with.
+fn fund_section_tail(report: &InitReport) -> String {
+    let settlement = &report.network.settlement;
+    let unit = settlement.token_unit();
+    let decimals = settlement.decimals();
+    let figure = price_in_tokens(decimals);
+    let mut text = format!(
+        "Prices count {unit}'s base units: with {decimals} decimals, {PRICE} is {figure} {unit}."
     );
-    if let Some(note) = evm.funding_note {
+    if let Some(note) = settlement.funding_note() {
         text.push('\n');
         text.push_str(note);
     }
@@ -629,30 +681,20 @@ fn solana_pay_section(network: &NamedNetwork, solana: &SolanaRow) -> String {
     )
 }
 
-fn solana_fund_section(report: &InitReport, solana: &SolanaRow) -> String {
+fn solana_fund_section(report: &InitReport) -> String {
     let network = report.network;
-    let SolanaRow {
-        token_name,
-        decimals,
-        ..
-    } = solana;
-    let mut text = format!(
+    format!(
         "Settlement address: {settlement}\n\
          Fund it first. This key must hold SOL on {name} before the first start: the node sends \
          a transaction as it boots and exits if it cannot, which restart: unless-stopped would \
          turn into a loop. It also pays for sponsored opens, which min_sponsored_deposit bounds, \
-         and needs {token_name} for any channel it opens itself.\n\
-         Prices count {token_name}'s base units: with {decimals} decimals, {PRICE} is 0.001 \
-         {token_name}.",
+         and needs {token} for any channel it opens itself.\n\
+         {tail}",
         settlement = report.settlement_address,
         name = network.name,
-    );
-    if let Some(note) = solana.funding_note {
-        text.push('\n');
-        text.push_str(note);
-    }
-    text.push_str(&mainnet_warnings(report));
-    text
+        token = network.settlement.token_name(),
+        tail = fund_section_tail(report),
+    )
 }
 
 /// What every mainnet report adds, set off by a blank line; nothing on a devnet.
@@ -684,17 +726,12 @@ fn config_toml(
     settlement_address: &str,
 ) -> String {
     let flags = network.flags();
-    let (token_unit, decimals, table) = match &network.settlement {
-        RowSettlement::Evm(evm) => (
-            evm.token_symbol,
-            evm.decimals,
-            evm_table(network, evm, rpc_url, settlement_address),
-        ),
-        RowSettlement::Solana(solana) => (
-            solana.token_name,
-            solana.decimals,
-            solana_table(network, solana, rpc_url, settlement_address),
-        ),
+    let token_unit = network.settlement.token_unit();
+    let decimals = network.settlement.decimals();
+    let figure = price_in_tokens(decimals);
+    let table = match &network.settlement {
+        RowSettlement::Evm(evm) => evm_table(network, evm, rpc_url, settlement_address),
+        RowSettlement::Solana(solana) => solana_table(network, solana, rpc_url, settlement_address),
     };
     format!(
         r#"# Written by `connector init {flags}`. One file, read once at boot; an
@@ -730,7 +767,7 @@ http_endpoint = "http://127.0.0.1:3000/ilp"
 
 # The route: everything addressed to {address} is paid for, unsealed and
 # handed to the app as a plain HTTP request. `price` counts the token's
-# smallest unit: with {decimals} decimals, {PRICE} is 0.001 {token_unit}.
+# smallest unit: with {decimals} decimals, {PRICE} is {figure} {token_unit}.
 [[routes]]
 prefix      = "{address}"
 handler_url = "http://app:{APP_PORT}/"
@@ -821,7 +858,7 @@ key_file = "/app/{key_file}""#,
 
 /// The comment above an EVM settlement table.
 fn settlement_comment(network: &NamedNetwork, evm: &EvmRow, settlement_address: &str) -> String {
-    if network.is_the_original() {
+    if network.is_base_sepolia() {
         return format!(
             "# Base Sepolia, the public devnet (docs/guide/get-paid.md). The token is\n\
              # Circle's devnet USDC; the facilitator relays a payer's deposit so they need\n\
@@ -933,20 +970,19 @@ fn settlement_address_of(
     settlement: &RowSettlement,
     secret: [u8; 32],
 ) -> Result<String, InitError> {
-    let key_error = |reason: String| InitError::Key(reason);
     match settlement {
         RowSettlement::Evm(_) => {
             let signer = LocalSigner::from_secret_bytes("settlement", secret)
-                .map_err(|error| key_error(error.to_string()))?;
+                .map_err(|error| InitError::Key(error.to_string()))?;
             let public = signer
                 .public_key()
-                .map_err(|error| key_error(error.to_string()))?;
+                .map_err(|error| InitError::Key(error.to_string()))?;
             Ok(to_hex(&derive_evm_address(&public)))
         }
         RowSettlement::Solana(_) => {
-            let keypair = solana_sdk::signer::keypair::keypair_from_seed(&secret)
-                .map_err(|error| key_error(error.to_string()))?;
-            Ok(solana_sdk::signer::Signer::pubkey(&keypair).to_string())
+            let signer = LocalEd25519Signer::from_secret_bytes(secret)
+                .map_err(|error| InitError::Key(error.to_string()))?;
+            Ok(solana_sdk::pubkey::Pubkey::new_from_array(signer.public_key()).to_string())
         }
     }
 }
@@ -1290,21 +1326,28 @@ mod tests {
         }
     }
 
-    /// Devnet and mainnet-beta: flags, RPC, mint, cluster. The figures are the
-    /// spec's, typed here rather than read off the table.
-    const SOLANA_ROWS: [(&[&str], &str, &str, &str); 2] = [
-        (
-            &["--devnet", "--chain", "solana"],
-            "https://api.devnet.solana.com",
-            "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU",
-            "devnet",
-        ),
-        (
-            &["--mainnet", "--chain", "solana"],
-            "https://api.mainnet-beta.solana.com",
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "mainnet-beta",
-        ),
+    /// What a Solana table must resolve to. The figures are the spec's, typed
+    /// here rather than read off the table.
+    struct ExpectedSolana {
+        args: &'static [&'static str],
+        rpc_url: &'static str,
+        mint: &'static str,
+        cluster: &'static str,
+    }
+
+    const SOLANA_ROWS: [ExpectedSolana; 2] = [
+        ExpectedSolana {
+            args: &["--devnet", "--chain", "solana"],
+            rpc_url: "https://api.devnet.solana.com",
+            mint: "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU",
+            cluster: "devnet",
+        },
+        ExpectedSolana {
+            args: &["--mainnet", "--chain", "solana"],
+            rpc_url: "https://api.mainnet-beta.solana.com",
+            mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            cluster: "mainnet-beta",
+        },
     ];
 
     fn the_solana_table(config: &Config) -> &connector_config::SolanaSettlementConfig {
@@ -1318,7 +1361,8 @@ mod tests {
     /// network's own RPC, mint and decimals.
     #[test]
     fn each_solana_row_loads_and_resolves_to_its_own_network_and_mint() {
-        for (args, rpc_url, mint, cluster) in &SOLANA_ROWS {
+        for expected in &SOLANA_ROWS {
+            let args = expected.args;
             let tmp = tempfile::tempdir().expect("tempdir");
             let dir = tmp.path().join("node");
             connector_init(&init_args(args, &dir))
@@ -1326,9 +1370,9 @@ mod tests {
             let config = load_written(&dir);
             let table = the_solana_table(&config);
 
-            assert_eq!(table.rpc_url(), *rpc_url, "{args:?}");
-            assert_eq!(table.cluster_hint(), Some(*cluster), "{args:?}");
-            assert_eq!(table.token_address(), *mint, "{args:?}");
+            assert_eq!(table.rpc_url(), expected.rpc_url, "{args:?}");
+            assert_eq!(table.cluster_hint(), Some(expected.cluster), "{args:?}");
+            assert_eq!(table.token_address(), expected.mint, "{args:?}");
             assert_eq!(table.decimals(), 6, "{args:?}");
             assert_eq!(table.batch_settlement().min_sponsored_deposit(), 1_000_000);
             assert_eq!(config.routes().len(), 1);
@@ -1346,7 +1390,7 @@ mod tests {
     /// so it is not written.
     #[test]
     fn a_solana_scaffold_writes_its_own_key_and_reports_its_address() {
-        for (args, ..) in &SOLANA_ROWS {
+        for ExpectedSolana { args, .. } in &SOLANA_ROWS {
             let tmp = tempfile::tempdir().expect("tempdir");
             let dir = tmp.path().join("node");
             let report = connector_init(&init_args(args, &dir)).expect("init");
@@ -1415,23 +1459,29 @@ mod tests {
     }
 
     /// Story 18: a mainnet node's default address does not claim to be on
-    /// devnet, and a devnet one still says so.
+    /// devnet, and a devnet one still says so, on every row of the table.
     #[test]
     fn the_default_address_follows_the_row() {
-        for expected in &EVM_ROWS {
+        for network in &NAMED_NETWORKS {
+            let flags = network.flags();
+            let args: Vec<&str> = flags.split(' ').collect();
             let tmp = tempfile::tempdir().expect("tempdir");
             let dir = tmp.path().join("node");
-            connector_init(&init_args(expected.args, &dir)).expect("init");
+            connector_init(&init_args(&args, &dir)).expect("init");
             let config = load_written(&dir);
             let prefix = config.routes()[0].prefix().to_string();
-            let tail = if expected.args[0] == "--mainnet" {
-                assert!(!prefix.contains("devnet"), "{prefix}");
-                prefix.strip_prefix("g.").expect("g.")
-            } else {
-                prefix.strip_prefix("g.devnet.").expect("g.devnet.")
+            let tail = match network.tier {
+                Tier::Mainnet => {
+                    assert!(!prefix.contains("devnet"), "{flags}: {prefix}");
+                    prefix.strip_prefix("g.").expect("g.")
+                }
+                Tier::Devnet => prefix.strip_prefix("g.devnet.").expect("g.devnet."),
             };
-            assert_eq!(tail.len(), 6, "{prefix}");
-            assert!(tail.bytes().all(|b| b.is_ascii_hexdigit()), "{prefix}");
+            assert_eq!(tail.len(), 6, "{flags}: {prefix}");
+            assert!(
+                tail.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{flags}: {prefix}"
+            );
         }
     }
 
@@ -1459,6 +1509,35 @@ mod tests {
             (&["--devnet", "--chain"], &["--chain needs a value"]),
             (&["--devnet", "--rpc-url"], &["--rpc-url needs a value"]),
             (&["--devnet", "--network"], &["--network"]),
+            // A repeated flag is refused rather than resolved: last-one-wins would
+            // write a chain or an RPC the operator typed over without noticing.
+            (
+                &["--devnet", "--chain", "base", "--chain", "solana"],
+                &["--chain", "twice"],
+            ),
+            (
+                &["--mainnet", "--chain", "base", "--chain", "base"],
+                &["--chain", "twice"],
+            ),
+            (
+                &[
+                    "--devnet",
+                    "--rpc-url",
+                    "https://a.example",
+                    "--rpc-url",
+                    "https://b.example",
+                ],
+                &["--rpc-url", "twice"],
+            ),
+            (
+                &["--devnet", "--address", "g.a", "--address", "g.b"],
+                &["--address", "twice"],
+            ),
+            (
+                &["--devnet", "--image", "a:1", "--image", "b:2"],
+                &["--image", "twice"],
+            ),
+            (&["--devnet", "--dir", "elsewhere"], &["--dir", "twice"]),
             (&["--devnet", "--address", "nope"], &["--address"]),
             (
                 &["--devnet", "--rpc-url", "not a url"],
@@ -1524,7 +1603,7 @@ mod tests {
         }
     }
 
-    /// Story 21, on a row that is not the original.
+    /// Story 21, on a row other than Base Sepolia.
     #[cfg(unix)]
     #[test]
     fn a_new_row_writes_its_keys_with_the_same_private_modes() {
@@ -1543,7 +1622,7 @@ mod tests {
         }
     }
 
-    /// Story 20, on a row that is not the original, and across rows: choosing
+    /// Story 20, on a row other than Base Sepolia, and across rows: choosing
     /// another chain is no way around it.
     #[test]
     fn a_repeat_init_on_a_new_row_is_refused_and_rotates_nothing() {
@@ -1589,10 +1668,8 @@ mod tests {
             assert!(text.contains("own ETH"), "{text}");
         }
         let testnet = report_for(&["--devnet", "--chain", "robinhood"]);
-        assert!(
-            testnet.contains("Robinhood's own testnet faucet"),
-            "{testnet}"
-        );
+        assert!(testnet.contains("Robinhood's faucet"), "{testnet}");
+        assert!(testnet.contains("faucet.paxos.com"), "{testnet}");
         assert!(testnet.contains("TOON's"), "{testnet}");
     }
 
@@ -1663,6 +1740,71 @@ mod tests {
         );
     }
 
+    /// On the three new EVM rows the report says, beside the commands, what is
+    /// known about paying there. Base Sepolia is the row the presets name, and
+    /// nothing on record says the same of Solana's.
+    #[test]
+    fn a_new_evm_report_says_paying_from_toon_client_has_not_been_run() {
+        let unrun = "presets name only 84532";
+        for args in [
+            &["--mainnet", "--chain", "base"][..],
+            &["--devnet", "--chain", "robinhood"][..],
+            &["--mainnet", "--chain", "robinhood"][..],
+        ] {
+            let text = report_for(args);
+            let line = text
+                .lines()
+                .find(|line| line.contains(unrun))
+                .unwrap_or_else(|| panic!("{args:?}: {text}"));
+            assert!(line.contains("has not been run"), "{line}");
+            assert!(text.contains("toon-client channel open"), "{text}");
+            assert!(text.contains("toon-client send"), "{text}");
+        }
+        for args in [
+            &["--devnet"][..],
+            &["--devnet", "--chain", "solana"][..],
+            &["--mainnet", "--chain", "solana"][..],
+        ] {
+            let text = report_for(args);
+            assert!(!text.contains(unrun), "{args:?}: {text}");
+        }
+    }
+
+    /// The figure a config comment prints is the row's decimals' own, not a
+    /// 6-decimal figure beside another token's decimals.
+    #[test]
+    fn the_price_figure_is_computed_from_the_rows_decimals() {
+        for (decimals, figure) in [
+            (6, "0.001"),
+            (9, "0.000001"),
+            (3, "1"),
+            (2, "10"),
+            (0, "1000"),
+        ] {
+            let network = NamedNetwork {
+                chain: Chain::Base,
+                tier: Tier::Mainnet,
+                name: "a test network",
+                rpc_url: "https://rpc.example",
+                address_prefix: "g.",
+                settlement: RowSettlement::Evm(EvmRow {
+                    chain_id: 1,
+                    token: "0x0000000000000000000000000000000000000001",
+                    token_name: "TOK",
+                    token_symbol: "TOK",
+                    decimals,
+                    eip712_name: "TOK",
+                    eip712_version: "1",
+                    facilitator: None,
+                    funding_note: None,
+                }),
+            };
+            let config = config_toml(&network, network.rpc_url, "g.a", "0xabc");
+            let stated = format!("with {decimals} decimals, 1000 is {figure} TOK.");
+            assert!(config.contains(&stated), "{stated} in {config}");
+        }
+    }
+
     /// Named your own endpoint: the warning about the default is not yours.
     #[test]
     fn a_mainnet_report_with_its_own_rpc_drops_only_the_rpc_warning() {
@@ -1722,9 +1864,9 @@ mod tests {
         );
     }
 
-    /// Reachable from another crate: a later drift test reads the guide
-    /// against this table from `connector-bin`'s tests. Holds all six rows,
-    /// Solana's included, with the spec's Solana values.
+    /// Reachable from another crate: `connector-bin`'s
+    /// `guide_publishes_named_networks.rs` reads the guide against this table.
+    /// Holds all six rows, Solana's included, with the spec's Solana values.
     #[test]
     fn the_table_holds_all_six_rows_once_each() {
         let mut keys: Vec<(Chain, Tier)> = crate::NAMED_NETWORKS

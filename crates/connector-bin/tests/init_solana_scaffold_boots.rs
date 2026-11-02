@@ -1,7 +1,7 @@
 //! `connector init`'s one new config shape, `[settlement.solana]`, booted by
 //! the real binary against a disposable chain (#1647). The operator's steps, in
 //! order: run `init`, fund the address its report names, start the node. The
-//! one substitution an operator never makes is the mint, which does not exist
+//! two substitutions an operator never makes are the mint, which does not exist
 //! on a chain spawned a moment ago, and the bind address, so tests can share a
 //! host.
 
