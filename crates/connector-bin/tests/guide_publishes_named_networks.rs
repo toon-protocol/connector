@@ -11,7 +11,9 @@
 
 use std::path::Path;
 
-use connector_cli::{Chain, EvmRow, NamedNetwork, RowSettlement, SolanaRow, Tier, NAMED_NETWORKS};
+use connector_cli::{
+    named_network, Chain, EvmRow, NamedNetwork, RowSettlement, SolanaRow, Tier, NAMED_NETWORKS,
+};
 
 const RUN_A_NODE: &str = include_str!("../../../docs/guide/run-a-node.md");
 const GET_PAID: &str = include_str!("../../../docs/guide/get-paid.md");
@@ -85,7 +87,7 @@ fn spans(cell: &str) -> Vec<&str> {
 }
 
 fn evm_row(chain: Chain, tier: Tier) -> (&'static NamedNetwork, &'static EvmRow) {
-    let row = row(chain, tier);
+    let row = named_network(chain, tier);
     match &row.settlement {
         RowSettlement::Evm(evm) => (row, evm),
         RowSettlement::Solana(_) => panic!("{} is not an EVM row", row.name),
@@ -93,18 +95,11 @@ fn evm_row(chain: Chain, tier: Tier) -> (&'static NamedNetwork, &'static EvmRow)
 }
 
 fn solana_row(tier: Tier) -> (&'static NamedNetwork, &'static SolanaRow) {
-    let row = row(Chain::Solana, tier);
+    let row = named_network(Chain::Solana, tier);
     match &row.settlement {
         RowSettlement::Solana(solana) => (row, solana),
         RowSettlement::Evm(_) => panic!("{} is not a Solana row", row.name),
     }
-}
-
-fn row(chain: Chain, tier: Tier) -> &'static NamedNetwork {
-    NAMED_NETWORKS
-        .iter()
-        .find(|row| row.chain == chain && row.tier == tier)
-        .expect("every chain has a row on both networks")
 }
 
 /// A value in a fenced TOML example: `key` in the table headed `table`.
@@ -181,6 +176,42 @@ fn the_robinhood_table_matches_its_rows() {
             .cell("Funding the key", column)
             .contains(evm.token_symbol));
     }
+}
+
+/// The faucet hosts named in `text`, as links or bare, sorted.
+fn faucet_hosts(text: &str) -> Vec<&str> {
+    let mut hosts: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || "()[]".contains(c))
+        .map(|word| word.strip_prefix("https://").unwrap_or(word))
+        .map(|word| word.trim_end_matches(['.', ',', ';', ':']))
+        .filter(|word| word.starts_with("faucet."))
+        .collect();
+    hosts.sort_unstable();
+    hosts
+}
+
+/// Story 14: the report's funding pointer is the table's. An operator on the
+/// testnet reads the report first, so it names the same two faucets, and says
+/// no more about Robinhood's than the guide does: a launch post names it.
+#[test]
+fn the_robinhood_funding_note_points_where_the_table_does() {
+    let table = Table::under(GET_PAID, "## Robinhood Chain");
+    let (_, evm) = evm_row(Chain::Robinhood, Tier::Devnet);
+    let note = evm
+        .funding_note
+        .expect("the testnet row says where funds come from");
+    let cell = table.cell("Funding the key", "Testnet");
+
+    assert_eq!(faucet_hosts(cell).len(), 2, "{cell}");
+    assert_eq!(faucet_hosts(note), faucet_hosts(cell), "{note}");
+    let attribution = "Arbitrum's launch post";
+    assert!(cell.contains(attribution), "{cell}");
+    assert!(note.contains(attribution), "{note}");
+
+    // The mainnet cell says nothing funds a node, so the report names no faucet.
+    let (_, evm) = evm_row(Chain::Robinhood, Tier::Mainnet);
+    assert_eq!(evm.funding_note, None);
+    assert!(faucet_hosts(table.cell("Funding the key", "Mainnet")).is_empty());
 }
 
 /// The table the guide already published for the two devnets, which is where

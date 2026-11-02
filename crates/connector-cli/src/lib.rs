@@ -60,7 +60,9 @@ pub use sponsor::{router as sponsor_router, SPONSOR_PATH};
 // The one definition of each named network's values (issue #1647), read and
 // nothing more: `init` writes from it, and a drift test in another crate holds
 // the guide's published values to it.
-pub use init::{Chain, EvmRow, NamedNetwork, RowSettlement, SolanaRow, Tier, NAMED_NETWORKS};
+pub use init::{
+    named_network, Chain, EvmRow, NamedNetwork, RowSettlement, SolanaRow, Tier, NAMED_NETWORKS,
+};
 
 /// Everything that can stop the connector from producing a validated,
 /// running node.
@@ -140,13 +142,24 @@ const ANNOUNCE_VERB: &str = "announce";
 const SEND_VERB: &str = "send";
 const PROBE_VERB: &str = "probe";
 const INIT_VERB: &str = "init";
-const INIT_CHAINS: &str = "base|solana|robinhood";
+/// A macro, because `concat!` below takes only literals.
+macro_rules! init_chains {
+    () => {
+        "base|solana|robinhood"
+    };
+}
+const INIT_CHAINS: &str = init_chains!();
 
-const USAGE: &str = "usage:\n  \
+const USAGE: &str = concat!(
+    "usage:\n  \
      connector <config-file>\n  \
-     connector init --devnet [--chain <base|solana|robinhood>] [--rpc-url <url>] [--dir <path>] \
+     connector init --devnet [--chain <",
+    init_chains!(),
+    ">] [--rpc-url <url>] [--dir <path>] \
      [--address <g.ilp.address>] [--image <ref>]\n  \
-     connector init --mainnet --chain <base|solana|robinhood> [--rpc-url <url>] [--dir <path>] \
+     connector init --mainnet --chain <",
+    init_chains!(),
+    "> [--rpc-url <url>] [--dir <path>] \
      [--address <g.ilp.address>] [--image <ref>]\n  \
      connector send --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
@@ -155,7 +168,8 @@ const USAGE: &str = "usage:\n  \
      connector send --operator-key <file> --print-keyid\n  \
      connector probe --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
-     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] [--json]";
+     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] [--json]"
+);
 
 /// What the process arguments asked for, before anything has been loaded.
 #[derive(Debug, PartialEq, Eq)]
@@ -356,19 +370,28 @@ fn parse_init_args(rest: &[&str]) -> Result<Invocation, CliError> {
     let mut image: Option<String> = None;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
-        let mut value = |flag: &str| -> Result<String, CliError> {
-            iter.next()
-                .map(|v| (*v).to_string())
-                .ok_or_else(|| CliError::Usage(format!("{flag} needs a value\n\n{USAGE}")))
+        // A flag given twice is refused, not resolved: the last one winning would
+        // write a chain or an RPC the operator typed over without noticing.
+        let mut once = |flag: &str, slot: &mut Option<String>| -> Result<(), CliError> {
+            let value = iter
+                .next()
+                .ok_or_else(|| CliError::Usage(format!("{flag} needs a value\n\n{USAGE}")))?;
+            if slot.is_some() {
+                return Err(CliError::Usage(format!(
+                    "{flag} given twice: give it once\n\n{USAGE}"
+                )));
+            }
+            *slot = Some((*value).to_string());
+            Ok(())
         };
         match *arg {
             "--devnet" => devnet = true,
             "--mainnet" => mainnet = true,
-            "--chain" => chain = Some(value("--chain")?),
-            "--rpc-url" => rpc_url = Some(value("--rpc-url")?),
-            "--dir" => dir = Some(value("--dir")?),
-            "--address" => address = Some(value("--address")?),
-            "--image" => image = Some(value("--image")?),
+            "--chain" => once("--chain", &mut chain)?,
+            "--rpc-url" => once("--rpc-url", &mut rpc_url)?,
+            "--dir" => once("--dir", &mut dir)?,
+            "--address" => once("--address", &mut address)?,
+            "--image" => once("--image", &mut image)?,
             other => {
                 return Err(CliError::Usage(format!(
                     "unknown argument to '{INIT_VERB}': {other}\n\n{USAGE}"
