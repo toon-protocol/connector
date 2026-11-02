@@ -445,9 +445,11 @@ impl fmt::Display for RuntimeError {
                 "[settlement.{table}] asset_eip712_name = \"{name}\" and asset_eip712_version = \
                  \"{version}\" are not the EIP-712 domain of token {token}: they do not reproduce \
                  its DOMAIN_SEPARATOR() on this chain. Payers sign their ERC-3009 deposit under \
-                 them, so the token would refuse every one -- set them to the token's own name \
-                 and version (cast call {token} 'name()(string)' and 'version()(string)') \
-                 (issue #1422)"
+                 them, so the token would refuse every one -- set them to the token's own EIP-712 \
+                 domain name and version, from its issuer's documentation or the network's \
+                 published values. Not every token answers a version() call, and name() need not \
+                 be the domain's name, so check a candidate by hashing it against \
+                 DOMAIN_SEPARATOR() (issue #1422)"
             ),
             RuntimeError::XrplKeyUnusable { table, message } => {
                 write!(f, "[settlement.{table}.key] cannot be used: {message}")
@@ -2359,6 +2361,29 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::io::Write;
     use tower::ServiceExt;
+
+    /// Stories 29-30: the refusal names what is wrong and where to look, and
+    /// does not tell the operator to call `version()`, which USDG reverts.
+    #[test]
+    fn a_wrong_token_domain_refusal_names_it_and_does_not_send_you_to_version() {
+        let text = RuntimeError::AssetEip712DomainMismatch {
+            table: "eip155.4663".to_string(),
+            token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168".to_string(),
+            name: "USD Coin".to_string(),
+            version: "2".to_string(),
+        }
+        .to_string();
+        for named in [
+            "eip155.4663",
+            "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+            "USD Coin",
+            "DOMAIN_SEPARATOR()",
+        ] {
+            assert!(text.contains(named), "{named}: {text}");
+        }
+        assert!(!text.contains("cast call"), "{text}");
+        assert!(!text.contains("'version()(string)'"), "{text}");
+    }
 
     fn load_config(text: &str) -> Config {
         try_load_config(text).expect("load config")

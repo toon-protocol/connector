@@ -1,0 +1,35 @@
+# Written by `connector init --devnet`. Both services run as the user who ran
+# init (<OWNER>), so the 0600 key files in data/ and the bind-mounted
+# state/ need no chown. The image's own uid is 10001; this overrides it.
+services:
+  connector:
+    image: ghcr.io/toon-protocol/connector:rust-main
+    user: "<OWNER>"
+    command: ['/app/config/connector.toml']
+    volumes:
+      - ./config/connector.toml:/app/config/connector.toml:ro
+      - ./data:/app/data:ro
+      - ./state:/app/state
+    ports:
+      # Loopback. Put a TLS-terminating proxy in front before it faces the
+      # world, or publish it as a hidden service (docs/guide/).
+      - '127.0.0.1:3000:3000'
+    restart: unless-stopped
+    depends_on:
+      - app
+    healthcheck:
+      # Free and unauthenticated. Answering means the config loaded, the
+      # settlement backend connected, and the router is serving.
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/ilp/identity']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # The app behind the route: a payment-oblivious echo this image already
+  # ships. Replace it with yours; keep the port, or change handler_url.
+  app:
+    image: ghcr.io/toon-protocol/connector:rust-main
+    user: "<OWNER>"
+    entrypoint: ['/usr/local/bin/stub-app']
+    command: ['0.0.0.0:3100']
+    restart: unless-stopped

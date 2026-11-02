@@ -1,0 +1,60 @@
+# Written by `connector init --devnet`. One file, read once at boot; an
+# unknown key refuses to load, by name (ADR 0009). Every key below is
+# explained in docs/guide/ (run-a-node, get-paid, operator-surface).
+
+client_edge_addr = "0.0.0.0:3000"
+state_dir        = "/app/state"
+
+# A loopback trial publishes a plain http:// endpoint, which a deployed node
+# never does: a TOON node refuses plaintext peers. Remove this line when you
+# put a TLS proxy in front and publish an https:// endpoint, or a .anyone
+# address, which needs no opt-in (docs/guide/run-a-node.md, hidden services).
+peer_allow_plaintext_endpoints = true
+
+[signer]
+key_file = "/app/data/signer.key"
+
+# The node's own ILP address and where a client reaches it. The address is
+# also the prefix of the one route below, so a caller can `toon-client send`
+# to this node without naming a destination; the endpoint is what lets a
+# client pick a carriage. Not dialable by peers until `peer_expose` is set
+# (docs/guide/peering.md).
+#
+# `http_endpoint` is published as written and a payer dials it as written, so
+# 127.0.0.1 only works for a payer on this same host. When the node is exposed,
+# change it to the absolute URL a payer outside this host dials: a public
+# https:// URL behind a TLS proxy, or a .anyone address. The node warns at boot
+# while it names a loopback or container host.
+[node]
+addresses     = ["<ADDRESS>"]
+http_endpoint = "http://127.0.0.1:3000/ilp"
+
+# The route: everything addressed to <ADDRESS> is paid for, unsealed and
+# handed to the app as a plain HTTP request. `price` counts the token's
+# smallest unit: with 6 decimals, 1000 is 0.001 USDC.
+[[routes]]
+prefix      = "<ADDRESS>"
+handler_url = "http://app:3100/"
+price       = 1000
+
+# Base Sepolia, the public devnet (docs/guide/get-paid.md). The token is
+# Circle's devnet USDC; the facilitator relays a payer's deposit so they need
+# no ETH to open a channel. This node settles to the key below, whose address
+# is <SETTLEMENT>.
+[settlement.eip155.84532]
+rpc_url              = "https://base-sepolia-rpc.publicnode.com"
+token_address        = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"
+decimals             = 6
+asset_eip712_name    = "USDC"
+asset_eip712_version = "2"
+facilitator_url      = "https://onboard.devnet.toonprotocol.dev"
+
+[settlement.eip155.84532.key]
+key_file = "/app/data/settlement.key"
+
+# The operator surface (docs/guide/operator-surface.md): bearer-token reads
+# such as GET /claims, ed25519-signed writes, and GET /dashboard. Both files
+# were written beside the keys. Without this section a paid node is silent.
+[operator]
+bearer_token_file = "/app/data/operator-bearer-token"
+write_keys_file   = "/app/data/operator-write-keys"
