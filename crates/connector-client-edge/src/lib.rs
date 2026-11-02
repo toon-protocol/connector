@@ -3947,7 +3947,7 @@ mod tests {
     /// created ten and a half periods before the clock.
     fn zk_edge_node(budget: u64) -> (Router, Arc<ClientClaimGate>, tempfile::TempDir) {
         use crate::zk_note::InMemoryZkNoteVault;
-        use connector_zk_note::note::policy::{SUBSIDY_PERIOD_MS, TIERS};
+        use connector_zk_note::note::policy::{SUBSIDY_PERIOD_SLOTS, TIERS};
         use connector_zk_note::tiers::Tiers;
         use connector_zk_note::{Scalar, SecKey};
         let clock = test_clock();
@@ -3968,8 +3968,18 @@ mod tests {
                     open_budget_cap: 10 * TIERS[0],
                     subsidy: (budget > 0).then_some(Subsidy {
                         budget,
-                        vault_creation_ms: now - 10 * SUBSIDY_PERIOD_MS - SUBSIDY_PERIOD_MS / 2,
+                        vault_creation_slot: 2_000_000
+                            - 10 * SUBSIDY_PERIOD_SLOTS
+                            - SUBSIDY_PERIOD_SLOTS / 2,
                     }),
+                    slots: crate::zk_note::SlotClock::new(
+                        crate::zk_note::SlotAnchor {
+                            slot: 2_000_000,
+                            time_ms: now,
+                        },
+                        now,
+                    )
+                    .unwrap(),
                     clock,
                 })
                 .unwrap(),

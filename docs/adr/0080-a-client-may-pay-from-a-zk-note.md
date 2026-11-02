@@ -56,9 +56,12 @@ closes, which zkAPI cannot say.
    and it checks the note's expiry only against the request time the payer supplies. So, before
    the tag, admission also refuses by name:
    - a state key other than the zk edge's own;
-   - a request time more than 10 minutes behind or 1 minute ahead of the zk edge's clock. The
-     window is a constant, not config, because every wallet has to know it. Without it a payer
-     could backdate a request and spend a note that has already expired;
+   - a request time more than 7 slots behind or 1 slot ahead of the zk edge's current slot
+     (zk*toon's `REQUEST_MAX_AGE_SLOTS` and `REQUEST_MAX_LEAD_SLOTS`, 10 minutes and a minute
+     rounded up to whole slots). \_Amended 2026-11-02 (owner decision, #1634):* a request time is a
+     slot, not a time, and the current slot is derived as decision 16 says. The window is a
+     constant, not config, because every wallet has to know it. Without it a payer could
+     backdate a request and spend a note that has already expired;
    - a subsidised flag, period or per-period nullifier that is set. _Amended 2026-10-28 (#1581):_
      decision 14 replaces this refusal with the subsidised checks.
 
@@ -150,7 +153,7 @@ closes, which zkAPI cannot say.
       challenge window and up to one allowance.
     - **Cheapest refusal first, and nothing written until every check passes:** structure,
       including that the destination is a Mina public key; a proof bound to this zk edge's state
-      key; `requestTime` inside the same window as decision 3's; a known root; the state's
+      key; `requestTime` inside the same window of slots as decision 3's; a known root; the state's
       nullifier unspent, locally and on chain; then the proof. Note expiry is the vault's to
       refuse, not the zk edge's.
     - **One spent-set.** A state's nullifier is spent once, by an allowance or by a clearance,
@@ -181,8 +184,8 @@ closes, which zkAPI cannot say.
       this order, when:
       1. its tier is not the smallest of zk_toon's tiers;
       2. its period is not the current one, as `zk_note::policy::subsidy_period` computes from
-         the vault's creation time and the zk edge's clock. There is no grace window at a period
-         boundary; the wallet proves again for the new period;
+         the vault's creation slot and the zk edge's current slot (decision 16). There is no
+         grace window at a period boundary; the wallet proves again for the new period;
       3. the period's subsidy budget is closed;
       4. its per-period nullifier has already been seen.
     - **Per-period nullifiers are the zk edge's alone.** The vault never records them, so they
@@ -236,6 +239,39 @@ closes, which zkAPI cannot say.
       maintains that copy.
     - **A zk edge may ship before clearances.** Until #1556 is built, its payers can leave only by
       escape (decision 13). The operator's guide and the release note say so.
+
+16. **The zk edge counts in slots, from a boot anchor and the node's clock.** _Added 2026-11-02
+    (owner decision, #1634), amending decisions 3 and 14, which compared times with the zk
+    edge's clock._ Re-pinning zk_toon at `ad4ee440` moved every time it states, `requestTime`
+    and the subsidy period included, from milliseconds to **slots**: zk_toon's **Slot**, the
+    global slot counted from the network's original genesis.
+    - **The anchor.** At boot the zk edge reads one anchor from the vault port: a best-tip
+      block's `slotSinceGenesis` and that same block's timestamp, from a single read. From then
+      on, current slot = `anchor_slot + floor((now − anchor_time) / SLOT_SECONDS)`, with
+      zk_toon's `SLOT_SECONDS`. There is one implementation (`zk_note::SlotClock`), no read per
+      allowance and no config key.
+    - **Why this is right.** An anchor is a true (slot, time) pair even when the tip is stale or
+      slots were empty, because both halves are one block's, so a lagging endpoint doesn't shift
+      it. A fork that changes the slot length changes the verification key, so it needs a new
+      build anyway (decision 15), and that build boots with a new anchor.
+    - **Never** use `daemonStatus.consensusTimeNow.globalSlot`: it counts from the Mesa fork, and
+      zk_toon's ADR 0007 records a transaction failing on devnet with it. Never compute a slot
+      from a genesis time and a slot length: no such pair is right across the fork, where slots
+      went from 180 s to 90 s.
+    - **Failing closed.** A zk edge whose anchor can't be read after the bounded boot retries
+      refuses to boot, by name, with no fallback to the clock alone; so does one whose anchor is
+      more than a slot ahead of the node's clock. If the node's clock is later behind the anchor
+      there is no current slot, and admission refuses the allowance by name (`no_current_slot`):
+      saturating to the anchor would fail open. The synchronous self-description readers report
+      closed (`subsidy_open`) or nothing (`subsidised_by_period`) in that state, and never gain
+      a network read.
+    - **What stays in milliseconds.** `expiresAt`, because the wire and the binding tag state it
+      so, and its expiry check; and `allowance_lifetime_secs`, whose cap derives from
+      `CHALLENGE_WINDOW_SLOTS × SLOT_SECONDS / 4` (43,200 s).
+    - **Compatibility.** `requestTime` changes on the wire: `schema_version` 13. No zk edge
+      boots from a released build yet (the Mina adapter is #1514), so no journal or evidence file
+      holds a period or a request time keyed in milliseconds; the journal's and the evidence
+      file's own fields (`expiresAt`, `grantedAt`) are unchanged.
 
 ## Why this does not undo 0002 or 0065-mina
 

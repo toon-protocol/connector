@@ -2075,6 +2075,8 @@ fn client_claim_gate(
     // boot sweep already runs inside `with_zk_edge`. The adapter also reads
     // `Subsidy::read(vault, zk_note.subsidy_budget())` there, once, through the
     // table's `RpcTransport`, and a failed read fails the boot (decision 14).
+    // It reads the slot anchor beside it, `SlotClock::read`, once, and a failed
+    // read fails the boot with no fallback to the clock alone (decision 16).
     if config.zk_note().is_some() {
         return Err(RuntimeError::ZkNoteVaultNotBuilt);
     }

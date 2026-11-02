@@ -229,7 +229,18 @@ use serde::Serialize;
 /// (a challenge with its own domain tag that binds the CAIP-2 network and
 /// is never a claim) and `client_auth_channel_challenge.xrpl`. Nothing
 /// existing changes bytes.
-pub const SCHEMA_VERSION: u32 = 12;
+/// **13** (issue #1634 / ADR 0080 decisions 3 and 14, as amended): **a
+/// zk edge's times are slots.** A request proof's `requestTime` is a
+/// zk_toon **Slot** (counted from the network's original genesis), no longer
+/// milliseconds, and the zk edge reads it against its current slot; the
+/// subsidy period is counted in slots from the vault's creation slot.
+/// `expiresAt` stays wall-clock milliseconds. In the `zk_note` section the
+/// vectors that change are `allowance_request` (its proof's `requestTime`
+/// public input), `subsidised_allowance_request` (the same) and the
+/// `zk_toon_commit` they were generated at; `toon-client`'s wallet must send
+/// a slot. The `zk_note` section's tags, signatures and successors do not
+/// move: none of them states a `requestTime`.
+pub const SCHEMA_VERSION: u32 = 13;
 
 pub mod xrpl;
 pub mod zk_note;
