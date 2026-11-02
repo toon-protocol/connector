@@ -541,6 +541,74 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    /// The verb as the operator drives it: `connector init <args>`, through
+    /// the same parser and the same `run` the binary calls. `Ok` is the report.
+    fn connector_init(args: &[&str]) -> Result<String, crate::CliError> {
+        let argv: Vec<&str> = ["connector", "init"].iter().chain(args).copied().collect();
+        let command = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(crate::run(&argv))?;
+        match command {
+            crate::Command::Finished { summary } => Ok(summary),
+            crate::Command::Serve(_) => panic!("init does not serve"),
+        }
+    }
+
+    /// Replace the three values a run draws or inherits with the placeholders
+    /// the pinned files were normalised to.
+    fn normalised(text: &str, dir: &Path, report: &str) -> String {
+        let after = |marker: &str| -> String {
+            let start = report.find(marker).expect(marker) + marker.len();
+            report[start..]
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .next()
+                .expect("a value")
+                .to_string()
+        };
+        let owner = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = fs::metadata(dir).expect("meta");
+                format!("{}:{}", meta.uid(), meta.gid())
+            }
+            #[cfg(not(unix))]
+            {
+                "10001:10001".to_string()
+            }
+        };
+        text.replace(&dir.display().to_string(), "<DIR>")
+            .replace(&after("one route, "), "<ADDRESS>")
+            .replace(&after("Settlement address: "), "<SETTLEMENT>")
+            .replace(&owner, "<OWNER>")
+    }
+
+    /// Story 12. These three files are what the binary printed and wrote
+    /// before `init` had a second network, normalised and committed before the
+    /// refactor: existing instructions rely on this exact node.
+    #[test]
+    fn a_bare_devnet_node_is_byte_for_byte_what_it_always_was() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("node");
+        let report = connector_init(&["--devnet", "--dir", dir.to_str().unwrap()]).expect("init");
+
+        assert_eq!(
+            normalised(&report, &dir, &report),
+            include_str!("../fixtures/init-devnet/report.txt"),
+        );
+        let config = fs::read_to_string(dir.join("config/connector.toml")).expect("read");
+        assert_eq!(
+            normalised(&config, &dir, &report),
+            include_str!("../fixtures/init-devnet/connector.toml"),
+        );
+        let compose = fs::read_to_string(dir.join("compose.yml")).expect("read");
+        assert_eq!(
+            normalised(&compose, &dir, &report),
+            include_str!("../fixtures/init-devnet/compose.yml"),
+        );
+    }
+
     #[test]
     fn the_report_tells_the_operator_what_to_fund_and_what_to_run() {
         let tmp = tempfile::tempdir().expect("tempdir");

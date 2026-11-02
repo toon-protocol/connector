@@ -1,0 +1,26 @@
+Wrote a devnet node to <DIR>:
+
+  config/connector.toml   one route, <ADDRESS>, at 1000 units (0.001 devnet USDC)
+  data/                   signer, settlement and operator keys, 0600, owned by you
+  state/                  the claim journal; keep it, it is the watermark
+  compose.yml             the connector and the stub app, as your own uid
+
+Start it, then ask it what it is:
+
+  docker compose up -d
+  curl -s http://127.0.0.1:3000/ilp | jq .routes
+
+Pay it from another terminal (devnet USDC from the faucet, no ETH needed):
+
+  npx toon-client faucet
+  npx toon-client channel open --connector http://127.0.0.1:3000 --deposit 100000
+  npx toon-client send --connector http://127.0.0.1:3000 --body 'hello'
+
+See that you were paid (the bearer token is data/operator-bearer-token):
+
+  curl -s -H "Authorization: Bearer $(cat data/operator-bearer-token)" http://127.0.0.1:3000/claims | jq
+
+Settlement address: <SETTLEMENT>
+Vouchers are landed on Base Sepolia from this key every ten minutes; give it a little Base Sepolia ETH from a public faucet before you expect the sweep to succeed. Admission works without it.
+
+compose.yml runs ghcr.io/toon-protocol/connector:rust-main. Pin a dated release handle (--image) for a node you keep.
