@@ -1,6 +1,6 @@
 # Whose code a channel may bind to
 
-**Status:** Accepted (owner decision, 2026-10-28, #1564; part of map #1563). Nothing is built: the binary settles on EVM and Solana only, and this record admits no new chain. It sets the bar each later chain is held to. _Amendment proposed by [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md) (#1609, not yet accepted): decision 3's table gains its XRPL rows._ It **amends** [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 1, which admitted only x402's own deployed code, and it **records** #1558's amendment of the same decision for Mina, which no record had written down. The facts it rests on were read from primary sources on the day of decision: [research note](../research/whose-code-a-channel-may-bind-to.md).
+**Status:** Accepted (owner decision, 2026-10-28, #1564; part of map #1563). Nothing is built: the binary settles on EVM and Solana only, and this record admits no new chain. It sets the bar each later chain is held to. _Amendment proposed by [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md) (#1609, not yet accepted): decision 3's table gains its XRPL rows._ _Amended by [0088](0088-init-scaffolds-a-mainnet-node-where-a-record-names-its-token.md) (2026-11-02, #1647): decision 3 holds one EVM entry, and decision 5 reaches the channel contract and not a token issuer._ It **amends** [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md) decision 1, which admitted only x402's own deployed code, and it **records** #1558's amendment of the same decision for Mina, which no record had written down. The facts it rests on were read from primary sources on the day of decision: [research note](../research/whose-code-a-channel-may-bind-to.md).
 
 **Scope:** connector architecture — which on-chain code a node will bind a channel to, and how the binary pins it. A binding's wire (its voucher and claim-state challenge) is protocol law, and is decided in each chain's own record. See the [ADR index](README.md).
 
@@ -76,6 +76,8 @@ amendment. XRPL's PayChan is a retired amendment: its code always runs, and test
 
 _Amended (proposed, #1609, [0087](0087-xrpl-settles-over-the-ledgers-payment-channels.md) decision 5):_ the table gains XRPL rows, each with an **empty** binding and checked against `server_info.network_id`: `xrpl:0` (mainnet), `xrpl:1` (testnet), `xrpl:2` (devnet), and one stand-alone network, `xrpl:1000`, for the test harness and `local/` (testnet-class, at most 1024 so transactions carry no `NetworkID`, and not 0, 1 or 2). The mainnet row passes decision 5 as a native primitive. The body above is otherwise unchanged.
 
+_Amended ([0088](0088-init-scaffolds-a-mainnet-node-where-a-record-names-its-token.md) decision 3, #1647):_ x402's EVM address is canonical, so `eip155` holds one entry for every chain id rather than a row per chain, and boot refuses a chain where that entry's code is absent rather than one that is unlisted. The binary holds no EVM chain list. The table per network still applies where the binding varies.
+
 ### 4. Adopting third-party code makes it TOON's
 
 Third-party code enters as kind 3 only when all of these hold:
@@ -110,6 +112,8 @@ On a **mainnet** entry of the table:
 A **testnet** entry names its upgrade authority, and any authority is admitted, a single key
 included. Testnet money has no value, and `payment-channels` on Solana devnet is upgradeable by one
 keypair that this repository's own nodes already settle under.
+
+_Amended ([0088](0088-init-scaffolds-a-mainnet-node-where-a-record-names-its-token.md) decision 5, #1647, owner decision 2026-11-02):_ this rule reaches the channel contract and not a token issuer. An issuer's freeze, pause or upgrade power does not fail a mainnet entry, and is an accepted risk stated in the operator guide.
 
 ## Considered options
 
