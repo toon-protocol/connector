@@ -30,8 +30,8 @@
 //! name, because a second run that silently rotated the signer key would
 //! change the node's identity under a running peering.
 //!
-//! A mainnet row exists only where the ADR recording this scaffold names its
-//! token, and the operator must say both `--mainnet` and `--chain`, so nothing
+//! A mainnet row exists only where a record names its token (ADR 0088), and the
+//! operator must say both `--mainnet` and `--chain`, so nothing
 //! is guessed. A named network is scaffolding, not a gate: the binary holds no
 //! chain allowlist, a hand-written table for any EVM chain keeps working, and
 //! the node still checks every value here against the chain when it boots.
