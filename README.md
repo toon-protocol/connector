@@ -59,8 +59,8 @@ What holds it up:
 - **You set the price; there is no protocol fee.** Per route, in the token's smallest unit:
   `price = 1000` is 0.001 USDC.
 - **A signed voucher per request, no gas per request.** Every ten minutes your node lands many
-  channels' vouchers in one transaction, on x402's audited contract on Base or the
-  `payment-channels` program on Solana.
+  channels' vouchers in one transaction, on x402's audited contract on Base or
+  Robinhood Chain, or the `payment-channels` program on Solana.
 - **Your app sees a plain HTTP request** and three optional `X-TOON-*` headers: who paid, how
   much, on what chain. It never sees a payment.
 - **One static binary, one TOML file, MIT.**
@@ -123,6 +123,40 @@ pays. A **settlement backend** is what lets anyone actually pay it: every channe
 `batch-settlement` channel, on EVM, Solana or XRPL. A **peering** puts you on paths that start
 somewhere else: you carry someone's packet one hop further, and keep a fee for doing it.
 [`CONTEXT.md`](CONTEXT.md) is the full glossary.
+
+## Supported chains
+
+`connector init` writes a node for any of these (`--devnet` or `--mainnet`, with
+`--chain base`, `solana` or `robinhood`), and [Get paid](docs/guide/get-paid.md) has the same
+values for writing the table by hand.
+
+| Chain           | Network          | Chain id | Token                                                    |
+| --------------- | ---------------- | -------- | -------------------------------------------------------- |
+| Base            | Sepolia (devnet) | `84532`  | devnet USDC `0x0C996d7c934c79a6255254875607Fe69df25C0E1` |
+| Base            | Mainnet          | `8453`   | USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`        |
+| Robinhood Chain | Testnet          | `46630`  | USDG `0x7E955252E15c84f5768B83c41a71F9eba181802F`        |
+| Robinhood Chain | Mainnet          | `4663`   | USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`        |
+| Solana          | Devnet           | n/a      | mock USDC `34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU` |
+| Solana          | Mainnet-beta     | n/a      | USDC `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`      |
+
+XRPL also settles, on testnet and mainnet, but over the ledger's own payment channels and in XRP:
+there is no contract to name, and `init` doesn't write it ([Get paid](docs/guide/get-paid.md#xrpl)
+has the table). Another EVM chain works by hand if x402's contracts are deployed on it.
+
+Robinhood Chain has no Circle USDC, so a node there prices and settles in Paxos's USDG, and its
+trust assumptions differ from Base's. Read
+[its section of the guide](docs/guide/get-paid.md#robinhood-chain) before holding collateral there.
+
+**Contracts and program.** The same addresses on every network above, and constants of the binary,
+so there is nothing to configure:
+
+| What                              | Address                                        |
+| --------------------------------- | ---------------------------------------------- |
+| EVM `x402BatchSettlement`         | `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`   |
+| EVM `ERC3009DepositCollector`     | `0x4020806089470a89826cb9fb1f4059150b550004`   |
+| EVM `Permit2DepositCollector`     | `0x4020425faf3b746c082c2f942b4e5159887b0005`   |
+| EVM Permit2                       | `0x000000000022d473030f116ddee9f6b43ac78ba3`   |
+| Solana `payment-channels` program | `CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX` |
 
 ## Four steps
 
