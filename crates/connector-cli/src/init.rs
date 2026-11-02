@@ -1408,7 +1408,7 @@ mod tests {
 
             assert!(
                 report.contains(&format!("Settlement address: {address}\n")),
-                "{address} in {report}"
+                "the report names the address the key derives"
             );
             let written = fs::read_to_string(dir.join("config/connector.toml")).expect("read");
             assert!(written.contains(&address), "{address} in {written}");
@@ -1424,14 +1424,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("node");
         connector_init(&init_args(&["--devnet", "--chain", "solana"], &dir)).expect("init");
-        for secret in [
+        for key_file in [
             "data/signer.key",
             "data/settlement-solana.key",
             "data/operator-write.key",
             "data/operator-bearer-token",
         ] {
-            let mode = fs::metadata(dir.join(secret)).expect("meta").mode() & 0o777;
-            assert_eq!(mode, 0o600, "{secret} mode {mode:o}");
+            let mode = fs::metadata(dir.join(key_file)).expect("meta").mode() & 0o777;
+            assert_eq!(mode, 0o600, "{key_file} mode {mode:o}");
         }
     }
 
@@ -1611,14 +1611,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("node");
         connector_init(&init_args(&["--mainnet", "--chain", "robinhood"], &dir)).expect("init");
-        for secret in [
+        for key_file in [
             "data/signer.key",
             "data/settlement.key",
             "data/operator-write.key",
             "data/operator-bearer-token",
         ] {
-            let mode = fs::metadata(dir.join(secret)).expect("meta").mode() & 0o777;
-            assert_eq!(mode, 0o600, "{secret} mode {mode:o}");
+            let mode = fs::metadata(dir.join(key_file)).expect("meta").mode() & 0o777;
+            assert_eq!(mode, 0o600, "{key_file} mode {mode:o}");
         }
     }
 
@@ -1657,20 +1657,20 @@ mod tests {
             ["--mainnet", "--chain", "robinhood"],
         ] {
             let text = report_for(&args);
-            assert!(!text.contains("USDC"), "{args:?}: {text}");
-            assert!(text.contains("ETH"), "{text}");
-            assert!(text.contains("USDG"), "{text}");
-            assert!(text.contains("Settlement address: 0x"), "{text}");
-            assert!(text.contains("6 decimals"), "{text}");
-            assert!(text.contains("0.001 USDG"), "{text}");
-            assert!(!text.contains("toon-client faucet"), "{text}");
+            assert!(!text.contains("USDC"), "{args:?}");
+            assert!(text.contains("ETH"));
+            assert!(text.contains("USDG"));
+            assert!(text.contains("Settlement address: 0x"));
+            assert!(text.contains("6 decimals"));
+            assert!(text.contains("0.001 USDG"));
+            assert!(!text.contains("toon-client faucet"));
             // No facilitator serves these rows, so a payer needs its own gas.
-            assert!(text.contains("own ETH"), "{text}");
+            assert!(text.contains("own ETH"));
         }
         let testnet = report_for(&["--devnet", "--chain", "robinhood"]);
-        assert!(testnet.contains("Robinhood's faucet"), "{testnet}");
-        assert!(testnet.contains("faucet.paxos.com"), "{testnet}");
-        assert!(testnet.contains("TOON's"), "{testnet}");
+        assert!(testnet.contains("Robinhood's faucet"));
+        assert!(testnet.contains("faucet.paxos.com"));
+        assert!(testnet.contains("TOON's"));
     }
 
     /// Stories 7, 17 and 19.
@@ -1681,18 +1681,18 @@ mod tests {
             ["--mainnet", "--chain", "robinhood"],
         ] {
             let text = report_for(&args);
-            assert!(text.contains("real money"), "{text}");
-            assert!(text.contains("not meant for production"), "{text}");
-            assert!(text.contains("peer_allow_plaintext_endpoints"), "{text}");
-            assert!(text.contains("https://"), "{text}");
-            assert!(text.contains(".anyone"), "{text}");
-            assert!(!text.contains("toon-client faucet"), "{text}");
+            assert!(text.contains("real money"));
+            assert!(text.contains("not meant for production"));
+            assert!(text.contains("peer_allow_plaintext_endpoints"));
+            assert!(text.contains("https://"));
+            assert!(text.contains(".anyone"));
+            assert!(!text.contains("toon-client faucet"));
         }
         assert!(report_for(&["--mainnet", "--chain", "base"]).contains("0.001 USDC"));
         // A devnet report carries none of this.
         for args in [&["--devnet"][..], &["--devnet", "--chain", "robinhood"][..]] {
             let text = report_for(args);
-            assert!(!text.contains("real money"), "{args:?}: {text}");
+            assert!(!text.contains("real money"), "{args:?}");
         }
     }
 
@@ -1707,17 +1707,17 @@ mod tests {
             (["--mainnet", "--chain", "solana"], "USDC"),
         ] {
             let text = report_for(&args);
-            let fund = text.find("must hold SOL").expect(&text);
-            let start = text.find("docker compose up -d").expect(&text);
-            assert!(fund < start, "funding comes first: {text}");
-            assert!(text.contains("exits"), "{text}");
-            assert!(text.contains("restart: unless-stopped"), "{text}");
-            assert!(text.contains("min_sponsored_deposit"), "{text}");
-            assert!(text.contains(&format!("0.001 {token}")), "{text}");
-            assert!(!text.contains("ETH"), "{text}");
+            let fund = text.find("must hold SOL").expect("names the funding");
+            let start = text.find("docker compose up -d").expect("names the start");
+            assert!(fund < start, "funding comes first");
+            assert!(text.contains("exits"));
+            assert!(text.contains("restart: unless-stopped"));
+            assert!(text.contains("min_sponsored_deposit"));
+            assert!(text.contains(&format!("0.001 {token}")));
+            assert!(!text.contains("ETH"));
             // The row's minimum: a smaller deposit is one the sponsor refuses.
-            assert!(text.contains("--deposit 1000000"), "{text}");
-            assert!(text.contains("no SOL"), "{text}");
+            assert!(text.contains("--deposit 1000000"));
+            assert!(text.contains("no SOL"));
         }
     }
 
@@ -1726,18 +1726,15 @@ mod tests {
     #[test]
     fn a_solana_report_differs_between_devnet_and_mainnet() {
         let devnet = report_for(&["--devnet", "--chain", "solana"]);
-        assert!(devnet.contains("toon-client faucet"), "{devnet}");
-        assert!(devnet.contains("solana airdrop"), "{devnet}");
-        assert!(!devnet.contains("real money"), "{devnet}");
+        assert!(devnet.contains("toon-client faucet"));
+        assert!(devnet.contains("solana airdrop"));
+        assert!(!devnet.contains("real money"));
 
         let mainnet = report_for(&["--mainnet", "--chain", "solana"]);
-        assert!(!mainnet.contains("faucet"), "{mainnet}");
-        assert!(mainnet.contains("real money"), "{mainnet}");
-        assert!(mainnet.contains("not meant for production"), "{mainnet}");
-        assert!(
-            mainnet.contains("peer_allow_plaintext_endpoints"),
-            "{mainnet}"
-        );
+        assert!(!mainnet.contains("faucet"));
+        assert!(mainnet.contains("real money"));
+        assert!(mainnet.contains("not meant for production"));
+        assert!(mainnet.contains("peer_allow_plaintext_endpoints"));
     }
 
     /// On the three new EVM rows the report says, beside the commands, what is
@@ -1755,10 +1752,10 @@ mod tests {
             let line = text
                 .lines()
                 .find(|line| line.contains(unrun))
-                .unwrap_or_else(|| panic!("{args:?}: {text}"));
+                .unwrap_or_else(|| panic!("{args:?}"));
             assert!(line.contains("has not been run"), "{line}");
-            assert!(text.contains("toon-client channel open"), "{text}");
-            assert!(text.contains("toon-client send"), "{text}");
+            assert!(text.contains("toon-client channel open"));
+            assert!(text.contains("toon-client send"));
         }
         for args in [
             &["--devnet"][..],
@@ -1766,7 +1763,7 @@ mod tests {
             &["--mainnet", "--chain", "solana"][..],
         ] {
             let text = report_for(args);
-            assert!(!text.contains(unrun), "{args:?}: {text}");
+            assert!(!text.contains(unrun), "{args:?}");
         }
     }
 
@@ -1815,8 +1812,8 @@ mod tests {
             "--rpc-url",
             "https://rpc.example.org",
         ]);
-        assert!(!text.contains("not meant for production"), "{text}");
-        assert!(text.contains("real money"), "{text}");
+        assert!(!text.contains("not meant for production"));
+        assert!(text.contains("real money"));
     }
 
     /// Stories 15 and 2d, in the file itself: its comments do not call a
