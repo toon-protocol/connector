@@ -170,14 +170,14 @@ price       = 1000
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file   = "/app/data/operator-write-keys"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url               = "http://anvil:8545"
 token_address         = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals              = 6
 asset_eip712_name     = "USDC"
 asset_eip712_version  = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"
 ```
 
@@ -202,14 +202,14 @@ key_file = "/app/data/signer.key"
 bearer_token_file = "/app/data/operator-bearer-token"
 write_keys_file   = "/app/data/operator-write-keys"
 
-[settlement.evm]
+[settlement.eip155.31337]
 rpc_url               = "http://anvil:8545"
 token_address         = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 decimals              = 6
 asset_eip712_name     = "USDC"
 asset_eip712_version  = "2"
 
-[settlement.evm.key]
+[settlement.eip155.31337.key]
 key_file = "/app/data/settlement.key"
 ```
 

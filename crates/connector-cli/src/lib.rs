@@ -57,6 +57,13 @@ pub use probe::{reject_cost_reading, CostReading};
 // decision 3, issue #1375), and its contract suite runs against the real one.
 pub use sponsor::{router as sponsor_router, SPONSOR_PATH};
 
+// The one definition of each named network's values (issue #1647), read and
+// nothing more: `init` writes from it, and a drift test in another crate holds
+// the guide's published values to it.
+pub use init::{
+    named_network, Chain, EvmRow, NamedNetwork, RowSettlement, SolanaRow, Tier, NAMED_NETWORKS,
+};
+
 /// Everything that can stop the connector from producing a validated,
 /// running node.
 #[derive(Debug)]
@@ -135,10 +142,25 @@ const ANNOUNCE_VERB: &str = "announce";
 const SEND_VERB: &str = "send";
 const PROBE_VERB: &str = "probe";
 const INIT_VERB: &str = "init";
+/// A macro, because `concat!` below takes only literals.
+macro_rules! init_chains {
+    () => {
+        "base|solana|robinhood"
+    };
+}
+const INIT_CHAINS: &str = init_chains!();
 
-const USAGE: &str = "usage:\n  \
+const USAGE: &str = concat!(
+    "usage:\n  \
      connector <config-file>\n  \
-     connector init --devnet [--dir <path>] [--address <g.ilp.address>] [--image <ref>]\n  \
+     connector init --devnet [--chain <",
+    init_chains!(),
+    ">] [--rpc-url <url>] [--dir <path>] \
+     [--address <g.ilp.address>] [--image <ref>]\n  \
+     connector init --mainnet --chain <",
+    init_chains!(),
+    "> [--rpc-url <url>] [--dir <path>] \
+     [--address <g.ilp.address>] [--image <ref>]\n  \
      connector send --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
      [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] \
@@ -146,7 +168,8 @@ const USAGE: &str = "usage:\n  \
      connector send --operator-key <file> --print-keyid\n  \
      connector probe --operator <url> --operator-key <file> --to <ilp-address> \
      --seal-to <url> [--amount <n>] [--target <path>] [--method <verb>] \
-     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] [--json]";
+     [--body <file|-> ] [--expires-in <seconds>] [--socks-proxy <socks5h-url>] [--json]"
+);
 
 /// What the process arguments asked for, before anything has been loaded.
 #[derive(Debug, PartialEq, Eq)]
@@ -172,7 +195,7 @@ enum Invocation {
     PrintKeyid {
         key_file: String,
     },
-    /// `connector init --devnet`: write a runnable devnet node into a
+    /// `connector init`: write a runnable node on a named network into a
     /// directory, touching no chain and no network.
     Init {
         options: Box<init::InitOptions>,
@@ -332,27 +355,43 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
     }
 }
 
-/// `connector init`'s arguments. `--devnet` is required, because it is the
-/// only network this verb knows how to write and an `init` that silently
-/// produced a devnet node when the operator meant mainnet would be worse
-/// than a usage error.
+/// `connector init`'s arguments. The network is always stated, because an
+/// `init` that silently produced a node on a network the operator did not mean
+/// would be worse than a usage error, and `--mainnet` must also name its chain,
+/// so that no chain or token is guessed for real money. `--devnet` alone is
+/// Base Sepolia, as it always was.
 fn parse_init_args(rest: &[&str]) -> Result<Invocation, CliError> {
     let mut devnet = false;
+    let mut mainnet = false;
+    let mut chain: Option<String> = None;
+    let mut rpc_url: Option<String> = None;
     let mut dir: Option<String> = None;
     let mut address: Option<String> = None;
     let mut image: Option<String> = None;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
-        let mut value = |flag: &str| -> Result<String, CliError> {
-            iter.next()
-                .map(|v| (*v).to_string())
-                .ok_or_else(|| CliError::Usage(format!("{flag} needs a value\n\n{USAGE}")))
+        // A flag given twice is refused, not resolved: the last one winning would
+        // write a chain or an RPC the operator typed over without noticing.
+        let mut once = |flag: &str, slot: &mut Option<String>| -> Result<(), CliError> {
+            let value = iter
+                .next()
+                .ok_or_else(|| CliError::Usage(format!("{flag} needs a value\n\n{USAGE}")))?;
+            if slot.is_some() {
+                return Err(CliError::Usage(format!(
+                    "{flag} given twice: give it once\n\n{USAGE}"
+                )));
+            }
+            *slot = Some((*value).to_string());
+            Ok(())
         };
         match *arg {
             "--devnet" => devnet = true,
-            "--dir" => dir = Some(value("--dir")?),
-            "--address" => address = Some(value("--address")?),
-            "--image" => image = Some(value("--image")?),
+            "--mainnet" => mainnet = true,
+            "--chain" => once("--chain", &mut chain)?,
+            "--rpc-url" => once("--rpc-url", &mut rpc_url)?,
+            "--dir" => once("--dir", &mut dir)?,
+            "--address" => once("--address", &mut address)?,
+            "--image" => once("--image", &mut image)?,
             other => {
                 return Err(CliError::Usage(format!(
                     "unknown argument to '{INIT_VERB}': {other}\n\n{USAGE}"
@@ -360,17 +399,38 @@ fn parse_init_args(rest: &[&str]) -> Result<Invocation, CliError> {
             }
         }
     }
-    if !devnet {
-        return Err(CliError::Usage(format!(
-            "'{INIT_VERB}' writes a devnet node and must be told so: `connector init --devnet`. \
-             A mainnet node settles real money in a token you choose, and every value in its \
-             settlement block is yours to read off the chain (docs/guide/get-paid.md); nothing \
-             here guesses it for you.\n\n{USAGE}"
-        )));
-    }
+    let refuse = |reason: String| CliError::Usage(format!("{reason}\n\n{USAGE}"));
+    let tier = match (devnet, mainnet) {
+        (true, true) => {
+            return Err(refuse(
+                "--devnet and --mainnet are different networks: give one, not both".to_string(),
+            ))
+        }
+        (false, false) => {
+            return Err(refuse(format!(
+                "'{INIT_VERB}' must be told which network it is writing: `connector init \
+                 --devnet`, or `connector init --mainnet --chain <{INIT_CHAINS}>`. Nothing here \
+                 guesses it for you."
+            )))
+        }
+        (true, false) => init::Tier::Devnet,
+        (false, true) => init::Tier::Mainnet,
+    };
+    let chain = match (chain, tier) {
+        (Some(name), _) => init::Chain::from_name(&name).map_err(refuse)?,
+        (None, init::Tier::Devnet) => init::Chain::Base,
+        (None, init::Tier::Mainnet) => {
+            return Err(refuse(format!(
+                "--mainnet must name a chain: `connector init --mainnet --chain <{INIT_CHAINS}>`. \
+                 A mainnet node settles real money, so no chain or token is guessed."
+            )))
+        }
+    };
     Ok(Invocation::Init {
         options: Box::new(init::InitOptions {
             dir: std::path::PathBuf::from(dir.unwrap_or_else(|| ".".to_string())),
+            network: init::named_network(chain, tier),
+            rpc_url,
             address,
             image: image.unwrap_or_else(|| init::DEFAULT_IMAGE.to_string()),
         }),
