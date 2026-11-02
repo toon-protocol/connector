@@ -139,7 +139,7 @@ values for writing the table by hand.
 | Solana          | Devnet           | n/a      | mock USDC `34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU` |
 | Solana          | Mainnet-beta     | n/a      | USDC `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`      |
 
-XRPL also settles, on testnet and mainnet, but over the ledger's own payment channels and in XRP:
+XRPL also settles, on mainnet, testnet and devnet, but over the ledger's own payment channels and in XRP:
 there is no contract to name, and `init` doesn't write it ([Get paid](docs/guide/get-paid.md#xrpl)
 has the table). Another EVM chain works by hand if x402's contracts are deployed on it.
 
