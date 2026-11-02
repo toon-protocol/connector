@@ -1,15 +1,26 @@
 # 1. Run a node
 
 The connector is one static binary that reads one TOML file. Three ways to get it running:
-`init` writes a devnet node for you, Docker runs the one you write, and source is for
+`init` writes a node for you, Docker runs the one you write, and source is for
 changing the connector rather than running it.
 
-## The fastest start: `connector init --devnet`
+## The fastest start: `connector init`
 
-One command writes a runnable devnet node into a directory: a config with one priced route,
-the Base Sepolia settlement block, an operator surface so you can see what you were paid,
-fresh keys owned by you, and a `compose.yml` that runs the connector and a payment-oblivious
-echo app as your own uid. It touches no chain and overwrites nothing.
+One command writes a runnable node into a directory: a config with one priced route, one
+chain's settlement table, an operator surface so you can see what you were paid, fresh keys
+owned by you, and a `compose.yml` that runs the connector and a payment-oblivious echo app as
+your own uid. It touches no chain and overwrites nothing.
+
+| Flags                                 | Network                 | Token       | Address                                        | Default RPC                               |
+| ------------------------------------- | ----------------------- | ----------- | ---------------------------------------------- | ----------------------------------------- |
+| `--devnet` or `--devnet --chain base` | Base Sepolia            | devnet USDC | `0x0C996d7c934c79a6255254875607Fe69df25C0E1`   | `https://base-sepolia-rpc.publicnode.com` |
+| `--devnet --chain solana`             | Solana devnet           | mock USDC   | `34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU` | `https://api.devnet.solana.com`           |
+| `--devnet --chain robinhood`          | Robinhood Chain testnet | USDG        | `0x7E955252E15c84f5768B83c41a71F9eba181802F`   | `https://rpc.testnet.chain.robinhood.com` |
+| `--mainnet --chain base`              | Base mainnet            | USDC        | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`   | `https://mainnet.base.org`                |
+| `--mainnet --chain solana`            | Solana mainnet-beta     | USDC        | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` | `https://api.mainnet-beta.solana.com`     |
+| `--mainnet --chain robinhood`         | Robinhood Chain mainnet | USDG        | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`   | `https://rpc.mainnet.chain.robinhood.com` |
+
+The first run below uses bare `--devnet`, which is Base Sepolia:
 
 ```bash
 IMG=ghcr.io/toon-protocol/connector:rust-main   # or a dated release handle that carries `init`
@@ -18,19 +29,34 @@ cd node && docker compose up -d
 curl -s http://127.0.0.1:3000/ilp | jq .routes
 ```
 
-`init` prints what it wrote, the node's settlement address, and the three `toon-client`
-commands that pay it. The first-run test of 2026-10-13 took a careful operator twenty minutes
+`init` prints what it wrote, the node's settlement address, what that address must hold, and
+the `toon-client` commands that pay it. The first-run test of 2026-10-13 took a careful operator twenty minutes
 and four traps to reach this point by hand; the traps were a key the image could not read, a
 config the client could not describe, a route that needed a destination, and a node that was
 silent when paid. `init` writes around all four, and the rest of this page explains each file
 it wrote so you can change it.
 
-Only `--devnet` exists. A mainnet node settles real money in a token you choose, and every
-value in that block is yours to read off the chain ([step 3](get-paid.md)). Flags:
-`--dir <path>` (default `.`), `--address <g.ilp.address>` (default `g.devnet.<six hex digits>`,
-also the one route's prefix), `--image <ref>` (what `compose.yml` runs; pin a release handle
-for a node you keep). A directory that already holds a `config/connector.toml` is refused by
-name, because rotating the signer key would change the node's identity under every peer.
+**A mainnet node settles real money**, so `--mainnet` must name its `--chain`: nothing picks a
+chain or a token for you. Its default RPC is public and rate-limited, so name your own with
+`--rpc-url <url>`, which works on any row. It starts on loopback like every other scaffold;
+before you expose it, remove `peer_allow_plaintext_endpoints` and publish an `https://` or
+`.anyone` endpoint. Before choosing a chain, read what each one asks you to trust
+([Robinhood Chain's](get-paid.md#robinhood-chain) especially).
+
+**A Solana scaffold needs SOL before its first start.** Its backend sends a transaction when it
+connects, so an unfunded node exits 1 at boot, and `restart: unless-stopped` will loop on it.
+It writes `data/settlement-solana.key` rather than `data/settlement.key`, and reports that
+key's address for you to fund.
+
+`init` writes one chain, because its one route's price is in one token. Add a second table by
+hand ([step 3](get-paid.md)). XRPL isn't a `--chain`; it needs a funded seed and declared tokens.
+The table above is not a gate: a table you write for any EVM chain carrying the x402 contract
+works the same, and the node checks every value against the chain when it boots. Other flags:
+`--dir <path>` (default `.`), `--address <g.ilp.address>` (default `g.devnet.<six hex digits>` on a
+devnet and `g.<six hex digits>` on a mainnet, also the one route's prefix), `--image <ref>`
+(what `compose.yml` runs; pin a release handle for a node you keep). A directory that already
+holds a `config/connector.toml` is refused by name, because rotating the signer key would change
+the node's identity under every peer.
 
 The node it writes publishes `http_endpoint = "http://127.0.0.1:3000/ilp"`. Published
 endpoints are **absolute** URLs that a payer dials exactly as written, so that one works only

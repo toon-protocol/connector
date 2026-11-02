@@ -22,17 +22,18 @@ facilitator, and which tokens work. This step is the short version.
 
 ```toml
 # EVM — Base Sepolia. These are live addresses, not placeholders.
-[settlement.evm]
+# The table key is the chain id, checked against the RPC at boot.
+[settlement.eip155.84532]
 rpc_url               = "https://base-sepolia-rpc.publicnode.com"
 token_address         = "0x0C996d7c934c79a6255254875607Fe69df25C0E1"  # the token every price on this node is in
 decimals              = 6              # units per token: 6 means 1,000,000 = 1.00
-asset_eip712_name     = "USDC"         # the token's own EIP-712 domain --
-asset_eip712_version  = "2"            # `cast call <token> 'name()(string)'` / `'version()(string)'`
+asset_eip712_name     = "USDC"         # the token's own EIP-712 domain, from its issuer or the
+asset_eip712_version  = "2"            # tables here; boot checks them against DOMAIN_SEPARATOR()
 # min_withdraw_delay_secs = 86400      # default one day; 900 at least, 30 days at most
 # asset_transfer_method = "eip3009"    # how a deposit moves the token; "permit2" for one without ERC-3009
 # facilitator_url = "https://..."      # the x402 facilitator payers relay deposits through; you pay its gas
 
-[settlement.evm.key]
+[settlement.eip155.84532.key]
 key_file = "/app/data/settlement.key"
 
 # Solana — public devnet.
@@ -50,13 +51,15 @@ key_file = "/app/data/settlement-solana.key"
 Copy the token address rather than picking your own: a voucher resolves
 against **one** token, so every node that might accept a given voucher has to
 name the same one. The two `asset_eip712_*` keys and `min_sponsored_deposit`
-have no default and are **required** wherever their table exists — read the
-EIP-712 name and version off the token itself rather than copying the devnet
-values, because Base mainnet's native USDC (`0x833589fC…2913`) is
-**`"USD Coin"`** / `"2"`, not `"USDC"`. The node boots either way, since it
-never signs under this domain itself, so a wrong name shows up only as every
-client's deposit failing; `0` is refused for `min_sponsored_deposit`, because
-it bounds an endpoint that spends your SOL.
+have no default and are **required** wherever their table exists. The EIP-712
+name and version belong to the token, so don't carry the devnet's to another
+network: Base mainnet's native USDC (`0x833589fC…2913`) is
+**`"USD Coin"`** / `"2"`, not `"USDC"`. Take them from the token's issuer or the
+tables in this guide, because not every token answers a `version()` call. Under
+the default `eip3009`, boot refuses a name and version that do not reproduce the
+token's `DOMAIN_SEPARATOR()`. Under `permit2` the domain is not checked, so a
+wrong one shows up only as every client's deposit failing. `0` is refused for
+`min_sponsored_deposit`, because it bounds an endpoint that spends your SOL.
 
 |                  | EVM                                                                                                                                                                                   | Solana                                                                                                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -73,7 +76,9 @@ above is what the fleet and the faucet serve; a node on mainnet funds itself.
 Because the x402 contract and program are the same address everywhere, there
 is no deployment record to get wrong here — the one thing that still has to
 match the network is the **token**: point `token_address` at Base mainnet's
-USDC or Solana mainnet-beta's, never the devnet one. TOON's own retired
+USDC or Solana mainnet-beta's, never the devnet one
+([`connector init`'s table](run-a-node.md#the-fastest-start-connector-init) has
+both). TOON's own retired
 contracts still have deployment records, now under
 [`docs/deployments/`](../deployments/) (moved out of `packages/contracts`
 and `packages/solana-program` when #1386 removed those packages), but this
@@ -94,13 +99,105 @@ disagrees, because a wrong `decimals` is not a rounding error: it misprices
 every route by a factor of ten or more.
 
 Every other settlement value is verified against the chain the same way, which is
-why there is no `--network` flag: which chain a node is on **is** these values and
-nothing else. The node reads the chain id off the RPC and confirms
+why a running node has no `--network` flag: which chain a node is on **is** these
+values and nothing else. `connector init`'s `--devnet`, `--mainnet` and `--chain`
+only choose what it writes into this file. The node reads the chain id off the RPC and confirms
 `x402BatchSettlement`'s code is present at its fixed address before it will
 serve (ADR 0075 decision 1). The Solana backend proves the program account
 behaves like `payment-channels`, that `token_address` is an SPL mint, and asks
 the chain its own genesis hash so a voucher declaring the wrong cluster is
 refused.
+
+## Robinhood Chain
+
+Robinhood Chain is an Arbitrum Nitro L2 on Ethereum, and an EVM table like any
+other. `connector init --devnet --chain robinhood` and
+`--mainnet --chain robinhood` write these values, or you can write them by hand:
+
+|                 | Testnet                                                                                                                                                                                                           | Mainnet                                                                           |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Chain id        | `46630`                                                                                                                                                                                                           | `4663`                                                                            |
+| RPC             | `https://rpc.testnet.chain.robinhood.com`                                                                                                                                                                         | `https://rpc.mainnet.chain.robinhood.com`                                         |
+| Token           | USDG `0x7E955252E15c84f5768B83c41a71F9eba181802F`                                                                                                                                                                 | USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`                                 |
+| Decimals        | `6`                                                                                                                                                                                                               | `6`                                                                               |
+| EIP-712 domain  | `Global Dollar` / `1`                                                                                                                                                                                             | `Global Dollar` / `1`                                                             |
+| Funding the key | ETH for gas: [Arbitrum's launch post](https://blog.arbitrum.io/robinhood-chain-testnet/) names [Robinhood's faucet](https://faucet.testnet.chain.robinhood.com). USDG: [Paxos's faucet](https://faucet.paxos.com) | ETH for gas, and USDG. Both are yours to bring; nothing here funds a mainnet node |
+
+```toml
+[settlement.eip155.4663]
+rpc_url               = "https://rpc.mainnet.chain.robinhood.com"  # public and rate-limited: use a provider's
+token_address         = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+decimals              = 6
+asset_eip712_name     = "Global Dollar"
+asset_eip712_version  = "1"
+
+[settlement.eip155.4663.key]
+key_file = "/app/data/settlement.key"
+```
+
+This page does not state either faucet's limits: Robinhood's refused an automated
+read when this was written, so its current terms are unconfirmed, and Arbitrum's
+post is from the testnet's launch. Check both before you rely on them. TOON's
+devnet faucet does not serve this chain, and no facilitator is written for it on
+either network, so a payer needs its own ETH to open a channel.
+
+**USDG is not USDC.** There is no Circle USDC on this chain. Its dollar is Paxos's
+USDG, so copy these values rather than Base's: boot refuses Base's domain on this
+token, by name. USDG's domain is one you can't look up by asking: its `version()`
+call reverts, and the version is known only because `"Global Dollar"` and `"1"`
+hash to its `DOMAIN_SEPARATOR()`. Prices count USDG's base units, so `price = 1000`
+is 0.001 USDG.
+
+**A peering needs the same token at both ends.** Your counterparty needs a table
+on this token on this network, or opening the channel fails with `TokenNotShared`.
+
+**USDG and USDC are not interchangeable, and the binary will not notice if you
+treat them so.** Reaching USDC elsewhere is a
+[dealing boundary](../adr/0071-a-forward-crosses-a-denomination-at-a-declared-rate.md)
+with a rate you declare. That rate is demanded only once you declare tokens: a
+node with **no `[[tokens]]` forwards between its tables unconverted**
+([ADR 0086](../adr/0086-a-node-settles-on-more-than-one-evm-network.md) decision
+13). Both tokens have 6 decimals, so a USDG table added beside a USDC one boots
+and forwards at par, whatever a dollar on either side is worth to you. Declare
+`[[tokens]]` for both and a rate for the pair, as the
+[XRPL example below](#xrpl) does; `local/dealing` is a worked one.
+
+**What you are trusting**, as [L2BEAT](https://l2beat.com/scaling/projects/robinhood)
+and [Robinhood's terms](https://docs.robinhood.com/chain/terms-of-service) stated it
+on 2026-11-02. Weigh it when you decide how much to hold here, and re-read both,
+since these facts change faster than this page:
+
+- **One sequencer, run by Robinhood.** A voucher is worth what you can land, and
+  landing it goes through that sequencer.
+- **Below Stage 0.** L2BEAT rates the chain "not even a Stage 0 project". Only two
+  whitelisted actors can submit fraud proofs.
+- **Instant upgrades.** A 7-of-8 multisig can upgrade core contracts with no delay,
+  so L2BEAT gives users no exit window. It reaches the chain beneath
+  `x402BatchSettlement`, not that contract, which is immutable.
+- **A transaction filter that defeats forced inclusion.** An authorised filterer
+  can register a transaction hash, and that transaction then fails, even when it was
+  force-included from L1, so L2BEAT calls forced inclusion "not a reliable
+  censorship escape hatch".
+- **Address blocking.** Robinhood reserves the right to restrict or block specific
+  wallet addresses from the chain.
+- **The issuer.** Paxos can freeze or pause USDG, and the token is upgradeable.
+  Circle can do the same to USDC on Base and Solana, so this risk isn't peculiar to
+  this chain. Every channel in a token escrows at one address, so a freeze of
+  `x402BatchSettlement`, or a pause of the token, stops payouts on all of them at
+  once, and this repository has no remedy for it.
+
+> [!NOTE]
+> **Before you set `rpc_via_socks_proxy` on this table,** read Robinhood's
+> [terms](https://docs.robinhood.com/chain/terms-of-service). They bar using a VPN,
+> proxy or other tool to mask your identity, location or IP address.
+
+**How far this has been run.** x402's contracts here match Base's except for their
+chain id and domain separator, and an unmodified node has booted on both public
+RPCs and run a whole channel's life in USDG on a local fork of mainnet
+([ADR 0088](../adr/0088-init-scaffolds-a-mainnet-node-where-a-record-names-its-token.md#evidence)).
+Nobody has yet sent a transaction through the live sequencer from this binary, run
+the shipped image on this chain, or paid from `toon-client`, whose presets name only
+Base Sepolia.
 
 ## XRPL
 
