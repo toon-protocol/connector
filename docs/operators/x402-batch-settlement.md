@@ -238,8 +238,9 @@ key_file = "/app/data/settlement.key"
 
 `kms_key_id` parses, but the binary refuses to start with it. Use `key_file`.
 
-**Read the EIP-712 name and version off the token itself**
-(`cast call <token> 'name()(string)'` and `'version()(string)'`). Base mainnet's native USDC is
+**Take the EIP-712 name and version from the token's issuer or the network's published values.**
+Not every token answers a `version()` call (USDG reverts it), and `name()` need not be the domain's
+name, so check a candidate by hashing it against `DOMAIN_SEPARATOR()`. Base mainnet's native USDC is
 `"USD Coin"` / `"2"`, not the devnet's `"USDC"` / `"2"`. Your node never signs under this domain
 itself, so boot checks what it can. Under `"eip3009"` it refuses a name and version that do not
 reproduce the token's own `DOMAIN_SEPARATOR()`, since the token would refuse every client's deposit
