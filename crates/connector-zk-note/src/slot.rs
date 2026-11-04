@@ -5,7 +5,7 @@
 //! too. [`Slot`] keeps the two apart: a slot is built from a `u64` only where one is read off the
 //! wire or a chain, and turned back into one only where zk_toon's functions, the [`Field`]
 //! encoding of a public input or the wire require it. The edge calls the wrappers here, never
-//! zk_toon's `u64` originals.
+//! zk_toon's `u64` `subsidy_period` and `is_request_time_fresh`.
 //!
 //! [`Field`]: crate::Field
 
@@ -40,12 +40,6 @@ impl Slot {
 impl fmt::Display for Slot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-impl From<u64> for Slot {
-    fn from(slot: u64) -> Slot {
-        Slot(slot)
     }
 }
 
