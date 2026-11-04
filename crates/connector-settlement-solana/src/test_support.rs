@@ -26,18 +26,50 @@ use solana_sdk::transaction::Transaction;
 /// needs (`connector-cli`'s settlement-construction tests,
 /// `connect_identity.rs`'s own), rather than each reimplementing the same
 /// request-airdrop-then-poll-confirm loop.
+///
+/// Waits up to 60 s -- the budget [`SolanaValidator::spawn`] gives readiness --
+/// and re-requests the airdrop every few seconds while none has confirmed,
+/// since under load with several validators running the first can be slow or
+/// dropped outright (its blockhash expiring before it lands). Every signature
+/// requested is kept and polled, because an earlier one may still land;
+/// funding the account twice is harmless. Panics at the deadline with the time
+/// elapsed, the requests made and the last status or request error seen.
 pub async fn fund(rpc: &RpcClient, pubkey: &Pubkey) {
-    let signature = rpc
-        .request_airdrop(pubkey, 10_000_000_000)
-        .await
-        .expect("airdrop");
-    for _ in 0..200 {
-        if rpc.confirm_transaction(&signature).await.unwrap_or(false) {
-            return;
+    const DEADLINE: Duration = Duration::from_secs(60);
+    const REREQUEST_AFTER: Duration = Duration::from_secs(5);
+    const POLL: Duration = Duration::from_millis(50);
+
+    let start = tokio::time::Instant::now();
+    let mut signatures: Vec<Signature> = Vec::new();
+    let mut last_requested: Option<tokio::time::Instant> = None;
+    let mut last_seen = String::from("no status seen");
+    loop {
+        let due = last_requested.is_none_or(|at| at.elapsed() >= REREQUEST_AFTER);
+        if due {
+            last_requested = Some(tokio::time::Instant::now());
+            match rpc.request_airdrop(pubkey, 10_000_000_000).await {
+                Ok(signature) => signatures.push(signature),
+                Err(e) => last_seen = format!("request error: {e}"),
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for signature in &signatures {
+            if rpc.confirm_transaction(signature).await.unwrap_or(false) {
+                return;
+            }
+            last_seen = format!(
+                "{signature}: {:?}",
+                rpc.get_signature_status(signature).await
+            );
+        }
+        if start.elapsed() >= DEADLINE {
+            panic!(
+                "airdrop did not confirm after {:?}; {} requested; last: {last_seen}",
+                start.elapsed(),
+                signatures.len()
+            );
+        }
+        tokio::time::sleep(POLL).await;
     }
-    panic!("airdrop did not confirm in time");
 }
 
 /// Why [`send`] failed: the RPC client's own error, boxed, since it is large.
