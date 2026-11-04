@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use connector_domain::AssetId;
-use connector_zk_note::note::policy::CHALLENGE_WINDOW_MS;
+use connector_zk_note::note::policy::{CHALLENGE_WINDOW_SLOTS, SLOT_SECONDS};
 use connector_zk_note::tiers::Tiers;
 use connector_zk_note::PubKey;
 use serde::Deserialize;
@@ -36,7 +36,9 @@ pub const ZK_NOTE_DECIMALS: u8 = 9;
 /// journaled and its evidence reach the challenger inside that window, so its
 /// lifetime has to be well below it (ADR 0080 decision 3, as amended); a
 /// quarter leaves three quarters of the window for everything after expiry.
-pub const MAX_ALLOWANCE_LIFETIME_MS: u64 = CHALLENGE_WINDOW_MS / 4;
+/// The window is zk_toon's, in slots; this is its wall-clock length in seconds,
+/// the unit `allowance_lifetime_secs` is written in (43,200).
+pub const MAX_ALLOWANCE_LIFETIME_SECS: u64 = CHALLENGE_WINDOW_SLOTS * SLOT_SECONDS / 4;
 
 /// The `[zk_note]` table as written.
 #[derive(Debug, Deserialize)]
@@ -191,11 +193,11 @@ pub(crate) fn resolve_zk_note(
     }
     let tiers =
         Tiers::new(raw.tiers).map_err(|source| ConfigError::ZkNoteTiersInvalid { source })?;
-    let lifetime_ms = raw.allowance_lifetime_secs.saturating_mul(1_000);
-    if lifetime_ms == 0 || lifetime_ms > MAX_ALLOWANCE_LIFETIME_MS {
+    if raw.allowance_lifetime_secs == 0 || raw.allowance_lifetime_secs > MAX_ALLOWANCE_LIFETIME_SECS
+    {
         return Err(ConfigError::ZkNoteAllowanceLifetimeInvalid {
             secs: raw.allowance_lifetime_secs,
-            max_secs: MAX_ALLOWANCE_LIFETIME_MS / 1_000,
+            max_secs: MAX_ALLOWANCE_LIFETIME_SECS,
         });
     }
     let smallest = tiers.as_slice()[0].budget();
@@ -221,7 +223,7 @@ pub(crate) fn resolve_zk_note(
         state_key: SecretLocation::File(raw.state_key_file),
         verification_key_hash: raw.verification_key_hash,
         tiers,
-        allowance_lifetime: Duration::from_millis(lifetime_ms),
+        allowance_lifetime: Duration::from_secs(raw.allowance_lifetime_secs),
         open_budget_cap: raw.open_budget_cap,
         subsidy_budget: raw.subsidy_budget,
     })

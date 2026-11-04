@@ -13,8 +13,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
-/// SHA-256 of `test-vectors/zk-note.json` at zk_toon `0d6b10c3`.
-const VECTORS_SHA256: &str = "8b2f8d92646e96e7ae3ea538249774b6f4e5c0e63d84847a35e54ccf8617c753";
+/// SHA-256 of `test-vectors/zk-note.json` at zk_toon `ad4ee440`.
+const VECTORS_SHA256: &str = "0b4bc3a429d1521d92755379c8fab08f5c12a2ccb57abb50682190d1e1f6cbd4";
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS_JSON).expect("zk_toon's vectors are JSON")
@@ -252,8 +252,47 @@ fn the_request_time_window_is_zk_toons() {
     assert!(!cases.is_empty());
     for e in cases {
         assert_eq!(
-            policy::is_request_time_fresh(u(&e["requestTime"]), u(&e["now"])),
+            policy::is_request_time_fresh(u(&e["requestTime"]), u(&e["currentSlot"])),
             e["fresh"].as_bool().expect("a bool"),
+        );
+    }
+}
+
+#[test]
+fn the_policy_constants_are_zk_toons_in_slots() {
+    let v = vectors();
+    let p = &v["policy"];
+    assert_eq!(policy::SLOT_SECONDS, u(&p["slotSeconds"]));
+    assert_eq!(policy::SLOTS_PER_DAY, u(&p["slotsPerDay"]));
+    assert_eq!(policy::NOTE_LIFETIME_SLOTS, u(&p["noteLifetimeSlots"]));
+    assert_eq!(policy::MIN_SUBSIDY_AGE_SLOTS, u(&p["minSubsidyAgeSlots"]));
+    assert_eq!(policy::SUBSIDY_PERIOD_SLOTS, u(&p["subsidyPeriodSlots"]));
+    assert_eq!(
+        policy::CHALLENGE_WINDOW_SLOTS,
+        u(&p["challengeWindowSlots"])
+    );
+    assert_eq!(policy::REQUEST_MAX_AGE_SLOTS, u(&p["requestMaxAgeSlots"]));
+    assert_eq!(policy::REQUEST_MAX_LEAD_SLOTS, u(&p["requestMaxLeadSlots"]));
+}
+
+#[test]
+fn the_subsidy_periods_and_ages_are_counted_in_slots_as_zk_toon_counts_them() {
+    let v = vectors();
+    let periods = v["periods"].as_array().expect("periods");
+    assert!(!periods.is_empty());
+    for e in periods {
+        let expected = (!e["period"].is_null()).then(|| u(&e["period"]));
+        assert_eq!(
+            policy::subsidy_period(u(&e["vaultCreation"]), u(&e["now"])),
+            expected
+        );
+    }
+    let ages = v["ages"].as_array().expect("ages");
+    assert!(!ages.is_empty());
+    for e in ages {
+        assert_eq!(
+            policy::is_old_enough_for_subsidy(u(&e["depositTime"]), u(&e["now"])),
+            e["oldEnough"].as_bool().expect("a bool"),
         );
     }
 }

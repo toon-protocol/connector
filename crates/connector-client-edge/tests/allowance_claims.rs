@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration as TimeDelta, TimeZone, Utc};
-use connector_client_edge::zk_note::{InMemoryZkNoteVault, ZkNoteVault};
+use connector_client_edge::zk_note::{InMemoryZkNoteVault, SlotAnchor, SlotClock, ZkNoteVault};
 use connector_client_edge::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
     ClaimIngestRejection, ClientClaimGate, EvidenceFile, SignedSuccessor, Subsidy, SuccessorStatus,
@@ -21,7 +21,9 @@ use connector_runtime::{Clock, FileJournal, Journal, TestClock};
 use connector_signer::ZkStateSigner;
 use connector_zk_note::evidence::{evidence_hash, scan, Record};
 use connector_zk_note::note::balance::{commit, Commitment};
-use connector_zk_note::note::policy::{subsidy_period, SUBSIDY_PERIOD_MS, TIERS};
+use connector_zk_note::note::policy::{
+    subsidy_period, SLOTS_PER_DAY, SLOT_SECONDS, SUBSIDY_PERIOD_SLOTS, TIERS,
+};
 use connector_zk_note::note::state::verify_state;
 use connector_zk_note::request::{
     expected_tag, json_proof_for, point, RequestProof, RequestPublic,
@@ -33,6 +35,12 @@ use connector_zk_note::tiers::Tiers;
 use connector_zk_note::{field_to_le_bytes, CompressedPubKey, Field, Keypair, Scalar, SecKey};
 
 const HOUR_MS: u64 = 3_600_000;
+const SLOT_MS: u64 = SLOT_SECONDS * 1_000;
+const SUBSIDY_PERIOD_MS: u64 = SUBSIDY_PERIOD_SLOTS * SLOT_MS;
+
+/// The slot the boot anchor names, and the instant (the clock's start) it was
+/// stamped.
+const ANCHOR_SLOT: u64 = 2_000_000;
 
 /// What every test payer's note holds before its allowance, nanomina.
 const NOTE_BALANCE: u64 = 5_000_000_000;
@@ -85,21 +93,38 @@ impl Edge {
         }
     }
 
-    /// When the vault was created: ten whole subsidy periods and a day
-    /// before the clock starts, so the first period this edge is in is 10.
-    fn vault_creation_ms(&self) -> u64 {
-        let start = u64::try_from(
+    /// The clock's start, ms since the epoch: the instant the anchor is stamped.
+    fn start_ms() -> u64 {
+        u64::try_from(
             Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0)
                 .unwrap()
                 .timestamp_millis(),
         )
-        .unwrap();
-        start - 10 * SUBSIDY_PERIOD_MS - 86_400_000
+        .unwrap()
+    }
+
+    /// The anchor the edge boots with: [`ANCHOR_SLOT`] at the clock's start.
+    fn anchor() -> SlotAnchor {
+        SlotAnchor {
+            slot: ANCHOR_SLOT,
+            time_ms: Edge::start_ms(),
+        }
+    }
+
+    /// The slot the clock is in.
+    fn slot(&self) -> u64 {
+        ANCHOR_SLOT + (self.now_ms() - Edge::start_ms()) / SLOT_MS
+    }
+
+    /// The slot the vault was created in: ten whole subsidy periods and a day
+    /// before the anchor, so the first period this edge is in is 10.
+    fn vault_creation_slot(&self) -> u64 {
+        ANCHOR_SLOT - 10 * SUBSIDY_PERIOD_SLOTS - SLOTS_PER_DAY
     }
 
     /// The subsidy period the clock is in, as zk_toon counts it.
     fn period(&self) -> u64 {
-        subsidy_period(self.vault_creation_ms(), self.now_ms()).expect("after the vault")
+        subsidy_period(self.vault_creation_slot(), self.slot()).expect("after the vault")
     }
 
     fn now_ms(&self) -> u64 {
@@ -136,8 +161,9 @@ impl Edge {
                 open_budget_cap: self.cap,
                 subsidy: (self.subsidy_budget > 0).then(|| Subsidy {
                     budget: self.subsidy_budget,
-                    vault_creation_ms: self.vault_creation_ms(),
+                    vault_creation_slot: self.vault_creation_slot(),
                 }),
+                slots: SlotClock::new(Edge::anchor(), Edge::start_ms()).expect("an anchor"),
                 clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
             })
             .expect("the evidence holds every grant")
@@ -191,7 +217,7 @@ impl Payer {
             root: Field::from(5_000u64),
             tier: TIERS[1],
             expires_at_ms: edge.now_ms() + HOUR_MS / 2,
-            request_time: edge.now_ms(),
+            request_time: edge.slot(),
             subsidised: false,
             period: 0,
             period_nullifier: Field::from(0u64),
@@ -417,18 +443,18 @@ async fn each_cheap_refusal_is_named_and_asks_the_vault_nothing() {
             |r| matches!(r, AllowanceRefusal::ForeignStateKey),
         ),
         (
-            "a request time more than ten minutes back",
+            "a request time 8 slots back",
             Payer {
-                request_time: now - 600_001,
+                request_time: edge.slot() - 8,
                 ..base.clone()
             }
             .request(),
             |r| matches!(r, AllowanceRefusal::RequestTimeOutsideWindow { .. }),
         ),
         (
-            "a request time more than a minute ahead",
+            "a request time 2 slots ahead",
             Payer {
-                request_time: now + 60_001,
+                request_time: edge.slot() + 2,
                 ..base.clone()
             }
             .request(),
@@ -1768,15 +1794,15 @@ async fn each_subsidy_refusal_has_its_own_name_and_writes_nothing() {
 #[tokio::test]
 async fn a_subsidy_period_must_be_the_request_times_not_just_the_edges() {
     let edge = Edge::with_subsidy(10 * TIERS[0]);
-    let creation = edge.vault_creation_ms();
-    // One minute into the next period, by the edge's clock.
-    let boundary = creation + (edge.period() + 1) * SUBSIDY_PERIOD_MS;
-    edge.clock.advance(TimeDelta::milliseconds(
-        i64::try_from(boundary + 60_000 - edge.now_ms()).unwrap(),
-    ));
+    let creation = edge.vault_creation_slot();
+    // One minute into the first slot of the next period, by the edge's clock.
+    let boundary = creation + (edge.period() + 1) * SUBSIDY_PERIOD_SLOTS;
+    edge.advance_ms(
+        (boundary - ANCHOR_SLOT) * SLOT_MS + 60_000 - (edge.now_ms() - Edge::start_ms()),
+    );
     let current = edge.period();
-    // Five minutes ago, inside the freshness window, and in the last period.
-    let request_time = edge.now_ms() - 5 * 60_000;
+    // Two slots back, inside the freshness window, and in the last period.
+    let request_time = edge.slot() - 2;
     assert_eq!(subsidy_period(creation, request_time), Some(current - 1));
 
     let forged = Payer {
@@ -1892,7 +1918,7 @@ async fn a_remainder_released_after_its_period_ended_does_not_raise_the_next_bud
     );
     // The old period's proof is refused by its period, whatever its budget.
     let stale = Payer {
-        request_time: edge.now_ms(),
+        request_time: edge.slot(),
         expires_at_ms: edge.now_ms() + HOUR_MS / 2,
         ..old
     }
@@ -1982,7 +2008,7 @@ async fn the_self_description_counts_every_finished_period() {
 }
 
 #[tokio::test]
-async fn the_vaults_creation_time_is_read_once_and_only_for_a_budget() {
+async fn the_vaults_creation_slot_is_read_once_and_only_for_a_budget() {
     let vault = InMemoryZkNoteVault::new();
     vault.created_at(1_234);
     assert_eq!(Subsidy::read(&vault, 0).await, Ok(None));
@@ -1991,11 +2017,161 @@ async fn the_vaults_creation_time_is_read_once_and_only_for_a_budget() {
         Subsidy::read(&vault, 9).await,
         Ok(Some(Subsidy {
             budget: 9,
-            vault_creation_ms: 1_234
+            vault_creation_slot: 1_234
         }))
     );
     assert_eq!(vault.creation_reads(), 1);
     vault.go_down();
     assert!(Subsidy::read(&vault, 9).await.is_err(), "boot fails");
     assert_eq!(Subsidy::read(&vault, 0).await, Ok(None));
+}
+
+// -- Slots (ADR 0080 decision 3, as amended) --
+
+#[test]
+fn the_slot_is_the_anchor_plus_whole_slots_of_the_clock() {
+    let (slot, time_ms) = (2_000_000, 1_700_000_000_000);
+    let clock = SlotClock::new(SlotAnchor { slot, time_ms }, time_ms).expect("an anchor");
+    assert_eq!(clock.slot_at(time_ms), Some(slot));
+    assert_eq!(clock.slot_at(time_ms + SLOT_MS - 1), Some(slot));
+    assert_eq!(
+        clock.slot_at(time_ms + SLOT_MS),
+        Some(slot + 1),
+        "the boundary"
+    );
+    assert_eq!(clock.slot_at(time_ms + 3 * SLOT_MS + 1), Some(slot + 3));
+    assert_eq!(
+        clock.slot_at(time_ms - 1),
+        None,
+        "a clock behind the anchor has no slot, not the anchor's"
+    );
+}
+
+#[test]
+fn an_anchor_more_than_a_slot_ahead_of_the_clock_is_refused() {
+    let now_ms = 1_700_000_000_000;
+    let anchor = |ahead| SlotAnchor {
+        slot: 5,
+        time_ms: now_ms + ahead,
+    };
+    assert!(SlotClock::new(anchor(SLOT_MS), now_ms).is_ok());
+    assert!(SlotClock::new(anchor(SLOT_MS + 1), now_ms)
+        .unwrap_err()
+        .to_string()
+        .contains("ahead of this node's clock"));
+    assert!(SlotClock::new(anchor(0), now_ms + 10 * SLOT_MS).is_ok());
+}
+
+#[tokio::test]
+async fn an_unreadable_anchor_refuses_boot_by_name_after_bounded_retries() {
+    let edge = Edge::new();
+    let none = std::time::Duration::ZERO;
+
+    // A vault that has no anchor to give.
+    let refusal = SlotClock::read(edge.vault.as_ref(), edge.clock.as_ref(), 3, none)
+        .await
+        .unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("slot anchor could not be read after 3 attempts"),
+        "{refusal}"
+    );
+    assert_eq!(edge.vault.anchor_reads(), 3, "bounded");
+
+    // A vault that is down.
+    edge.vault.anchored_at(ANCHOR_SLOT, Edge::start_ms());
+    edge.vault.go_down();
+    assert!(
+        SlotClock::read(edge.vault.as_ref(), edge.clock.as_ref(), 2, none)
+            .await
+            .is_err()
+    );
+    assert_eq!(edge.vault.anchor_reads(), 5);
+
+    // An anchor from the future of this node's clock.
+    let future = Edge::new();
+    future
+        .vault
+        .anchored_at(ANCHOR_SLOT, Edge::start_ms() + 2 * SLOT_MS);
+    assert!(
+        SlotClock::read(future.vault.as_ref(), future.clock.as_ref(), 3, none)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("ahead of this node's clock")
+    );
+
+    // A readable one boots.
+    let ok = Edge::new();
+    ok.vault.anchored_at(ANCHOR_SLOT, Edge::start_ms());
+    let clock = SlotClock::read(ok.vault.as_ref(), ok.clock.as_ref(), 3, none)
+        .await
+        .expect("boots");
+    assert_eq!(clock.anchor(), Edge::anchor());
+    assert_eq!(ok.vault.anchor_reads(), 1, "one read, then the clock");
+}
+
+#[tokio::test]
+async fn a_request_time_is_fresh_from_7_slots_behind_to_1_ahead() {
+    let edge = Edge::new();
+    // Not at a slot boundary: the slot is the one the clock is in.
+    edge.advance_ms(5 * SLOT_MS + 17_000);
+    let gate = edge.gate();
+    let slot = edge.slot();
+    for (seed, request_time) in [(1, slot - 7), (2, slot + 1), (3, slot)] {
+        let payer = Payer {
+            request_time,
+            ..Payer::new(&edge, seed)
+        }
+        .provable(&edge);
+        grant(&gate, &payer).await;
+    }
+    for (seed, request_time) in [(4, slot - 8), (5, slot + 2)] {
+        let payer = Payer {
+            request_time,
+            ..Payer::new(&edge, seed)
+        }
+        .provable(&edge);
+        let refusal = gate.admit_allowance(payer.request()).await.unwrap_err();
+        assert_eq!(refusal.name(), "request_time_outside_window", "{refusal}");
+        assert!(refusal.to_string().contains("slot"), "{refusal}");
+    }
+    // The edge moves a slot on, and the window with it.
+    edge.advance_ms(SLOT_MS);
+    let payer = Payer {
+        request_time: edge.slot() - 8,
+        ..Payer::new(&edge, 6)
+    }
+    .provable(&edge);
+    assert!(gate.admit_allowance(payer.request()).await.is_err());
+}
+
+#[tokio::test]
+async fn a_clock_behind_the_anchor_has_no_current_slot_and_the_edge_fails_closed() {
+    let edge = Edge::with_subsidy(5 * TIERS[0]);
+    let gate = edge.gate();
+    let payer = subsidised_payer(&edge, 130);
+    grant(&gate, &subsidised_payer(&edge, 131)).await;
+    assert_eq!(gate.subsidy_open(), Some(true));
+    assert_eq!(gate.subsidised_by_period(), Some(vec![0; 10]));
+
+    // The clock goes back past the anchor.
+    edge.clock.advance(TimeDelta::minutes(-10));
+    let refusal = gate.admit_allowance(payer.request()).await.unwrap_err();
+    assert_eq!(refusal, AllowanceRefusal::NoCurrentSlot);
+    assert_eq!(refusal.name(), "no_current_slot");
+    assert_eq!(
+        gate.subsidy_open(),
+        Some(false),
+        "closed, not the anchor's period"
+    );
+    assert_eq!(gate.subsidised_by_period(), None);
+    // Neither reader nor the refusal asked the vault anything.
+    assert_eq!(edge.vault.anchor_reads(), 0);
+
+    // The clock catches up again.
+    edge.clock.advance(TimeDelta::minutes(10));
+    assert_eq!(gate.subsidy_open(), Some(true));
+    assert_eq!(gate.subsidised_by_period(), Some(vec![0; 10]));
 }

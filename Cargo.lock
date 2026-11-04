@@ -6376,7 +6376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7517,7 +7517,7 @@ dependencies = [
 [[package]]
 name = "zk-evidence"
 version = "0.1.0"
-source = "git+https://github.com/toon-protocol/zk_toon?rev=0d6b10c332558caf7d8d6350e14b19d68f443f2c#0d6b10c332558caf7d8d6350e14b19d68f443f2c"
+source = "git+https://github.com/toon-protocol/zk_toon?rev=ad4ee440ed243a3913af222fb3ea1f8e43ece4f5#ad4ee440ed243a3913af222fb3ea1f8e43ece4f5"
 dependencies = [
  "ark-ff 0.5.0",
  "crc32c",
@@ -7529,7 +7529,7 @@ dependencies = [
 [[package]]
 name = "zk-note"
 version = "0.1.0"
-source = "git+https://github.com/toon-protocol/zk_toon?rev=0d6b10c332558caf7d8d6350e14b19d68f443f2c#0d6b10c332558caf7d8d6350e14b19d68f443f2c"
+source = "git+https://github.com/toon-protocol/zk_toon?rev=ad4ee440ed243a3913af222fb3ea1f8e43ece4f5#ad4ee440ed243a3913af222fb3ea1f8e43ece4f5"
 dependencies = [
  "ark-ec 0.5.0",
  "ark-ff 0.5.0",

@@ -16,8 +16,8 @@ description = "The connector's zk-note boundary (ADR 0080 decision 12): re-expor
 # tag 0.7.0, which zk_toon spelled before, is it plus a release commit with no Rust source
 # change. No JavaScript prover dependency may appear here (ADR 0080's falsifiers).
 [dependencies]
-zk-note = { git = "https://github.com/toon-protocol/zk_toon", rev = "0d6b10c332558caf7d8d6350e14b19d68f443f2c" }
-zk-evidence = { git = "https://github.com/toon-protocol/zk_toon", rev = "0d6b10c332558caf7d8d6350e14b19d68f443f2c" }
+zk-note = { git = "https://github.com/toon-protocol/zk_toon", rev = "ad4ee440ed243a3913af222fb3ea1f8e43ece4f5" }
+zk-evidence = { git = "https://github.com/toon-protocol/zk_toon", rev = "ad4ee440ed243a3913af222fb3ea1f8e43ece4f5" }
 ark-ec = { version = "0.5", default-features = false }
 ark-ff = { version = "0.5", default-features = false }
 mina-curves = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false }

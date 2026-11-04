@@ -2,7 +2,7 @@
 //! is the crate's, not the gate's public surface.
 
 use super::*;
-use crate::zk_note::InMemoryZkNoteVault;
+use crate::zk_note::{InMemoryZkNoteVault, SlotAnchor};
 use chrono::TimeZone;
 use connector_runtime::{FileJournal, TestClock};
 use connector_zk_note::note::balance::commit;
@@ -27,6 +27,14 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
         allowance_lifetime: Duration::from_secs(3600),
         open_budget_cap: TIERS[1],
         subsidy: None,
+        slots: SlotClock::new(
+            SlotAnchor {
+                slot: 2_000_000,
+                time_ms: clock_ms(clock.as_ref()),
+            },
+            clock_ms(clock.as_ref()),
+        )
+        .unwrap(),
         clock,
     }
 }
@@ -55,7 +63,7 @@ async fn edge_with_allowance(
         vault_x: state.x,
         vault_is_odd: state.is_odd,
         root: Field::from(1u64),
-        request_time: now,
+        request_time: 2_000_000,
         tier: TIERS[1],
         nullifier,
         tag: expected_tag(nullifier, &state, &session_key, TIERS[1], expires),

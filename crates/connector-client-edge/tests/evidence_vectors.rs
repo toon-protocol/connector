@@ -16,8 +16,8 @@ use std::str::FromStr;
 
 const VECTORS: &str = include_str!("fixtures/zk-evidence.json");
 
-/// SHA-256 of `test-vectors/zk-evidence.json` at zk_toon `0d6b10c3`.
-const VECTORS_SHA256: &str = "a6d56a9437cc6bd8095bab8e3e3252249bc09b5f8253c01f74e63fdd92e06872";
+/// SHA-256 of `test-vectors/zk-evidence.json` at zk_toon `ad4ee440`.
+const VECTORS_SHA256: &str = "cbb4942947cd8ea419898b55b4dc012f021da18ab96799b923813fb302bf900e";
 
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("zk_toon's evidence vectors are JSON")

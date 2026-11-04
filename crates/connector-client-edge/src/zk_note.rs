@@ -46,10 +46,112 @@ pub trait ZkNoteVault: Send + Sync + std::fmt::Debug {
     /// Whether `nullifier` is already used on chain.
     async fn nullifier_used(&self, nullifier: Field) -> Result<bool, ZkNoteVaultUnavailable>;
 
-    /// When the vault was created, in ms since the epoch: the origin of
-    /// zk_toon's subsidy periods (ADR 0080 decision 14). Read once, at boot,
-    /// and only by a node with a non-zero `subsidy_budget`.
-    async fn creation_time_ms(&self) -> Result<u64, ZkNoteVaultUnavailable>;
+    /// The slot the vault was created in: the origin of zk_toon's subsidy
+    /// periods (ADR 0080 decision 14). A zk_toon **Slot**, counted from the
+    /// network's original genesis. Read once, at boot, and only by a node
+    /// with a non-zero `subsidy_budget`.
+    async fn creation_slot(&self) -> Result<u64, ZkNoteVaultUnavailable>;
+
+    /// One best-tip block's `slotSinceGenesis` and that same block's
+    /// timestamp, from a single read: the (slot, time) pair the zk edge
+    /// derives every later slot from (ADR 0080 decision 3, as amended). Read
+    /// once, at boot; an implementation must never answer with
+    /// `consensusTimeNow.globalSlot`, which counts from the Mesa fork.
+    async fn slot_anchor(&self) -> Result<SlotAnchor, ZkNoteVaultUnavailable>;
+}
+
+/// A true (slot, time) pair read off one block: `slot` is that block's
+/// `slotSinceGenesis` and `time_ms` its timestamp, ms since the epoch. True
+/// even when the tip is stale or slots before it were empty, because both
+/// halves are the one block's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotAnchor {
+    pub slot: u64,
+    pub time_ms: u64,
+}
+
+/// Why a zk edge has no slot clock, at boot.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SlotAnchorRefusal {
+    #[error("the zk edge's slot anchor could not be read after {attempts} attempts: {last}")]
+    Unreadable { attempts: u32, last: String },
+    #[error(
+        "the zk edge's slot anchor is dated {anchor_ms} ms, more than a slot ahead of this \
+         node's clock ({now_ms} ms): the clock is wrong, or the anchor is"
+    )]
+    AheadOfClock { anchor_ms: u64, now_ms: u64 },
+}
+
+/// The zk edge's one derivation of the current slot (ADR 0080 decision 3, as
+/// amended): `anchor.slot + floor((now - anchor.time) / SLOT_SECONDS)`, from
+/// an anchor read once at boot and the node's clock after that. Never a read
+/// per allowance, and never a genesis time and a slot length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotClock {
+    anchor: SlotAnchor,
+}
+
+const SLOT_MS: u64 = connector_zk_note::note::policy::SLOT_SECONDS * 1_000;
+
+impl SlotClock {
+    /// The clock over `anchor`, for a node whose clock reads `now_ms`.
+    ///
+    /// # Errors
+    /// [`SlotAnchorRefusal::AheadOfClock`] for an anchor more than a slot
+    /// ahead of `now_ms`.
+    pub fn new(anchor: SlotAnchor, now_ms: u64) -> Result<SlotClock, SlotAnchorRefusal> {
+        if anchor.time_ms.saturating_sub(now_ms) > SLOT_MS {
+            return Err(SlotAnchorRefusal::AheadOfClock {
+                anchor_ms: anchor.time_ms,
+                now_ms,
+            });
+        }
+        Ok(SlotClock { anchor })
+    }
+
+    /// Read the anchor from `vault`, at most `attempts` times, `delay` apart,
+    /// and build the clock. A zk edge that cannot has no fallback to the
+    /// node's clock alone: it does not boot.
+    ///
+    /// # Errors
+    /// [`SlotAnchorRefusal`].
+    pub async fn read(
+        vault: &dyn ZkNoteVault,
+        clock: &dyn connector_runtime::Clock,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> Result<SlotClock, SlotAnchorRefusal> {
+        let attempts = attempts.max(1);
+        let mut last = String::new();
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(delay).await;
+            }
+            match vault.slot_anchor().await {
+                Ok(anchor) => return SlotClock::new(anchor, clock_ms(clock)),
+                Err(error) => last = error.to_string(),
+            }
+        }
+        Err(SlotAnchorRefusal::Unreadable { attempts, last })
+    }
+
+    /// The anchor this clock counts from.
+    pub fn anchor(&self) -> SlotAnchor {
+        self.anchor
+    }
+
+    /// The slot at `now_ms`; `None` when `now_ms` is before the anchor: a
+    /// clock that has gone backwards has no current slot, and saturating to
+    /// the anchor would be failing open.
+    pub fn slot_at(&self, now_ms: u64) -> Option<u64> {
+        let elapsed = now_ms.checked_sub(self.anchor.time_ms)?;
+        self.anchor.slot.checked_add(elapsed / SLOT_MS)
+    }
+}
+
+/// `clock` in ms since the epoch: the one conversion the zk edge makes.
+pub(crate) fn clock_ms(clock: &dyn connector_runtime::Clock) -> u64 {
+    u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
 }
 
 /// An in-memory [`ZkNoteVault`]: the roots it has held, the nullifiers
@@ -59,9 +161,11 @@ pub struct InMemoryZkNoteVault {
     roots: Mutex<HashSet<[u8; 32]>>,
     used: Mutex<HashSet<[u8; 32]>>,
     valid: Mutex<HashSet<Vec<u8>>>,
-    created_at_ms: AtomicU64,
+    created_at_slot: AtomicU64,
+    anchor: Mutex<Option<SlotAnchor>>,
     unavailable: AtomicBool,
     creation_reads: AtomicUsize,
+    anchor_reads: AtomicUsize,
     root_reads: AtomicUsize,
     nullifier_reads: AtomicUsize,
     verifications: AtomicUsize,
@@ -98,9 +202,20 @@ impl InMemoryZkNoteVault {
             .insert(proof.json().to_vec());
     }
 
-    /// The vault was created at `created_at_ms` (ms since the epoch).
-    pub fn created_at(&self, created_at_ms: u64) {
-        self.created_at_ms.store(created_at_ms, Ordering::SeqCst);
+    /// The vault was created in `slot`.
+    pub fn created_at(&self, slot: u64) {
+        self.created_at_slot.store(slot, Ordering::SeqCst);
+    }
+
+    /// The best tip's block is `slot`, stamped `time_ms` (ms since the
+    /// epoch). Until this is called the vault has no anchor to give.
+    pub fn anchored_at(&self, slot: u64, time_ms: u64) {
+        *self.anchor.lock().expect("vault lock") = Some(SlotAnchor { slot, time_ms });
+    }
+
+    /// How many times the anchor has been read.
+    pub fn anchor_reads(&self) -> usize {
+        self.anchor_reads.load(Ordering::SeqCst)
     }
 
     /// How many times the vault's creation time has been read.
@@ -115,7 +230,11 @@ impl InMemoryZkNoteVault {
 
     /// How many times the vault has been asked anything.
     pub fn reads(&self) -> usize {
-        self.root_reads() + self.nullifier_reads() + self.verifications() + self.creation_reads()
+        self.root_reads()
+            + self.nullifier_reads()
+            + self.verifications()
+            + self.creation_reads()
+            + self.anchor_reads()
     }
 
     /// How many root reads.
@@ -177,10 +296,17 @@ impl ZkNoteVault for InMemoryZkNoteVault {
             .contains(&field_to_le_bytes(nullifier)))
     }
 
-    async fn creation_time_ms(&self) -> Result<u64, ZkNoteVaultUnavailable> {
+    async fn creation_slot(&self) -> Result<u64, ZkNoteVaultUnavailable> {
         self.creation_reads.fetch_add(1, Ordering::SeqCst);
         self.available()?;
-        Ok(self.created_at_ms.load(Ordering::SeqCst))
+        Ok(self.created_at_slot.load(Ordering::SeqCst))
+    }
+
+    async fn slot_anchor(&self) -> Result<SlotAnchor, ZkNoteVaultUnavailable> {
+        self.anchor_reads.fetch_add(1, Ordering::SeqCst);
+        self.available()?;
+        (*self.anchor.lock().expect("vault lock"))
+            .ok_or_else(|| ZkNoteVaultUnavailable("the in-memory vault has no anchor".into()))
     }
 }
 
@@ -216,8 +342,10 @@ pub mod contract {
         /// about its subsidy -- its flag, its period, its per-period
         /// nullifier -- and nothing else. None verifies.
         pub subsidy_altered_proofs: Vec<RequestProof>,
-        /// When the vault was created, ms since the epoch.
-        pub creation_time_ms: u64,
+        /// The slot the vault was created in.
+        pub creation_slot: u64,
+        /// The anchor the vault answers with.
+        pub anchor: SlotAnchor,
     }
 
     /// Assert every rule of the port against `fixture`.
@@ -294,14 +422,24 @@ pub mod contract {
             );
         }
         assert_eq!(
-            vault.creation_time_ms().await,
-            Ok(fixture.creation_time_ms),
-            "the vault says when it was created"
+            vault.creation_slot().await,
+            Ok(fixture.creation_slot),
+            "the vault says which slot it was created in"
         );
         assert_eq!(
-            vault.creation_time_ms().await,
-            Ok(fixture.creation_time_ms),
+            vault.creation_slot().await,
+            Ok(fixture.creation_slot),
             "and says the same every time"
+        );
+        assert_eq!(
+            vault.slot_anchor().await,
+            Ok(fixture.anchor),
+            "the vault gives one (slot, time) pair"
+        );
+        assert_eq!(
+            vault.slot_anchor().await,
+            Ok(fixture.anchor),
+            "and the same one every time it is asked, while its tip has not moved"
         );
         // Verifying is a read: it spends nothing.
         assert_eq!(
@@ -327,9 +465,14 @@ pub mod contract {
         valid_subsidised: RequestProof,
         subsidy_altered: Vec<RequestProof>,
     ) -> ZkNoteVaultFixture {
-        const CREATED_AT_MS: u64 = 1_700_000_000_000;
+        const CREATED_AT_SLOT: u64 = 1_234_567;
+        let anchor = SlotAnchor {
+            slot: 2_000_000,
+            time_ms: 1_700_000_000_000,
+        };
         let vault = InMemoryZkNoteVault::new();
-        vault.created_at(CREATED_AT_MS);
+        vault.created_at(CREATED_AT_SLOT);
+        vault.anchored_at(anchor.slot, anchor.time_ms);
         vault.accept(&valid_subsidised);
         let (known, unknown) = (Field::from(11u64), Field::from(12u64));
         let (used, unused) = (Field::from(21u64), Field::from(22u64));
@@ -346,7 +489,8 @@ pub mod contract {
             invalid_proof: invalid,
             valid_subsidised_proof: valid_subsidised,
             subsidy_altered_proofs: subsidy_altered,
-            creation_time_ms: CREATED_AT_MS,
+            creation_slot: CREATED_AT_SLOT,
+            anchor,
         }
     }
 

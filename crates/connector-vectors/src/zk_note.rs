@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 
 /// The zk_toon commit every value in this section was generated at: the
 /// `rev` `crates/connector-zk-note/Cargo.toml` pins.
-pub const ZK_TOON_COMMIT: &str = "0d6b10c332558caf7d8d6350e14b19d68f443f2c";
+pub const ZK_TOON_COMMIT: &str = "ad4ee440ed243a3913af222fb3ea1f8e43ece4f5";
 
 #[derive(Debug, Serialize)]
 pub struct ZkNoteVectors {
@@ -74,8 +74,9 @@ fn fields_json(fields: &[Field]) -> Vec<String> {
 pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     const SESSION_SECRET: u64 = 0x5e55_1011;
     const STATE_SECRET: u64 = 0x57a7_e001;
-    const REQUEST_TIME_MS: u64 = 1_793_188_800_000;
-    const EXPIRES_AT_MS: u64 = REQUEST_TIME_MS + 1_800_000;
+    // `requestTime` is a zk_toon slot; `expiresAt` stays wall-clock milliseconds.
+    const REQUEST_TIME_SLOT: u64 = 907_680;
+    const EXPIRES_AT_MS: u64 = 1_793_188_800_000 + 1_800_000;
     const BALANCE: u64 = 5_000_000_000;
     const BLINDING: u64 = 0x0123_4567_89ab_cdef;
     const CHARGE: u64 = 250_000;
@@ -100,7 +101,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         vault_x: state_key.x,
         vault_is_odd: state_key.is_odd,
         root: Field::from(0x726f_6f74u64),
-        request_time: REQUEST_TIME_MS,
+        request_time: REQUEST_TIME_SLOT,
         tier,
         nullifier,
         tag: expected_tag(nullifier, &state_key, &session_key, tier, EXPIRES_AT_MS),
