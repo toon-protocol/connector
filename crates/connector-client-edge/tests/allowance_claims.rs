@@ -32,7 +32,9 @@ use connector_zk_note::session::{
     sign_allowance_claim, sign_allowance_close, signature_to_be_bytes, signature_to_hex,
 };
 use connector_zk_note::tiers::Tiers;
-use connector_zk_note::{field_to_le_bytes, CompressedPubKey, Field, Keypair, Scalar, SecKey};
+use connector_zk_note::{
+    field_to_le_bytes, CompressedPubKey, Field, Keypair, Scalar, SecKey, Slot,
+};
 
 const HOUR_MS: u64 = 3_600_000;
 const SLOT_MS: u64 = SLOT_SECONDS * 1_000;
@@ -106,7 +108,7 @@ impl Edge {
     /// The anchor the edge boots with: [`ANCHOR_SLOT`] at the clock's start.
     fn anchor() -> SlotAnchor {
         SlotAnchor {
-            slot: ANCHOR_SLOT,
+            slot: Slot::new(ANCHOR_SLOT),
             time_ms: Edge::start_ms(),
         }
     }
@@ -161,7 +163,7 @@ impl Edge {
                 open_budget_cap: self.cap,
                 subsidy: (self.subsidy_budget > 0).then(|| Subsidy {
                     budget: self.subsidy_budget,
-                    vault_creation_slot: self.vault_creation_slot(),
+                    vault_creation_slot: Slot::new(self.vault_creation_slot()),
                 }),
                 slots: SlotClock::new(Edge::anchor(), Edge::start_ms()).expect("an anchor"),
                 clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
@@ -2010,14 +2012,14 @@ async fn the_self_description_counts_every_finished_period() {
 #[tokio::test]
 async fn the_vaults_creation_slot_is_read_once_and_only_for_a_budget() {
     let vault = InMemoryZkNoteVault::new();
-    vault.created_at(1_234);
+    vault.created_at(Slot::new(1_234));
     assert_eq!(Subsidy::read(&vault, 0).await, Ok(None));
     assert_eq!(vault.creation_reads(), 0, "a zero budget reads nothing");
     assert_eq!(
         Subsidy::read(&vault, 9).await,
         Ok(Some(Subsidy {
             budget: 9,
-            vault_creation_slot: 1_234
+            vault_creation_slot: Slot::new(1_234)
         }))
     );
     assert_eq!(vault.creation_reads(), 1);
@@ -2030,16 +2032,19 @@ async fn the_vaults_creation_slot_is_read_once_and_only_for_a_budget() {
 
 #[test]
 fn the_slot_is_the_anchor_plus_whole_slots_of_the_clock() {
-    let (slot, time_ms) = (2_000_000, 1_700_000_000_000);
+    let (slot, time_ms) = (Slot::new(2_000_000), 1_700_000_000_000);
     let clock = SlotClock::new(SlotAnchor { slot, time_ms }, time_ms).expect("an anchor");
     assert_eq!(clock.slot_at(time_ms), Some(slot));
     assert_eq!(clock.slot_at(time_ms + SLOT_MS - 1), Some(slot));
     assert_eq!(
         clock.slot_at(time_ms + SLOT_MS),
-        Some(slot + 1),
+        slot.checked_add(1),
         "the boundary"
     );
-    assert_eq!(clock.slot_at(time_ms + 3 * SLOT_MS + 1), Some(slot + 3));
+    assert_eq!(
+        clock.slot_at(time_ms + 3 * SLOT_MS + 1),
+        slot.checked_add(3)
+    );
     assert_eq!(
         clock.slot_at(time_ms - 1),
         None,
@@ -2051,7 +2056,7 @@ fn the_slot_is_the_anchor_plus_whole_slots_of_the_clock() {
 fn an_anchor_more_than_a_slot_ahead_of_the_clock_is_refused() {
     let now_ms = 1_700_000_000_000;
     let anchor = |ahead| SlotAnchor {
-        slot: 5,
+        slot: Slot::new(5),
         time_ms: now_ms + ahead,
     };
     assert!(SlotClock::new(anchor(SLOT_MS), now_ms).is_ok());
@@ -2080,7 +2085,8 @@ async fn an_unreadable_anchor_refuses_boot_by_name_after_bounded_retries() {
     assert_eq!(edge.vault.anchor_reads(), 3, "bounded");
 
     // A vault that is down.
-    edge.vault.anchored_at(ANCHOR_SLOT, Edge::start_ms());
+    edge.vault
+        .anchored_at(Slot::new(ANCHOR_SLOT), Edge::start_ms());
     edge.vault.go_down();
     assert!(
         SlotClock::read(edge.vault.as_ref(), edge.clock.as_ref(), 2, none)
@@ -2093,7 +2099,7 @@ async fn an_unreadable_anchor_refuses_boot_by_name_after_bounded_retries() {
     let future = Edge::new();
     future
         .vault
-        .anchored_at(ANCHOR_SLOT, Edge::start_ms() + 2 * SLOT_MS);
+        .anchored_at(Slot::new(ANCHOR_SLOT), Edge::start_ms() + 2 * SLOT_MS);
     assert!(
         SlotClock::read(future.vault.as_ref(), future.clock.as_ref(), 3, none)
             .await
@@ -2104,7 +2110,8 @@ async fn an_unreadable_anchor_refuses_boot_by_name_after_bounded_retries() {
 
     // A readable one boots.
     let ok = Edge::new();
-    ok.vault.anchored_at(ANCHOR_SLOT, Edge::start_ms());
+    ok.vault
+        .anchored_at(Slot::new(ANCHOR_SLOT), Edge::start_ms());
     let clock = SlotClock::read(ok.vault.as_ref(), ok.clock.as_ref(), 3, none)
         .await
         .expect("boots");

@@ -3968,13 +3968,13 @@ mod tests {
                     open_budget_cap: 10 * TIERS[0],
                     subsidy: (budget > 0).then_some(Subsidy {
                         budget,
-                        vault_creation_slot: 2_000_000
-                            - 10 * SUBSIDY_PERIOD_SLOTS
-                            - SUBSIDY_PERIOD_SLOTS / 2,
+                        vault_creation_slot: connector_zk_note::Slot::new(
+                            2_000_000 - 10 * SUBSIDY_PERIOD_SLOTS - SUBSIDY_PERIOD_SLOTS / 2,
+                        ),
                     }),
                     slots: crate::zk_note::SlotClock::new(
                         crate::zk_note::SlotAnchor {
-                            slot: 2_000_000,
+                            slot: connector_zk_note::Slot::new(2_000_000),
                             time_ms: now,
                         },
                         now,

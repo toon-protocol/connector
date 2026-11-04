@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use connector_zk_note::request::RequestProof;
-use connector_zk_note::{field_to_le_bytes, Field};
+use connector_zk_note::{field_to_le_bytes, Field, Slot};
 
 /// Why the vault could not answer. Refuses the one allowance that asked;
 /// the node keeps serving.
@@ -50,7 +50,7 @@ pub trait ZkNoteVault: Send + Sync + std::fmt::Debug {
     /// periods (ADR 0080 decision 14). A zk_toon **Slot**, counted from the
     /// network's original genesis. Read once, at boot, and only by a node
     /// with a non-zero `subsidy_budget`.
-    async fn creation_slot(&self) -> Result<u64, ZkNoteVaultUnavailable>;
+    async fn creation_slot(&self) -> Result<Slot, ZkNoteVaultUnavailable>;
 
     /// One best-tip block's `slotSinceGenesis` and that same block's
     /// timestamp, from a single read: the (slot, time) pair the zk edge
@@ -66,7 +66,7 @@ pub trait ZkNoteVault: Send + Sync + std::fmt::Debug {
 /// halves are the one block's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotAnchor {
-    pub slot: u64,
+    pub slot: Slot,
     pub time_ms: u64,
 }
 
@@ -143,7 +143,7 @@ impl SlotClock {
     /// The slot at `now_ms`; `None` when `now_ms` is before the anchor: a
     /// clock that has gone backwards has no current slot, and saturating to
     /// the anchor would be failing open.
-    pub fn slot_at(&self, now_ms: u64) -> Option<u64> {
+    pub fn slot_at(&self, now_ms: u64) -> Option<Slot> {
         let elapsed = now_ms.checked_sub(self.anchor.time_ms)?;
         self.anchor.slot.checked_add(elapsed / SLOT_MS)
     }
@@ -203,13 +203,13 @@ impl InMemoryZkNoteVault {
     }
 
     /// The vault was created in `slot`.
-    pub fn created_at(&self, slot: u64) {
-        self.created_at_slot.store(slot, Ordering::SeqCst);
+    pub fn created_at(&self, slot: Slot) {
+        self.created_at_slot.store(slot.get(), Ordering::SeqCst);
     }
 
     /// The best tip's block is `slot`, stamped `time_ms` (ms since the
     /// epoch). Until this is called the vault has no anchor to give.
-    pub fn anchored_at(&self, slot: u64, time_ms: u64) {
+    pub fn anchored_at(&self, slot: Slot, time_ms: u64) {
         *self.anchor.lock().expect("vault lock") = Some(SlotAnchor { slot, time_ms });
     }
 
@@ -296,10 +296,10 @@ impl ZkNoteVault for InMemoryZkNoteVault {
             .contains(&field_to_le_bytes(nullifier)))
     }
 
-    async fn creation_slot(&self) -> Result<u64, ZkNoteVaultUnavailable> {
+    async fn creation_slot(&self) -> Result<Slot, ZkNoteVaultUnavailable> {
         self.creation_reads.fetch_add(1, Ordering::SeqCst);
         self.available()?;
-        Ok(self.created_at_slot.load(Ordering::SeqCst))
+        Ok(Slot::new(self.created_at_slot.load(Ordering::SeqCst)))
     }
 
     async fn slot_anchor(&self) -> Result<SlotAnchor, ZkNoteVaultUnavailable> {
@@ -343,7 +343,7 @@ pub mod contract {
         /// nullifier -- and nothing else. None verifies.
         pub subsidy_altered_proofs: Vec<RequestProof>,
         /// The slot the vault was created in.
-        pub creation_slot: u64,
+        pub creation_slot: Slot,
         /// The anchor the vault answers with.
         pub anchor: SlotAnchor,
     }
@@ -465,9 +465,9 @@ pub mod contract {
         valid_subsidised: RequestProof,
         subsidy_altered: Vec<RequestProof>,
     ) -> ZkNoteVaultFixture {
-        const CREATED_AT_SLOT: u64 = 1_234_567;
+        const CREATED_AT_SLOT: Slot = Slot::new(1_234_567);
         let anchor = SlotAnchor {
-            slot: 2_000_000,
+            slot: Slot::new(2_000_000),
             time_ms: 1_700_000_000_000,
         };
         let vault = InMemoryZkNoteVault::new();
