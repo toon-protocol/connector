@@ -28,44 +28,55 @@ use solana_sdk::transaction::Transaction;
 /// request-airdrop-then-poll-confirm loop.
 ///
 /// Waits up to 60 s -- the budget [`SolanaValidator::spawn`] gives readiness --
-/// and re-requests the airdrop every few seconds while none has confirmed,
+/// and re-requests the airdrop every 5 s while none has confirmed,
 /// since under load with several validators running the first can be slow or
 /// dropped outright (its blockhash expiring before it lands). Every signature
 /// requested is kept and polled, because an earlier one may still land;
 /// funding the account twice is harmless. Panics at the deadline with the time
-/// elapsed, the requests made and the last status or request error seen.
+/// elapsed, the requests made and the last status and request error seen.
+/// Every RPC call is bounded by the same deadline, so a hung validator
+/// cannot hold it past 60 s.
 pub async fn fund(rpc: &RpcClient, pubkey: &Pubkey) {
     const DEADLINE: Duration = Duration::from_secs(60);
     const REREQUEST_AFTER: Duration = Duration::from_secs(5);
     const POLL: Duration = Duration::from_millis(50);
 
     let start = tokio::time::Instant::now();
+    let deadline = start + DEADLINE;
     let mut signatures: Vec<Signature> = Vec::new();
+    let mut requests = 0usize;
     let mut last_requested: Option<tokio::time::Instant> = None;
-    let mut last_seen = String::from("no status seen");
+    let mut last_status = String::from("no status seen");
+    let mut last_error: Option<String> = None;
     loop {
         let due = last_requested.is_none_or(|at| at.elapsed() >= REREQUEST_AFTER);
         if due {
             last_requested = Some(tokio::time::Instant::now());
-            match rpc.request_airdrop(pubkey, 10_000_000_000).await {
-                Ok(signature) => signatures.push(signature),
-                Err(e) => last_seen = format!("request error: {e}"),
+            requests += 1;
+            match tokio::time::timeout_at(deadline, rpc.request_airdrop(pubkey, 10_000_000_000))
+                .await
+            {
+                Ok(Ok(signature)) => signatures.push(signature),
+                Ok(Err(e)) => last_error = Some(format!("request error: {e}")),
+                Err(_) => last_error = Some("request outlived the deadline".to_string()),
             }
         }
         for signature in &signatures {
-            if rpc.confirm_transaction(signature).await.unwrap_or(false) {
-                return;
+            // At the client's commitment, `Some(Ok(()))` is exactly what
+            // `confirm_transaction` reports as `true`.
+            match tokio::time::timeout_at(deadline, rpc.get_signature_status(signature)).await {
+                Ok(Ok(Some(Ok(())))) => return,
+                Ok(status) => last_status = format!("{signature}: {status:?}"),
+                Err(_) => last_status = format!("{signature}: status outlived the deadline"),
             }
-            last_seen = format!(
-                "{signature}: {:?}",
-                rpc.get_signature_status(signature).await
-            );
         }
-        if start.elapsed() >= DEADLINE {
+        if tokio::time::Instant::now() >= deadline {
             panic!(
-                "airdrop did not confirm after {:?}; {} requested; last: {last_seen}",
+                "airdrop did not confirm after {:?}; {requests} requested, {} accepted; \
+                 last status: {last_status}; last error: {}",
                 start.elapsed(),
-                signatures.len()
+                signatures.len(),
+                last_error.as_deref().unwrap_or("none"),
             );
         }
         tokio::time::sleep(POLL).await;
