@@ -563,12 +563,14 @@ pub struct X402ZkNoteTerms {
     /// never says how much remains.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subsidy: Option<ZkNoteSubsidy>,
-    /// How many subsidised allowances were granted in the last **finished**
-    /// subsidy period -- never the current one, and no amount (decision 14).
-    /// Set where the self-description is served, and `None` while the node's
-    /// `subsidy_budget` is zero.
+    /// How many subsidised allowances each **finished** subsidy period
+    /// granted, decimal strings: index `p` is period `p`, counted from the
+    /// vault's creation, zeros included. Never the current period, and no
+    /// amount (decision 14, as amended by #1650). Empty before the first
+    /// period finishes. Set where the self-description is served, and `None`
+    /// while the node's `subsidy_budget` is zero.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub subsidised_last_period: Option<u64>,
+    pub subsidised_by_period: Option<Vec<String>>,
 }
 
 /// Whether a subsidised allowance is on offer, as the greeting says it. A
@@ -1261,7 +1263,44 @@ mod tests {
             allowance_lifetime_secs: 3600,
             allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
             subsidy: None,
-            subsidised_last_period: None,
+            subsidised_by_period: None,
+        }
+    }
+
+    /// ADR 0080 decision 14 (#1650): the published subsidy history is counts
+    /// only, keyed by position, as decimal strings -- and absent with no subsidy.
+    #[test]
+    fn subsidised_by_period_publishes_counts_only() {
+        let mut fact = zk_note_fact();
+        let absent = serde_json::to_value(&fact).unwrap();
+        assert!(absent.get("subsidisedByPeriod").is_none());
+        assert!(absent.get("subsidisedLastPeriod").is_none());
+
+        fact.subsidised_by_period = Some(vec!["2".into(), "0".into(), "11".into()]);
+        let value = serde_json::to_value(&fact).unwrap();
+        assert_eq!(
+            value["subsidisedByPeriod"],
+            serde_json::json!(["2", "0", "11"])
+        );
+        let fields: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for forbidden in [
+            "nullifier",
+            "allowanceId",
+            "sessionKey",
+            "timestamp",
+            "budget",
+        ] {
+            assert!(
+                !fields
+                    .iter()
+                    .any(|f| f.to_lowercase().contains(&forbidden.to_lowercase())),
+                "{forbidden} in {fields:?}"
+            );
         }
     }
 

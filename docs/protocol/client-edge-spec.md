@@ -1597,8 +1597,11 @@ replaces that with Δ. Its successor carries the note's old balance unchanged (`
 the note is charged nothing, and Δ is the budget's. The greeting's `zk-note` entry gains
 `extra.subsidy`, `"open"` or `"closed"`, read when the greeting is served, and omits it when the
 budget is zero; a wallet that read `"open"` may still be refused as closed. The self-description's
-`zkNote.subsidisedLastPeriod` counts the subsidised allowances granted in the last finished period,
-never the current one and never an amount.
+`zkNote.subsidisedByPeriod` is an array of decimal counts: index `p` is the number of subsidised
+allowances granted in subsidy period `p`, numbered from the vault's creation as
+`zk_note::policy::subsidy_period` does. It covers every finished period, zeros included, and never
+the current one; it is empty before the first period finishes, and left out when the node's
+`subsidy_budget` is zero. It carries counts only: no nullifier, allowance id, time, tier or amount.
 
 A packet paid by an allowance claim reaches the app with `X-TOON-Amount` and `X-TOON-Chain` (the
 vault's Mina network) and **without** `X-TOON-Payer` (ADR 0040 as amended by ADR 0080 decision 6).

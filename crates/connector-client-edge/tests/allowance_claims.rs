@@ -1947,26 +1947,35 @@ async fn the_greeting_reads_open_and_closed_and_says_nothing_without_a_budget() 
 }
 
 #[tokio::test]
-async fn the_self_description_counts_the_last_finished_period_only() {
-    assert_eq!(Edge::new().gate().subsidised_last_period(), None);
+async fn the_self_description_counts_every_finished_period() {
+    assert_eq!(Edge::new().gate().subsidised_by_period(), None);
     let edge = Edge::with_subsidy(5 * TIERS[0]);
     let gate = edge.gate();
     grant(&gate, &subsidised_payer(&edge, 120)).await;
     grant(&gate, &subsidised_payer(&edge, 121)).await;
     // Two are granted in the current period, which is not finished.
-    assert_eq!(gate.subsidised_last_period(), Some(0));
+    assert_eq!(gate.subsidised_by_period(), Some(vec![]));
     edge.advance_ms(SUBSIDY_PERIOD_MS);
-    assert_eq!(gate.subsidised_last_period(), Some(2));
+    assert_eq!(gate.subsidised_by_period(), Some(vec![2]));
     grant(&gate, &subsidised_payer(&edge, 122)).await;
     assert_eq!(
-        gate.subsidised_last_period(),
-        Some(2),
+        gate.subsidised_by_period(),
+        Some(vec![2]),
         "the new period's grant is not counted until it ends"
     );
-    // The count is rebuilt from the journal.
-    assert_eq!(edge.gate().subsidised_last_period(), Some(2));
+    // The counts are rebuilt from the journal.
+    assert_eq!(edge.gate().subsidised_by_period(), Some(vec![2]));
     edge.advance_ms(SUBSIDY_PERIOD_MS);
-    assert_eq!(gate.subsidised_last_period(), Some(1));
+    assert_eq!(gate.subsidised_by_period(), Some(vec![2, 1]));
+    // A period with no grants reads zero, and earlier counts are not pruned
+    // by later periods being served.
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    grant(&gate, &subsidised_payer(&edge, 123)).await;
+    edge.advance_ms(SUBSIDY_PERIOD_MS);
+    let expected = Some(vec![2, 1, 0, 0, 1]);
+    assert_eq!(gate.subsidised_by_period(), expected);
+    assert_eq!(edge.gate().subsidised_by_period(), expected);
 }
 
 #[tokio::test]

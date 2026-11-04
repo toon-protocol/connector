@@ -2173,7 +2173,7 @@ fn zk_note_terms(
         allowance_lifetime_secs: zk_note.allowance_lifetime().as_secs(),
         allowance_endpoint: connector_client_edge::ZK_NOTE_ALLOWANCES_PATH.to_string(),
         subsidy: None,
-        subsidised_last_period: None,
+        subsidised_by_period: None,
     })
 }
 
@@ -3255,7 +3255,7 @@ open_budget_cap = 1000000000
                 state_key: address.clone(),
                 tiers: vec!["10000000".to_string(), "100000000".to_string()],
                 subsidy: None,
-                subsidised_last_period: None,
+                subsidised_by_period: None,
                 allowance_lifetime_secs: 3600,
                 allowance_endpoint: "/ilp/zk-note/allowances".to_string(),
             }
