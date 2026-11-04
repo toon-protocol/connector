@@ -1,8 +1,7 @@
 //! A real, disposable `anvil` chain harness other crates' tests reuse
 //! rather than reimplementing (issue #542): `connector-bin`'s devnet-config
 //! test and `connector-cli`'s settlement-construction tests all need
-//! exactly what this crate's own `tests/support/mod.rs` already provides
-//! its own integration tests. Gated behind the `test-util` feature for the
+//! the same chain this crate's own integration tests spawn. Gated behind the `test-util` feature for the
 //! same reason `connector-operator`'s own `test_support` module is: a
 //! downstream crate's tests cannot see anything behind `#[cfg(test)]`,
 //! since that cfg is only active while this crate compiles its own test
@@ -10,10 +9,11 @@
 
 pub mod x402;
 
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
@@ -138,8 +138,16 @@ static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
 /// A freshly spawned `anvil` instance, killed when dropped.
 pub struct Anvil {
     child: Child,
+    stderr_log: PathBuf,
     pub rpc_url: String,
 }
+
+/// How long [`Anvil::spawn`] waits for the first answer, the same bound
+/// `Xrpld::spawn` and `SolanaValidator::spawn` give their chains.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The most one readiness probe may take before the next tick.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl Anvil {
     /// Spawn `anvil` bound to a port derived from `base_port`, this
@@ -163,6 +171,13 @@ impl Anvil {
             .wrapping_add(offset);
         let rpc_url = format!("http://127.0.0.1:{port}");
 
+        // anvil's stderr goes to a file, read only if it dies at startup.
+        let stderr_log = std::env::temp_dir().join(format!(
+            "anvil-{}-{port}-{offset}.stderr",
+            std::process::id()
+        ));
+        let stderr_file = std::fs::File::create(&stderr_log).expect("create anvil stderr log");
+
         let child = Command::new("anvil")
             .args(["--host", "127.0.0.1", "--port"])
             .arg(port.to_string())
@@ -178,19 +193,45 @@ impl Anvil {
                 "10000",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .expect("spawn anvil (is `anvil` on PATH? see foundryup)");
+        // From here `Drop` kills the child and removes the log, panics included.
+        let mut anvil = Self {
+            child,
+            stderr_log,
+            rpc_url,
+        };
 
-        let provider = Provider::<Http>::try_from(rpc_url.as_str()).expect("build provider");
-        for _ in 0..200 {
-            if provider.get_chainid().await.is_ok() {
-                break;
+        let provider = Provider::<Http>::try_from(anvil.rpc_url.as_str()).expect("build provider");
+        let started = Instant::now();
+        loop {
+            // Checked before the RPC, so an anvil already dead is not mistaken
+            // for whatever else answers on its port.
+            if let Ok(Some(status)) = anvil.child.try_wait() {
+                panic!(
+                    "anvil exited at startup ({status}) before serving {}\nstderr:\n{}",
+                    anvil.rpc_url,
+                    std::fs::read_to_string(&anvil.stderr_log).unwrap_or_default()
+                );
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Bounded, so a listener that accepts and never replies can hold
+            // `spawn` neither past the deadline nor long enough to hide an exit.
+            let attempt = STARTUP_DEADLINE
+                .saturating_sub(started.elapsed())
+                .min(ATTEMPT_TIMEOUT);
+            if let Ok(Ok(_)) = tokio::time::timeout(attempt, provider.get_chainid()).await {
+                return anvil;
+            }
+            if started.elapsed() >= STARTUP_DEADLINE {
+                panic!(
+                    "anvil did not answer at {} within {:?}",
+                    anvil.rpc_url,
+                    started.elapsed()
+                );
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-
-        Self { child, rpc_url }
     }
 }
 
@@ -198,5 +239,6 @@ impl Drop for Anvil {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.stderr_log);
     }
 }
