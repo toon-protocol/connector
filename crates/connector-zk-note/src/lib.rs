@@ -12,6 +12,7 @@
 //!   session-key signature over them.
 //! - [`successor`]: the successor state, composed from zk_toon's charge, anchor and state
 //!   message. The state key that signs it is `connector-signer`'s, never read or held here.
+//! - [`slot`]: zk_toon's global slot as its own type, and slot-typed wrappers over its policy.
 //! - [`tiers`]: the operator's published tiers, validated against zk_toon's.
 //! - [`request`]: the request proof as the payer sends it, read strictly around zk_toon's
 //!   `RequestPublic`, and the binding tag the zk edge expects of it.
@@ -24,11 +25,13 @@ pub use zk_note as note;
 pub mod evidence;
 pub mod request;
 pub mod session;
+pub mod slot;
 pub mod successor;
 pub mod tiers;
 
 /// The Mina keys and signatures the zk edge reads and signs with.
 pub use mina_signer::{CompressedPubKey, Keypair, NetworkId, PubKey, SecKey, Signature};
+pub use slot::Slot;
 /// The balance commitment: a point on Pallas, in affine form.
 pub use zk_note::balance::{Commitment, Scalar};
 /// The Pallas base field, the field every value in a zk note lives in.

@@ -76,11 +76,12 @@ use connector_zk_note::request::{expected_tag, RequestProof};
 use connector_zk_note::session::{
     signature_from_be_bytes, verify_allowance_claim, verify_allowance_close,
 };
+use connector_zk_note::slot::{is_request_time_fresh, request_time, subsidy_period};
 use connector_zk_note::successor::successor_state;
 use connector_zk_note::tiers::Tiers;
 use connector_zk_note::{
     commitment_from_le_bytes, decompress, field_from_le_bytes, field_to_le_bytes,
-    scalar_from_le_bytes, scalar_to_le_bytes, Commitment, CompressedPubKey, Field, Signature,
+    scalar_from_le_bytes, scalar_to_le_bytes, Commitment, CompressedPubKey, Field, Signature, Slot,
 };
 
 use super::*;
@@ -116,7 +117,7 @@ impl ZkEdge {
     /// The current zk_toon slot, or `None` when the node's clock is behind
     /// the boot anchor: there is then no current slot, and nothing that needs
     /// one may proceed. The one place the edge turns its clock into a slot.
-    fn current_slot(&self) -> Option<u64> {
+    fn current_slot(&self) -> Option<Slot> {
         self.slots.slot_at(clock_ms(self.clock.as_ref()))
     }
 }
@@ -130,7 +131,7 @@ pub struct Subsidy {
     /// units. Never zero: a zero budget is no `Subsidy` at all.
     pub budget: u64,
     /// The zk_toon slot the vault was created in.
-    pub vault_creation_slot: u64,
+    pub vault_creation_slot: Slot,
 }
 
 impl Subsidy {
@@ -155,8 +156,8 @@ impl Subsidy {
 
     /// The subsidy period `slot` falls in: zk_toon's, or `None` before the
     /// vault was created.
-    fn period(&self, slot: u64) -> Option<u64> {
-        policy::subsidy_period(self.vault_creation_slot, slot)
+    fn period(&self, slot: Slot) -> Option<u64> {
+        subsidy_period(self.vault_creation_slot, slot)
     }
 }
 
@@ -215,8 +216,8 @@ pub enum AllowanceRefusal {
          1 slot ahead of this zk edge's current slot ({current_slot})"
     )]
     RequestTimeOutsideWindow {
-        request_time: u64,
-        current_slot: u64,
+        request_time: Slot,
+        current_slot: Slot,
     },
     #[error(
         "allowance refused: this zk edge has no current slot: its clock is behind the slot \
@@ -711,9 +712,10 @@ impl ClientClaimGate {
             return Err(AllowanceRefusal::ForeignStateKey);
         }
         let current_slot = edge.current_slot().ok_or(AllowanceRefusal::NoCurrentSlot)?;
-        if !policy::is_request_time_fresh(public.request_time, current_slot) {
+        let request_time = request_time(public);
+        if !is_request_time_fresh(request_time, current_slot) {
             return Err(AllowanceRefusal::RequestTimeOutsideWindow {
-                request_time: public.request_time,
+                request_time,
                 current_slot,
             });
         }
@@ -877,7 +879,7 @@ impl ClientClaimGate {
         &self,
         edge: &ZkEdge,
         public: &connector_zk_note::request::RequestPublic,
-        current_slot: u64,
+        current_slot: Slot,
     ) -> Result<Option<(u64, [u8; 32])>, AllowanceRefusal> {
         if !public.subsidised {
             // zk_toon's rule for an unsubsidised proof: no period and no
@@ -912,7 +914,7 @@ impl ClientClaimGate {
             .filter(|current| public.period == *current)
             .ok_or_else(not_current)?;
         public
-            .check_subsidy_period(subsidy.vault_creation_slot)
+            .check_subsidy_period(subsidy.vault_creation_slot.get())
             .map_err(|_| not_current())?;
         // 3. and 4. The budget and the per-period nullifier.
         let period_nullifier = field_to_le_bytes(public.period_nullifier);
