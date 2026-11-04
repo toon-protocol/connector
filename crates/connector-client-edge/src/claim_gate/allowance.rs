@@ -369,8 +369,9 @@ pub(super) struct ZkLedger {
     /// The per-period nullifiers seen in each period. A finished period's are
     /// pruned: a proof for it can no longer be admitted.
     subsidy_nullifiers: HashMap<u64, HashSet<[u8; 32]>>,
-    /// How many subsidised allowances each period granted. Pruned to the
-    /// current period and the last finished one.
+    /// How many subsidised allowances each period granted. Never pruned: the
+    /// self-description publishes every finished period's count (ADR 0080
+    /// decision 14, #1650), and replay rebuilds them from the journal.
     subsidy_grants: HashMap<u64, u64>,
 }
 
@@ -552,8 +553,8 @@ impl ZkLedger {
 
     /// The refusal, if any, that `period`'s budget and nullifier make
     /// (decision 14, refusals 3 and 4). Also forgets what finished periods
-    /// left behind, keeping only the last one's grant count for the
-    /// self-description.
+    /// left behind, except their grant counts, which the self-description
+    /// publishes.
     fn subsidy_refusal(
         &mut self,
         budget: u64,
@@ -562,8 +563,6 @@ impl ZkLedger {
     ) -> Option<AllowanceRefusal> {
         self.subsidy_nullifiers.retain(|p, _| *p >= period);
         self.subsidy_used.retain(|p, _| *p >= period);
-        self.subsidy_grants
-            .retain(|p, _| p.saturating_add(1) >= period);
         if !self.subsidy_open(budget, period) {
             return Some(AllowanceRefusal::SubsidyBudgetClosed);
         }
@@ -927,24 +926,20 @@ impl ClientClaimGate {
         )
     }
 
-    /// How many subsidised allowances the last **finished** subsidy period
-    /// granted, for the self-description: never the current period's count.
-    /// `None` when this edge offers no subsidy.
-    pub fn subsidised_last_period(&self) -> Option<u64> {
+    /// How many subsidised allowances each **finished** subsidy period
+    /// granted, in period order and zeros included, for the self-description:
+    /// never the current period's count. `None` when this edge offers no
+    /// subsidy.
+    pub fn subsidised_by_period(&self) -> Option<Vec<u64>> {
         let edge = self.zk_edge.as_ref()?;
         let subsidy = edge.subsidy.as_ref()?;
-        let finished = subsidy
-            .period(now_ms(edge.clock.as_ref()))
-            .and_then(|current| current.checked_sub(1));
-        Some(finished.map_or(0, |period| {
-            self.zk_ledger
-                .lock()
-                .expect("zk ledger lock poisoned")
-                .subsidy_grants
-                .get(&period)
-                .copied()
-                .unwrap_or(0)
-        }))
+        let current = subsidy.period(now_ms(edge.clock.as_ref())).unwrap_or(0);
+        let ledger = self.zk_ledger.lock().expect("zk ledger lock poisoned");
+        Some(
+            (0..current)
+                .map(|period| ledger.subsidy_grants.get(&period).copied().unwrap_or(0))
+                .collect(),
+        )
     }
 
     /// [`Self::admit`]'s stages for an allowance claim: the allowance is

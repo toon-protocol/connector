@@ -266,7 +266,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
             allowance_lifetime_secs: 1_800,
             allowance_endpoint: ZK_NOTE_ALLOWANCES_PATH.into(),
             subsidy,
-            subsidised_last_period: None,
+            subsidised_by_period: None,
         };
         let facts = NodeFacts {
             zk_note: Some(terms),

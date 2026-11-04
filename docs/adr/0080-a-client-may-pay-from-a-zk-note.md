@@ -188,7 +188,7 @@ closes, which zkAPI cannot say.
     - **Per-period nullifiers are the zk edge's alone.** The vault never records them, so they
       are checked in the journal only, never on chain. Each is journaled durably before the grant
       (decision 11). One from a finished period may be pruned, because its proof could no longer
-      be admitted.
+      be admitted. Grant counts are not pruned (see "What is published").
     - **The budget is counted in the vault's asset, per period.** The table's `subsidy_budget`
       is an amount in MINA base units, zero by default. A table with a non-zero budget must offer
       the smallest tier, or it refuses to boot, and only then does it read the vault's creation
@@ -206,8 +206,10 @@ closes, which zkAPI cannot say.
     - **What is published.** The greeting's zk-note entry gains `subsidy`, `"open"` or
       `"closed"`, and omits it when the budget is zero. It never says how much remains. A wallet
       that read `"open"` may still be refused as closed; the refusal is authoritative. The
-      self-description publishes how many subsidised allowances were granted in the last
-      **finished** period, never the current one, and no amount.
+      self-description publishes, as `zkNote.subsidisedByPeriod`, how many subsidised allowances
+      were granted in **every finished** period: an array of decimal counts in which index `p` is
+      subsidy period `p`, zeros included, never the current period, and no amount. _Amended
+      2026-11-04 (#1650):_ it was the last finished period only.
     - **Vectors.** A subsidised allowance request, its successor with zero charge and the
       greeting's `subsidy` field join `vectors/wire-vectors.json`. The budget, an amount, stays
       out of them, as the asset does.
@@ -298,6 +300,11 @@ challenger all live outside this repository. The rule "do not reintroduce an o1j
   record them, so there is nothing on chain to check.
 - **Publishing subsidy counts for every finished period.** Rejected (2026-10-28, #1581): the
   journal would grow without bound, for history anyone watching can keep for themselves.
+  _Superseded 2026-11-04 (#1650), and now the decision (decision 14):_ the premise was wrong. The
+  journal is never compacted and every subsidised `AllowanceGranted` already records its period,
+  so every count can be rebuilt from it and publishing adds nothing to it. What grows is one small
+  integer per week in the document. Without it, no one who was not recording from the vault's first
+  week can see the crowd grow. No cap.
 
 ## Consequences
 

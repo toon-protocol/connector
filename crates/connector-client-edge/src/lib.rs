@@ -178,15 +178,15 @@ impl ClientEdgeState {
     }
 
     /// The node's facts as the self-description states them: how many
-    /// subsidised allowances the last finished subsidy period granted --
-    /// never the current period's, and no amount (decision 14).
+    /// subsidised allowances each finished subsidy period granted -- never
+    /// the current period's, and no amount (decision 14).
     fn description_node(&self) -> std::borrow::Cow<'_, NodeFacts> {
-        let Some(granted) = self.claim_gate.subsidised_last_period() else {
+        let Some(granted) = self.claim_gate.subsidised_by_period() else {
             return std::borrow::Cow::Borrowed(&self.node);
         };
         let mut node = (*self.node).clone();
         if let Some(zk_note) = node.zk_note.as_mut() {
-            zk_note.subsidised_last_period = Some(granted);
+            zk_note.subsidised_by_period = Some(granted.iter().map(u64::to_string).collect());
         }
         std::borrow::Cow::Owned(node)
     }
@@ -3997,7 +3997,7 @@ mod tests {
                     allowance_lifetime_secs: 3_600,
                     allowance_endpoint: ZK_NOTE_ALLOWANCES_PATH.into(),
                     subsidy: None,
-                    subsidised_last_period: None,
+                    subsidised_by_period: None,
                 }),
                 ..Default::default()
             },
@@ -4030,10 +4030,10 @@ mod tests {
 
     /// ADR 0080 decision 14: the greeting says whether a subsidy is open or
     /// closed -- read when it is served, never an amount -- and says nothing
-    /// at a node whose budget is zero. The self-description carries the last
+    /// at a node whose budget is zero. The self-description carries every
     /// finished period's count instead, and never the open/closed word.
     #[tokio::test]
-    async fn the_greeting_says_open_or_closed_and_the_description_counts_the_last_period() {
+    async fn the_greeting_says_open_or_closed_and_the_description_counts_finished_periods() {
         use connector_zk_note::note::policy::TIERS;
         let (app, gate, _dir) = zk_edge_node(5 * 10_000_000);
         let extra = zk_greeting_extra(app.clone()).await;
@@ -4043,7 +4043,12 @@ mod tests {
             "the greeting never says how much remains: {extra}"
         );
         let document = self_description_of(app.clone()).await;
-        assert_eq!(document["zkNote"]["subsidisedLastPeriod"], 0);
+        // The fixture's vault is ten and a half periods old: periods 0 to 9
+        // are finished, and granted nothing.
+        assert_eq!(
+            document["zkNote"]["subsidisedByPeriod"],
+            serde_json::json!(vec!["0"; 10])
+        );
         assert!(document["zkNote"].get("subsidy").is_none());
 
         assert_eq!(gate.subsidy_open(), Some(true));
@@ -4063,7 +4068,7 @@ mod tests {
         let extra = zk_greeting_extra(app.clone()).await;
         assert!(extra.get("subsidy").is_none(), "{extra}");
         let document = self_description_of(app).await;
-        assert!(document["zkNote"].get("subsidisedLastPeriod").is_none());
+        assert!(document["zkNote"].get("subsidisedByPeriod").is_none());
         assert!(document["zkNote"].get("subsidy").is_none());
     }
 
