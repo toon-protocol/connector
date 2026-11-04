@@ -1,8 +1,7 @@
 //! A real, disposable `anvil` chain harness other crates' tests reuse
 //! rather than reimplementing (issue #542): `connector-bin`'s devnet-config
 //! test and `connector-cli`'s settlement-construction tests all need
-//! exactly what this crate's own `tests/support/mod.rs` already provides
-//! its own integration tests. Gated behind the `test-util` feature for the
+//! the same chain this crate's own integration tests spawn. Gated behind the `test-util` feature for the
 //! same reason `connector-operator`'s own `test_support` module is: a
 //! downstream crate's tests cannot see anything behind `#[cfg(test)]`,
 //! since that cfg is only active while this crate compiles its own test
@@ -147,6 +146,8 @@ pub struct Anvil {
 /// `Xrpld::spawn` and `SolanaValidator::spawn` give their chains.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The most one readiness probe may take before the next tick.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl Anvil {
     /// Spawn `anvil` bound to a port derived from `base_port`, this
@@ -205,15 +206,22 @@ impl Anvil {
         let provider = Provider::<Http>::try_from(anvil.rpc_url.as_str()).expect("build provider");
         let started = Instant::now();
         loop {
-            if provider.get_chainid().await.is_ok() {
-                return anvil;
-            }
+            // Checked before the RPC, so an anvil already dead is not mistaken
+            // for whatever else answers on its port.
             if let Ok(Some(status)) = anvil.child.try_wait() {
                 panic!(
                     "anvil exited at startup ({status}) before serving {}\nstderr:\n{}",
                     anvil.rpc_url,
                     std::fs::read_to_string(&anvil.stderr_log).unwrap_or_default()
                 );
+            }
+            // Bounded, so a listener that accepts and never replies can hold
+            // `spawn` neither past the deadline nor long enough to hide an exit.
+            let attempt = STARTUP_DEADLINE
+                .saturating_sub(started.elapsed())
+                .min(ATTEMPT_TIMEOUT);
+            if let Ok(Ok(_)) = tokio::time::timeout(attempt, provider.get_chainid()).await {
+                return anvil;
             }
             if started.elapsed() >= STARTUP_DEADLINE {
                 panic!(
