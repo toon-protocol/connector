@@ -54,6 +54,8 @@ use url::Url;
 pub mod evm;
 #[cfg(feature = "test-support")]
 mod fake;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "solana")]
 pub mod solana;
 #[cfg(feature = "xrpl")]
@@ -108,6 +110,12 @@ pub enum Circuit {
     /// `[settlement.xrpl.<network_id>]`: the backend of that one XRPL network
     /// (ADR 0087), a circuit of its own like an EVM network's.
     XrplSettlement { network_id: u32 },
+    /// `[zk_note]`: both of the zk edge's Mina endpoints, the daemon's
+    /// `graphql_url` and the archive's `archive_url`, ride this one circuit
+    /// (ADR 0080 decision 15, amending decision 9). It is not a settlement
+    /// circuit: the vault is read, never settled on, and it is a pin of its
+    /// own so a settlement exit never sees the vault being read.
+    ZkNoteMina,
 }
 
 impl Circuit {
@@ -121,6 +129,7 @@ impl Circuit {
             Circuit::XrplSettlement { network_id } => {
                 format!("toon-settlement-xrpl-{network_id}")
             }
+            Circuit::ZkNoteMina => "toon-zk-note-mina".to_string(),
         }
     }
 

@@ -29,3 +29,7 @@ docs/rfcs
 # the index and exits non-zero on a file it cannot read.
 local/*/.store
 crates/connector-zk-note/fixtures/
+# zk_toon's recorded fixtures and the request key the binary carries: pinned by hash, byte for byte
+crates/connector-zk-note-mina/fixtures
+crates/connector-zk-note-mina/key
+crates/connector-zk-verifier/tests/fixtures

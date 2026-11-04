@@ -56,7 +56,7 @@ What option 1 brings that #1555 did not ask about:
 | #   | Question                         | Recommendation (short)                                                                                                                                   |
 | --- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | Fate of `connector-zk-note`      | Keep the crate as a thin boundary: re-export B, delete every derivation, keep the session-key verify and tier validation                                 |
-| 2   | proof-systems revision           | Use tag `0.7.0` everywhere, including #1514's verifier. It is code-identical to `ab84160f`                                                               |
+| 2   | proof-systems revision           | Spell it `rev = "ab84160f…"` everywhere, including #1514's verifier. Tag `0.7.0` is that commit plus a release commit, and the live daemon pins the rev  |
 | 3   | Pin mechanism                    | A git `rev` now, at `db978ea` or later. Don't wait for a tag. The repo is public, so CI and Docker need nothing new                                      |
 | 4   | Tiers and lifetime               | Config keeps tiers, refused at boot unless they are a subset of B's `TIERS`. Allowance lifetime and `NOTE_LIFETIME_MS` are unrelated                     |
 | 5   | `b` and the binding tag          | `b` is the tier. The difference is in naming, not substance                                                                                              |
@@ -147,7 +147,7 @@ on this crate.
 
 - **A pins `rev = ab84160f`** on five crates (`crates/connector-zk-note/Cargo.toml:17-21`).
   `Cargo.lock` resolves them as `?rev=ab84160f…` (`Cargo.lock:3522`).
-- **B pins `tag = "0.7.0"`** on four crates with `default-features = false`
+- **B pinned `tag = "0.7.0"`** (when this was written) on four crates with `default-features = false`
   (`zk-note/Cargo.toml:8-14`). zk_toon's lock resolves this as `?tag=0.7.0#36a8b510`.
 - **Why A chose `ab84160f`:** it is the commit the live Mina daemon `4.0.0-mainnet-mesa` pins
   (spike note lines 24 and 148). The spike's Mesa verifier was built by repinning mina-rust to that
@@ -175,10 +175,12 @@ on this crate.
 
 ### Recommendation
 
-**Spell it `tag = "0.7.0"` everywhere in the connector, including #1514's vendored verifier.**
-That is one source, B's spelling, and the same code the spike verified. #1514 should still rerun
-its committed o1js fixture at `0.7.0`. It will do so anyway, because the fixture is its contract
-test.
+**Spell it `rev = "ab84160fa2c22290a8506a7742ac1378879fc386"` everywhere in the connector, including
+#1514's vendored verifier.** That is one source, and the commit the live Mina daemon pins. (This
+note first recommended the tag `0.7.0`, which is the same code plus a release commit. zk_toon
+re-pinned to the rev, #1514 followed, and `crates/connector-zk-note/Cargo.toml` records why.)
+#1514 should still rerun its committed o1js fixture there. It will do so anyway, because the
+fixture is its contract test.
 
 **If a fork ever splits them** (the verifier needs a commit that B has not moved to), B repins.
 B's primitives are Poseidon, Pallas and the signer, none of which a Mesa-style kimchi gate change
@@ -615,7 +617,7 @@ Listed only. None was edited.
 - **#1523:** item 1's three formulas and item 6's 20-byte line (§7). Item 6 also gets "each
   zk-note vector section names its zk_toon commit" and the parity tripwire (§8).
 - **#1514:**
-  - Pin `tag = "0.7.0"`, and rerun the fixture there.
+  - Pin proof-systems at `rev = "ab84160f…"` (the rev, not the tag), and rerun the fixture there.
   - The public input is B's `RequestPublic`: 12 fields, in declaration order.
   - Take the fixtures from zk_toon's `RequestProgram` (`zk-toon-request`) and its published key
     (zk_toon #16), not the spike's stand-in `toon-1512-spend`.
@@ -666,7 +668,7 @@ These are the recommendations the owner adopted on 2026-10-28.
 | Question                     | Recommendation                                                                                                                                        |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1. `connector-zk-note`       | Thin boundary crate: re-export B; delete every derivation, `group_map` and `parity.json`; keep session-key `verify_fields` and `Tiers`                |
-| 2. proof-systems             | Tag `0.7.0` everywhere, verifier included (code-identical to `ab84160f`). On a future split, B follows the daemon's pin                               |
+| 2. proof-systems             | The rev `ab84160f` everywhere, verifier included (tag `0.7.0` is that plus a release commit). On a future split, B follows the daemon's pin           |
 | 3. Pin                       | Git `rev` at `db978ea` or later, now. No credentials needed (public repo)                                                                             |
 | 4. Tiers and lifetime        | Config tiers ⊆ `policy::TIERS`, refused at boot otherwise. Allowance lifetime is separate from `NOTE_LIFETIME_MS` and well below the challenge window |
 | 5. `b` and the tag           | `b` is the tier. Add vault-key, `requestTime`-window and subsidy-zero checks to admission                                                             |

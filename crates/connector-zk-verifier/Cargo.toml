@@ -1,0 +1,41 @@
+[package]
+name = "connector-zk-verifier"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Verifies ZkProgram (Pickles side-loaded) proofs made elsewhere: the verifier subset of toon-protocol/mina-rust, vendored as source and maintained by the connector (ADR 0080 decision 15)."
+
+# Vendored from toon-protocol/mina-rust (Apache-2.0, not the workspace's MIT): see NOTICE.
+#
+# Every proof-systems crate is spelled as connector-zk-note spells it (git URL, rev ab84160f,
+# default-features off), so Cargo resolves one source and there is one `Fp` type, not two.
+# `std` and `parallel` are what the verifier needs on top of that: poly-commitment's accumulator
+# check uses rayon unconditionally, and kimchi's verifier lives behind `std`.
+#
+# No `[patch.crates-io]`: the subset needs no fork of num-bigint or num-rational.
+# Nothing here pulls in an HTTP client, TLS, a GraphQL server or an async runtime.
+[dependencies]
+anyhow = "1"
+ark-ec = { version = "0.5", default-features = false }
+ark-ff = { version = "0.5", default-features = false }
+ark-poly = { version = "0.5", default-features = false }
+ark-serialize = { version = "0.5", default-features = false }
+base64 = "0.22"
+binprot = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
+binprot_derive = { git = "https://github.com/openmina/binprot-rs", rev = "400b52c" }
+blake2 = "0.10"
+derive_more = "0.99"
+kimchi = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false, features = ["std"] }
+mina-curves = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false }
+mina-hasher = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false }
+mina-poseidon = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false, features = ["std"] }
+mina-signer = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false }
+once_cell = "1"
+poly-commitment = { git = "https://github.com/o1-labs/proof-systems", rev = "ab84160fa2c22290a8506a7742ac1378879fc386", default-features = false, features = ["std", "parallel"] }
+rsexp = "0.2.3"
+rsexp-derive = "0.2.3"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"

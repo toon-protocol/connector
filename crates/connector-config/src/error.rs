@@ -1734,6 +1734,10 @@ pub enum ConfigError {
     #[error("[zk_note] graphql_url '{value}' is not an http or https URL")]
     ZkNoteGraphqlUrlInvalid { value: String },
 
+    /// The archive endpoint is not an http(s) URL.
+    #[error("[zk_note] archive_url '{value}' is not an http or https URL")]
+    ZkNoteArchiveUrlInvalid { value: String },
+
     /// The vault's reads asked to ride a circuit on a node with none (ADR 0073).
     #[error(
         "[zk_note] sets rpc_via_socks_proxy = true but no top-level socks_proxy is set: there \
@@ -1744,12 +1748,12 @@ pub enum ConfigError {
 
     /// The vault's reads would ride a circuit to a plain http endpoint (ADR 0073).
     #[error(
-        "[zk_note] graphql_url '{value}' is plain http, and rpc_via_socks_proxy = true would \
+        "[zk_note] {key} '{value}' is plain http, and rpc_via_socks_proxy = true would \
          send it through an exit relay that can read and rewrite every answer (a known root, a \
          spent nullifier). Use the endpoint's https URL; plain http over a circuit is accepted \
          only for a .onion or .anyone host (ADR 0070, ADR 0073)"
     )]
-    ZkNoteViaSocksProxyPlaintext { value: String },
+    ZkNoteViaSocksProxyPlaintext { key: &'static str, value: String },
 
     /// The state key file does not exist.
     #[error("[zk_note] state_key_file '{}' does not exist or is not a file", .0.display())]

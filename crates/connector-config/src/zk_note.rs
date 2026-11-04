@@ -1,8 +1,9 @@
 //! `[zk_note]`: the one opt-in table that makes a node a **zk edge** (ADR
 //! 0080, issue #1522).
 //!
-//! It names the vault and its Mina network, the GraphQL endpoint the vault is
-//! read from and whether that rides the node's `socks_proxy`, the file holding
+//! It names the vault and its Mina network, the two GraphQL endpoints the vault is
+//! read from -- the daemon's, for its account, and an archive node's, for its actions
+//! (decision 15) -- and whether they ride the node's `socks_proxy`, the file holding
 //! the state key the zk edge signs successors with, the verification key hash
 //! request proofs are checked against, the tiers it publishes, how long an
 //! allowance lives, and the **open budget** cap. Absent, the node is exactly
@@ -47,6 +48,7 @@ pub(crate) struct RawZkNoteTable {
     vault: String,
     network: String,
     graphql_url: String,
+    archive_url: String,
     #[serde(default)]
     rpc_via_socks_proxy: bool,
     state_key_file: PathBuf,
@@ -68,6 +70,7 @@ pub struct ZkNoteConfig {
     vault: String,
     network: MinaNetwork,
     graphql_url: Url,
+    archive_url: Url,
     rpc_via_socks_proxy: bool,
     state_key: SecretLocation,
     verification_key_hash: String,
@@ -88,12 +91,19 @@ impl ZkNoteConfig {
         self.network
     }
 
-    /// Where the vault's state is read from.
+    /// Where the vault's account is read from: a Mina daemon's GraphQL.
     pub fn graphql_url(&self) -> &Url {
         &self.graphql_url
     }
 
-    /// Whether every read of `graphql_url` rides the node's `socks_proxy`
+    /// Where the vault's actions are read from: an archive node's GraphQL
+    /// (ADR 0080 decision 15). The vault keeps only the root of its nullifier
+    /// set, so whether a nullifier is spent is answered by its actions.
+    pub fn archive_url(&self) -> &Url {
+        &self.archive_url
+    }
+
+    /// Whether every read of `graphql_url` and `archive_url` rides the node's `socks_proxy`
     /// (ADR 0080 decision 9, ADR 0073).
     pub fn rpc_via_socks_proxy(&self) -> bool {
         self.rpc_via_socks_proxy
@@ -161,15 +171,28 @@ pub(crate) fn resolve_zk_note(
         .ok_or_else(|| ConfigError::ZkNoteGraphqlUrlInvalid {
             value: raw.graphql_url.clone(),
         })?;
-    // ADR 0073's two rules for a read that rides the circuit: the ones a
-    // settlement table is held to, named for this table.
-    if raw.rpc_via_socks_proxy {
-        check_circuit_route(&graphql_url, socks_proxy).map_err(|refusal| match refusal {
-            CircuitRouteRefusal::WithoutProxy => ConfigError::ZkNoteViaSocksProxyWithoutProxy,
-            CircuitRouteRefusal::Plaintext => ConfigError::ZkNoteViaSocksProxyPlaintext {
-                value: raw.graphql_url.clone(),
-            },
+    let archive_url = Url::parse(&raw.archive_url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .ok_or_else(|| ConfigError::ZkNoteArchiveUrlInvalid {
+            value: raw.archive_url.clone(),
         })?;
+    // ADR 0073's two rules for a read that rides the circuit: the ones a
+    // settlement table is held to, named for this table. Both endpoints are
+    // held to them (ADR 0080 decision 15).
+    if raw.rpc_via_socks_proxy {
+        for (key, url, value) in [
+            ("graphql_url", &graphql_url, &raw.graphql_url),
+            ("archive_url", &archive_url, &raw.archive_url),
+        ] {
+            check_circuit_route(url, socks_proxy).map_err(|refusal| match refusal {
+                CircuitRouteRefusal::WithoutProxy => ConfigError::ZkNoteViaSocksProxyWithoutProxy,
+                CircuitRouteRefusal::Plaintext => ConfigError::ZkNoteViaSocksProxyPlaintext {
+                    key,
+                    value: value.clone(),
+                },
+            })?;
+        }
     }
     if !raw.state_key_file.is_file() {
         return Err(ConfigError::ZkNoteStateKeyFileNotFound(raw.state_key_file));
@@ -219,6 +242,7 @@ pub(crate) fn resolve_zk_note(
         vault: raw.vault,
         network,
         graphql_url,
+        archive_url,
         rpc_via_socks_proxy: raw.rpc_via_socks_proxy,
         state_key: SecretLocation::File(raw.state_key_file),
         verification_key_hash: raw.verification_key_hash,
@@ -255,6 +279,7 @@ mod tests {
 vault = "{vault}"
 network = "mina:devnet"
 graphql_url = "https://api.minascan.io/node/devnet/v1/graphql"
+archive_url = "https://api.minascan.io/archive/devnet/v1/graphql"
 state_key_file = "{key}"
 verification_key_hash = "{VK_HASH}"
 tiers = [{t0}, {t1}]
@@ -301,6 +326,10 @@ key_file = "{signer}"
         assert_eq!(zk.vault(), address());
         assert_eq!(zk.network().caip2(), "mina:devnet");
         assert_eq!(zk.asset().to_string(), "mina:devnet/slip44:12586");
+        assert_eq!(
+            zk.archive_url().as_str(),
+            "https://api.minascan.io/archive/devnet/v1/graphql"
+        );
         assert_eq!(zk.verification_key_hash(), VK_HASH);
         assert_eq!(zk.allowance_lifetime(), Duration::from_secs(3600));
         assert_eq!(zk.open_budget_cap(), 10 * TIERS[1]);
@@ -437,6 +466,13 @@ key_file = "{signer}"
             matches!(url, ConfigError::ZkNoteGraphqlUrlInvalid { .. }),
             "{url}"
         );
+        let archive =
+            load(|text| text.replace("https://api.minascan.io/archive", "ftp://x/archive"))
+                .unwrap_err();
+        assert!(
+            matches!(archive, ConfigError::ZkNoteArchiveUrlInvalid { .. }),
+            "{archive}"
+        );
         let hash = load(|text| text.replace(VK_HASH, "0x12")).unwrap_err();
         assert!(
             matches!(hash, ConfigError::ZkNoteVerificationKeyHashInvalid { .. }),
@@ -475,6 +511,24 @@ key_file = "{signer}"
         let error = load(|text| with_proxy(text).replace("https://api", "http://api")).unwrap_err();
         assert!(
             matches!(error, ConfigError::ZkNoteViaSocksProxyPlaintext { .. }),
+            "{error}"
+        );
+        // The archive endpoint is held to the same rules, and named when it breaks them.
+        let error = load(|text| {
+            with_proxy(text).replace(
+                "https://api.minascan.io/archive",
+                "http://x.example/archive",
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::ZkNoteViaSocksProxyPlaintext {
+                    key: "archive_url",
+                    ..
+                }
+            ),
             "{error}"
         );
     }

@@ -237,6 +237,19 @@ connector-zk-note                the connector's zk-note boundary (ADR 0080 deci
                                   validation, and the strict reading of a request proof.
                                   tests/zk_toon_parity.rs replays zk_toon's vectors. Pure: no
                                   I/O, no clock, no connector crate
+connector-zk-note-mina           the zk edge's Mina vault adapter (ADR 0080 decision 15):
+                                  the `ZkNoteVault` that reads a vault's account from a daemon
+                                  and its actions from an archive node (checked against the
+                                  account's action state, recomputed in Rust), and verifies
+                                  request proofs under the key the binary carries. Every
+                                  operation is a read; tests run the port's contract suite
+                                  over zk_toon's recorded vault, served by real HTTP
+connector-zk-verifier            verifies o1js ZkProgram (Pickles, side-loaded) proofs under a
+                                  verification key (ADR 0080 decision 15): the verifier subset
+                                  of toon-protocol/mina-rust vendored as source, Apache-2.0
+                                  (see its NOTICE), maintained by the connector. `Verifier::new`
+                                  builds the index once, `Verifier::verify` is sync and
+                                  CPU-bound. No I/O, no network, no HTTP, TLS or async runtime
 ```
 
 ### Test layout
@@ -290,9 +303,10 @@ Node sidecar beside the binary was refused — and
 [ADR 0065](../adr/0065-mina-leaves-the-repository.md) then deleted the zkApp, the browser faucet
 dApp and the Mina tooling that record had left standing. The npm workspaces have no Mina
 package. What remains of the old Mina support is the connector refusing a `mina` claim by name,
-which is wire behaviour. The one Mina-derived crate, `connector-zk-note`, is
-[ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s boundary over zk_toon's `zk-note` and
-o1-labs `proof-systems` — no o1js, no proving, no settlement — and leaves both records standing.
+which is wire behaviour. The Mina-derived crates, `connector-zk-note`, `connector-zk-note-mina` and
+`connector-zk-verifier`, are [ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)'s boundary
+over zk_toon's `zk-note`, the adapter that reads a vault, and a vendored verifier from mina-rust —
+no o1js, no proving, no sending a transaction, no settlement — and leave both records standing.
 
 ### `tools/`
 
