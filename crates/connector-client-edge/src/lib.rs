@@ -4043,9 +4043,11 @@ mod tests {
             "the greeting never says how much remains: {extra}"
         );
         let document = self_description_of(app.clone()).await;
+        // The fixture's vault is ten and a half periods old: periods 0 to 9
+        // are finished, and granted nothing.
         assert_eq!(
             document["zkNote"]["subsidisedByPeriod"],
-            serde_json::json!([])
+            serde_json::json!(vec!["0"; 10])
         );
         assert!(document["zkNote"].get("subsidy").is_none());
 

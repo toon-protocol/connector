@@ -1293,6 +1293,7 @@ mod tests {
             "allowanceId",
             "sessionKey",
             "timestamp",
+            "amount",
             "budget",
         ] {
             assert!(
