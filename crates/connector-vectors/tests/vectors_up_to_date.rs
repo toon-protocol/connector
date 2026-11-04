@@ -784,26 +784,39 @@ fn the_committed_zk_note_vectors_replay_against_the_real_implementation() {
         claim.allowance_id.as_bytes()
     ));
 
-    // The request's public input binds this edge, the session key, the tier
-    // and the expiry.
+    // The request is a proof o1js made (zk_toon#65), verbatim. Its tag binds
+    // what `proof_binds` states -- zk_toon's sample context, whose session
+    // secret the sample never had -- so the binding is replayed against that,
+    // not against this file's `keys`.
     let body = &zk["allowance_request"]["body"];
     let proof = RequestProof::parse(body["proof"].to_string().as_bytes()).expect("a JsonProof");
     let public = proof.public();
-    assert_eq!(proof.vault(), state.public.into_compressed());
+    let binds = &zk["allowance_request"]["proof_binds"];
     assert_eq!(
-        CompressedPubKey::from_address(&text(&body["sessionKey"])).unwrap(),
-        session_key
+        proof.vault(),
+        CompressedPubKey::from_address(&text(&binds["edge"])).unwrap()
     );
-    let expires_at = text(&body["expiresAt"]).parse::<u64>().unwrap();
     assert_eq!(
         public.tag,
         expected_tag(
             public.nullifier,
             &proof.vault(),
-            &session_key,
-            public.tier,
-            expires_at
+            &CompressedPubKey {
+                x: field(&binds["sessionKeyX"]),
+                is_odd: binds["sessionKeyIsOdd"].as_bool().unwrap(),
+            },
+            text(&binds["tier"]).parse().unwrap(),
+            text(&binds["expiry"]).parse().unwrap()
         )
+    );
+    assert_eq!(public.tier.to_string(), text(&binds["tier"]));
+    assert_eq!(
+        CompressedPubKey::from_address(&text(&body["sessionKey"])).unwrap(),
+        session_key
+    );
+    assert!(
+        !public.subsidised,
+        "the first request is the unsubsidised one"
     );
     assert_eq!(
         zk["allowance_answer"]["body"]["tier"],
@@ -1064,16 +1077,18 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
         text(&request["subsidy_period"]).parse::<u64>().unwrap()
     );
     assert_ne!(public.period_nullifier, Field::from(0u64));
-    let session_key =
-        CompressedPubKey::from_address(&text(&body["sessionKey"])).expect("a B62 key");
+    let binds = &request["proof_binds"];
     assert_eq!(
         public.tag,
         expected_tag(
             public.nullifier,
             &proof.vault(),
-            &session_key,
-            public.tier,
-            text(&body["expiresAt"]).parse().unwrap()
+            &CompressedPubKey {
+                x: field(&binds["sessionKeyX"]),
+                is_odd: binds["sessionKeyIsOdd"].as_bool().unwrap(),
+            },
+            text(&binds["tier"]).parse().unwrap(),
+            text(&binds["expiry"]).parse().unwrap()
         )
     );
     assert_eq!(

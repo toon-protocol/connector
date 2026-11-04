@@ -31,8 +31,40 @@ members = [
     "crates/connector-bin",
     "crates/connector-vectors",
     "crates/connector-zk-note",
+    "crates/connector-zk-verifier",
+    "crates/connector-zk-note-mina",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
+
+# connector-zk-verifier checks a real Pickles proof (a Kimchi verification over the Pasta
+# curves) and builds its verifier index from scratch; unoptimised, one proof takes minutes and
+# the test binary an hour. Only the verifier and the crypto it runs on are optimised for tests.
+[profile.test.package.connector-zk-verifier]
+opt-level = 3
+[profile.test.package.kimchi]
+opt-level = 3
+[profile.test.package.poly-commitment]
+opt-level = 3
+[profile.test.package.mina-poseidon]
+opt-level = 3
+[profile.test.package.mina-curves]
+opt-level = 3
+[profile.test.package.o1-utils]
+opt-level = 3
+[profile.test.package.groupmap]
+opt-level = 3
+[profile.test.package.ark-ff]
+opt-level = 3
+[profile.test.package.ark-ec]
+opt-level = 3
+[profile.test.package.ark-poly]
+opt-level = 3
+[profile.test.package.ark-serialize]
+opt-level = 3
+[profile.test.package.rayon]
+opt-level = 3
+[profile.test.package.rayon-core]
+opt-level = 3

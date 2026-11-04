@@ -1,0 +1,84 @@
+connector-zk-verifier
+=====================
+
+This crate is licensed under the Apache License, Version 2.0 (see LICENSE-APACHE). The
+workspace's own crates are MIT; this one is not, because most of it is not ours.
+
+Origin
+------
+
+The vendored code is the verifier subset of
+
+    toon-protocol/mina-rust   (a fork of o1-labs/mina-rust, formerly openmina/openmina)
+    branch toon/v0.19.0, commit 6feeb3797fff6dba49fd848cb2d6decd63fee1b4
+
+taken as source, not as a dependency, under the Apache License 2.0. The connector maintains this
+copy (ADR 0080 decision 15, docs/adr/0080-a-client-may-pay-from-a-zk-note.md): it does not track
+upstream, and a change to it is a reviewed change to this repository.
+
+src/verify.rs is derived from `zk-prover/src/verify.rs` of toon-protocol/zk_toon (Apache-2.0),
+itself derived from toon-protocol/zk-note-vectors `rust/mesa-toon-1512/src/main.rs` at commit
+384a0907078edb50ff840805a7011cae055c28b8, which builds on mina-rust. `load_vk`, `WrapProof`
+(with `pad_proof` and `hex_limbs`), `fields` and `verify` there are `VerifierKey::from_o1js_base64`,
+`WrapProof::from_o1js_base64`, `fields` and `Verifier::verify` here.
+
+What was taken
+--------------
+
+Under src/ledger/ (from crates/ledger, package `mina-tree`):
+
+  - proofs/verification.rs      `verify_sideloaded_with_index`, the Pickles checks it runs
+  - proofs/verifiers.rs         `make_zkapp_verifier_index`, `wrap_domains`
+  - proofs/accumulator_check.rs the bulletproof accumulator check
+  - proofs/step.rs              `expand_deferred` and the statement it reads
+  - proofs/wrap.rs              the wrap-side domain and polynomial-commitment helpers
+  - proofs/transaction.rs       `InnerCurve`, `PlonkVerificationKeyEvals`, the scalar-challenge
+                                and curve helpers the checks call
+  - proofs/prover.rs            `make_padded_proof_from_p2p` (wire proof to Kimchi proof)
+  - proofs/conv.rs              the wire/verifier conversions that upstream keeps in merge.rs
+  - proofs/{field,witness,opt_sponge,group_map,to_field_elements,unfinalized,util,constants}.rs
+  - proofs/public_input/         plonk_checks, scalars, scalar_challenge, messages,
+                                prepared_statement
+  - account.rs                  `VerificationKey`, `ProofVerified` and the verification-key hash
+                                (from account/account.rs and account/conv.rs)
+  - hash.rs, cache.rs           `ToInputs`, the thread-local cache macros
+  - lazy.rs                     `LazyValue` (from scan_state/transaction_logic/local_state.rs)
+  - verifier.rs                 `get_srs` (from verifier/mod.rs)
+
+Under src/p2p_messages/ (from crates/p2p-messages, package `mina-p2p-messages`): the binprot and
+sexp wire types of a Pickles proof and a verification key, and the containers they use
+(array, bigint, char, list, number, pseq, string; v2/generated.rs and v2/manual.rs cut to the
+types reachable from the proof and the key).
+
+Under src/poseidon/ (from the repository's poseidon/ crate): the Poseidon sponge, the Pasta
+round constants and the hash-input packing.
+
+What was removed
+----------------
+
+Everything a node needs and a verifier does not: the ledger (database, masks, on-disk store,
+sparse ledger, scan state, staged ledger, transaction pool, zkApp execution, generators), block,
+transaction, merge and zkApp proving and the prover indexes, the circuit-blob and verifier-index
+download and disk caches, the block and transaction verifier indexes and the JSON data files
+behind them, the gossip and RPC wire types, mina-core (logging, network config, HTTP), mina-macros
+and redux, fuzzing and benchmark code, wasm configuration, and every test of removed code. No
+OpenSSL, TLS, HTTP client, GraphQL server or async runtime is a dependency.
+
+What was changed
+----------------
+
+  - Nothing prints and nothing reads the environment: upstream's `eprintln!`/`println!` calls and
+    the `TOON_1512_DEBUG` variable are gone.
+  - The structured reference string is derived in process, once (`std::sync::OnceLock`), from its
+    size alone. Upstream's `get_srs` used a thread-local cache; the verifier index is built by
+    `make_zkapp_verifier_index` as upstream does, from `SRS::create`, with no download.
+  - `urs_utils::batch_dlog_accumulator_check` is proof-systems' own
+    `poly_commitment::utils::batch_dlog_accumulator_check`, which it was copied from.
+  - serde, `MallocSizeOf` and mina-macros' `SerdeYojsonEnum` derives are gone from the wire types
+    (the verifier does not serialise them); the manual `Serialize`/`Deserialize` impls with them.
+  - Items the compiler reports unreachable from the public API were deleted, and the clippy
+    findings of the vendored code fixed rather than allowed (one allow remains, `type_complexity`
+    on the ledger module, with its reason).
+  - Wire-format and arithmetic code is otherwise as upstream, including its upstream doc links.
+
+Upstream files carry no per-file licence header; none was added.
