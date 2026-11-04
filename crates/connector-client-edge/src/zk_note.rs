@@ -94,11 +94,6 @@ pub struct SlotClock {
 const SLOT_MS: u64 = connector_zk_note::note::policy::SLOT_SECONDS * 1_000;
 
 impl SlotClock {
-    /// How many times boot tries to read the anchor.
-    pub const BOOT_ATTEMPTS: u32 = 5;
-    /// How long boot waits between those tries.
-    pub const BOOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
     /// The clock over `anchor`, for a node whose clock reads `now_ms`.
     ///
     /// # Errors

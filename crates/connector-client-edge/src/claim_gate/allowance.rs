@@ -117,7 +117,7 @@ impl ZkEdge {
     /// the boot anchor: there is then no current slot, and nothing that needs
     /// one may proceed. The one place the edge turns its clock into a slot.
     fn current_slot(&self) -> Option<u64> {
-        self.slots.slot_at(now_ms(self.clock.as_ref()))
+        self.slots.slot_at(clock_ms(self.clock.as_ref()))
     }
 }
 
@@ -624,10 +624,6 @@ impl Drop for Reservation<'_> {
     }
 }
 
-fn now_ms(clock: &dyn Clock) -> u64 {
-    clock_ms(clock)
-}
-
 fn mint_allowance_id() -> AllowanceId {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).expect("the OS random source is available");
@@ -699,7 +695,7 @@ impl ClientClaimGate {
             .get(public.tier)
             .ok_or(AllowanceRefusal::TierNotOffered { tier: public.tier })?
             .budget();
-        let now = now_ms(edge.clock.as_ref());
+        let now = clock_ms(edge.clock.as_ref());
         let lifetime_ms = u64::try_from(edge.allowance_lifetime.as_millis()).unwrap_or(u64::MAX);
         let latest = now.saturating_add(lifetime_ms);
         if request.expires_at_ms <= now || request.expires_at_ms > latest {
@@ -990,7 +986,7 @@ impl ClientClaimGate {
             if allowance.state != AllowanceState::Open {
                 return Err(ClaimIngestRejection::AllowanceClosed);
             }
-            if now_ms(parts.edge.clock.as_ref()) >= allowance.expires_at_ms {
+            if clock_ms(parts.edge.clock.as_ref()) >= allowance.expires_at_ms {
                 return Err(ClaimIngestRejection::AllowanceExpired);
             }
             // Counted before anything moves, and under the same lock a
@@ -1169,7 +1165,7 @@ impl ClientClaimGate {
         let Some(parts) = self.zk_parts() else {
             return;
         };
-        let now = now_ms(parts.edge.clock.as_ref());
+        let now = clock_ms(parts.edge.clock.as_ref());
         let due: Vec<AllowanceId> = {
             let ledger = parts.ledger.lock().expect("zk ledger lock poisoned");
             ledger

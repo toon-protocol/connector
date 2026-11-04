@@ -30,9 +30,9 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
         slots: SlotClock::new(
             SlotAnchor {
                 slot: 2_000_000,
-                time_ms: now_ms(clock.as_ref()),
+                time_ms: clock_ms(clock.as_ref()),
             },
-            now_ms(clock.as_ref()),
+            clock_ms(clock.as_ref()),
         )
         .unwrap(),
         clock,
