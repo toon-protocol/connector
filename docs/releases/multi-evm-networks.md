@@ -4,7 +4,7 @@
 settles on more than one EVM network") lets one node hold a settlement table per
 EVM network. To do that it names the network on every claim, every asset id and
 every channel row. The first release to contain it is **`2026.11.02.1`** (#1607);
-the last one before it is **`2026.09.29.1`**.
+the last one before it is **`2026.10.23.1`**.
 
 This build breaks three things at once, **even on a node that settles on one
 network**: the wire, the config and the journal. Read this whole page, and
@@ -18,8 +18,9 @@ snapshot your state directory, before bumping a node repository's pin past it.
 
 ## The wire: `network` is required
 
-`vectors/wire-vectors.json` moves to `schema_version` 11 (ADR 0086 decision 3;
-a later release moved it on to 12 for XRPL, see [`xrpl.md`](xrpl.md)).
+`network` arrives with `schema_version` 11 of `vectors/wire-vectors.json` (ADR 0086
+decision 3). `2026.11.02.1` itself ships 12, because XRPL landed in the same release (see
+[`xrpl.md`](xrpl.md)); `2026.10.23.1` was at 9.
 
 - **Claims, claim-state challenges and payout vouchers** — every EVM and Solana
   voucher, whether it comes from a peer or from a client — carry a required CAIP-2
@@ -44,7 +45,8 @@ a later release moved it on to 12 for XRPL, see [`xrpl.md`](xrpl.md)).
 
 - **Asset ids are CAIP-19**: `eip155:<chainId>/erc20:0x…` and
   `solana:<genesis prefix>/token:<mint>`. The old `evm:0x…` and `solana:<mint>` spellings
-  are refused by name, and so is `evm:<chainId>:0x…`. This reaches `[[tokens]]` and
+  are refused by name, and so are `evm:<chainId>:0x…` and `<chain>:native` (now
+  `<network>/slip44:<coin type>`). This reaches `[[tokens]]` and
   anything else in your config that spells an asset.
 - Apps behind a route get a new header, `X-TOON-Network`, carrying the CAIP-2 network.
   `X-TOON-Chain` and `X-TOON-Payer` keep their values.
@@ -58,7 +60,7 @@ node, which ignores a field it does not know; an older payer against this build 
 case that stops payments.
 
 1. **Clients first.** Upgrade `toon-client` (and `rig`, `swap`) to a release that
-   speaks `schema_version` 11 before any node you operate that clients pay.
+   speaks `schema_version` 11 or later before any node you operate that clients pay.
 2. **Peers, leaf to root.** For every node, upgrade the peers that pay it first.
 3. **A peering is two channels, so it has two payers.** A pays B on one channel and B pays A
    on the other. Whichever node upgrades first refuses the other's vouchers until the other
@@ -72,10 +74,12 @@ every voucher. An upgraded payer is the fix; rolling the node back is the other 
 
 ## The journal upgrade is one-way
 
-At boot, this build rewrites every outbound channel record in the journal to **version 2**,
-which records the network the channel is on (ADR 0086 decision 10). A version-1 record gets
-its network by proof: its channel id is recomputed under each configured table's EIP-712
-domain, and the one table that reproduces it is its network. Nothing is guessed.
+At boot, this build journals every outbound channel record again as **version 2**, under its
+unchanged key, which records the network the channel is on (ADR 0086 decision 10); replay reads
+the version-2 copy in place of the first. A version-1 EVM record gets its network by proof: its
+channel id is recomputed under each configured table's EIP-712 domain, and the one table that
+reproduces it is its network. A Solana record is placed on the node's one Solana network.
+Nothing is guessed.
 
 - A **build from before this release cannot read a version-2 record, and refuses to boot**:
 
@@ -196,7 +200,7 @@ same id are refused. Several tables may name one `key_file`. `facilitator_url`,
 
 ## Mixed fleets: do not add a second EVM network yet
 
-A node on `2026.09.29.1` or earlier filters a peer's self-description by `"evm"`, not by
+A node on `2026.10.23.1` or earlier filters a peer's self-description by `"evm"`, not by
 network, and refuses a peer that publishes two EVM networks as `AmbiguousChain`. It cannot be
 patched. **Do not add a second `[settlement.eip155.<chainId>]` table to any node until every
 node it peers with has upgraded.** A node with one EVM table publishes one entry and peers with
@@ -206,7 +210,7 @@ is a forward between assets (ADR 0071, as 0086 decision 13 amends it).
 
 ## Upgrade checklist
 
-1. Every client and every peer that pays this node sends `network` (`schema_version` 11).
+1. Every client and every peer that pays this node sends `network` (`schema_version` 11 or later).
 2. `cp -a` the state directory, or at least `outbound-channels.log`, somewhere the upgrade
    does not touch.
 3. Rewrite `[settlement.evm]` to `[settlement.eip155.<chainId>]`, spell every asset in CAIP-19,

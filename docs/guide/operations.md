@@ -14,7 +14,7 @@ nothing here moves a tag onto a box (ADR 0068) — a node repository pins the
 connector image it runs, by release handle, in its own `deploy/` bundle. Because
 the binary and a box's mounted TOML are a matched pair in both directions,
 **adding a required config key is a breaking deploy**: land the config first, then
-bump that pin. A breaking release has a note under
+bump that pin. A breaking release may have a note under
 [`docs/releases/`](../releases/) with the upgrade order and what cannot be rolled back —
 read it, and snapshot the state directory, before bumping (the multi-EVM-network build's is
 [`multi-evm-networks.md`](../releases/multi-evm-networks.md)).
