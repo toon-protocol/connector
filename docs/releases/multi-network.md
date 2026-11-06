@@ -29,10 +29,11 @@ How the refusal shows up, so you can recognise it:
 
 - **Client edge:** the payer gets the reject `claim rejected: claim carries no
 'network': …` with the explanation and the upgrade order.
-- **Peer carriage (BTP and ILP-over-HTTP):** nothing is sent back to the peer.
-  The _paid_ node logs a warning, `refusing a voucher with no 'network'`, followed
-  by the same explanation. Seeing it means a peer that pays you is on a
-  pre-`schema_version`-11 build: have its operator upgrade first.
+- **Peer carriage (BTP and ILP-over-HTTP):** the peer gets the same explanation
+  back, in BTP's `F00` error frame or ILP-over-HTTP's `400` body, and the _paid_
+  node logs a warning, `refusing a voucher with no 'network'`, carrying it too.
+  Seeing it means a peer that pays you is on a pre-`schema_version`-11 build:
+  have its operator upgrade first.
 
 ## Before and after: `connector.toml`
 
@@ -86,7 +87,7 @@ crate:
 | Was                                                                              | Now                                                                                                                                                                                                                                                   |
 | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[settlement.evm]`, `[settlement.evm.key]`                                       | `[settlement.eip155.<chainId>]`, `[settlement.eip155.<chainId>.key]`. `[settlement.evm]` is refused by name with this rewrite. A key that is not a decimal chain id, and an empty `[settlement.eip155]`, are refused too                              |
-| `chain_id` on a channel row (parsed only to be refused)                          | `network = "eip155:<chainId>"` (EVM) or `network = "solana:<genesis prefix>"` on `[[peer_channels]]` and `[[pay_channels]]` rows. Required on a `0x` row when the node holds more than one EVM table; a row naming a network with no table is refused |
+| (no key: a channel row's network was the one `[settlement.evm]` table's)         | `network = "eip155:<chainId>"` (EVM) or `network = "solana:<genesis prefix>"` on `[[peer_channels]]` and `[[pay_channels]]` rows. Required on a `0x` row when the node holds more than one EVM table; a row naming a network with no table is refused |
 | `evm:0x…`, `evm:<chainId>:0x…`, `solana:<mint>`, `<chain>:native` as an asset id | CAIP-19: `eip155:<chainId>/erc20:0x…`, `solana:<genesis prefix>/token:<mint>`, `<network>/slip44:<coin type>`. The old spellings are refused by name, each with its rewrite                                                                           |
 | `[[tokens]]` on a network the node has no table for                              | refused (`TokenWithoutSettlement`); a token off the numeraire's network needs a static `[[rates]]` row                                                                                                                                                |
 | a peering whose two channel rows are on different networks                       | refused: both channels of a peering are on one network                                                                                                                                                                                                |
@@ -107,6 +108,11 @@ table gets its own circuit.
 - `POST /peers`'s `chain` filter is a CAIP-2 network; a peer publishing several
   networks this node has tables for, with no filter given, is refused as
   `AmbiguousNetwork`.
+
+`2026.11.02.1` itself ships `schema_version` 12, because XRPL
+([ADR 0087](../adr/0087-xrpl-settles-over-the-ledgers-payment-channels.md)) landed
+in the same release; the `network` requirement above is 11's, and a payer on any
+build from 11 onward sends it.
 
 `vectors/wire-vectors.json` is the normative contract
 ([ADR 0021](../adr/0021-vectors-are-normative-prose-is-not.md)).

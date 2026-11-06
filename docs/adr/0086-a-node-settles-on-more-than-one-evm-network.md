@@ -14,9 +14,9 @@ moves [0021](0021-vectors-are-normative-prose-is-not.md)'s `schema_version` from
 **Scope:** protocol law — binds every implementation, because a claim, an asset id and the vectors
 change. See the [ADR index](README.md).
 
-**Falsifier:** none — what it refuses (`[settlement.evm]`,
-`evm:0x…` as an asset, a claim with no `network`) is refused by name, which is a presence the tests
-will hold rather than an absence a pattern can find.
+**Falsifier:** none — what it refuses (`[settlement.evm]`, `evm:0x…` as an asset, a claim with no
+`network`) is refused by name, which is a presence the tests hold rather than an absence a pattern
+can find.
 
 **A node may hold one settlement table per EVM network, keyed by chain id, and every identifier that
 says which network a value is on says so in CAIP form.** A claim names its network, an asset id is
@@ -72,7 +72,8 @@ and gets a table of its own if it returns.
    upgraded before such a peer refuses every voucher the peer sends, since decision 1 admits no
    window, and the peer's payments stop; upgraded after, nothing is lost, for the same reason the
    order above is safe. The refusal says so: the client-edge reject and the peer carriage's log
-   both carry `ClientClaimError::NetworkMissing`'s text, which names the upgrade order. See
+   both carry `ClientClaimError::NetworkMissing`'s text, which names the upgrade order; the
+   peer carriages also send that text back to the peer, in BTP's `F00` and ILP-over-HTTP's `400`. See
    [the release note](../releases/multi-network.md).
 
 ### Configuration and keys
