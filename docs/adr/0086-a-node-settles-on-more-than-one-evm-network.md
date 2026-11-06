@@ -146,7 +146,8 @@ it is already parsed on those rows only to be refused.
 
 - **A breaking deploy, and a wire change.** Every committed `[settlement.evm]` table (13 TOML files
   here, and each node repository's) is rewritten, and `local/dealing/connector-b.toml`'s
-  `evm:0x…` asset with it. The release gets a note in `docs/releases/` with the before and after.
+  `evm:0x…` asset with it. The release gets a note in `docs/releases/` with the before and after:
+  [`multi-evm-networks.md`](../releases/multi-evm-networks.md).
 - **Mixed fleets.** A node on the current release cannot peer with one that publishes two EVM
   networks: it filters by `"evm"`, not by network, and refuses as `AmbiguousChain`. Old nodes cannot
   be patched, so the release note says: do not add a second EVM network until every node you peer
