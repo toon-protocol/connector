@@ -1,6 +1,7 @@
 # A node settles on more than one EVM network
 
-**Status:** Accepted (owner decision, 2026-10-28, #1566) — **not yet built**; the spec is
+**Status:** Accepted (owner decision, 2026-10-28, #1566) — built by #1607 and first released in
+`2026.11.02.1` (see [the release note](../releases/multi-network.md)); the spec is
 #1569. It **amends** [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) (the asset
 spelling, and decision 2's same-asset sentence),
 [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md) decision 3 (one
@@ -13,7 +14,7 @@ moves [0021](0021-vectors-are-normative-prose-is-not.md)'s `schema_version` from
 **Scope:** protocol law — binds every implementation, because a claim, an asset id and the vectors
 change. See the [ADR index](README.md).
 
-**Falsifier:** none — the record is not yet built, and what it refuses (`[settlement.evm]`,
+**Falsifier:** none — what it refuses (`[settlement.evm]`,
 `evm:0x…` as an asset, a claim with no `network`) is refused by name, which is a presence the tests
 will hold rather than an absence a pattern can find.
 
@@ -65,6 +66,14 @@ and gets a table of its own if it returns.
    `rig` and `swap` ship before any node does. That order is safe: a node on the current release
    ignores an unknown `network`, and a claim for another network still fails safe there, because its
    channel id does not recompute under that node's domain.
+
+   _Amended 2026-11-06 (#1666):_ "ship before any node does" binds every **payer** of a node, and a
+   **peer connector that pays it** is one, as much as `toon-client`, `rig` or `swap`. A node
+   upgraded before such a peer refuses every voucher the peer sends, since decision 1 admits no
+   window, and the peer's payments stop; upgraded after, nothing is lost, for the same reason the
+   order above is safe. The refusal says so: the client-edge reject and the peer carriage's log
+   both carry `ClientClaimError::NetworkMissing`'s text, which names the upgrade order. See
+   [the release note](../releases/multi-network.md).
 
 ### Configuration and keys
 

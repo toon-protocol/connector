@@ -305,8 +305,8 @@ pub fn decode_claim(raw: &[u8]) -> Result<Option<ClientClaim>, RefusedEvidence> 
             tracing::warn!("refusing a toon-channel claim: ADR 0075 retired the scheme");
             Err(RefusedEvidence::ToonChannelClaim)
         }
-        Err(ClaimDecodeError::NetworkMissing) => {
-            tracing::warn!("refusing a voucher with no 'network': ADR 0086 requires one");
+        Err(error @ ClaimDecodeError::NetworkMissing) => {
+            tracing::warn!(%error, "refusing a voucher with no 'network'");
             Err(RefusedEvidence::NetworkMissingClaim)
         }
         Err(error) => {
