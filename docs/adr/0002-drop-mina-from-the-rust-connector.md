@@ -1,6 +1,6 @@
 # The Rust connector settles on EVM and Solana only; Mina is dropped
 
-**Status:** Accepted — extended by [0065-mina](0065-mina-leaves-the-repository.md). It holds in the tree: the Cargo workspace has no Mina crate. The one thing this record deliberately left standing, `packages/mina-zkapp` (the separately deployed zkApp), was deleted by 0065-mina along with the rest of the Mina surface.
+**Status:** Accepted — extended by [0065-mina](0065-mina-leaves-the-repository.md). It holds in the tree: the Cargo workspace has no Mina crate. The one thing this record deliberately left standing, `packages/mina-zkapp` (the separately deployed zkApp), was deleted by 0065-mina along with the rest of the Mina surface. _Amended by [0089](0089-mina-returns-as-a-settlement-chain.md) (2026-11-05, #1660): Mina returns as a settlement chain, proved in Rust in-process with no sidecar, which keeps this record's refusal of one. Its "a VK mismatch is undetectable until rejected on-chain" no longer holds; its maintenance worry holds in a narrower form._
 
 **Scope:** connector architecture — internal to this codebase. See the [ADR index](README.md).
 
