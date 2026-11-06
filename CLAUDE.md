@@ -28,6 +28,12 @@ faucet dApp, the Mina tooling and the faucet's Mina leg. What survives is the
 connector's refusal of a `mina` claim **by name**, which is wire behaviour owed to
 `toon-client`, not Mina support. Do not reintroduce an o1js dependency.
 
+ADR 0089 (_Mina returns as a settlement chain_, **not yet built**) brings Mina back for
+peerings only, without o1js. The channel zkApp is TOON's and lives in
+`toon-protocol/zk_toon`, and the connector proves its transactions in Rust, in-process, with
+zk_toon's prover crates. The `mina` refusal then narrows to the client edge. Until that
+backend exists, everything above still describes the tree.
+
 The **app** (or **handler**, for the HTTP endpoint specifically) is the payment-oblivious
 service behind a route's `handler_url`. Composition of a connector with an app lives
 in the _app's_ repository, not here — this repo builds only the connector image.
