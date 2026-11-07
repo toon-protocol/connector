@@ -1,7 +1,7 @@
 # A node settles on more than one EVM network
 
 **Status:** Accepted (owner decision, 2026-10-28, #1566) — built by #1607 and first released in
-`2026.11.02.1` (see [the release note](../releases/multi-network.md)); the spec is
+`2026.11.02.1` (see [the release note](../releases/multi-evm-networks.md)); the spec is
 #1569. It **amends** [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) (the asset
 spelling, and decision 2's same-asset sentence),
 [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md) decision 3 (one
@@ -74,7 +74,7 @@ and gets a table of its own if it returns.
    order above is safe. The refusal says so: the client-edge reject and the peer carriage's log
    both carry `ClientClaimError::NetworkMissing`'s text, which names the upgrade order; the
    peer carriages also send that text back to the peer, in BTP's `F00` and ILP-over-HTTP's `400`. See
-   [the release note](../releases/multi-network.md).
+   [the release note](../releases/multi-evm-networks.md).
 
 ### Configuration and keys
 
@@ -156,7 +156,8 @@ it is already parsed on those rows only to be refused.
 
 - **A breaking deploy, and a wire change.** Every committed `[settlement.evm]` table (13 TOML files
   here, and each node repository's) is rewritten, and `local/dealing/connector-b.toml`'s
-  `evm:0x…` asset with it. The release gets a note in `docs/releases/` with the before and after.
+  `evm:0x…` asset with it. The release gets a note in `docs/releases/` with the before and after:
+  [`multi-evm-networks.md`](../releases/multi-evm-networks.md).
 - **Mixed fleets.** A node on the current release cannot peer with one that publishes two EVM
   networks: it filters by `"evm"`, not by network, and refuses as `AmbiguousChain`. Old nodes cannot
   be patched, so the release note says: do not add a second EVM network until every node you peer

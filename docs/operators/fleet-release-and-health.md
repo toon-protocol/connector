@@ -73,7 +73,10 @@ connector is the relay's, so adopting a build on the devnet is a PR in `toon-pro
 bumping its pinned connector tag to the `rust-sha-` tag (or the release's `rust-<handle>` alias) the
 release names. That repo's own guard — a test that fails if a second copy of the pin appears
 anywhere — is what keeps the pin singular; there is no config-compatibility boot gate here to run
-first, because the config that pin boots against no longer lives in this repository.
+first, because the config that pin boots against no longer lives in this repository. A breaking
+release may have a note under [`docs/releases/`](../releases/) with its upgrade order and what
+cannot be rolled back; read it before bumping the pin. The multi-EVM-network build's is
+[`multi-evm-networks.md`](../releases/multi-evm-networks.md).
 
 `:rust-release` is **frozen**. It used to be a promotion tag moved only by an explicit
 `promote-to-fleet.yml` dispatch after booting the candidate against the fleet's committed
