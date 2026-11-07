@@ -113,9 +113,10 @@ jobs:
       - name: The released commit must be on main
         run: |
           set -euo pipefail
-          # A release is a build of main (ADR 0068 Decision 8). Failing here costs no build: an
-          # off-main dispatch would otherwise burn ten minutes of runner and a
-          # handle before being refused at the last job.
+          # A release is a build of main (ADR 0068 Decision 8). Failing here
+          # costs no build: an off-main dispatch would otherwise burn ten
+          # minutes of runner and a handle before being refused at the last
+          # job.
           if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
             echo "::error::${{ github.sha }} is not an ancestor of origin/main."
             echo "::error::A release is a build of main (ADR 0068). Re-dispatch on main."
