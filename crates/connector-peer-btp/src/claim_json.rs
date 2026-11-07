@@ -257,6 +257,16 @@ mod tests {
         assert!(message.contains("'network'"), "{message}");
     }
 
+    /// #1666: the refusal names its probable cause and the upgrade order, so
+    /// the paid node's log (and the peer's reject) says who must upgrade.
+    #[test]
+    fn a_voucher_with_no_network_names_the_upgrade_order() {
+        let message = ClaimDecodeError::NetworkMissing.to_string();
+        assert!(message.contains("before schema_version 11"), "{message}");
+        assert!(message.contains("peer connector that pays it"), "{message}");
+        assert!(message.contains("upgrade before the node"), "{message}");
+    }
+
     /// §4: the entry is raw UTF-8 JSON, not base64.
     #[test]
     fn the_claim_entry_carries_raw_utf8_json() {

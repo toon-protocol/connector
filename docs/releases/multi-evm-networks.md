@@ -28,20 +28,16 @@ decision 3). `2026.11.02.1` itself ships 12, because XRPL landed in the same rel
   `blockchain` stays and still picks the parser.
 - A voucher with no `network` is **refused by name**, never guessed, even on a node
   with one table. ADR 0086 considered inferring it for a single-network node and refused:
-  the answer would change the day the operator added a second table. A node logs:
+  the answer would change the day the operator added a second table. A node logs a warning,
+  `refusing a voucher with no 'network'`, carrying the refusal it sends back, which reads:
 
   ```text
-  refusing a voucher with no 'network': ADR 0086 requires one
-  ```
-
-  and the refusal it sends back reads:
-
-  ```text
-  claim carries no 'network': since wire schema_version 11 every voucher names the CAIP-2 network it is on (eip155:<chainId>, solana:<genesis prefix> or xrpl:<id>), and one without it is refused rather than guessed (ADR 0086)
+  claim carries no 'network': since wire schema_version 11 every voucher names the CAIP-2 network it is on (eip155:<chainId>, solana:<genesis prefix> or xrpl:<id>), and one without it is refused rather than guessed (ADR 0086) -- a payer that sends none is probably on a build from before schema_version 11, and every payer of a node (its clients and any peer connector that pays it) must upgrade before the node does
   ```
 
   A peer-role claim-state challenge with no `network` is refused with the same text,
-  prefixed `peer-role challenge: `.
+  prefixed `peer-role challenge: `. A peer gets the refusal back in BTP's `F00` error frame
+  or ILP-over-HTTP's `400` body; a client gets it after `claim rejected: `.
 
 - **Asset ids are CAIP-19**: `eip155:<chainId>/erc20:0x…` and
   `solana:<genesis prefix>/token:<mint>`. The old `evm:0x…` and `solana:<mint>` spellings

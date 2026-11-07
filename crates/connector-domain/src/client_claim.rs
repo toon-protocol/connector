@@ -421,7 +421,9 @@ pub enum ClientClaimError {
     #[error(
         "claim carries no 'network': since wire schema_version 11 every voucher names the \
          CAIP-2 network it is on (eip155:<chainId>, solana:<genesis prefix> or xrpl:<id>), and one \
-         without it is refused rather than guessed (ADR 0086)"
+         without it is refused rather than guessed (ADR 0086) -- a payer that sends none is \
+         probably on a build from before schema_version 11, and every payer of a node (its \
+         clients and any peer connector that pays it) must upgrade before the node does"
     )]
     NetworkMissing,
     /// A `network` that is not a CAIP-2 network this connector reads.
