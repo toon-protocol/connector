@@ -9,7 +9,7 @@
 # This workflow automates the mechanical parts. It is `workflow_dispatch`
 # ONLY. It has no `push:` trigger, no `schedule:`, and no `workflow_run:`
 # chaining off a green build, and adding one would be a reversal of ADR 0041
-# Decision 3 rather than a convenience:
+# Decision 3 (restated by ADR 0068 Decision 2) rather than a convenience:
 #
 #   "The connector image does not follow rule 1 by checking — it is not
 #    auto-deployed at all."
@@ -31,8 +31,10 @@
 # This workflow's job ends at the GitHub Release. Bumping a node repo's pin
 # to a new handle is that repo's own reviewed change, not a step here.
 #
-# The record for this workflow is ADR 0055 (superseded in part by ADR 0068).
-# ADR 0041 remains the record for why the image was supervised at all.
+# The record for this workflow is ADR 0068, which also holds the two rules a
+# release rests on (Decision 8): it is a build of main, and it is named by the
+# date it was cut. ADR 0041 remains the record for why the image was
+# supervised at all.
 #
 # ── THE RELEASE HANDLE IS A DATE AND A COUNTER, NOT A VERSION ───────────────
 # A release is named `2026.08.21.1`: UTC date, then the 1-based ordinal of
@@ -111,12 +113,13 @@ jobs:
       - name: The released commit must be on main
         run: |
           set -euo pipefail
-          # A release fronts the live fleet. Failing here costs no build: an
-          # off-main dispatch would otherwise burn ten minutes of runner and a
-          # handle before being refused at the last job.
+          # A release is a build of main (ADR 0068 Decision 8). Failing here
+          # costs no build: an off-main dispatch would otherwise burn ten
+          # minutes of runner and a handle before being refused at the last
+          # job.
           if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
             echo "::error::${{ github.sha }} is not an ancestor of origin/main."
-            echo "::error::Only a build of main may front the live fleet (ADR 0041). Re-dispatch on main."
+            echo "::error::A release is a build of main (ADR 0068). Re-dispatch on main."
             exit 1
           fi
           echo "✓ ${{ github.sha }} is on main."

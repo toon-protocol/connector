@@ -5,6 +5,9 @@
 the connector-specific promotion mechanism; Decisions 1, 2 and 4 stand. Supersedes
 [0055](0055-a-release-is-one-dispatch-and-the-ordering-rides-as-data.md) in full — it never reached
 Accepted, and the promotion regime it specified is retired before it was ever exercised.
+**Amended** by Decision 8 (#1668, from #1665): the two rules a release rests on — it is a build of
+`main`, and it is named by the date it was cut — are recorded here, because 0041 Decision 3 and
+0055 no longer can.
 
 **Scope:** deployment law for this fleet — not protocol. See the [ADR index](README.md).
 
@@ -133,6 +136,14 @@ further business moving.
 7. **`fleet-health.yml` runs on a schedule or a human dispatch only.** Its `workflow_call` trigger
    (which existed only to be called from `promote-to-fleet.yml`) and its `pull_request` trigger are
    removed. Its probe and alert jobs are unchanged.
+8. **A release is a build of `main`, named by the date it was cut.** `release-connector.yml`
+   refuses any commit that is not an ancestor of `origin/main`, and names the release by the
+   monotonic handle `YYYY.MM.DD.N` — the UTC date it was cut, then that day's 1-based ordinal. This
+   restates ADR 0055 Decision 3, which this record supersedes, and stands on its own rather than on
+   0041 Decision 3, whose on-main provenance check guarded the promotion this record retires. There
+   is no patch line: no release is cut off an older base, and a fix reaches an operator by moving
+   forward to a newer release (#1665; reasoning in
+   [`.out-of-scope/patch-release-off-an-older-base.md`](../../.out-of-scope/patch-release-off-an-older-base.md)).
 
 ## Consequences
 

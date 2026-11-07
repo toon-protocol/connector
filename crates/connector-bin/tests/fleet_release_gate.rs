@@ -126,8 +126,8 @@ fn workflow_triggers(raw: &str) -> BTreeSet<String> {
     triggers
 }
 
-/// THE regression test for ADR 0041 Decision 3, restated by ADR 0055 and
-/// left standing by ADR 0068: a release is a human act.
+/// THE regression test for ADR 0041 Decision 3, restated and left standing by
+/// ADR 0068 Decision 2: a release is a human act.
 ///
 /// `release-connector.yml` builds, versions and publishes a GitHub Release --
 /// which is to say it is one `workflow_run:` away from firing on every green
@@ -148,7 +148,7 @@ fn the_release_workflow_is_dispatch_only() {
         triggers, expected,
         "release-connector.yml is triggered by something other than a human \
          dispatch. Cutting a release and publishing a GitHub Release is a \
-         deliberate act (ADR 0041 Decision 3, ADR 0055) and ANY automatic \
+         deliberate act (ADR 0068 Decision 2) and ANY automatic \
          trigger here turns it into churn on every merge -- the shape \
          connector#990 shipped once and was reverted."
     );
@@ -198,14 +198,14 @@ fn the_release_handle_is_a_dated_ordinal_and_never_a_semver_series() {
         "release-connector.yml no longer cuts its handle from a UTC date. A \
          local date makes the series non-monotonic for anyone west of \
          Greenwich, and a handle that is not a date is a version number \
-         wearing a disguise. See ADR 0055."
+         wearing a disguise. See ADR 0068 Decision 8."
     );
     assert!(
         !RELEASE_WORKFLOW.contains("semantic-release"),
         "release-connector.yml reaches for a semver series. Every crate under \
          `crates/` is 0.1.0 with no release process; a version here would \
-         claim a stability contract the binary has not earned. See ADR 0055 \
-         and deploy/connector-rust/README.md."
+         claim a stability contract the binary has not earned. See ADR 0068 \
+         Decision 8 and deploy/connector-rust/README.md."
     );
 }
 
