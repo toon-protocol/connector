@@ -72,7 +72,7 @@ on:
         type: string
         required: true
       notes:
-        description: 'Extra release notes, appended verbatim under the generated body.'
+        description: 'Extra release notes, appended verbatim under the generated body. A build that changes a journal encoding MUST say so here and link its docs/releases note (ADR 0090).'
         type: string
         required: false
         default: ''

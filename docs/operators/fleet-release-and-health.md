@@ -78,6 +78,24 @@ release may have a note under [`docs/releases/`](../releases/) with its upgrade 
 cannot be rolled back; read it before bumping the pin. The multi-EVM-network build's is
 [`multi-evm-networks.md`](../releases/multi-evm-networks.md).
 
+**Mark a release that changes a journal's encoding** ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)).
+If any commit since the last release makes the node write anything under `state_dir` that the
+previous release cannot decode, whether by migrating old records or by writing new ones in a new
+form, the release is one-way. Before dispatching:
+
+1. Write or extend a `docs/releases/` note that names the journal, says this is the first release
+   writing the new encoding, and tells the operator to snapshot all of `state_dir` first. It also
+   says the snapshot can be restored under the older build **only if the new build has moved no
+   money since**. [`multi-evm-networks.md`](../releases/multi-evm-networks.md#the-journal-upgrade-is-one-way)
+   is the model.
+2. Say so in the GitHub Release body through the `notes` input, linking that note:
+
+   ```sh
+   gh workflow run release-connector.yml --ref main \
+     -f reason="…" \
+     -f notes="**One-way journal migration:** first boot rewrites \`<journal>\`; an older build then refuses it. Snapshot \`state_dir\` first: docs/releases/<note>.md"
+   ```
+
 `:rust-release` is **frozen**. It used to be a promotion tag moved only by an explicit
 `promote-to-fleet.yml` dispatch after booting the candidate against the fleet's committed
 `connector-rust.toml`; ADR 0068 retired that mechanism because there is nothing left in this repo
@@ -136,6 +154,11 @@ For relay, store, gas-station and the gateway there is no separate rollback mech
 merge in the node's own repository, and its `toon-auto-apply-<node>.timer` applies the revert like
 any other commit** on its next tick. Nothing in this repository, and nothing on any runner, can
 make a node deploy.
+
+**Reverting the pin is not a rollback across a journal-migrating release** ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)):
+the older build refuses the migrated state directory and the node does not come back up. Restore
+the `state_dir` snapshot taken before the upgrade alongside the revert, under the condition in
+0090 decision 5 (no money moved since). Otherwise roll forward.
 
 ---
 

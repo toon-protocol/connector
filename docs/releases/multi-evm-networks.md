@@ -66,7 +66,8 @@ case that stops payments.
    not credited.
 
 If you skip the order, payments do not degrade — they stop, and the log is the line above on
-every voucher. An upgraded payer is the fix; rolling the node back is the other one, see below.
+every voucher. An upgraded payer is the fix. Rolling the node back is the other one, but only
+under the condition [below](#the-journal-upgrade-is-one-way).
 
 ## The journal upgrade is one-way
 
@@ -85,10 +86,22 @@ Nothing is guessed.
 
   This build prints the same line if a record is damaged.
 
-- **Snapshot the state directory before the first boot — at least `outbound-channels.log`**.
-  Rolling back means restoring that snapshot under the old build. Any channel opened since
-  the upgrade is not in the snapshot and is lost **to the old build**; the chain still holds
-  its collateral, so keep the new build's journal aside to withdraw from it later.
+- **This is the rule for every journal-migrating release, not a one-off**
+  ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)): there is no
+  down-migration, and the old build's refusal is the correct behaviour. The fix for a bad upgrade
+  is to roll forward to a later release, or to restore a snapshot.
+- **Snapshot the whole state directory before the first boot**, with the node stopped. Rolling
+  back means restoring that snapshot under the old build, and **that is safe only if the new
+  build moved no money**: signed no outbound voucher and accepted no inbound claim since the
+  snapshot. The snapshot lacks every `outbound_voucher_signed` and `outbound_watermark_set` entry
+  written after it, and the inbound claim watermarks in `client-edge-claims.log` (every voucher
+  the node accepted, a peer's included). Restored, the old build would sign below vouchers its payees hold but
+  have not settled, so its payments go uncredited, and accept claims the new build already
+  credited, so it serves work twice for one payment. Once money has moved, roll forward instead.
+- Opening or funding a channel pays no one, so it does not count as moving money, but any
+  channel opened since the upgrade is not in the snapshot either, and is lost **to the old
+  build**. The chain still holds its collateral, so keep the new build's journal aside to withdraw
+  from it later.
 - The restore **refuses to boot, by name**, in two further cases, both of which leave the
   journal untouched:
 
@@ -207,8 +220,9 @@ is a forward between assets (ADR 0071, as 0086 decision 13 amends it).
 ## Upgrade checklist
 
 1. Every client and every peer that pays this node sends `network` (`schema_version` 11 or later).
-2. `cp -a` the state directory, or at least `outbound-channels.log`, somewhere the upgrade
-   does not touch.
+2. Stop the node and `cp -a` the whole state directory somewhere the upgrade does not touch.
+   It is a way back only until the new build moves money (see
+   [the journal](#the-journal-upgrade-is-one-way)).
 3. Rewrite `[settlement.evm]` to `[settlement.eip155.<chainId>]`, spell every asset in CAIP-19,
    and add `network` to channel rows where the node holds more than one EVM table.
 4. Bump the pin. On first boot, expect no refusal above; a refusal at boot is a config problem
