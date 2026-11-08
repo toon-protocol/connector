@@ -2,7 +2,8 @@
 //! disposable validator (issue #1663): an Open channel whose held voucher is
 //! below the minimum is not settled by the sweep, and once its payer calls
 //! `request_close` the same voucher lands via `settle_and_seal`, minimum or
-//! not -- every way a payer takes value back goes through an exit.
+//! not -- every way a payer takes value back goes through an exit. The
+//! operator's manual land ignores the minimum too.
 //!
 //! Its own test binary: `solana-test-validator` binds fixed ports, so one
 //! validator per binary.
@@ -10,7 +11,9 @@
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-use connector_settlement::batch::{ChannelPresentation, HeldVoucher, HeldVouchers, Voucher};
+use connector_settlement::batch::{
+    BatchSettlementBackend, ChannelPresentation, HeldVoucher, HeldVouchers, Voucher,
+};
 use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::wire::{self, ChannelStatus, PAYMENT_CHANNELS_PROGRAM_ID};
 use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher, Step};
@@ -106,6 +109,37 @@ async fn an_open_channel_below_the_minimum_waits_and_an_exit_lands_it_anyway() {
     let taken = watcher.tick(true).await.expect("tick");
     assert!(steps_on(&taken, &channel).is_empty());
     assert_eq!(read(&rpc, &channel).await.settled, 0);
+
+    // The operator's manual land of another Open channel below the
+    // minimum lands it: asking is the decision that it is worth the fee.
+    let landed = payer
+        .open(
+            &payer
+                .admissible_open(&sponsor.pubkey(), &mint, DEPOSIT, GRACE)
+                .await,
+            &sponsor,
+        )
+        .await
+        .expect("open");
+    backend
+        .admit(ChannelPresentation::Solana {
+            channel: ChannelId(landed.to_string()),
+        })
+        .await
+        .expect("admit");
+    backend
+        .land(
+            &ChannelId(landed.to_string()),
+            Voucher {
+                cumulative_amount: u128::from(amount),
+                signature: payer.sign(&landed, amount).to_vec(),
+            },
+        )
+        .await
+        .expect("a manual land ignores the minimum");
+    let manual = read(&rpc, &landed).await;
+    assert_eq!(manual.status, ChannelStatus::Open);
+    assert_eq!(manual.settled, amount);
 
     // The payer asks to close; the voucher lands, whatever the minimum.
     payer.request_close(&channel).await.expect("request_close");

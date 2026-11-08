@@ -31,18 +31,17 @@
 //! `settle` only when `totalClaimed - totalSettled` does, judged separately.
 //! An exit is exempt: a sweep that finds any row's channel with a withdrawal
 //! pending sends the claim whatever the sum, as does the watcher (which
-//! never consults the minimum), and an operator's manual land does not
-//! either. Nothing ages out: value below the minimum waits for more, an exit
-//! or the operator.
+//! never consults the minimum). So is an operator's manual land, which never
+//! consults it either. Nothing ages out: value below the minimum waits for
+//! more, an exit or the operator.
 //!
 //! # Policy and I/O
 //!
 //! What to claim and whether to claim or settle at all are [`claim_target`],
 //! [`claim_due`] and [`settle_due`], pure functions with no chain and no
 //! clock; the minimum and the pending-withdrawal fact are their inputs.
-//! Everything else
-//! here is the thin shell that reads the chain, calls them and sends what
-//! they decide. Every read and write goes through the backend's own client
+//! Everything else here is the thin shell that reads the chain, calls them
+//! and sends what they decide. Every read and write goes through the backend's own client
 //! and sender, so the table's one `RpcTransport` (ADR 0073) and the
 //! settlement key's one nonce sequence.
 
@@ -86,8 +85,9 @@ pub const BATCH_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 /// bound, for the same provider caps.
 const MAX_BLOCK_RANGE: u64 = 2_000;
 
-/// Most channels one `multicall` read asks about: a node that has held
-/// vouchers on many channels still reads them in bounded `eth_call`s.
+/// Most calls one `multicall` read makes -- two per channel, `channels(id)`
+/// and `pendingWithdrawals(id)`: a node that has held vouchers on many
+/// channels still reads them in bounded `eth_call`s.
 const MAX_READS_PER_MULTICALL: usize = 100;
 
 /// Most rows one `claim` carries. Each row verifies a signature and writes
@@ -370,7 +370,7 @@ impl EvmBatchSettlementBackend {
     /// `(balance, totalClaimed, withdrawing)` for each of `ids`, in order,
     /// through the contract's own `multicall` of `channels(id)` and
     /// `pendingWithdrawals(id)` -- `withdrawing` is whether one is pending --
-    /// at most [`MAX_READS_PER_MULTICALL`] channels to one `eth_call`. Each
+    /// at most [`MAX_READS_PER_MULTICALL`] calls to one `eth_call`. Each
     /// answer is one block's reading of its channel, which is all a row
     /// needs.
     async fn read_channels(
