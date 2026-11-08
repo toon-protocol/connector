@@ -94,11 +94,12 @@ Nothing is guessed.
   back means restoring that snapshot under the old build, and **that is safe only if the new
   build moved no money**: signed no outbound voucher and accepted no inbound claim since the
   snapshot. The snapshot lacks every `outbound_voucher_signed` and `outbound_watermark_set` entry
-  written after it, and the inbound claim watermarks in `peer-claims.log` and
-  `client-edge-claims.log`. Restored, the old build would sign below what its payees already hold,
-  so its payments go uncredited, and accept claims the new build already credited, so it serves
-  work twice for one payment. Once money has moved, roll forward instead.
-- Any channel opened since the upgrade is not in the snapshot either, and is lost **to the old
+  written after it, and the inbound claim watermarks in `client-edge-claims.log` (every voucher
+  the node accepted, a peer's included). Restored, the old build would sign below vouchers its payees hold but
+  have not settled, so its payments go uncredited, and accept claims the new build already
+  credited, so it serves work twice for one payment. Once money has moved, roll forward instead.
+- Opening or funding a channel pays no one, so it does not count as moving money, but any
+  channel opened since the upgrade is not in the snapshot either, and is lost **to the old
   build**. The chain still holds its collateral, so keep the new build's journal aside to withdraw
   from it later.
 - The restore **refuses to boot, by name**, in two further cases, both of which leave the

@@ -2,7 +2,8 @@
 
 **Status:** Accepted (owner decision, 2026-10-28, #1566) — built by #1607 and first released in
 `2026.11.02.1` (see [the release note](../releases/multi-evm-networks.md)); the spec is
-#1569. It **amends** [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) (the asset
+#1569. Its journal upgrade (decision 10) is one-way, under
+[0090](0090-a-release-that-changes-a-journal-encoding-is-one-way.md). It **amends** [0071](0071-a-forward-crosses-a-denomination-at-a-declared-rate.md) (the asset
 spelling, and decision 2's same-asset sentence),
 [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md) decision 3 (one
 circuit per network), [0075](0075-every-channel-is-an-x402-channel-a-peering-is-two-of-them.md)
@@ -104,9 +105,9 @@ it is already parsed on those rows only to be refused.
     no successor; these are live x402 channels.
 
     _Noted 2026-11-08 (#1667):_ the upgrade is one-way. A build from before it cannot read a
-    version-2 record and refuses to boot, and nothing writes one back. A rollback is a snapshot
-    of `state_dir` restored only if the new build moved no money:
-    [0090](0090-a-release-that-changes-a-journal-encoding-is-one-way.md).
+    version-2 record and refuses to boot, and nothing writes one back; see
+    [0090](0090-a-release-that-changes-a-journal-encoding-is-one-way.md) decision 5 for when a
+    snapshot may be restored.
 
 ### Peering, forwarding and apps
 

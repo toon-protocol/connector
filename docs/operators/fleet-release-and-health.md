@@ -79,7 +79,7 @@ cannot be rolled back; read it before bumping the pin. The multi-EVM-network bui
 [`multi-evm-networks.md`](../releases/multi-evm-networks.md).
 
 **Mark a release that changes a journal's encoding** ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)).
-If any commit since the last release makes the node write a record under `state_dir` that the
+If any commit since the last release makes the node write anything under `state_dir` that the
 previous release cannot decode, whether by migrating old records or by writing new ones in a new
 form, the release is one-way. Before dispatching:
 
@@ -93,7 +93,7 @@ form, the release is one-way. Before dispatching:
    ```sh
    gh workflow run release-connector.yml --ref main \
      -f reason="…" \
-     -f notes="**One-way journal migration:** first boot rewrites \`outbound-channels.log\`; an older build then refuses it. Snapshot \`state_dir\` first: docs/releases/<note>.md"
+     -f notes="**One-way journal migration:** first boot rewrites \`<journal>\`; an older build then refuses it. Snapshot \`state_dir\` first: docs/releases/<note>.md"
    ```
 
 `:rust-release` is **frozen**. It used to be a promotion tag moved only by an explicit
@@ -157,8 +157,8 @@ make a node deploy.
 
 **Reverting the pin is not a rollback across a journal-migrating release** ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)):
 the older build refuses the migrated state directory and the node does not come back up. Restore
-the `state_dir` snapshot taken before the upgrade alongside the revert, and only if the new build
-has moved no money since. Otherwise roll forward.
+the `state_dir` snapshot taken before the upgrade alongside the revert, under the condition in
+0090 decision 5 (no money moved since). Otherwise roll forward.
 
 ---
 

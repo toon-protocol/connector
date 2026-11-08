@@ -1,6 +1,8 @@
 # A node repository pins the connector; nothing here moves a tag onto a box
 
-**Status:** Accepted — built (#1213). Partly supersedes
+**Status:** Accepted — built (#1213). Extended by
+[0090](0090-a-release-that-changes-a-journal-encoding-is-one-way.md): a release that changes a
+journal's encoding says so in its note and its GitHub Release body. Partly supersedes
 [0041](0041-a-moving-tag-carries-the-fleets-committed-config-or-it-does-not-move.md)'s Decision 3,
 the connector-specific promotion mechanism; Decisions 1, 2 and 4 stand. Supersedes
 [0055](0055-a-release-is-one-dispatch-and-the-ordering-rides-as-data.md) in full — it never reached

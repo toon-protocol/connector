@@ -24,9 +24,8 @@ Its note and its GitHub Release body say so. Once it has booted, the release bef
 the state directory by name, and no tool writes the journal back. Before upgrading to one, stop
 the node and snapshot **all of `state_dir`**. Restoring that snapshot under the old build is safe
 **only if the new build has moved no money since**: signed no outbound voucher and accepted no
-inbound claim. The snapshot lacks the watermarks the new build wrote, so the old build would sign
-below what its payees already hold and accept claims already credited. After that, the way back is
-forward: a later release.
+inbound claim ([why](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md#decision),
+decision 5). After that, the way back is forward: a later release.
 
 **Devnet** settles on Base Sepolia and Solana devnet; test funds come from the
 [devnet faucet](https://faucet.devnet.toonprotocol.dev). **Mainnet**: TOON's own

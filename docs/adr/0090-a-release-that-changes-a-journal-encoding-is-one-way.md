@@ -1,6 +1,6 @@
 # A release that changes a journal's encoding is one-way
 
-**Status:** Accepted (maintainer decision at triage, 2026-11-06, #1667). It states a rule the tree
+**Status:** Accepted (owner decision at triage, 2026-11-06, #1667). It states a rule the tree
 already obeys and builds nothing. It **notes** [0086](0086-a-node-settles-on-more-than-one-evm-network.md)
 decision 10 as the first release it governs, and adds a duty to the release process of
 [0068](0068-a-node-repository-pins-the-connector-nothing-here-moves-a-tag-onto-a-box.md).
@@ -38,8 +38,9 @@ does not undo it.
 ## Decision
 
 1. **A release that changes a journal encoding is one-way.** A journal here means any file the
-   node appends to under `state_dir`: `outbound-channels.log`, `peer-claims.log`,
-   `client-edge-claims.log`, the controller day totals and any journal added later. Changing its
+   node keeps under `state_dir`: today the append-only `outbound-channels.log`,
+   `client-edge-claims.log` and `controller-day-totals.journal`, the whole-table snapshot
+   `runtime-peers.json`, and any file added later. Changing its
    encoding means writing a record an earlier build cannot decode, whether by migrating old records
    or only by writing new ones in the new form.
 
@@ -65,14 +66,18 @@ does not undo it.
    Restoring it under the older build is safe **only if the new build signed no outbound voucher
    and accepted no inbound claim** since the snapshot. Otherwise the restored journal is missing the
    new build's watermarks:
-   - **Outbound** (`outbound_voucher_signed`, `outbound_watermark_set`): the older build resumes
-     signing from a cumulative figure below the one its payees already hold. Those vouchers add
-     nothing, so its payments go uncredited until it catches up.
-   - **Inbound** (the peer and client claim journals): the older build accepts a claim at or below
-     what the new build already credited as new value, which serves work twice for one payment.
+   - **Outbound** (`outbound_voucher_signed`, `outbound_watermark_set`): the older build restores
+     each channel from the larger of its journal and what the chain shows settled, so it resumes
+     below any voucher a payee holds but has not yet settled. Those vouchers add nothing, so its
+     payments go uncredited until it catches up.
+   - **Inbound** (`client-edge-claims.log`, which since 0075 holds every voucher the node accepts,
+     a peer's included): the older build accepts a claim at or below what the new build already
+     credited as new value, which serves work twice for one payment.
 
-   A channel the new build opened is not in the snapshot either. The chain still holds its
-   collateral, so the new build's journal is kept aside to withdraw it later.
+   Opening or funding a channel does not count as moving money here: it moves the node's own
+   collateral into a channel and pays no counterparty. Such a channel is not in the snapshot, so it
+   is lost **to the older build**, but the chain still holds its collateral, and the new build's
+   journal is kept aside to withdraw it later.
 
 6. **Every such release says so where a node repository bumping its pin will see it**: in a
    `docs/releases/` note, which names the journal, the first release that writes the new encoding,
