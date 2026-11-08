@@ -101,7 +101,8 @@ does not undo it.
 
 - `2026.11.02.1` is the first release this record governs. Its note,
   [`multi-evm-networks.md`](../releases/multi-evm-networks.md), carries decision 5's step and
-  condition. Its published GitHub Release body predates this record and does not.
+  condition. Its GitHub Release body predates this record and was edited on 2026-11-08 to
+  say so and link the note.
 - [`docs/guide/operations.md`](../guide/operations.md) tells an operator to snapshot `state_dir`
   before a journal-migrating release and gives decision 5's condition. The fleet runbook's
   "revert the pin" rollback is marked as not a rollback across such a release.
