@@ -103,6 +103,11 @@ it is already parsed on those rows only to be refused.
     refused at boot **by name**. 0075 refused its legacy state outright, but that was a scheme with
     no successor; these are live x402 channels.
 
+    _Noted 2026-11-08 (#1667):_ the upgrade is one-way. A build from before it cannot read a
+    version-2 record and refuses to boot, and nothing writes one back. A rollback is a snapshot
+    of `state_dir` restored only if the new build moved no money:
+    [0090](0090-a-release-that-changes-a-journal-encoding-is-one-way.md).
+
 ### Peering, forwarding and apps
 
 11. **Both channels of a peering are on one network.** A peering whose halves would be on two

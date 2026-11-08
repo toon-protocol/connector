@@ -16,8 +16,17 @@ the binary and a box's mounted TOML are a matched pair in both directions,
 **adding a required config key is a breaking deploy**: land the config first, then
 bump that pin. A breaking release may have a note under
 [`docs/releases/`](../releases/) with the upgrade order and what cannot be rolled back —
-read it, and snapshot the state directory, before bumping (the multi-EVM-network build's is
+read it before bumping (the multi-EVM-network build's is
 [`multi-evm-networks.md`](../releases/multi-evm-networks.md)).
+
+**A release that migrates a journal is one-way** ([ADR 0090](../adr/0090-a-release-that-changes-a-journal-encoding-is-one-way.md)).
+Its note and its GitHub Release body say so. Once it has booted, the release before it refuses
+the state directory by name, and no tool writes the journal back. Before upgrading to one, stop
+the node and snapshot **all of `state_dir`**. Restoring that snapshot under the old build is safe
+**only if the new build has moved no money since**: signed no outbound voucher and accepted no
+inbound claim. The snapshot lacks the watermarks the new build wrote, so the old build would sign
+below what its payees already hold and accept claims already credited. After that, the way back is
+forward: a later release.
 
 **Devnet** settles on Base Sepolia and Solana devnet; test funds come from the
 [devnet faucet](https://faucet.devnet.toonprotocol.dev). **Mainnet**: TOON's own
