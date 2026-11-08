@@ -38,6 +38,11 @@ struct Chain {
 
 impl Chain {
     async fn spawn() -> Chain {
+        Chain::spawn_with_min(0).await
+    }
+
+    /// A chain whose node's table sets `min_sweep_amount = min`.
+    async fn spawn_with_min(min: u128) -> Chain {
         let anvil = Anvil::spawn(ANVIL_BASE_PORT).await;
         let mut x402 = X402Chain::place(&anvil.rpc_url).await;
         let token = x402.deploy_fiat_token().await;
@@ -49,7 +54,8 @@ impl Chain {
             ONE_DAY,
         )
         .await
-        .expect("bound to x402BatchSettlement");
+        .expect("bound to x402BatchSettlement")
+        .with_min_sweep_amount(min);
         let payer = LocalWallet::from_bytes(&[0x71; 32]).expect("key");
         let session = LocalWallet::from_bytes(&[0x72; 32]).expect("key");
         x402.fund_gas(payer.address()).await;
@@ -270,4 +276,96 @@ async fn the_sweep_claims_every_channel_in_one_transaction_and_then_settles() {
     assert!(report.claimed.is_empty());
     assert_eq!(report.settled, 0);
     assert_eq!(chain.x402.nonce(chain.node()).await, node_nonce + 2);
+}
+
+/// `min_sweep_amount`, per transaction: below it the sweep sends neither a
+/// `claim` nor a `settle` (the node's nonce does not move); once the rows'
+/// summed increase reaches it, one claim carries every row, including the
+/// small one.
+#[tokio::test]
+async fn a_sweep_below_the_minimum_sends_nothing_and_at_it_sends_every_row() {
+    if !require_anvil() {
+        return;
+    }
+    let mut chain = Chain::spawn_with_min(100).await;
+    let small = chain.open(1_000).await;
+    let large = chain.open(1_000).await;
+    chain.pay(&small, 30);
+    chain.pay(&large, 60);
+    let node_nonce = chain.x402.nonce(chain.node()).await;
+
+    let report = chain.watcher().sweep_once().await.expect("sweep");
+    assert!(report.claimed.is_empty(), "30 + 60 is below 100");
+    assert_eq!(report.settled, 0);
+    assert_eq!(chain.x402.nonce(chain.node()).await, node_nonce);
+    assert_eq!(
+        chain.x402.channel(&chain.x402.channel_id(&small)).await,
+        (1_000, 0)
+    );
+
+    chain.pay(&large, 70);
+    let report = chain.watcher().sweep_once().await.expect("sweep");
+    assert_eq!(
+        report.claimed.len(),
+        2,
+        "30 + 70 reaches 100: every row goes"
+    );
+    assert_eq!(report.settled, 100);
+    assert_eq!(chain.x402.nonce(chain.node()).await, node_nonce + 2);
+}
+
+/// The test that guards against losing money: a payer's withdrawal begun
+/// while the node was down (no watcher runs here) is claimed by the sweep on
+/// its own read of `pendingWithdrawals`, whatever the minimum. `settle`
+/// is judged apart and still waits for the minimum.
+#[tokio::test]
+async fn a_sweep_claims_a_channel_with_a_pending_withdrawal_below_the_minimum() {
+    if !require_anvil() {
+        return;
+    }
+    let mut chain = Chain::spawn_with_min(1_000_000).await;
+    let exiting = chain.open(1_000).await;
+    let quiet = chain.open(1_000).await;
+    chain.pay(&exiting, 40);
+    chain.pay(&quiet, 5);
+    chain
+        .x402
+        .initiate_withdraw(&chain.session, &exiting, 1_000)
+        .await;
+    let node_nonce = chain.x402.nonce(chain.node()).await;
+
+    let report = chain.watcher().sweep_once().await.expect("sweep");
+    let mut totals: Vec<u128> = report.claimed.iter().map(|c| c.total_claimed).collect();
+    totals.sort();
+    assert_eq!(
+        totals,
+        vec![5, 40],
+        "the exit's claim carries the other row too"
+    );
+    assert_eq!(
+        chain.x402.channel(&chain.x402.channel_id(&exiting)).await,
+        (1_000, 40)
+    );
+    assert_eq!(report.settled, 0, "45 is below the minimum to settle");
+    assert_eq!(chain.x402.nonce(chain.node()).await, node_nonce + 1);
+}
+
+/// An operator who lands a channel by hand has decided it is worth the gas.
+#[tokio::test]
+async fn a_manual_land_ignores_the_minimum() {
+    if !require_anvil() {
+        return;
+    }
+    let mut chain = Chain::spawn_with_min(1_000_000).await;
+    let config = chain.open(1_000).await;
+    chain.pay(&config, 7);
+    let id = chain.x402.channel_id(&config);
+    let entry = chain.held.read().unwrap()[0].clone();
+    chain
+        .backend
+        .admit(entry.presentation.clone())
+        .await
+        .expect("admit");
+    chain.backend.land(&id, entry.voucher).await.expect("land");
+    assert_eq!(chain.x402.channel(&id).await, (1_000, 7));
 }

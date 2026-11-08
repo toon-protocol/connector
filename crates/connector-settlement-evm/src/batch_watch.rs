@@ -22,12 +22,25 @@
 //! claimed to this node's address with `settle(receiver, token)`. It is also
 //! what catches a withdrawal initiated while the node was down: the watcher
 //! only reads logs from the block it started at, and the sweep runs as soon
-//! as the node does.
+//! as the node does -- which is why its read of each channel includes
+//! `pendingWithdrawals(id)`.
+//!
+//! The table's `min_sweep_amount` (default 0) holds the sweep back from a
+//! transaction that moves too little, **per transaction**: the `claim` goes
+//! out, with every row, only when the rows' summed increase reaches it, and
+//! `settle` only when `totalClaimed - totalSettled` does, judged separately.
+//! An exit is exempt: a sweep that finds any row's channel with a withdrawal
+//! pending sends the claim whatever the sum, as does the watcher (which
+//! never consults the minimum), and an operator's manual land does not
+//! either. Nothing ages out: value below the minimum waits for more, an exit
+//! or the operator.
 //!
 //! # Policy and I/O
 //!
-//! What to claim and whether to settle are [`claim_target`] and
-//! [`settle_due`], pure functions with no chain and no clock. Everything else
+//! What to claim and whether to claim or settle at all are [`claim_target`],
+//! [`claim_due`] and [`settle_due`], pure functions with no chain and no
+//! clock; the minimum and the pending-withdrawal fact are their inputs.
+//! Everything else
 //! here is the thin shell that reads the chain, calls them and sends what
 //! they decide. Every read and write goes through the backend's own client
 //! and sender, so the table's one `RpcTransport` (ADR 0073) and the
@@ -52,8 +65,8 @@ use crate::batch_settlement::{
     backend_error, chain_config, parse_id, rpc_error, signer_config, EvmBatchSettlementBackend,
 };
 use crate::bindings::x402_batch_settlement::{
-    ChannelsCall, ChannelsReturn, Voucher as X402Voucher, VoucherClaim, WithdrawInitiatedFilter,
-    X402BatchSettlement,
+    ChannelsCall, ChannelsReturn, PendingWithdrawalsCall, PendingWithdrawalsReturn,
+    Voucher as X402Voucher, VoucherClaim, WithdrawInitiatedFilter, X402BatchSettlement,
 };
 use crate::channel_id::format_channel_id;
 use crate::log_query::scoped_event;
@@ -64,7 +77,9 @@ use connector_chain_rpc::{RefusalLog, Refused};
 /// keeps what a withdrawal could race to at most ten minutes of vouchers
 /// even with the watcher down, while "claims are constant, settlement is
 /// rare" (ADR 0004, 0005) still holds: one `claim` for every channel, and
-/// one `settle`, per sweep that has anything to do.
+/// one `settle`, per sweep that has anything to do -- and a table's
+/// `min_sweep_amount` can make that nothing until enough has accrued (a
+/// channel with a withdrawal pending is claimed regardless).
 pub const BATCH_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Widest `eth_getLogs` range asked for at once; the channel-index syncer's
@@ -97,11 +112,23 @@ pub fn claim_target(voucher: u128, balance: u128, total_claimed: u128) -> Option
 }
 
 /// What `settle(receiver, token)` would move to this node, or `None` when it
-/// would move nothing: the receiver's `totalClaimed` above its
-/// `totalSettled`.
-pub fn settle_due(total_claimed: u128, total_settled: u128) -> Option<u128> {
+/// would move nothing or less than `min_sweep_amount`: the receiver's
+/// `totalClaimed` above its `totalSettled`.
+pub fn settle_due(
+    total_claimed: u128,
+    total_settled: u128,
+    min_sweep_amount: u128,
+) -> Option<u128> {
     let due = total_claimed.saturating_sub(total_settled);
-    (due > 0).then_some(due)
+    (due > 0 && due >= min_sweep_amount).then_some(due)
+}
+
+/// Whether a `claim` carrying rows that raise `totalClaimed` by `increase` in
+/// all is sent: when it moves at least `min_sweep_amount`, or when any row's
+/// channel has a withdrawal pending (`exit`), whatever it moves. The minimum
+/// is per transaction, so the caller sends every row or none.
+pub fn claim_due(increase: u128, exit: bool, min_sweep_amount: u128) -> bool {
+    exit || increase >= min_sweep_amount
 }
 
 /// One row a claim landed: the channel and the `totalClaimed` it now has.
@@ -171,6 +198,9 @@ impl EvmBatchSettlementBackend {
     /// has, in as few `claim`s as [`MAX_CLAIM_ROWS`] allows. Returns the rows
     /// landed.
     ///
+    /// Nothing is sent unless [`claim_due`] says so for `min_sweep_amount`:
+    /// the watcher passes 0, since it answers an exit.
+    ///
     /// A voucher is claimed only on a channel this backend knows -- one it
     /// has not admitted or restored in this process is restored first, from
     /// the voucher's own presentation -- and only when its signature is the
@@ -179,6 +209,7 @@ impl EvmBatchSettlementBackend {
     pub async fn claim_held(
         &self,
         held: &[HeldVoucher],
+        min_sweep_amount: u128,
     ) -> Result<Vec<Claimed>, BatchSettlementError> {
         let mut candidates: Vec<(ChannelId, [u8; 32], EvmChannelConfig, u128, Bytes)> = Vec::new();
         for entry in held {
@@ -220,12 +251,16 @@ impl EvmBatchSettlementBackend {
         let on_chain = self.read_channels(&ids).await?;
         let mut rows = Vec::new();
         let mut claimed = Vec::new();
-        for ((channel, _, config, amount, signature), (balance, total_claimed)) in
+        let mut increase = 0u128;
+        let mut exit = false;
+        for ((channel, _, config, amount, signature), (balance, total_claimed, withdrawing)) in
             candidates.into_iter().zip(on_chain)
         {
             let Some(target) = claim_target(amount, balance, total_claimed) else {
                 continue;
             };
+            increase = increase.saturating_add(target - total_claimed);
+            exit |= withdrawing;
             if target < amount {
                 tracing::warn!(
                     %channel,
@@ -249,6 +284,10 @@ impl EvmBatchSettlementBackend {
             });
         }
 
+        if rows.is_empty() || !claim_due(increase, exit, min_sweep_amount) {
+            return Ok(Vec::new());
+        }
+
         let mut landed = Vec::new();
         for (rows, claimed) in rows
             .chunks(MAX_CLAIM_ROWS)
@@ -269,14 +308,20 @@ impl EvmBatchSettlementBackend {
 
     /// `settle(receiver, token)` for this node's own address and token, when
     /// it would move anything. Returns what it moved.
-    pub async fn settle_claimed(&self) -> Result<u128, BatchSettlementError> {
+    ///
+    /// Nothing is sent when what it would move is below `min_sweep_amount`
+    /// ([`settle_due`]), judged apart from any claim.
+    pub async fn settle_claimed(
+        &self,
+        min_sweep_amount: u128,
+    ) -> Result<u128, BatchSettlementError> {
         let (total_claimed, total_settled) = self
             .contract
             .receivers(self.own_address, self.token)
             .call()
             .await
             .map_err(rpc_error)?;
-        let Some(due) = settle_due(total_claimed, total_settled) else {
+        let Some(due) = settle_due(total_claimed, total_settled, min_sweep_amount) else {
             return Ok(0);
         };
         let hash = self
@@ -322,36 +367,48 @@ impl EvmBatchSettlementBackend {
         }
     }
 
-    /// `(balance, totalClaimed)` for each of `ids`, in order, through the
-    /// contract's own `multicall` of `channels(id)`, at most
-    /// [`MAX_READS_PER_MULTICALL`] to one `eth_call`. Each answer is one
-    /// block's reading of its channel, which is all a row needs.
+    /// `(balance, totalClaimed, withdrawing)` for each of `ids`, in order,
+    /// through the contract's own `multicall` of `channels(id)` and
+    /// `pendingWithdrawals(id)` -- `withdrawing` is whether one is pending --
+    /// at most [`MAX_READS_PER_MULTICALL`] channels to one `eth_call`. Each
+    /// answer is one block's reading of its channel, which is all a row
+    /// needs.
     async fn read_channels(
         &self,
         ids: &[[u8; 32]],
-    ) -> Result<Vec<(u128, u128)>, BatchSettlementError> {
+    ) -> Result<Vec<(u128, u128, bool)>, BatchSettlementError> {
         let mut read = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(MAX_READS_PER_MULTICALL) {
-            let calls = chunk
+        for chunk in ids.chunks(MAX_READS_PER_MULTICALL / 2) {
+            let calls: Vec<Bytes> = chunk
                 .iter()
-                .map(|id| Bytes::from(ChannelsCall { channel_id: *id }.encode()))
+                .flat_map(|id| {
+                    [
+                        Bytes::from(ChannelsCall { channel_id: *id }.encode()),
+                        Bytes::from(PendingWithdrawalsCall { channel_id: *id }.encode()),
+                    ]
+                })
                 .collect();
+            let expected = calls.len();
             let answers = self
                 .contract
                 .multicall(calls)
                 .call()
                 .await
                 .map_err(rpc_error)?;
-            if answers.len() != chunk.len() {
+            if answers.len() != expected {
                 return Err(BatchSettlementError::Backend(format!(
-                    "x402BatchSettlement's multicall answered {} results for {} calls",
+                    "x402BatchSettlement's multicall answered {} results for {expected} calls",
                     answers.len(),
-                    chunk.len()
                 )));
             }
-            for answer in &answers {
-                let channel = ChannelsReturn::decode(answer).map_err(backend_error)?;
-                read.push((channel.balance, channel.total_claimed));
+            for pair in answers.chunks(2) {
+                let channel = ChannelsReturn::decode(&pair[0]).map_err(backend_error)?;
+                let pending = PendingWithdrawalsReturn::decode(&pair[1]).map_err(backend_error)?;
+                read.push((
+                    channel.balance,
+                    channel.total_claimed,
+                    pending.initiated_at != 0,
+                ));
             }
         }
         Ok(read)
@@ -417,7 +474,7 @@ impl EvmBatchWatcher {
         let claimed = if at_risk.is_empty() {
             Vec::new()
         } else {
-            self.backend.claim_held(&at_risk).await?
+            self.backend.claim_held(&at_risk, 0).await?
         };
         // Only now is the cursor moved: a claim that failed is retried from
         // the same logs on the next watch.
@@ -463,10 +520,15 @@ impl EvmBatchWatcher {
     }
 
     /// Claim every held voucher the chain has not recorded, then settle what
-    /// is claimed to this node's address.
+    /// is claimed to this node's address -- each only if it moves at least
+    /// the minimum, or, for the claim, a channel has a withdrawal pending.
     pub async fn sweep_once(&self) -> Result<SweepReport, BatchSettlementError> {
-        let claimed = self.backend.claim_held(&self.held.held_vouchers()).await?;
-        let settled = self.backend.settle_claimed().await?;
+        let min = self.backend.min_sweep_amount();
+        let claimed = self
+            .backend
+            .claim_held(&self.held.held_vouchers(), min)
+            .await?;
+        let settled = self.backend.settle_claimed(min).await?;
         Ok(SweepReport { claimed, settled })
     }
 
@@ -599,9 +661,43 @@ mod tests {
             total_settled in 0u128..1_000_000,
             more in 0u128..1_000_000,
         ) {
-            let due = settle_due(total_settled + more, total_settled);
+            let due = settle_due(total_settled + more, total_settled, 0);
             prop_assert_eq!(due, (more > 0).then_some(more));
         }
+    }
+
+    proptest! {
+        /// Below the minimum a settle is held back; at or above, it is what
+        /// a minimum of 0 would send.
+        #[test]
+        fn settle_waits_for_the_minimum(
+            total_settled in 0u128..1_000_000,
+            more in 0u128..1_000_000,
+            min in 0u128..1_000_000,
+        ) {
+            let today = settle_due(total_settled + more, total_settled, 0);
+            let held_back = settle_due(total_settled + more, total_settled, min);
+            prop_assert_eq!(held_back, today.filter(|due| *due >= min));
+        }
+
+        /// A claim goes out when its rows move at least the minimum, or any
+        /// row is an exit; with a minimum of 0 it always does.
+        #[test]
+        fn claim_is_due_at_the_minimum_or_on_an_exit(
+            increase in 0u128..1_000_000,
+            min in 0u128..1_000_000,
+            exit: bool,
+        ) {
+            prop_assert_eq!(claim_due(increase, exit, min), exit || increase >= min);
+            prop_assert!(claim_due(increase, exit, 0));
+        }
+    }
+
+    #[test]
+    fn an_exit_forces_a_claim_below_the_minimum() {
+        assert!(!claim_due(1, false, 2));
+        assert!(claim_due(2, false, 2));
+        assert!(claim_due(1, true, 1_000_000));
     }
 
     /// A withdrawal that finalized first leaves less than the voucher; what

@@ -32,6 +32,7 @@ asset_eip712_version  = "2"            # tables here; boot checks them against D
 # min_withdraw_delay_secs = 86400      # default one day; 900 at least, 30 days at most
 # asset_transfer_method = "eip3009"    # how a deposit moves the token; "permit2" for one without ERC-3009
 # facilitator_url = "https://..."      # the x402 facilitator payers relay deposits through; you pay its gas
+# min_sweep_amount = 0                 # base units; the sweep sends no transaction that moves less
 
 [settlement.eip155.84532.key]
 key_file = "/app/data/settlement.key"
@@ -43,6 +44,7 @@ token_address         = "34eSxY7qxQ4GzyhDJ8GpUcTz1WWzruGbJbR8q6TtxfQU"  # an SPL
 decimals              = 6
 min_sponsored_deposit = 1000000        # base units: the smallest deposit whose open you will pay rent for
 # min_grace_period_secs = 86400        # default one day; 900 at least
+# min_sweep_amount = 0                 # base units; an Open channel settles once this far above settled
 
 [settlement.solana.key]
 key_file = "/app/data/settlement-solana.key"
@@ -358,6 +360,16 @@ runs at the same rate off `min_withdraw_delay_secs`. On a closing channel it lan
 censored transaction still has to land. `POST /channels/:id/land` is the
 manual lever for planned maintenance — see
 [the operator surface](operator-surface.md).
+
+**Gas on a quiet node.** Each sweep is up to two transactions on EVM, however
+little they move. If your node is lightly used, set `min_sweep_amount` in the
+settlement table, in the token's base units (`250000` is 0.25 USDC): the sweep
+then sends a transaction only when it moves at least that much, and what is
+below waits until more accrues. It counts per transaction, not per channel.
+It never holds back an exit — a payer's withdrawal or close is always landed,
+whatever the amount — and `POST /channels/:id/land` ignores it too. Nothing
+ages out, so pick a figure you are content to wait for. It is yours alone:
+payers are never told it.
 
 > [!WARNING]
 > **Fund the settlement key _before_ you start the node**, and know that

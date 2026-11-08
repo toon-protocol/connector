@@ -96,6 +96,10 @@ pub struct SolanaBatchSettlement {
     /// bounds only the public sponsor endpoint, and is published beside
     /// `min_grace_period_secs` (ADR 0074 decision 5).
     min_sponsored_deposit: u64,
+    /// The table's `min_sweep_amount`: local policy for the Open-channel
+    /// sweep alone (see [`next_step`]), never published. 0 unless
+    /// [`Self::with_min_sweep_amount`] sets it.
+    min_sweep_amount: u64,
     /// The chain's own genesis hash, read at connect: what
     /// [`Self::caip2_network`] names the network by.
     genesis_hash: solana_sdk::hash::Hash,
@@ -119,6 +123,19 @@ pub struct SolanaBatchSettlement {
 }
 
 impl SolanaBatchSettlement {
+    /// Hold the Open-channel sweep back until a channel's held voucher is at
+    /// least `min_sweep_amount` base units above what is settled. Closing
+    /// channels, and an operator's manual land, ignore it.
+    pub fn with_min_sweep_amount(mut self, min_sweep_amount: u64) -> Self {
+        self.min_sweep_amount = min_sweep_amount;
+        self
+    }
+
+    /// The table's `min_sweep_amount`.
+    pub fn min_sweep_amount(&self) -> u64 {
+        self.min_sweep_amount
+    }
+
     /// Bind to the `payment-channels` program at the one id the record
     /// fixes ([`wire::PAYMENT_CHANNELS_PROGRAM_ID`]), admitting channels in
     /// `mint` (`[settlement.solana] token_address`) whose `grace_period` is
@@ -217,6 +234,7 @@ impl SolanaBatchSettlement {
             )));
         }
         let backend = SolanaBatchSettlement {
+            min_sweep_amount: 0,
             rpc,
             confirm: ConfirmPolicy::for_transport(transport),
             program_id,

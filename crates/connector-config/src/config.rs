@@ -4456,6 +4456,85 @@ key_file = "{key_path}"
             .any(|s| s.chain() == crate::SettlementChain::Solana));
     }
 
+    /// `min_sweep_amount` is an optional per-table key on the EVM and Solana
+    /// tables, `0` when absent, and XRPL's table refuses it by name.
+    #[test]
+    fn min_sweep_amount_parses_on_evm_and_solana_defaults_to_zero_and_is_refused_on_xrpl() {
+        let tables = |evm: &str, solana: &str, key: &str| {
+            format!(
+                r#"
+client_edge_addr = "127.0.0.1:3000"
+state_dir = "/tmp"
+
+[signer]
+key_file = "{key}"
+
+[settlement.eip155.31337]
+rpc_url = "http://127.0.0.1:8545"
+token_address = "0x49beE1Bca5d15Fb0963117893403F9498119a9Ce"
+decimals = 6
+asset_eip712_name = "USDC"
+asset_eip712_version = "2"
+{evm}
+
+[settlement.eip155.31337.key]
+key_file = "{key}"
+
+[settlement.solana]
+rpc_url = "http://127.0.0.1:8899"
+token_address = "SoLMint11111111111111111111111111111111111"
+decimals = 6
+min_sponsored_deposit = 1
+{solana}
+
+[settlement.solana.key]
+key_file = "{key}"
+"#
+            )
+        };
+        let minimums = |config: &Config| -> (u64, u64) {
+            let mut evm = None;
+            let mut solana = None;
+            for table in config.settlements() {
+                match table {
+                    SettlementConfig::Evm(table) => evm = Some(table.min_sweep_amount()),
+                    SettlementConfig::Solana(table) => solana = Some(table.min_sweep_amount()),
+                    SettlementConfig::Xrpl(_) => {}
+                }
+            }
+            (evm.expect("evm table"), solana.expect("solana table"))
+        };
+
+        let absent = with_key_file(|key| tables("", "", &key.display().to_string())).expect("load");
+        assert_eq!(minimums(&absent), (0, 0));
+
+        let set = with_key_file(|key| {
+            tables(
+                "min_sweep_amount = 250000",
+                "min_sweep_amount = 7",
+                &key.display().to_string(),
+            )
+        })
+        .expect("load");
+        assert_eq!(minimums(&set), (250_000, 7));
+
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key file");
+        key_file
+            .write_all(b"not a real key")
+            .expect("write key file");
+        let xrpl = xrpl_settlement(1000, key_file.path())
+            .replace("rpc_url", "min_sweep_amount = 1\nrpc_url");
+        let error = load_text(&node_settling_on(
+            key_file.path(),
+            &format!("{xrpl}{}", declaring(&["xrpl:1000/slip44:144"])),
+        ))
+        .expect_err("XRPL has no open-channel sweep to hold back");
+        assert!(
+            error.to_string().contains("min_sweep_amount"),
+            "got: {error}"
+        );
+    }
+
     /// AC: "[settlement.solana] alone: config loads" -- construction refusal
     /// is `connector-cli`'s to enforce (epic #627's fail-closed-per-chain),
     /// not config load's.

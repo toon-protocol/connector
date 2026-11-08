@@ -116,6 +116,14 @@ pub(crate) struct RawEvmSettlementTable {
     /// `socks_proxy`. See [`EvmSettlementConfig::rpc_via_socks_proxy`].
     #[serde(default)]
     rpc_via_socks_proxy: bool,
+    /// Local policy, never published: the least a transaction of the
+    /// automatic batch-settlement sweep must move, in this table's token's
+    /// base units. Below it the sweep sends nothing; value waits until more
+    /// accrues, an exit lands it, or the operator lands the channel by hand.
+    /// Measured per transaction. Exits (a payer's withdrawal or close) and an
+    /// operator's manual land ignore it. `0` (the default) lands any amount.
+    #[serde(default)]
+    min_sweep_amount: u64,
     #[serde(default)]
     min_withdraw_delay_secs: Option<u64>,
     #[serde(default)]
@@ -154,6 +162,14 @@ pub(crate) struct RawSolanaSettlementTable {
     /// `socks_proxy`. See [`SolanaSettlementConfig::rpc_via_socks_proxy`].
     #[serde(default)]
     rpc_via_socks_proxy: bool,
+    /// Local policy, never published: the least a transaction of the
+    /// automatic batch-settlement sweep must move, in this table's token's
+    /// base units. Below it the sweep sends nothing; value waits until more
+    /// accrues, an exit lands it, or the operator lands the channel by hand.
+    /// Measured per transaction. Exits (a payer's withdrawal or close) and an
+    /// operator's manual land ignore it. `0` (the default) lands any amount.
+    #[serde(default)]
+    min_sweep_amount: u64,
     #[serde(default)]
     min_grace_period_secs: Option<u64>,
     #[serde(default)]
@@ -312,6 +328,7 @@ pub struct EvmSettlementConfig {
     decimals: u8,
     key: SecretLocation,
     rpc_via_socks_proxy: bool,
+    min_sweep_amount: u64,
     batch_settlement: EvmBatchSettlementConfig,
 }
 
@@ -372,6 +389,11 @@ impl EvmSettlementConfig {
         self.rpc_via_socks_proxy
     }
 
+    /// The table's `min_sweep_amount`: see the key's doc. `0` unless set.
+    pub fn min_sweep_amount(&self) -> u64 {
+        self.min_sweep_amount
+    }
+
     /// This node's terms for x402 batch-settlement channels on EVM (ADR
     /// 0074, ADR 0075 decision 9): the only channels it settles on, so every
     /// `[settlement.eip155.<chainId>]` table carries them.
@@ -386,6 +408,7 @@ impl EvmSettlementConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolanaSettlementConfig {
     rpc_via_socks_proxy: bool,
+    min_sweep_amount: u64,
     rpc_url: String,
     token_address: String,
     decimals: u8,
@@ -439,6 +462,11 @@ impl SolanaSettlementConfig {
     /// [`EvmSettlementConfig::rpc_via_socks_proxy`].
     pub fn rpc_via_socks_proxy(&self) -> bool {
         self.rpc_via_socks_proxy
+    }
+
+    /// The table's `min_sweep_amount`: see the key's doc. `0` unless set.
+    pub fn min_sweep_amount(&self) -> u64 {
+        self.min_sweep_amount
     }
 
     /// This node's terms for x402 batch-settlement channels on Solana (ADR
@@ -1038,6 +1066,7 @@ fn resolve_evm_fields(
         decimals: table.decimals,
         key,
         rpc_via_socks_proxy: table.rpc_via_socks_proxy,
+        min_sweep_amount: table.min_sweep_amount,
         batch_settlement,
     })
 }
@@ -1080,6 +1109,7 @@ fn resolve_solana_fields(
 
     Ok(SolanaSettlementConfig {
         rpc_via_socks_proxy: table.rpc_via_socks_proxy,
+        min_sweep_amount: table.min_sweep_amount,
         rpc_url,
         token_address: table.token_address,
         decimals: table.decimals,
