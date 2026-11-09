@@ -2,7 +2,9 @@
 //! carries every channel this node sponsors through `payment-channels`'
 //! lifecycle, from Open to reclaimed rent.
 //!
-//! - **Open.** Settle the latest held voucher, on the sweep's cadence. Not
+//! - **Open.** Settle the latest held voucher, on the sweep's cadence, once it
+//!   is at least the table's `min_sweep_amount` above what is settled (default
+//!   0: any amount). Not
 //!   what protects this node -- as `payee` it can always still land a voucher
 //!   once a payer asks to close -- but what keeps what is unlanded small.
 //! - **Closing.** The payer called `request_close`; only this node, as
@@ -89,6 +91,9 @@ pub enum Step {
 /// `sponsor`. `held` is the highest voucher amount this node holds on it,
 /// already checked to be the channel's signer's; `now` and `slot` are the
 /// chain's clock; `settle_open` is whether the Open-channel sweep is due.
+/// `min_sweep_amount` is the table's local floor: an Open channel is settled
+/// only once its landable voucher is at least that far above `settled`.
+/// Closing, Sealed and Distributed channels ignore it -- an exit always lands.
 ///
 /// A held voucher is landable only above `settled` and at most `deposit`:
 /// the program refuses anything else, and a voucher above the deposit is one
@@ -100,6 +105,7 @@ pub fn next_step(
     now: i64,
     slot: u64,
     settle_open: bool,
+    min_sweep_amount: u64,
 ) -> Step {
     if account.status == wire::ChannelStatus::Distributed {
         let unlocked = account.open_slot.saturating_add(wire::OPEN_SLOT_WINDOW);
@@ -117,7 +123,9 @@ pub fn next_step(
     let landable = held.filter(|amount| *amount > account.settled && *amount <= account.deposit);
     match account.status {
         wire::ChannelStatus::Open => match landable {
-            Some(amount) if settle_open => Step::Settle { amount },
+            Some(amount) if settle_open && amount - account.settled >= min_sweep_amount => {
+                Step::Settle { amount }
+            }
             _ => Step::Wait,
         },
         wire::ChannelStatus::Closing => {
@@ -433,6 +441,7 @@ impl SolanaBatchWatcher {
                 clock.unix_timestamp,
                 clock.slot,
                 settle_open,
+                self.backend.min_sweep_amount(),
             );
             match step {
                 Step::Wait => continue,
@@ -646,7 +655,7 @@ mod tests {
                 ..ours(sponsor, status)
             };
             let now = CLOSED_AT + now_offset;
-            let step = next_step(&account, &sponsor, held, now, 0, settle_open);
+            let step = next_step(&account, &sponsor, held, now, 0, settle_open, 0);
             if let Step::Settle { amount } | Step::SettleAndSeal { amount } = step {
                 proptest::prop_assert!(amount > account.settled && amount <= account.deposit);
                 proptest::prop_assert_eq!(Some(amount), held);
@@ -659,11 +668,77 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// The minimum only ever holds back an Open channel's settle, and
+        /// only when it is short of the minimum: every other step -- every
+        /// exit -- is what a minimum of 0 gives.
+        #[test]
+        fn the_minimum_holds_back_only_a_short_open_settle(
+            status in 0u8..4,
+            deposit in 1u64..10_000,
+            settled_part in 0u64..10_000,
+            held in proptest::option::of(0u64..20_000),
+            now_offset in -100_000i64..200_000,
+            settle_open: bool,
+            min in 0u64..20_000,
+        ) {
+            let sponsor = Pubkey::new_from_array([7; 32]);
+            let status = match status {
+                0 => wire::ChannelStatus::Open,
+                1 => wire::ChannelStatus::Closing,
+                2 => wire::ChannelStatus::Sealed,
+                _ => wire::ChannelStatus::Distributed,
+            };
+            let account = wire::ChannelAccount {
+                deposit,
+                settled: settled_part.min(deposit),
+                ..ours(sponsor, status)
+            };
+            let now = CLOSED_AT + now_offset;
+            let today = next_step(&account, &sponsor, held, now, 0, settle_open, 0);
+            let with_min = next_step(&account, &sponsor, held, now, 0, settle_open, min);
+            match today {
+                Step::Settle { amount } if amount - account.settled < min => {
+                    proptest::prop_assert_eq!(with_min, Step::Wait)
+                }
+                _ => proptest::prop_assert_eq!(with_min, today),
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_channel_below_the_minimum_waits_and_a_closing_one_lands_at_any_amount() {
+        let sponsor = Pubkey::new_unique();
+        let open = ours(sponsor, wire::ChannelStatus::Open);
+        // settled is 300: 500 is 200 above it.
+        assert_eq!(
+            next_step(&open, &sponsor, Some(500), 0, 0, true, 201),
+            Step::Wait
+        );
+        assert_eq!(
+            next_step(&open, &sponsor, Some(500), 0, 0, true, 200),
+            Step::Settle { amount: 500 }
+        );
+        let closing = ours(sponsor, wire::ChannelStatus::Closing);
+        assert_eq!(
+            next_step(
+                &closing,
+                &sponsor,
+                Some(301),
+                CLOSED_AT,
+                0,
+                false,
+                1_000_000
+            ),
+            Step::SettleAndSeal { amount: 301 }
+        );
+    }
+
     #[test]
     fn an_open_channel_is_settled_only_when_the_sweep_is_due_and_a_voucher_is_new() {
         let sponsor = Pubkey::new_unique();
         let open = ours(sponsor, wire::ChannelStatus::Open);
-        let step = |held, due| next_step(&open, &sponsor, held, 0, 0, due);
+        let step = |held, due| next_step(&open, &sponsor, held, 0, 0, due, 0);
         assert_eq!(step(Some(500), true), Step::Settle { amount: 500 });
         assert_eq!(step(Some(500), false), Step::Wait);
         assert_eq!(step(Some(300), true), Step::Wait, "already settled");
@@ -678,7 +753,7 @@ mod tests {
         let sponsor = Pubkey::new_unique();
         let closing = ours(sponsor, wire::ChannelStatus::Closing);
         let deadline = CLOSED_AT + i64::from(GRACE);
-        let step = |held, now| next_step(&closing, &sponsor, held, now, 0, false);
+        let step = |held, now| next_step(&closing, &sponsor, held, now, 0, false, 0);
 
         // Due or not, the Closing watch does not wait for the sweep.
         assert_eq!(
@@ -705,13 +780,13 @@ mod tests {
         let sponsor = Pubkey::new_unique();
         let sealed = ours(sponsor, wire::ChannelStatus::Sealed);
         assert_eq!(
-            next_step(&sealed, &sponsor, Some(900), 0, 0, false),
+            next_step(&sealed, &sponsor, Some(900), 0, 0, false, 0),
             Step::Distribute
         );
 
         let distributed = ours(sponsor, wire::ChannelStatus::Distributed);
         let unlocked = distributed.open_slot + wire::OPEN_SLOT_WINDOW;
-        let at = |slot| next_step(&distributed, &sponsor, None, 0, slot, true);
+        let at = |slot| next_step(&distributed, &sponsor, None, 0, slot, true, 0);
         assert_eq!(
             at(unlocked),
             Step::Wait,
@@ -742,7 +817,7 @@ mod tests {
             };
             for account in [other_payee, other_split] {
                 assert_eq!(
-                    next_step(&account, &sponsor, Some(700), CLOSED_AT, 0, true),
+                    next_step(&account, &sponsor, Some(700), CLOSED_AT, 0, true, 0),
                     Step::NotOurs
                 );
             }
@@ -752,7 +827,7 @@ mod tests {
             ..ours(sponsor, wire::ChannelStatus::Distributed)
         };
         assert_eq!(
-            next_step(&distributed, &sponsor, None, 0, u64::MAX, false),
+            next_step(&distributed, &sponsor, None, 0, u64::MAX, false, 0),
             Step::Reclaim
         );
     }

@@ -673,7 +673,8 @@ async fn build_evm_batch_settlement(
         settlement.batch_settlement().min_withdraw_delay_secs(),
     )
     .await
-    .map_err(|source| unbound(&table, source))?;
+    .map_err(|source| unbound(&table, source))?
+    .with_min_sweep_amount(u128::from(settlement.min_sweep_amount()));
     check_published_deposit_terms(settlement, &backend).await?;
     Ok(Arc::new(backend))
 }
@@ -770,7 +771,8 @@ async fn build_solana_batch_settlement(
         batch.min_sponsored_deposit(),
     )
     .await
-    .map_err(|source| unbound(table, source))?;
+    .map_err(|source| unbound(table, source))?
+    .with_min_sweep_amount(settlement.min_sweep_amount());
     let backend = match socks_proxy {
         Some(proxy) => backend
             .with_socks_proxy(proxy)

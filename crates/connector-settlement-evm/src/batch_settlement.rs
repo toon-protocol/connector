@@ -103,6 +103,10 @@ pub struct EvmBatchSettlementBackend {
     /// table's `token_address`, never declared twice (CF-26).
     pub(crate) token: Address,
     min_withdraw_delay_secs: u64,
+    /// The table's `min_sweep_amount`: local policy for the automatic sweep
+    /// alone (see `batch_watch`), never published. 0 unless
+    /// [`Self::with_min_sweep_amount`] sets it.
+    min_sweep_amount: u128,
     pub(crate) client: Arc<EvmClient>,
     pub(crate) sender: Arc<Sender>,
     pub(crate) confirm: ConfirmPolicy,
@@ -124,6 +128,20 @@ pub struct EvmBatchSettlementBackend {
 }
 
 impl EvmBatchSettlementBackend {
+    /// Hold the automatic sweep back from a `claim` or `settle` that moves
+    /// less than `min_sweep_amount` base units of the token. A channel with
+    /// a withdrawal pending, the watcher, and an operator's manual land
+    /// ignore it.
+    pub fn with_min_sweep_amount(mut self, min_sweep_amount: u128) -> Self {
+        self.min_sweep_amount = min_sweep_amount;
+        self
+    }
+
+    /// The table's `min_sweep_amount`.
+    pub fn min_sweep_amount(&self) -> u128 {
+        self.min_sweep_amount
+    }
+
     /// The chain id `transport`'s endpoint answers `eth_chainId` with,
     /// retried like every boot read. What boot asserts a
     /// `[settlement.eip155.<chainId>]` table's key against before
@@ -236,6 +254,7 @@ impl EvmBatchSettlementBackend {
             own_address,
             token,
             min_withdraw_delay_secs,
+            min_sweep_amount: 0,
             client,
             sender: built.sender,
             confirm: built.confirm,
