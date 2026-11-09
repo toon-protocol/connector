@@ -38,6 +38,18 @@ If your context is getting full (around 150k tokens) before you are done, commit
 write the remaining steps to `.sandcastle/logs/handoff-{{ISSUE_NUMBER}}.md`, commit it with
 `git add -f`, and end your turn. A fresh session continues from your commits.
 
+## Ending your session
+
+- Write a completion signal only as the very last line of your final message. Never quote,
+  paraphrase-with-tags or mention it in a progress note: the runner treats the string
+  appearing anywhere in your output as the signal.
+- Commit working changes before running the full `cargo test --workspace`, then amend or
+  add commits afterwards. The runner starts another session if you leave work uncommitted.
+- Never end your turn while a background command is still running. Run the gate in the
+  foreground with a timeout. In headless mode, ending the turn ends the session.
+- Never use `pkill -f` / `pgrep -f` with a pattern that also appears in your own command
+  line, because it matches your own shell.
+
 When the ticket is done and committed, output <promise>COMPLETE</promise>.
 
 If you stopped because you're blocked, output <promise>BLOCKED</promise> instead, after your

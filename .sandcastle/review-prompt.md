@@ -19,3 +19,12 @@ Once both review axes have reported:
 </review-summary>
 
 Then output <promise>COMPLETE</promise>.
+
+Rules for the session:
+
+- Write a completion signal only as the very last line of your final message. Never quote,
+  paraphrase-with-tags or mention it in a progress note.
+- Never end your turn while a background command is still running. Run commands in the
+  foreground with a timeout.
+- Never use `pkill -f` / `pgrep -f` with a pattern that also appears in your own command
+  line, because it matches your own shell.
