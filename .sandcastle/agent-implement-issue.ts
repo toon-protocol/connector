@@ -28,6 +28,7 @@
 //   SANDCASTLE_ISSUE_NUMBER=123 npm run sandcastle:implement
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
 import { sandboxSecrets } from './sandbox-secrets.ts';
@@ -53,6 +54,13 @@ const branch = `sandcastle/issue-${issueNumber}`;
 // How many times a red gate is handed back for a fix before the run fails. The
 // failures it catches are almost always small compile or lint errors.
 const MAX_GATE_FIX_ATTEMPTS = 2;
+
+// How many extra implement sessions a run gets when one ends with a dirty tree or
+// nothing committed. Bounded so a session that cannot commit does not loop forever.
+const MAX_IMPLEMENT_FOLLOW_UPS = 2;
+
+const COMPLETE = '<promise>COMPLETE</promise>';
+const BLOCKED = '<promise>BLOCKED</promise>';
 
 const issue = JSON.parse(
   execFileSync('gh', ['issue', 'view', issueNumber, '--json', 'title,url,labels'], {
@@ -144,6 +152,26 @@ async function pushBranch(
   }
 }
 
+/** The implement prompt, plus a paragraph telling a follow-up session what it found. */
+function followUpPrompt(args: Record<string, string>, dirty: boolean): string {
+  // An inline prompt takes no promptArgs, so substitute them as sandcastle's promptFile
+  // does: same placeholder pattern, and a placeholder with no value is an error.
+  const base = readFileSync('./.sandcastle/implement-prompt.md', 'utf8').replace(
+    /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g,
+    (_match, key: string) => {
+      const value = args[key];
+      if (value === undefined) throw new Error(`Prompt argument {{${key}}} has no value.`);
+      return value;
+    }
+  );
+  const found = dirty
+    ? 'A previous session left uncommitted work in the working tree. Run `git status` and ' +
+      '`git diff` to see it, check it is correct and finish it, run the gate, and commit it.'
+    : `A previous session ended with no commits on '${args.BRANCH}' ahead of ${BASE}. ` +
+      'Check what it left, finish the ticket and commit it.';
+  return `${base}\n\n## Follow-up session\n\n${found} Only a session commits: the runner will not.\n`;
+}
+
 /** Last `<review-summary>` block in a session's output, or null if it wrote none. */
 function reviewSummary(stdout: string): string | null {
   const blocks = [...stdout.matchAll(/<review-summary>([\s\S]*?)<\/review-summary>/g)];
@@ -184,30 +212,74 @@ async function main() {
   try {
     // 1. Implement: /implement in a fresh session. It may take several sessions
     //    on a large ticket, each continuing from the previous one's commits.
-    const implement = await sandbox.run({
+    const implementArgs = { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch };
+    let implement = await sandbox.run({
       name: 'implement',
-      completionSignal: ['<promise>COMPLETE</promise>', '<promise>BLOCKED</promise>'],
+      completionSignal: [COMPLETE, BLOCKED],
       maxIterations: 10,
       agent: sandcastle.claudeCode('claude-sonnet-5-5'),
       promptFile: './.sandcastle/implement-prompt.md',
-      promptArgs: { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch },
+      promptArgs: implementArgs,
     });
 
     // A session that stops blocked has explained why on the issue. Ending here keeps
     // the runner from starting nine more sessions that hit the same blocker and post
-    // the same comment (slop_machine#37 did exactly that).
-    if (implement.completionSignal === '<promise>BLOCKED</promise>') {
-      throw new Error(
-        'The implement session stopped blocked. It explained why in a comment on the issue.'
-      );
-    }
+    // the same comment (slop_machine#37 did exactly that). It also skips the
+    // follow-ups below, whatever state the tree is in.
+    const throwIfBlocked = () => {
+      if (implement.completionSignal === BLOCKED) {
+        throw new Error(
+          'The implement session stopped blocked. It explained why in a comment on the issue.'
+        );
+      }
+    };
+    throwIfBlocked();
 
     // What matters is whether the branch has work on it, not whether this session
     // added any. A rerun of an issue whose earlier run committed the implementation
     // and then failed later (#1429: the push) finds nothing left to do, and should go
     // on to review, gate and PR rather than fail.
-    const ahead = await sandbox.exec(`git rev-list --count ${BASE}..HEAD`);
-    const commitsOnBranch = ahead.exitCode === 0 ? Number(ahead.stdout.trim()) : NaN;
+    //
+    // sandcastle treats a signal as received once the string appears anywhere in the
+    // output, so a session that merely quotes it, or that ends its turn with work
+    // uncommitted, looks finished. Check the tree too, and hand it back to a session
+    // (never committed by the runner: only a session that has run the tests may
+    // commit under the agent's name).
+    const inspectBranch = async () => {
+      const ahead = await sandbox.exec(`git rev-list --count ${BASE}..HEAD`);
+      const status = await sandbox.exec('git status --porcelain');
+      return {
+        commitsOnBranch: ahead.exitCode === 0 ? Number(ahead.stdout.trim()) : NaN,
+        dirty: status.exitCode !== 0 || status.stdout.trim() !== '',
+      };
+    };
+    let { commitsOnBranch, dirty } = await inspectBranch();
+    for (
+      let attempt = 1;
+      (dirty || !(commitsOnBranch > 0)) && attempt <= MAX_IMPLEMENT_FOLLOW_UPS;
+      attempt++
+    ) {
+      console.log(
+        `\nImplement left ${dirty ? 'uncommitted changes' : `no commits ahead of ${BASE}`} — ` +
+          `follow-up session ${attempt}/${MAX_IMPLEMENT_FOLLOW_UPS}.`
+      );
+      implement = await sandbox.run({
+        name: `implement-follow-up-${attempt}`,
+        completionSignal: [COMPLETE, BLOCKED],
+        // One session per follow-up, so the cap above bounds sessions, not batches of them.
+        maxIterations: 1,
+        agent: sandcastle.claudeCode('claude-sonnet-5-5'),
+        prompt: followUpPrompt(implementArgs, dirty),
+      });
+      throwIfBlocked();
+      ({ commitsOnBranch, dirty } = await inspectBranch());
+    }
+    if (dirty) {
+      throw new Error(
+        `The working tree is still dirty after ${MAX_IMPLEMENT_FOLLOW_UPS} follow-up ` +
+          `session(s): uncommitted work was left in the sandbox, so '${branch}' was not pushed.`
+      );
+    }
     if (!(commitsOnBranch > 0)) {
       throw new Error(
         `'${branch}' has no commits ahead of ${BASE}. If the implement session hit a ` +
@@ -216,8 +288,8 @@ async function main() {
     }
     if (implement.commits.length === 0) {
       console.log(
-        `\nThe implement session added nothing; '${branch}' already has ${commitsOnBranch} ` +
-          `commit(s) ahead of ${BASE} from an earlier run. Continuing to review.`
+        `\nThe last implement session added nothing; '${branch}' already has ${commitsOnBranch} ` +
+          `commit(s) ahead of ${BASE}. Continuing to review.`
       );
     }
 
