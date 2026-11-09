@@ -19,7 +19,8 @@ push, open a PR or close the issue. The runner does all three once you finish.
 - After you finish, the runner runs CI's gate itself and won't open a PR while it is red:
   `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace` and
   `cargo clippy --workspace --all-targets -- -D warnings`, plus the npm gate if you
-  touched `packages/`. Run them yourself before you commit. Never weaken, skip or
+  touched `packages/`. Run them yourself before you finish (see "Ending your session" for
+  the order of committing and testing). Never weaken, skip or
   `#[ignore]` a test, and never loosen a lint, to get green.
 - A ticket that needs a live box, a funded key or an on-chain write doesn't need a human.
   `.github/workflows/fleet-ops.yml` and `.github/workflows/funded-ops.yml` do that work.

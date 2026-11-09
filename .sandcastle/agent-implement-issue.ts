@@ -154,9 +154,15 @@ async function pushBranch(
 
 /** The implement prompt, plus a paragraph telling a follow-up session what it found. */
 function followUpPrompt(args: Record<string, string>, dirty: boolean): string {
+  // An inline prompt takes no promptArgs, so substitute them as sandcastle's promptFile
+  // does: same placeholder pattern, and a placeholder with no value is an error.
   const base = readFileSync('./.sandcastle/implement-prompt.md', 'utf8').replace(
-    /\{\{(\w+)\}\}/g,
-    (match, key: string) => args[key] ?? match
+    /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g,
+    (_match, key: string) => {
+      const value = args[key];
+      if (value === undefined) throw new Error(`Prompt argument {{${key}}} has no value.`);
+      return value;
+    }
   );
   const found = dirty
     ? 'A previous session left uncommitted work in the working tree. Run `git status` and ' +
@@ -260,7 +266,8 @@ async function main() {
       implement = await sandbox.run({
         name: `implement-follow-up-${attempt}`,
         completionSignal: [COMPLETE, BLOCKED],
-        maxIterations: 10,
+        // One session per follow-up, so the cap above bounds sessions, not batches of them.
+        maxIterations: 1,
         agent: sandcastle.claudeCode('claude-sonnet-5-5'),
         prompt: followUpPrompt(implementArgs, dirty),
       });
