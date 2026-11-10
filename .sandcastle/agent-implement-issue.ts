@@ -28,13 +28,13 @@
 //   SANDCASTLE_ISSUE_NUMBER=123 npm run sandcastle:implement
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
 import { sandboxSecrets } from './sandbox-secrets.ts';
 import { mintAppToken } from './mint-app-token.ts';
 import { fixPrompt, runGate, selectSteps } from './run-gate.ts';
-import { pushLeased, pushRescue, remoteTip, rescueRef, type PushResult } from './push-lease.ts';
+import { finalPushFailure, pushLeased, pushRescue, remoteTip, rescueRef } from './push-lease.ts';
 
 const issueNumber: string = (() => {
   const value = process.env.SANDCASTLE_ISSUE_NUMBER?.trim();
@@ -145,24 +145,24 @@ async function pushBranch(
     return false;
   };
 
-  let result: PushResult;
+  let message: string;
   try {
-    result = await withCredential(sandbox, label, (git) =>
+    const result = await withCredential(sandbox, label, (git) =>
       pushLeased(sandbox.exec.bind(sandbox), git, branch, expectedTip, (line) =>
         console.log(`  [${label}] ${line}`)
       )
     );
+    if (result.ok) {
+      expectedTip = result.sha;
+      return true;
+    }
+    message = result.message;
   } catch (err) {
-    return fail(`[${label}] could not push: ${(err as Error).message}`);
+    message = `could not push: ${(err as Error).message}`;
   }
-  if (result.ok) {
-    expectedTip = result.sha;
-    return true;
-  }
-  if (bestEffort) return fail(`[${label}] ${result.message}`);
+  if (bestEffort) return fail(`[${label}] ${message}`);
 
   // The final push: do not let the commits die with the sandbox.
-  const rescue = rescueRef(branch);
   let rescued = false;
   try {
     rescued = await withCredential(sandbox, `${label}:rescue`, (git) =>
@@ -171,12 +171,11 @@ async function pushBranch(
   } catch (err) {
     console.warn(`  WARNING: rescue push failed: ${(err as Error).message}`);
   }
-  return fail(
-    `[${label}] ${result.message}\n` +
-      (rescued
-        ? `The run's HEAD was pushed to '${rescue}' instead; recover the work from there.`
-        : `The rescue push to '${rescue}' failed too, so the commits are lost with the sandbox.`)
-  );
+  // The workflow's failure comment on the issue names the ref the work is on.
+  if (rescued && process.env.GITHUB_OUTPUT) {
+    appendFileSync(process.env.GITHUB_OUTPUT, `rescue_ref=${rescueRef(branch)}\n`);
+  }
+  return fail(`[${label}] ${finalPushFailure(message, branch, rescued)}`);
 }
 
 /** The implement prompt, plus a paragraph telling a follow-up session what it found. */

@@ -1,11 +1,18 @@
 // Exercises push-lease.ts against a scratch bare repo, never `origin` (#1677).
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
-import { pushLeased, pushRescue, remoteTip, rescueRef, type Exec } from './push-lease.ts';
+import { after, test } from 'node:test';
+import {
+  finalPushFailure,
+  pushLeased,
+  pushRescue,
+  remoteTip,
+  rescueRef,
+  type Exec,
+} from './push-lease.ts';
 
 const branch = 'sandcastle/issue-1';
 
@@ -15,6 +22,7 @@ function sh(cwd: string, cmd: string): string {
 
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'push-lease-'));
+  after(() => rmSync(root, { recursive: true, force: true }));
   const remote = join(root, 'remote.git');
   const work = join(root, 'work');
   sh(root, `git init -q --bare -b main ${remote}`);
@@ -91,4 +99,25 @@ test('a rescue push leaves HEAD on the rescue ref', async () => {
   commit('a');
   assert.ok(await pushRescue(exec, 'git', branch));
   assert.equal(sh(remote, `git rev-parse ${rescueRef(branch)}`), sh(work, 'git rev-parse HEAD'));
+});
+
+test('a failed final push leaves HEAD on the rescue ref, and the error names it', async () => {
+  const { exec, commit, remote, root, work, id } = setup();
+  commit('a');
+  const first = await pushLeased(exec, 'git', branch, null);
+  assert.ok(first.ok);
+  const other = join(root, 'other');
+  sh(
+    root,
+    `git clone -q ${remote} ${other} 2>/dev/null && cd ${other} && git checkout -q ${branch}`
+  );
+  sh(other, `git ${id} commit -q --allow-empty -m theirs && git push -q origin ${branch}`);
+  commit('b');
+  const final = await pushLeased(exec, 'git', branch, first.ok ? first.sha : null);
+  assert.ok(!final.ok);
+  const rescued = await pushRescue(exec, 'git', branch);
+  assert.ok(rescued);
+  assert.equal(sh(remote, `git rev-parse ${rescueRef(branch)}`), sh(work, 'git rev-parse HEAD'));
+  const error = finalPushFailure(final.ok ? '' : final.message, branch, rescued);
+  assert.match(error, new RegExp(`'${rescueRef(branch)}'`));
 });

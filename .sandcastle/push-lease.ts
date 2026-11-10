@@ -23,6 +23,17 @@ export function rescueRef(branch: string): string {
   return `${branch}-rescue`;
 }
 
+/** The error a failed final push throws: it names the rescue ref the work is on. */
+export function finalPushFailure(message: string, branch: string, rescued: boolean): string {
+  const rescue = rescueRef(branch);
+  return (
+    `${message}\n` +
+    (rescued
+      ? `The run's HEAD was pushed to '${rescue}' instead; recover the work from there.`
+      : `The rescue push to '${rescue}' failed too, so the commits are lost with the sandbox.`)
+  );
+}
+
 /** The remote tip of `branch`, or null when it is absent. `git` is the command prefix. */
 export async function remoteTip(exec: Exec, git: string, branch: string): Promise<string | null> {
   const r = await exec(`${git} ls-remote origin refs/heads/${branch}`);
