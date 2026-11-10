@@ -28,12 +28,13 @@
 //   SANDCASTLE_ISSUE_NUMBER=123 npm run sandcastle:implement
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import * as sandcastle from '@ai-hero/sandcastle';
 import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
 import { sandboxSecrets } from './sandbox-secrets.ts';
 import { mintAppToken } from './mint-app-token.ts';
 import { fixPrompt, runGate, selectSteps } from './run-gate.ts';
+import { finalPushFailure, pushLeased, pushRescue, remoteTip, rescueRef } from './push-lease.ts';
 
 const issueNumber: string = (() => {
   const value = process.env.SANDCASTLE_ISSUE_NUMBER?.trim();
@@ -100,10 +101,38 @@ const FRESH_CREDENTIAL_HELPER =
   `!f() { test "$1" = get && ` +
   `{ echo username=x-access-token; echo "password=$(cat ${TOKEN_PATH})"; }; }; f`;
 
+// The remote tip this run last saw for `branch` (null: absent), set at sandbox creation
+// and advanced on every successful push. Every push leases against it (#1677).
+let expectedTip: string | null = null;
+
+/** Mint a token, stage it, run `fn` with the credential-helper git prefix, then unstage. */
+async function withCredential<T>(
+  sandbox: Sandbox,
+  label: string,
+  fn: (git: string) => Promise<T>
+): Promise<T> {
+  const minted = await mintAppToken();
+  const token = minted.token;
+  process.env.GH_TOKEN = token;
+  console.log(`  [${label}] credential: freshly minted (source=${minted.source})`);
+
+  const stage = await sandbox.exec(`umask 077 && cat > ${TOKEN_PATH}`, { stdin: token });
+  if (stage.exitCode !== 0) {
+    throw new Error(`failed to stage the push credential (exit ${stage.exitCode}).`);
+  }
+  try {
+    return await fn(`git -c credential.helper= -c credential.helper='${FRESH_CREDENTIAL_HELPER}'`);
+  } finally {
+    // Leave no usable credential in the container for the agent sessions that follow.
+    await sandbox.exec(`rm -f ${TOKEN_PATH}`);
+  }
+}
+
 /**
- * Push the branch from inside the sandbox with a newly minted App token, and
- * refresh the host's GH_TOKEN from the same mint for the `gh` calls that follow.
- * `bestEffort` pushes only warn on failure; the final push throws.
+ * Push the branch from inside the sandbox with a newly minted App token, leased on
+ * the last tip this run saw, and refresh the host's GH_TOKEN from the same mint for
+ * the `gh` calls that follow. `bestEffort` pushes only warn on failure; the final
+ * push throws, after trying to leave HEAD on a rescue ref.
  */
 async function pushBranch(
   sandbox: Sandbox,
@@ -116,40 +145,37 @@ async function pushBranch(
     return false;
   };
 
-  let token: string;
+  let message: string;
   try {
-    const minted = await mintAppToken();
-    token = minted.token;
-    process.env.GH_TOKEN = token;
-    console.log(`  [${label}] credential: freshly minted (source=${minted.source})`);
-  } catch (err) {
-    return fail(`[${label}] could not obtain a push credential: ${(err as Error).message}`);
-  }
-
-  const stage = await sandbox.exec(`umask 077 && cat > ${TOKEN_PATH}`, { stdin: token });
-  if (stage.exitCode !== 0) {
-    return fail(`[${label}] failed to stage the push credential (exit ${stage.exitCode}).`);
-  }
-
-  try {
-    const push = await sandbox.exec(
-      `git -c credential.helper= -c credential.helper='${FRESH_CREDENTIAL_HELPER}' ` +
-        // --no-verify: this repo's husky pre-push hook runs a local test pass meant for
-        // people pushing by hand. The runner has just run CI's own gate, and the hook
-        // failing in the sandbox is what cost #1429 its final push.
-        `push --no-verify -u origin ${branch}`,
-      { onLine: (line) => console.log(`  [${label}] ${line}`) }
+    const result = await withCredential(sandbox, label, (git) =>
+      pushLeased(sandbox.exec.bind(sandbox), git, branch, expectedTip, (line) =>
+        console.log(`  [${label}] ${line}`)
+      )
     );
-    if (push.exitCode !== 0) {
-      return fail(
-        `[${label}] git push of '${branch}' failed (exit ${push.exitCode}).\n${push.stderr}`
-      );
+    if (result.ok) {
+      expectedTip = result.sha;
+      return true;
     }
-    return true;
-  } finally {
-    // Leave no usable credential in the container for the agent sessions that follow.
-    await sandbox.exec(`rm -f ${TOKEN_PATH}`);
+    message = result.message;
+  } catch (err) {
+    message = `could not push: ${(err as Error).message}`;
   }
+  if (bestEffort) return fail(`[${label}] ${message}`);
+
+  // The final push: do not let the commits die with the sandbox.
+  let rescued = false;
+  try {
+    rescued = await withCredential(sandbox, `${label}:rescue`, (git) =>
+      pushRescue(sandbox.exec.bind(sandbox), git, branch)
+    );
+  } catch (err) {
+    console.warn(`  WARNING: rescue push failed: ${(err as Error).message}`);
+  }
+  // The workflow's failure comment on the issue names the ref the work is on.
+  if (rescued && process.env.GITHUB_OUTPUT) {
+    appendFileSync(process.env.GITHUB_OUTPUT, `rescue_ref=${rescueRef(branch)}\n`);
+  }
+  return fail(`[${label}] ${finalPushFailure(message, branch, rescued)}`);
 }
 
 /** The implement prompt, plus a paragraph telling a follow-up session what it found. */
@@ -210,6 +236,12 @@ async function main() {
 
   let pr: { number: number; url: string } | undefined;
   try {
+    // Record where the remote branch stands, so every push can lease against it.
+    expectedTip = await withCredential(sandbox, 'lease:init', (git) =>
+      remoteTip(sandbox.exec.bind(sandbox), git, branch)
+    );
+    console.log(`  remote tip of '${branch}': ${expectedTip ?? '(absent)'}`);
+
     // 1. Implement: /implement in a fresh session. It may take several sessions
     //    on a large ticket, each continuing from the previous one's commits.
     const implementArgs = { ISSUE_URL: issue.url, ISSUE_NUMBER: issueNumber, BRANCH: branch };
