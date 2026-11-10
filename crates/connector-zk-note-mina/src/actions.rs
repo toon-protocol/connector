@@ -129,7 +129,8 @@ pub struct Entry {
     actions: Vec<Vec<Field>>,
 }
 
-fn field_of(value: &Value, what: &str) -> Result<Field, String> {
+/// A decimal field element as an answer states it, refused unless canonical.
+pub(crate) fn field_of(value: &Value, what: &str) -> Result<Field, String> {
     let text = value
         .as_str()
         .ok_or_else(|| format!("{what} is not a decimal string"))?;

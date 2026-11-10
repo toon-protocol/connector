@@ -3,7 +3,8 @@
 //! changed file fails here, naming what to look at, instead of drifting.
 //!
 //! They come from `toon-protocol/zk_toon` `test-vectors/request-proofs/`
-//! (zk_toon#65 and #67), at commit 8d6a34153eb330b7354f5232c0e422e82f06070e.
+//! (zk_toon#65 and #67), byte-identical at `ad4ee440`, the rev
+//! `connector-zk-note` pins.
 //! The connector can't make them itself: its ADR 0080 forbids o1js.
 
 use sha2::{Digest, Sha256};

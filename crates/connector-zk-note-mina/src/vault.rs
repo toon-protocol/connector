@@ -122,19 +122,6 @@ struct Account {
     action_state: Field,
 }
 
-fn decimal_field(value: &Value, what: &str) -> Result<Field, String> {
-    let text = value
-        .as_str()
-        .ok_or_else(|| format!("{what} is not a decimal string"))?;
-    let field: Field = text
-        .parse()
-        .map_err(|_| format!("{what} '{text}' is not a field element"))?;
-    if connector_zk_note::note::field_to_string(field) != text {
-        return Err(format!("{what} '{text}' is not canonical"));
-    }
-    Ok(field)
-}
-
 impl Account {
     fn read(data: &Value) -> Result<Account, String> {
         let account = data
@@ -145,7 +132,7 @@ impl Account {
             .as_array()
             .ok_or("the vault's account has no zkappState")?
             .iter()
-            .map(|f| decimal_field(f, "a zkappState field"))
+            .map(|f| actions::field_of(f, "a zkappState field"))
             .collect::<Result<Vec<_>, _>>()?;
         if app_state.len() != STATE_FIELDS {
             return Err(format!(
@@ -160,7 +147,7 @@ impl Account {
             .ok_or("the vault's account has no five-state actionState")?;
         Ok(Account {
             app_state,
-            action_state: decimal_field(&action_states[0], "the account's actionState")?,
+            action_state: actions::field_of(&action_states[0], "the account's actionState")?,
         })
     }
 
@@ -189,15 +176,19 @@ impl ZkNoteVault for MinaZkNoteVault {
             return Ok(false);
         };
         let public: Vec<Field> = public_input(proof.public());
-        let _permit = self
-            .verifications
-            .acquire()
+        // The permit moves into the blocking task: a caller that gives up on
+        // the answer does not free a core the verification is still using.
+        let permit = Arc::clone(&self.verifications)
+            .acquire_owned()
             .await
             .map_err(|_| unavailable("the verifier is shut down"))?;
         let verifier = Arc::clone(&self.verifier);
-        tokio::task::spawn_blocking(move || verifier.verify(&public, &wrap))
-            .await
-            .map_err(|e| unavailable(format!("verification did not finish: {e}")))
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verifier.verify(&public, &wrap)
+        })
+        .await
+        .map_err(|e| unavailable(format!("verification did not finish: {e}")))
     }
 
     async fn root_known(&self, root: Field) -> Result<bool, ZkNoteVaultUnavailable> {
