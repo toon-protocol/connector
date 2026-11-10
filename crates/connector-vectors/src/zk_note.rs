@@ -27,11 +27,9 @@ use connector_zk_note::{scalar_to_string, Field, Keypair, Scalar, SecKey, Signat
 use serde::Serialize;
 use serde_json::{json, Value};
 
-/// The zk_toon commit `request-proofs.json` was committed at (zk_toon#65).
-pub const REQUEST_PROOFS_COMMIT: &str = "8d6a34153eb330b7354f5232c0e422e82f06070e";
-
 /// zk_toon's request-proof fixtures (zk_toon#65), pinned by hash in
-/// `connector-zk-note-mina`'s tests.
+/// `connector-zk-note-mina`'s tests. They are byte-identical at
+/// [`ZK_TOON_COMMIT`] (`ad4ee440`), the rev `connector-zk-note` pins.
 const REQUEST_PROOFS: &str =
     include_str!("../../connector-zk-note-mina/fixtures/request-proofs.json");
 
@@ -144,7 +142,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         ],
         "verification_key_hash": fixtures["verificationKey"]["hash"],
         "proof_binds": proof_binds(&request),
-        "note": "the proof is a request proof o1js made (zk_toon#65, REQUEST_PROOFS_COMMIT), \
+        "note": "the proof is a request proof o1js made (zk_toon#65, `ZK_TOON_COMMIT`), \
                  verbatim. Its tag binds `proof_binds` -- zk_toon's sample context -- and not \
                  `keys` or this body's sessionKey and expiresAt, whose secrets o1js's sample \
                  never had, so this body shows the wire, not an allowance this file's keys \
@@ -242,7 +240,7 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         "verification_key_hash": fixtures["verificationKey"]["hash"],
         "proof_binds": proof_binds(&subsidised_request),
         "note": "the proof is a subsidised request proof o1js made (zk_toon#65, \
-                 REQUEST_PROOFS_COMMIT), verbatim; its period is zk_toon's \
+                 `ZK_TOON_COMMIT`), verbatim; its period is zk_toon's \
                  policy::subsidy_period of the fixture vault's creation slot, and its tag \
                  binds `proof_binds`, as in `allowance_request`",
     });

@@ -2252,7 +2252,19 @@ fn client_claim_gate(
                 reason: error.to_string(),
             })
         }
-        _ => Ok(gate),
+        (None, _, _) => Ok(gate),
+        // `Config::load` requires `state_dir` beside `[zk_note]` and boot builds
+        // the zk edge exactly when `[zk_note]` is written, so neither arm below
+        // is reachable. Were one reached, serving without the edge would be a
+        // zk node that silently accepts nothing it can check: fail closed.
+        (Some(_), None, _) => Err(RuntimeError::ZkNoteEvidence {
+            path: PathBuf::new(),
+            reason: "[zk_note] needs a state_dir for its evidence file".to_string(),
+        }),
+        (Some(_), Some(state_dir), None) => Err(RuntimeError::ZkNoteEvidence {
+            path: state_dir.join(connector_client_edge::EVIDENCE_FILE),
+            reason: "[zk_note] is written but boot built no zk edge".to_string(),
+        }),
     }
 }
 

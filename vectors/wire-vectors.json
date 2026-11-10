@@ -1296,7 +1296,7 @@
         "sessionKey": "B62qnkiphcf5feTC6vCRa3rytfxr9FEHH4RAKH7Q4RZX4ytJ5wKzFqb"
       },
       "method": "POST",
-      "note": "the proof is a request proof o1js made (zk_toon#65, REQUEST_PROOFS_COMMIT), verbatim. Its tag binds `proof_binds` -- zk_toon's sample context -- and not `keys` or this body's sessionKey and expiresAt, whose secrets o1js's sample never had, so this body shows the wire, not an allowance this file's keys could open",
+      "note": "the proof is a request proof o1js made (zk_toon#65, `ZK_TOON_COMMIT`), verbatim. Its tag binds `proof_binds` -- zk_toon's sample context -- and not `keys` or this body's sessionKey and expiresAt, whose secrets o1js's sample never had, so this body shows the wire, not an allowance this file's keys could open",
       "path": "/ilp/zk-note/allowances",
       "proof_binds": {
         "edge": "B62qoiTqnwoKYnxW98J7xggHwPoaTzqhLoeNYe5wM1owBAyhMqQ3ydi",
@@ -1435,7 +1435,7 @@
         "sessionKey": "B62qnkiphcf5feTC6vCRa3rytfxr9FEHH4RAKH7Q4RZX4ytJ5wKzFqb"
       },
       "method": "POST",
-      "note": "the proof is a subsidised request proof o1js made (zk_toon#65, REQUEST_PROOFS_COMMIT), verbatim; its period is zk_toon's policy::subsidy_period of the fixture vault's creation slot, and its tag binds `proof_binds`, as in `allowance_request`",
+      "note": "the proof is a subsidised request proof o1js made (zk_toon#65, `ZK_TOON_COMMIT`), verbatim; its period is zk_toon's policy::subsidy_period of the fixture vault's creation slot, and its tag binds `proof_binds`, as in `allowance_request`",
       "path": "/ilp/zk-note/allowances",
       "proof_binds": {
         "edge": "B62qoiTqnwoKYnxW98J7xggHwPoaTzqhLoeNYe5wM1owBAyhMqQ3ydi",

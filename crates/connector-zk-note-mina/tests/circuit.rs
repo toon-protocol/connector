@@ -98,6 +98,42 @@ async fn with_the_proxy_down_nothing_reaches_either_endpoint_directly() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn with_only_the_archives_proxy_down_the_archives_own_read_is_refused() {
+    let (daemon, archive) = (StandIn::daemon().await, StandIn::archive().await);
+    // The daemon's proxy is up, so the daemon read succeeds and the archive's
+    // own read is the one that has to fail. Were it to go direct, the plain
+    // loopback URL would reach the archive.
+    let up = Socks5TestServer::spawn(HashMap::from([(
+        format!("{DAEMON_HOST}:80"),
+        daemon.addr(),
+    )]))
+    .await;
+    let down = {
+        let proxy = Socks5TestServer::spawn_recording_only().await;
+        let url = proxy.proxy_url();
+        drop(proxy);
+        url
+    };
+    let vault = MinaZkNoteVault::new(
+        support::VAULT.to_string(),
+        through(&format!("http://{DAEMON_HOST}/"), &up.proxy_url()),
+        through(&archive.url(), &down),
+        support::verifier().await,
+    );
+    assert!(vault.nullifier_used(consumed()).await.is_err());
+    assert_eq!(
+        daemon.calls(),
+        ["VaultState"],
+        "the daemon read went through"
+    );
+    assert_eq!(
+        archive.calls(),
+        Vec::<String>::new(),
+        "nothing reached the archive"
+    );
+}
+
 #[test]
 fn the_circuit_has_a_username_of_its_own() {
     assert_eq!(Circuit::ZkNoteMina.socks_username(), "toon-zk-note-mina");

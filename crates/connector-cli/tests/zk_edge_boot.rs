@@ -137,14 +137,12 @@ open_budget_cap = 1000000000
     Fixture { config, _dir: dir }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// A current-thread runtime, so no leftover connection task can end between the
+// two counts and cancel out the sweep's +1.
+#[tokio::test(flavor = "current_thread")]
 async fn a_zk_edge_boots_reads_its_vault_publishes_its_terms_and_runs_the_sweep() {
     let (daemon, archive) = (daemon().await, StandIn::spawn(|_| None).await);
     let fixture = fixture(&daemon.url(), &archive.url(), &request_key_hash());
-    let alive_before = tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks();
-
     let runtime = build(&fixture.config)
         .await
         .expect("a zk edge boots against a readable vault");
@@ -155,9 +153,13 @@ async fn a_zk_edge_boots_reads_its_vault_publishes_its_terms_and_runs_the_sweep(
     );
     assert!(runtime.zk_edge.is_some());
 
-    let app = router(&runtime, &fixture.config).expect("the node's router");
     // The allowance sweep is a task for the life of the node, and a node with
-    // no zk edge starts none.
+    // no zk edge starts none. Counted across `router()` alone: the tasks
+    // boot's own reads leave alive are not the sweep.
+    let alive_before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
+    let app = router(&runtime, &fixture.config).expect("the node's router");
     let alive_after = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
