@@ -15,10 +15,9 @@ use connector_domain::client_claim::{AllowanceId, SCHEME_ZK_NOTE};
 use connector_domain::x402::{terms_body, GreetingTerms, X402ZkNoteTerms, ZkNoteSubsidy};
 use connector_domain::{NodeFacts, Price};
 use connector_signer::ZkStateSigner;
-use connector_zk_note::note::balance::commit;
 use connector_zk_note::note::field_to_string;
 use connector_zk_note::note::policy::TIERS;
-use connector_zk_note::request::{expected_tag, json_proof_for, point, RequestPublic};
+use connector_zk_note::request::RequestProof;
 use connector_zk_note::session::{
     allowance_claim_fields, allowance_close_fields, sign_allowance_claim, sign_allowance_close,
     signature_to_hex,
@@ -27,6 +26,12 @@ use connector_zk_note::successor::successor_state;
 use connector_zk_note::{scalar_to_string, Field, Keypair, Scalar, SecKey, Signature};
 use serde::Serialize;
 use serde_json::{json, Value};
+
+/// zk_toon's request-proof fixtures (zk_toon#65), pinned by hash in
+/// `connector-zk-note-mina`'s tests. They are byte-identical at
+/// [`ZK_TOON_COMMIT`] (`ad4ee440`), the rev `connector-zk-note` pins.
+const REQUEST_PROOFS: &str =
+    include_str!("../../connector-zk-note-mina/fixtures/request-proofs.json");
 
 /// The zk_toon commit every value in this section was generated at: the
 /// `rev` `crates/connector-zk-note/Cargo.toml` pins.
@@ -55,6 +60,25 @@ pub struct ZkNoteVectors {
     pub greeting_subsidy: Value,
 }
 
+/// The session key's x in zk_toon's request-fixture sample context
+/// (`defaultSample().ctx.sessionKeyX`, parity odd): the key the fixture
+/// proofs' tags bind, whose secret the sample never had.
+pub const SAMPLE_SESSION_KEY_X: u64 = 31_337;
+
+/// What a fixture proof's tag binds: the context zk_toon's fixture
+/// generator proved it in. `edge` is the recorded vault's state key (the
+/// proof's `vault`), and the expiry is the slot after the request's.
+fn proof_binds(proof: &RequestProof) -> Value {
+    let public = proof.public();
+    json!({
+        "edge": proof.vault().into_address(),
+        "sessionKeyX": SAMPLE_SESSION_KEY_X.to_string(),
+        "sessionKeyIsOdd": true,
+        "tier": public.tier.to_string(),
+        "expiry": (public.request_time + 1).to_string(),
+    })
+}
+
 fn keypair(secret: u64) -> Keypair {
     Keypair::try_from(SecKey::new(Scalar::from(secret))).expect("a fixture keypair")
 }
@@ -74,11 +98,7 @@ fn fields_json(fields: &[Field]) -> Vec<String> {
 pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     const SESSION_SECRET: u64 = 0x5e55_1011;
     const STATE_SECRET: u64 = 0x57a7_e001;
-    // `requestTime` is a zk_toon slot; `expiresAt` stays wall-clock milliseconds.
-    const REQUEST_TIME_SLOT: u64 = 907_680;
     const EXPIRES_AT_MS: u64 = 1_793_188_800_000 + 1_800_000;
-    const BALANCE: u64 = 5_000_000_000;
-    const BLINDING: u64 = 0x0123_4567_89ab_cdef;
     const CHARGE: u64 = 250_000;
 
     let session = keypair(SESSION_SECRET);
@@ -87,31 +107,27 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     let session_key = session.public.into_compressed();
     let state_key = state.public_key();
     let tier = TIERS[1];
-    let nullifier = Field::from(0x6e75_6c6c_6966_6965u64);
-    let commitment = commit(Scalar::from(BALANCE), Scalar::from(BLINDING));
     let allowance_id = AllowanceId::from_bytes([
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
         0x1f,
     ]);
 
-    // The request: a JsonProof whose public input is zk_toon's request
-    // proof's, bound by its tag to this edge, session key, tier and expiry.
-    // Its `proof` is a placeholder: the o1js proof fixture is #1514's.
-    let public = RequestPublic {
-        vault_x: state_key.x,
-        vault_is_odd: state_key.is_odd,
-        root: Field::from(0x726f_6f74u64),
-        request_time: REQUEST_TIME_SLOT,
-        tier,
-        nullifier,
-        tag: expected_tag(nullifier, &state_key, &session_key, tier, EXPIRES_AT_MS),
-        commitment: point(commitment),
-        subsidised: false,
-        period: 0,
-        period_nullifier: Field::from(0u64),
-    };
-    let proof: Value = serde_json::from_slice(&json_proof_for(&public, "placeholder"))
-        .expect("a JsonProof is JSON");
+    // The request: a request proof o1js made (zk_toon#65), verbatim -- its
+    // `proof` is the Pickles proof a verifier checks under the request key
+    // (`verification_key_hash`), and `connector-zk-note-mina`'s contract suite
+    // verifies it in Rust. Its public input is the fixture's own: the tag it
+    // carries binds the key and expiry zk_toon's sample chose, not this
+    // file's `keys`, so a zk edge would refuse this exact body as
+    // `tag_does_not_bind`. What is pinned is the wire.
+    let fixtures: Value =
+        serde_json::from_str(REQUEST_PROOFS).expect("zk_toon's request-proof fixtures");
+    let proof = fixtures["unsubsidised"]["proof"].clone();
+    let request = RequestProof::parse(&serde_json::to_vec(&proof).expect("json"))
+        .expect("zk_toon's unsubsidised proof is a request proof");
+    // The note the request spends, and the balance commitment the zk edge
+    // carries into its successor, are the proof's own.
+    let nullifier = request.public().nullifier;
+    let commitment = request.commitment();
     let allowance_request = json!({
         "method": "POST",
         "path": ZK_NOTE_ALLOWANCES_PATH,
@@ -124,7 +140,13 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
             "vault.x", "vault.isOdd", "root", "requestTime", "tier", "nullifier", "tag",
             "commitment.x", "commitment.y", "subsidised", "period", "periodNullifier"
         ],
-        "note": "the proof string is a placeholder; a request proof o1js made is #1514's fixture",
+        "verification_key_hash": fixtures["verificationKey"]["hash"],
+        "proof_binds": proof_binds(&request),
+        "note": "the proof is a request proof o1js made (zk_toon#65, `ZK_TOON_COMMIT`), \
+                 verbatim. Its tag binds `proof_binds` -- zk_toon's sample context -- and not \
+                 `keys` or this body's sessionKey and expiresAt, whose secrets o1js's sample \
+                 never had, so this body shows the wire, not an allowance this file's keys \
+                 could open",
     });
     let allowance_answer = json!({
         "status": 200,
@@ -188,30 +210,18 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
     });
 
     // A subsidised allowance (decision 14): the smallest tier, the period the
-    // edge is in, and a per-period nullifier. The proof states all three
+    // proof is for, and a per-period nullifier. The proof states all three
     // publicly. Its successor charges the note nothing: the commitment
     // carries over unchanged and only the anchor moves.
-    const SUBSIDY_PERIOD: u64 = 11;
-    let subsidised_tier = TIERS[0];
-    let subsidised_nullifier = Field::from(0x0073_7562_7369_6479_u64);
-    let subsidised_public = RequestPublic {
-        tier: subsidised_tier,
-        nullifier: subsidised_nullifier,
-        tag: expected_tag(
-            subsidised_nullifier,
-            &state_key,
-            &session_key,
-            subsidised_tier,
-            EXPIRES_AT_MS,
-        ),
-        subsidised: true,
-        period: SUBSIDY_PERIOD,
-        period_nullifier: Field::from(0x7065_7269_6f64u64),
-        ..public
-    };
-    let subsidised_proof: Value =
-        serde_json::from_slice(&json_proof_for(&subsidised_public, "placeholder"))
-            .expect("a JsonProof is JSON");
+    let subsidised_proof = fixtures["subsidised"]["proof"].clone();
+    let subsidised_request =
+        RequestProof::parse(&serde_json::to_vec(&subsidised_proof).expect("json"))
+            .expect("zk_toon's subsidised proof is a request proof");
+    let subsidised_public = subsidised_request.public();
+    assert!(subsidised_public.subsidised);
+    let subsidy_period = subsidised_public.period;
+    let subsidised_nullifier = subsidised_public.nullifier;
+    let subsidised_commitment = subsidised_request.commitment();
     let subsidised_allowance_request = json!({
         "method": "POST",
         "path": ZK_NOTE_ALLOWANCES_PATH,
@@ -220,19 +230,25 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
             "sessionKey": session_key.into_address(),
             "expiresAt": EXPIRES_AT_MS.to_string(),
         },
-        "subsidy_period": SUBSIDY_PERIOD.to_string(),
+        "subsidy_period": subsidy_period.to_string(),
         "refusals": {
             "tier_above_the_smallest": "subsidy_tier_not_smallest",
             "period_not_the_current_one": "subsidy_period_not_current",
             "budget_closed": "subsidy_budget_closed",
             "per_period_nullifier_seen": "subsidy_nullifier_spent",
         },
-        "note": "the proof string is a placeholder; the period is zk_toon's policy::subsidy_period",
+        "verification_key_hash": fixtures["verificationKey"]["hash"],
+        "proof_binds": proof_binds(&subsidised_request),
+        "note": "the proof is a subsidised request proof o1js made (zk_toon#65, \
+                 `ZK_TOON_COMMIT`), verbatim; its period is zk_toon's \
+                 policy::subsidy_period of the fixture vault's creation slot, and its tag \
+                 binds `proof_binds`, as in `allowance_request`",
     });
-    let subsidised_next = successor_state(&state_key, commitment, subsidised_nullifier, 0)
-        .expect("a signable successor");
+    let subsidised_next =
+        successor_state(&state_key, subsidised_commitment, subsidised_nullifier, 0)
+            .expect("a signable successor");
     assert_eq!(
-        subsidised_next.commitment, commitment,
+        subsidised_next.commitment, subsidised_commitment,
         "a zero charge leaves the balance commitment as it was"
     );
     let subsidised_signed = SignedSuccessor {
@@ -247,8 +263,8 @@ pub fn generate_zk_note_vectors() -> ZkNoteVectors {
         "path": format!("{ZK_NOTE_ALLOWANCES_PATH}/{allowance_id}/successor"),
         "nullifier": field_to_string(subsidised_nullifier),
         "commitment_before": {
-            "x": field_to_string(commitment.x),
-            "y": field_to_string(commitment.y),
+            "x": field_to_string(subsidised_commitment.x),
+            "y": field_to_string(subsidised_commitment.y),
         },
         "charge": "0",
         "signed_fields": fields_json(&subsidised_next.message.to_fields()),

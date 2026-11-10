@@ -240,6 +240,13 @@ use serde::Serialize;
 /// `zk_toon_commit` they were generated at; `toon-client`'s wallet must send
 /// a slot. The `zk_note` section's tags, signatures and successors do not
 /// move: none of them states a `requestTime`.
+///
+/// The placeholder proof in `allowance_request` and
+/// `subsidised_allowance_request` was replaced by the real request proofs o1js
+/// made (zk_toon#65, issue #1514) **without a further bump, on purpose**: no
+/// field, name or frame changes, only the content of a string the vectors had
+/// always said was a placeholder. The two entries gain a
+/// `verification_key_hash`, a field an SDK that does not read it ignores.
 pub const SCHEMA_VERSION: u32 = 13;
 
 pub mod xrpl;

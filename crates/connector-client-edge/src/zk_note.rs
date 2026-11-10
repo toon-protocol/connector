@@ -13,8 +13,9 @@
 //! nullifiers spent on chain, which proofs verify -- and asserts no call
 //! sequence. It counts each operation, so a test can show that a refusal the
 //! gate should make for free really asked the vault nothing. The Mina
-//! adapter (#1514) runs [`contract::assert_upholds_the_contract`] against
-//! committed fixtures o1js produced.
+//! adapter (`connector-zk-note-mina`, #1514) runs
+//! [`contract::assert_upholds_the_contract`] against committed fixtures o1js
+//! produced.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -311,7 +312,7 @@ impl ZkNoteVault for InMemoryZkNoteVault {
 }
 
 /// The contract every [`ZkNoteVault`] upholds, run against the fake here and
-/// against the Mina adapter in #1514 (ADR 0007: a fake that upholds a
+/// against the Mina adapter, `connector-zk-note-mina` (ADR 0007: a fake that upholds a
 /// port's contract suite is a legitimate test subject).
 #[cfg(any(test, feature = "test-util"))]
 pub mod contract {

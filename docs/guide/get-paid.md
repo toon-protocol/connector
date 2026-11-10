@@ -417,3 +417,49 @@ and §1.11 are the wire rules, and
 [`configuration-spec.md`](../protocol/configuration-spec.md) is the keys. The
 voucher's exact bytes are `claim_voucher` in
 [`vectors/wire-vectors.json`](../../vectors/wire-vectors.json).
+
+## A zk note (Mina)
+
+A node can also be paid from a **zk note** ([ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)):
+a deposit in a Mina vault that its owner spends through a signed **allowance** rather than a
+channel. That makes the node a **zk edge**. It is opt-in, and a node without the table is exactly what
+it was. Nothing in this repository proves or sends a Mina transaction: the node only _reads_ the
+vault, and verifies proofs payers made elsewhere.
+
+```toml
+[zk_note]
+vault                   = "B62q…"                       # the vault's zkApp address
+network                 = "mina:devnet"                 # or "mina:mainnet"
+graphql_url             = "https://…/graphql"           # a Mina daemon: the vault's account
+archive_url             = "https://…/graphql"           # an archive node: the vault's actions
+# rpc_via_socks_proxy   = true                          # both reads ride socks_proxy, https only
+state_key_file          = "/app/data/zk-state.key"      # a Mina secret key, EK…
+verification_key_hash   = "17783576495452972973648719307576910001175195573379209737447262132918659765208"
+tiers                   = [100000000]                   # nanomina; a subset of zk_toon's tiers
+allowance_lifetime_secs = 3600
+open_budget_cap         = 1000000000
+```
+
+- **Two endpoints, because the vault keeps only the root of its nullifier set.** The daemon
+  answers the vault's account (its recent roots, its creation slot, its latest action state); whether a note's
+  state is already spent is answered from the vault's actions, which only an archive node lists.
+  Both ride the same circuit under `rpc_via_socks_proxy`, and an `http` URL is refused on it unless its
+  host is an onion one.
+- **The request key is part of the binary.** `verification_key_hash` must be the hash of the key this
+  build carries (the one above is the build's today); any other value stops the node at boot, naming the
+  key. The key is not on chain, and a build serves one Mina era.
+- **Boot reads, and then serves.** The node builds its verifier (a second or two of CPU), reads the
+  slot it counts time from and, if `subsidy_budget` is set, the vault's creation slot. Each gets a few attempts;
+  a node that cannot make them does not boot. It needs `state_dir`.
+- **A failed read refuses one allowance.** A slow, down or wrong endpoint answers that request
+  `vault_unavailable`, and the next is served. An archive that is behind the daemon, or that lists
+  actions that do not hash to the vault's own action state, is a failed read, never "unused".
+- **Until clearances exist, payers can leave only by escape.** A payer's quick exit, a mutual close,
+  needs the zk edge's signature letting one state leave to one destination (a **clearance**), and
+  this build does not issue them ([#1556](https://github.com/toon-protocol/connector/issues/1556)).
+  Until it does, a payer takes their balance out by **escape**: they start it on chain, the vault holds
+  it for zk_toon's two-day challenge window so a later state can defeat it, and it pays after. A node
+  that offers allowances today is offering a note that costs its owner that wait to leave.
+
+The terms are in [`configuration-spec.md`](../protocol/configuration-spec.md) and the wire in
+[`client-edge-spec.md`](../protocol/client-edge-spec.md) §1.12.

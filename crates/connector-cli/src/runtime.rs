@@ -13,8 +13,9 @@ use std::sync::Arc;
 use axum::Router;
 
 use connector_chain_rpc::{Circuit, RpcTransport};
+use connector_client_edge::zk_note::{SlotClock, ZkNoteVault};
 use connector_client_edge::{
-    ClientClaimGate, ClientPayoutLedger, PeerCarriages, UnresolvableLookupBudgetPolicy,
+    ClientClaimGate, ClientPayoutLedger, PeerCarriages, Subsidy, UnresolvableLookupBudgetPolicy,
 };
 use connector_config::{
     Config, EvmSettlementConfig, PeerCarriage, SecretLocation, SettlementChain, SettlementConfig,
@@ -95,11 +96,20 @@ pub enum RuntimeError {
     /// skipped: a skipped entry is a claim somebody could still redeem that
     /// this node has forgotten it accepted.
     ToonChannelJournal { path: PathBuf, channel: String },
-    /// `[zk_note]` is set, and this build has no Mina vault adapter to read
-    /// the vault or verify a request proof with (ADR 0080; the adapter is
-    /// #1514). Refused by name rather than served: a zk edge that cannot
-    /// verify a proof can grant no allowance.
-    ZkNoteVaultNotBuilt,
+    /// `[zk_note] verification_key_hash` is not the request key this build
+    /// carries (ADR 0080 decision 15), or the carried key is unusable.
+    ZkNoteKey(connector_zk_note_mina::KeyRefusal),
+    /// One of `[zk_note]`'s endpoints could not become a transport.
+    ZkNoteEndpointUnusable { key: &'static str, message: String },
+    /// A read the zk edge makes once at boot, and cannot serve without,
+    /// failed on every one of its bounded attempts (ADR 0080 decisions 14
+    /// and 15): the vault's creation slot.
+    ZkNoteBootRead { what: &'static str, message: String },
+    /// The zk edge has no slot clock (ADR 0080 decision 16).
+    ZkNoteSlotAnchor(connector_client_edge::zk_note::SlotAnchorRefusal),
+    /// `zk-note-evidence.bin` could not be opened, or lacks a record the
+    /// journal says was granted.
+    ZkNoteEvidence { path: PathBuf, reason: String },
     /// `[zk_note] state_key_file` could not be read, or does not hold a
     /// Mina secret key in base58 (ADR 0080, #1523).
     ZkNoteStateKey { path: PathBuf, reason: String },
@@ -311,11 +321,21 @@ impl fmt::Display for RuntimeError {
                  0075 decision 1), so a chain without it cannot be settled on -- point rpc_url at \
                  a chain x402 is deployed to, or remove the table"
             ),
-            RuntimeError::ZkNoteVaultNotBuilt => write!(
+            RuntimeError::ZkNoteKey(refusal) => write!(f, "{refusal}"),
+            RuntimeError::ZkNoteEndpointUnusable { key, message } => write!(
                 f,
-                "[zk_note] is set, but this build has no Mina vault adapter to read the vault \
-                 and verify request proofs with (ADR 0080; connector#1514), so it cannot be a \
-                 zk edge yet -- remove the [zk_note] table to run this build"
+                "[zk_note] {key} could not be set up: {message}"
+            ),
+            RuntimeError::ZkNoteBootRead { what, message } => write!(
+                f,
+                "[zk_note]: the vault's {what} could not be read, and a zk edge cannot serve \
+                 without it: {message}"
+            ),
+            RuntimeError::ZkNoteSlotAnchor(refusal) => write!(f, "[zk_note]: {refusal}"),
+            RuntimeError::ZkNoteEvidence { path, reason } => write!(
+                f,
+                "the zk-note evidence file {} is unusable: {reason}",
+                path.display()
             ),
             RuntimeError::ZkNoteStateKey { path, reason } => write!(
                 f,
@@ -1082,7 +1102,32 @@ pub struct Runtime {
     /// names one. `run` moves it into the `RunningNode` it hands back, because
     /// the runtime is dropped before the process stops serving.
     pub state_dir_lock: Option<std::fs::File>,
+    /// What a zk edge reads once at boot (ADR 0080 decisions 14--16), `Some`
+    /// exactly when `[zk_note]` is written. [`router`] hands it to the claim
+    /// gate and starts the allowance sweep.
+    pub zk_edge: Option<ZkEdgeBoot>,
 }
+
+/// A zk edge's vault and the facts read from it at boot (ADR 0080 decision
+/// 15): the one [`ZkNoteVault`] the gate verifies and checks through, the
+/// subsidy terms and the slot clock.
+pub struct ZkEdgeBoot {
+    pub vault: Arc<dyn ZkNoteVault>,
+    pub subsidy: Option<Subsidy>,
+    pub slots: SlotClock,
+}
+
+/// How often the zk edge closes the allowances that have expired
+/// (`ClientClaimGate::run_allowance_sweep`, ADR 0080 decision 4). An
+/// allowance lives for hours, so a minute is prompt.
+pub const ALLOWANCE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The attempts a boot read of the vault gets (ADR 0073 decision 5 sets
+/// three retries for a read nothing yet depends on): `1 + READ_RETRIES`.
+const ZK_NOTE_BOOT_ATTEMPTS: u32 = 1 + connector_chain_rpc::READ_RETRIES;
+
+/// The wait between those attempts.
+const ZK_NOTE_BOOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
 /// describes. Every `peer_id`-targeted `[[routes]]` entry becomes a
@@ -1485,6 +1530,12 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         }
     }
     let connector = Arc::new(connector);
+    // ADR 0080 decision 15: a zk edge's vault is read, and its key checked,
+    // before the node serves anything.
+    let zk_edge = match config.zk_note() {
+        Some(zk_note) => Some(build_zk_edge(config, zk_note).await?),
+        None => None,
+    };
     Ok(Runtime {
         connector,
         signer,
@@ -1496,6 +1547,92 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         batch_settlement_xrpl,
         outbound_channels,
         state_dir_lock,
+        zk_edge,
+    })
+}
+
+/// A zk edge's vault adapter and the reads boot makes of it (ADR 0080
+/// decisions 14, 15 and 16).
+///
+/// The key comes first, before anything is dialled: a `[zk_note]` table whose
+/// `verification_key_hash` is not the request key this build carries is
+/// refused by name. The verifier index is then built once (a second of CPU,
+/// off the async workers), each endpoint becomes one [`RpcTransport`] the way
+/// [`settlement_transports`] builds a settlement table's -- on the
+/// `toon-zk-note-mina` circuit when the table opts in, direct otherwise, never
+/// a fallback -- and the two boot reads (the slot anchor, and the creation
+/// slot of a node that subsidises) get a bounded number of attempts. A zk edge
+/// that cannot make them does not boot.
+async fn build_zk_edge(
+    config: &Config,
+    zk_note: &connector_config::ZkNoteConfig,
+) -> Result<ZkEdgeBoot, RuntimeError> {
+    let verifier = connector_zk_note_mina::request_verifier(zk_note.verification_key_hash())
+        .await
+        .map_err(RuntimeError::ZkNoteKey)?;
+    let transport = |key: &'static str, url: &url::Url| -> Result<RpcTransport, RuntimeError> {
+        let unusable = |message: String| RuntimeError::ZkNoteEndpointUnusable { key, message };
+        if zk_note.rpc_via_socks_proxy() {
+            // `Config::load` refuses this without a `socks_proxy`, so a miss
+            // is reported, and is never a reason to dial direct (ADR 0073).
+            let proxy = config.socks_proxy().ok_or_else(|| {
+                unusable("rpc_via_socks_proxy is set and there is no socks_proxy".to_string())
+            })?;
+            let transport = RpcTransport::through(url.as_str(), proxy, Circuit::ZkNoteMina)
+                .map_err(|error| unusable(error.to_string()))?;
+            tracing::info!(
+                key,
+                endpoint = %transport.endpoint(),
+                circuit = Circuit::ZkNoteMina.socks_username(),
+                "zk-note vault read via socks_proxy"
+            );
+            Ok(transport)
+        } else {
+            RpcTransport::direct(url.as_str()).map_err(|error| unusable(error.to_string()))
+        }
+    };
+    let daemon = connector_chain_rpc::graphql::GraphqlRpc::new(transport(
+        "graphql_url",
+        zk_note.graphql_url(),
+    )?);
+    let archive = connector_chain_rpc::graphql::GraphqlRpc::new(transport(
+        "archive_url",
+        zk_note.archive_url(),
+    )?);
+    let vault = Arc::new(connector_zk_note_mina::MinaZkNoteVault::new(
+        zk_note.vault().to_string(),
+        daemon,
+        archive,
+        verifier,
+    ));
+    let slots = SlotClock::read(
+        vault.as_ref(),
+        &SystemClock,
+        ZK_NOTE_BOOT_ATTEMPTS,
+        ZK_NOTE_BOOT_RETRY_DELAY,
+    )
+    .await
+    .map_err(RuntimeError::ZkNoteSlotAnchor)?;
+    let mut attempt = 1;
+    let subsidy = loop {
+        match Subsidy::read(vault.as_ref(), zk_note.subsidy_budget()).await {
+            Ok(subsidy) => break subsidy,
+            Err(error) if attempt >= ZK_NOTE_BOOT_ATTEMPTS => {
+                return Err(RuntimeError::ZkNoteBootRead {
+                    what: "creation slot",
+                    message: error.to_string(),
+                })
+            }
+            Err(_) => {
+                attempt += 1;
+                tokio::time::sleep(ZK_NOTE_BOOT_RETRY_DELAY).await;
+            }
+        }
+    };
+    Ok(ZkEdgeBoot {
+        vault,
+        subsidy,
+        slots,
     })
 }
 
@@ -2054,6 +2191,7 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
 fn client_claim_gate(
     config: &Config,
     outbound: Option<Arc<OutboundChannels>>,
+    zk_edge: Option<&ZkEdgeBoot>,
 ) -> Result<ClientClaimGate, RuntimeError> {
     let (journal, path) = match config.state_dir() {
         Some(state_dir) => (
@@ -2070,18 +2208,6 @@ fn client_claim_gate(
     // sender, and what a node can afford to spend discovering channels that
     // turn out not to exist depends on the settlement endpoint it pays for.
     let budget = UnresolvableLookupBudgetPolicy::default();
-    // The gate's zk edge (`ClientClaimGate::with_zk_edge`) needs a
-    // `ZkNoteVault`, and the only one is the in-memory fake. #1514's Mina
-    // adapter is what this refusal becomes the construction of -- with
-    // `ClientClaimGate::run_allowance_sweep` spawned beside it (#1523): the
-    // boot sweep already runs inside `with_zk_edge`. The adapter also reads
-    // `Subsidy::read(vault, zk_note.subsidy_budget())` there, once, through the
-    // table's `RpcTransport`, and a failed read fails the boot (decision 14).
-    // It reads the slot anchor beside it, `SlotClock::read`, once, and a failed
-    // read fails the boot with no fallback to the clock alone (decision 16).
-    if config.zk_note().is_some() {
-        return Err(RuntimeError::ZkNoteVaultNotBuilt);
-    }
     let gate = ClientClaimGate::restore(journal)
         .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?
         .with_lookup_budget(UnresolvableLookupBudgetPolicy {
@@ -2094,10 +2220,52 @@ fn client_claim_gate(
                 .unresolvable_lookup_max_wait()
                 .unwrap_or(budget.max_wait),
         });
-    Ok(match outbound {
+    let gate = match outbound {
         Some(outbound) => gate.with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound))),
         None => gate,
-    })
+    };
+    // ADR 0080: the zk edge. `with_zk_edge` checks the evidence file against
+    // the journal and runs the boot sweep, so an allowance that expired while
+    // the node was down is closed before anything is served.
+    match (config.zk_note(), config.state_dir(), zk_edge) {
+        (Some(zk_note), Some(state_dir), Some(boot)) => {
+            let path = state_dir.join(connector_client_edge::EVIDENCE_FILE);
+            let evidence = connector_client_edge::EvidenceFile::open(&path).map_err(|error| {
+                RuntimeError::ZkNoteEvidence {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+            gate.with_zk_edge(connector_client_edge::ZkEdge {
+                vault: Arc::clone(&boot.vault),
+                evidence,
+                state_signer: read_zk_note_state_key(zk_note.state_key())?,
+                tiers: zk_note.tiers().clone(),
+                allowance_lifetime: zk_note.allowance_lifetime(),
+                open_budget_cap: zk_note.open_budget_cap(),
+                subsidy: boot.subsidy,
+                slots: boot.slots,
+                clock: Arc::new(SystemClock),
+            })
+            .map_err(|error| RuntimeError::ZkNoteEvidence {
+                path,
+                reason: error.to_string(),
+            })
+        }
+        (None, _, _) => Ok(gate),
+        // `Config::load` requires `state_dir` beside `[zk_note]` and boot builds
+        // the zk edge exactly when `[zk_note]` is written, so neither arm below
+        // is reachable. Were one reached, serving without the edge would be a
+        // zk node that silently accepts nothing it can check: fail closed.
+        (Some(_), None, _) => Err(RuntimeError::ZkNoteEvidence {
+            path: PathBuf::new(),
+            reason: "[zk_note] needs a state_dir for its evidence file".to_string(),
+        }),
+        (Some(_), Some(state_dir), None) => Err(RuntimeError::ZkNoteEvidence {
+            path: state_dir.join(connector_client_edge::EVIDENCE_FILE),
+            reason: "[zk_note] is written but boot built no zk edge".to_string(),
+        }),
+    }
 }
 
 /// This node's own facts (ADR 0050), assembled once at router construction:
@@ -2232,7 +2400,11 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // a receiver public key, a sender can wrap to no other one. No new
     // config section exists or is needed for this.
     let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
-    let mut claim_gate = client_claim_gate(config, runtime.outbound_channels.clone())?;
+    let mut claim_gate = client_claim_gate(
+        config,
+        runtime.outbound_channels.clone(),
+        runtime.zk_edge.as_ref(),
+    )?;
     // Vouchers are accepted on exactly the chains whose `batch_settlement`
     // table is written, and refused by name on the rest.
     if let Some(channels) = batch_settlement_channels(runtime) {
@@ -2250,6 +2422,11 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
             .collect(),
     }));
     spawn_batch_settlement_watchers(runtime, &claim_gate);
+    // ADR 0080 decision 4: a zk edge closes the allowances that expire, for
+    // as long as it runs.
+    if runtime.zk_edge.is_some() {
+        tokio::spawn(Arc::clone(&claim_gate).run_allowance_sweep(ALLOWANCE_SWEEP_INTERVAL));
+    }
     let app = connector_client_edge::router_with_node_facts(
         connector.clone(),
         signer.clone(),
@@ -2979,7 +3156,7 @@ key_file = "{}"
         });
 
         let backend = Arc::new(EmptyCountingBackend::default());
-        let gate = client_claim_gate(&config, None)
+        let gate = client_claim_gate(&config, None, None)
             .expect("a fresh in-memory journal has nothing to replay")
             .with_batch_settlement(backend.clone());
 
@@ -3118,7 +3295,7 @@ key_file = "{key_path}"
             )
         });
 
-        client_claim_gate(&config, None).expect("a writable state_dir produces a gate");
+        client_claim_gate(&config, None, None).expect("a writable state_dir produces a gate");
         assert!(
             state_dir.path().join(CLIENT_EDGE_JOURNAL).exists(),
             "the journal file is created at startup, not lazily at the first claim"
@@ -3149,7 +3326,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None) else {
+        let Err(error) = client_claim_gate(&config, None, None) else {
             panic!("an unusable state_dir must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::StateDirUnusable { .. }));
@@ -3160,11 +3337,11 @@ key_file = "{key_path}"
         );
     }
 
-    /// ADR 0080: a `[zk_note]` table on a build with no Mina vault adapter
-    /// is refused by name at boot, never served as a zk edge that grants
-    /// nothing.
-    #[test]
-    fn a_zk_note_table_without_a_vault_adapter_refuses_to_build_a_gate() {
+    /// ADR 0080 decision 15: the request key is compiled in, and a table
+    /// naming a different hash refuses boot by name, before anything is
+    /// dialled -- the endpoints below answer nothing.
+    #[tokio::test]
+    async fn a_zk_note_table_naming_another_key_hash_refuses_boot_by_name() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         let state_key = state_dir.path().join("zk-state.key");
         std::fs::write(&state_key, b"not a real key").expect("write");
@@ -3186,7 +3363,8 @@ key_file = "{key_path}"
 [zk_note]
 vault = "{vault}"
 network = "mina:devnet"
-graphql_url = "https://api.minascan.io/node/devnet/v1/graphql"
+graphql_url = "http://127.0.0.1:1/graphql"
+archive_url = "http://127.0.0.1:1/archive"
 state_key_file = "{state_key}"
 verification_key_hash = "1"
 tiers = [100000000]
@@ -3198,11 +3376,14 @@ open_budget_cap = 1000000000
                 state_key = state_key.display(),
             )
         });
-        let Err(error) = client_claim_gate(&config, None) else {
-            panic!("a zk-note table must not produce a gate this build cannot back");
+        let Err(error) = build(&config).await else {
+            panic!("a key hash this build does not carry must not boot");
         };
-        assert!(matches!(error, RuntimeError::ZkNoteVaultNotBuilt));
-        assert!(error.to_string().contains("[zk_note]"), "{error}");
+        assert!(matches!(error, RuntimeError::ZkNoteKey(_)), "{error}");
+        assert!(
+            error.to_string().contains("verification_key_hash"),
+            "{error}"
+        );
     }
 
     /// ADR 0080 (#1523): the greeting's and self-description's zk-note
@@ -3234,6 +3415,7 @@ key_file = "{key_path}"
 vault = "{address}"
 network = "mina:devnet"
 graphql_url = "https://api.minascan.io/node/devnet/v1/graphql"
+archive_url = "https://api.minascan.io/archive/devnet/v1/graphql"
 state_key_file = "{state_key}"
 verification_key_hash = "1"
 tiers = [100000000, 10000000]
@@ -3299,7 +3481,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None) else {
+        let Err(error) = client_claim_gate(&config, None, None) else {
             panic!("a corrupt journal must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));

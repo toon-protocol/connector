@@ -593,10 +593,14 @@ what a refresh changes is an observation.
 **`[zk_note]` makes a node a zk edge** ([ADR 0080](../adr/0080-a-client-may-pay-from-a-zk-note.md)),
 and its absence leaves `scheme: "zk-note"` an unknown scheme, refused exactly as before. It names
 `vault` (the vault's `B62…` zkApp address), `network` (`"mina:mainnet"` or `"mina:devnet"`),
-`graphql_url` and `rpc_via_socks_proxy` (held to ADR 0073's two rules, as a settlement table is),
+`graphql_url` (a Mina daemon, which answers the vault's account), `archive_url` (required: an archive
+node, which lists the vault's actions, because the vault keeps only the root of its nullifier set — ADR 0080
+decision 15) and `rpc_via_socks_proxy` (both endpoints are held to ADR 0073's two rules, as a settlement table is, and
+ride the one `toon-zk-note-mina` circuit),
 `state_key_file` (the key successor states are signed with, by path, never inline: a Mina secret key in
 base58, `EK…`, as Mina's tooling exports it),
-`verification_key_hash` (a decimal field element), `tiers` (nanomina, a subset of zk_toon's
+`verification_key_hash` (a decimal field element, and the hash of the request key the binary carries: any other
+value refuses boot by name, ADR 0080 decision 15), `tiers` (nanomina, a subset of zk_toon's
 `policy::TIERS` — any other is refused naming it), `allowance_lifetime_secs` (above zero and at most a
 quarter of zk_toon's two-day challenge window) and `open_budget_cap` (nanomina, at least the smallest
 tier) and, optionally, `subsidy_budget` (MINA base units per subsidy period, default 0: no subsidised
@@ -608,9 +612,11 @@ pays its next hops in a settlement asset, so it needs a `[[rates]]` row from tha
 settlement table's token, and is refused naming the missing pair without one; a packet paid
 by an allowance claim is denominated in it, so a forward out of it converts at that rate
 (ADR 0071). It requires `state_dir`, where its spent nullifiers are
-journaled and its evidence file, `zk-note-evidence.bin`, is kept. This build parses and validates the
-table but refuses to boot with it: the Mina vault adapter that reads the vault and verifies proofs is
-connector#1514.
+journaled and its evidence file, `zk-note-evidence.bin`, is kept. Boot builds the request-proof
+verifier and reads the slot anchor (and, with a non-zero `subsidy_budget`, the creation slot), each
+with a bounded number of attempts; a node that cannot does not boot. A read that fails afterwards
+refuses that one allowance, by name. Until clearances are built (connector#1556), a payer leaves a
+zk edge only by escape.
 
 **`[[client_identities]]`.** Each entry is an `id` a request presents in `ILP-Peer-Id` and the `secret`
 it must present in `Authorization: Bearer <secret>`; an empty or omitted secret makes that identity a

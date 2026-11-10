@@ -1,0 +1,183 @@
+use crate::p2p_messages::v2::{
+    CompositionTypesBranchDataStableV1, PicklesBaseProofsVerifiedStableV1,
+};
+use ark_ff::{BigInteger256, Zero};
+use mina_curves::pasta::{Fp, Fq};
+
+use crate::ledger::proofs::{
+    field::FieldWitness,
+    step::FeatureFlags,
+    to_field_elements::ToFieldElements,
+    util::{four_u64_to_field, two_u64_to_field},
+};
+
+#[derive(Clone, Debug)]
+pub struct Plonk<F: FieldWitness> {
+    pub alpha: [u64; 2],
+    pub beta: [u64; 2],
+    pub gamma: [u64; 2],
+    pub zeta: [u64; 2],
+    pub zeta_to_srs_length: F::Shifting,
+    pub zeta_to_domain_size: F::Shifting,
+    pub perm: F::Shifting,
+    pub lookup: Option<[u64; 2]>,
+    pub feature_flags: FeatureFlags<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeferredValues<F: FieldWitness> {
+    pub plonk: Plonk<F>,
+    pub combined_inner_product: F::Shifting,
+    pub b: F::Shifting,
+    pub xi: [u64; 2],
+    pub bulletproof_challenges: Vec<F>,
+    pub branch_data: CompositionTypesBranchDataStableV1,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProofState {
+    pub deferred_values: DeferredValues<Fp>,
+    pub sponge_digest_before_evaluations: [u64; 4],
+    pub messages_for_next_wrap_proof: [u64; 4],
+}
+
+#[derive(Debug)]
+pub struct PreparedStatement {
+    pub proof_state: ProofState,
+    pub messages_for_next_step_proof: [u64; 4],
+}
+
+impl PreparedStatement {
+    /// Implementation of `tock_unpadded_public_input_of_statement`
+    /// <https://github.com/MinaProtocol/mina/blob/32a91613c388a71f875581ad72276e762242f802/src/lib/pickles/common.ml#L202>
+    pub fn to_public_input(&self, npublic_input: usize) -> anyhow::Result<Vec<Fq>> {
+        let PreparedStatement {
+            proof_state:
+                ProofState {
+                    deferred_values:
+                        DeferredValues {
+                            plonk:
+                                Plonk {
+                                    alpha,
+                                    beta,
+                                    gamma,
+                                    zeta,
+                                    zeta_to_srs_length,
+                                    zeta_to_domain_size,
+                                    perm,
+                                    lookup,
+                                    feature_flags,
+                                },
+                            combined_inner_product,
+                            b,
+                            xi,
+                            bulletproof_challenges,
+                            branch_data:
+                                CompositionTypesBranchDataStableV1 {
+                                    proofs_verified,
+                                    domain_log2,
+                                },
+                        },
+                    sponge_digest_before_evaluations,
+                    messages_for_next_wrap_proof,
+                },
+            messages_for_next_step_proof,
+        } = &self;
+
+        // We sort the fields in the same order as here:
+        // <https://github.com/MinaProtocol/mina/blob/c824be7d80db1d290e0d48cbc920182d07de0330/src/lib/pickles/composition_types/composition_types.ml#L739>
+
+        let mut fields: Vec<Fq> = Vec::with_capacity(npublic_input);
+
+        let to_fq = |fp: Fp| -> Fq {
+            let bigint: BigInteger256 = fp.into();
+            Fq::from(bigint) // Never fail, `Fq` is larger than `Fp`
+        };
+
+        // Fp
+        {
+            fields.push(to_fq(combined_inner_product.shifted));
+            fields.push(to_fq(b.shifted));
+            fields.push(to_fq(zeta_to_srs_length.shifted));
+            fields.push(to_fq(zeta_to_domain_size.shifted));
+            fields.push(to_fq(perm.shifted));
+        }
+
+        // Challenge
+        {
+            fields.push(two_u64_to_field(beta));
+            fields.push(two_u64_to_field(gamma));
+        }
+
+        // Scalar challenge
+        {
+            fields.push(two_u64_to_field(alpha));
+            fields.push(two_u64_to_field(zeta));
+            fields.push(two_u64_to_field(xi));
+        }
+
+        // Digest
+        {
+            fields.push(four_u64_to_field(sponge_digest_before_evaluations)?);
+            fields.push(four_u64_to_field(messages_for_next_wrap_proof)?);
+            fields.push(four_u64_to_field(messages_for_next_step_proof)?);
+        }
+
+        fields.extend(bulletproof_challenges.iter().copied().map(to_fq));
+
+        // Index
+        {
+            // <https://github.com/MinaProtocol/mina/blob/32a91613c388a71f875581ad72276e762242f802/src/lib/pickles_base/proofs_verified.ml#L58>
+            let proofs_verified = match proofs_verified {
+                PicklesBaseProofsVerifiedStableV1::N0 => 0b00,
+                PicklesBaseProofsVerifiedStableV1::N1 => 0b10,
+                PicklesBaseProofsVerifiedStableV1::N2 => 0b11,
+            };
+            // <https://github.com/MinaProtocol/mina/blob/c824be7d80db1d290e0d48cbc920182d07de0330/src/lib/pickles/composition_types/branch_data.ml#L63>
+            let domain_log2: u8 = domain_log2.0.into();
+            let domain_log2: u64 = domain_log2 as u64;
+            let branch_data: u64 = (domain_log2 << 2) | proofs_verified;
+
+            fields.push(Fq::from(branch_data));
+        }
+
+        let lookup_value = lookup.as_ref().map(two_u64_to_field);
+
+        feature_flags.to_field_elements(&mut fields);
+
+        let FeatureFlags {
+            range_check0,
+            range_check1,
+            foreign_field_add: _,
+            foreign_field_mul,
+            xor,
+            rot,
+            lookup,
+            runtime_tables: _,
+        } = feature_flags;
+
+        // <https://github.com/MinaProtocol/mina/blob/dc6bf78b8ddbbca3a1a248971b76af1514bf05aa/src/lib/pickles/composition_types/composition_types.ml#L146>
+        let uses_lookup = [
+            range_check0,
+            range_check1,
+            foreign_field_mul,
+            xor,
+            rot,
+            lookup,
+        ]
+        .iter()
+        .any(|b| **b);
+
+        uses_lookup.to_field_elements(&mut fields);
+
+        if uses_lookup {
+            fields.push(lookup_value.unwrap_or(Fq::zero()));
+        } else {
+            fields.push(Fq::zero());
+        }
+
+        assert_eq!(fields.len(), npublic_input);
+
+        Ok(fields)
+    }
+}
