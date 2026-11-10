@@ -64,9 +64,11 @@ async fn the_adapter_upholds_the_contract() {
             .into_iter()
             .map(|i| proof_of(&altered(subsidised, i)))
             .collect(),
-        creation_slot: set["vaultCreation"].as_str().unwrap().parse().unwrap(),
+        creation_slot: connector_zk_note::Slot::new(
+            set["vaultCreation"].as_str().unwrap().parse().unwrap(),
+        ),
         anchor: SlotAnchor {
-            slot: ANCHOR_SLOT,
+            slot: connector_zk_note::Slot::new(ANCHOR_SLOT),
             time_ms: ANCHOR_TIME_MS,
         },
     })

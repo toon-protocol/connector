@@ -5,7 +5,7 @@ use std::sync::Arc;
 use connector_chain_rpc::graphql::{GraphqlError, GraphqlRpc};
 use connector_client_edge::zk_note::{SlotAnchor, ZkNoteVault, ZkNoteVaultUnavailable};
 use connector_zk_note::request::{public_input, RequestProof};
-use connector_zk_note::{note::field_to_u64, Field};
+use connector_zk_note::{note::field_to_u64, Field, Slot};
 use connector_zk_verifier::{Verifier, WrapProof};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -220,9 +220,10 @@ impl ZkNoteVault for MinaZkNoteVault {
         Ok(replay.spent(&nullifier))
     }
 
-    async fn creation_slot(&self) -> Result<u64, ZkNoteVaultUnavailable> {
+    async fn creation_slot(&self) -> Result<Slot, ZkNoteVaultUnavailable> {
         let account = self.account().await?;
         field_to_u64(account.app_state[CREATION_TIME])
+            .map(Slot::new)
             .ok_or_else(|| unavailable("the vault's creationTime does not fit 64 bits"))
     }
 
@@ -240,10 +241,10 @@ impl ZkNoteVault for MinaZkNoteVault {
                 .ok_or_else(|| unavailable(format!("the tip's {what} is not a decimal number")))
         };
         Ok(SlotAnchor {
-            slot: number(
+            slot: Slot::new(number(
                 &state["consensusState"]["slotSinceGenesis"],
                 "slotSinceGenesis",
-            )?,
+            )?),
             time_ms: number(&state["blockchainState"]["utcDate"], "utcDate")?,
         })
     }

@@ -41,7 +41,10 @@ async fn an_archive_behind_the_daemon_is_a_failed_read_not_an_unused_nullifier()
     let error = vault.nullifier_used(consumed()).await.unwrap_err();
     assert!(reason(error).contains("behind the daemon"));
     // The node keeps serving: reads that don't need the archive are unharmed.
-    assert_eq!(vault.creation_slot().await, Ok(1049));
+    assert_eq!(
+        vault.creation_slot().await,
+        Ok(connector_zk_note::Slot::new(1049))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -132,7 +135,10 @@ async fn a_down_endpoint_refuses_the_read_naming_it() {
     );
     assert!(down_archive.nullifier_used(consumed()).await.is_err());
     // The daemon's reads still answer while the archive is down.
-    assert_eq!(down_archive.creation_slot().await, Ok(1049));
+    assert_eq!(
+        down_archive.creation_slot().await,
+        Ok(connector_zk_note::Slot::new(1049))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
