@@ -1132,7 +1132,7 @@ pub fn packet_response(response: PacketResponse) -> Response {
             }
             // `Toon-Watermark`: the watermark the journal holds, on the two
             // refusals about it.
-            if let Some(watermark) = reject.watermark {
+            if let Some(watermark) = &reject.watermark {
                 response.headers_mut().insert(
                     header::HeaderName::from_static(WATERMARK_HEADER),
                     header::HeaderValue::from_str(&watermark.to_string())
@@ -1256,13 +1256,13 @@ fn claim_rejection_reject(rejection: ClaimIngestRejection, charge: u64) -> Rejec
             RejectCode::f01_invalid_packet(),
             0,
             Some(RejectReason::AmountNotAdvancing),
-            Some(watermark),
+            Some(Box::new(watermark)),
         ),
         ClaimIngestRejection::Underpayment { watermark, .. } => (
             RejectCode::f03_invalid_amount(),
             charge,
             Some(RejectReason::Underpayment),
-            Some(watermark),
+            Some(Box::new(watermark)),
         ),
         ClaimIngestRejection::Undercollateralized { .. } => (
             RejectCode::f03_invalid_amount(),

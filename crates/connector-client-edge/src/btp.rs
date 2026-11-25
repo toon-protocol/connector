@@ -474,7 +474,7 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
             data: reason.as_str().as_bytes().to_vec(),
         });
     }
-    if let Some(watermark) = reject.watermark {
+    if let Some(watermark) = &reject.watermark {
         protocol_data.push(ProtocolData {
             name: WATERMARK_PROTOCOL.to_string(),
             content_type: CONTENT_TYPE_TEXT,

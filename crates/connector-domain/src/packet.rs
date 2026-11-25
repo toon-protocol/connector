@@ -386,7 +386,10 @@ pub struct Reject {
     /// two refusals that are about it (`amount_not_advancing`,
     /// `underpayment`): `None` on every other reject. Like `reason` it rides
     /// beside the packet (`toon-watermark`), never in the OER bytes.
-    pub watermark: Option<u128>,
+    ///
+    /// Boxed: an inline `u128` would take `Reject` past clippy's
+    /// `result_large_err` bound, and it is set on two refusals only.
+    pub watermark: Option<Box<u128>>,
 }
 
 /// The closed set of reasons a client-edge `F03` carries
