@@ -7,7 +7,7 @@ use serde::Deserialize;
 use url::Url;
 
 use connector_domain::peering_admission::{
-    admit as admit_peerings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
+    admit as admit_peerings, check_bindings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
 };
 
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
@@ -380,11 +380,10 @@ impl Config {
         let settlement_tables = SettlementTables::of(&settlements);
         let peer_channels = resolve_peer_channels(raw.peer_channels, &settlement_tables)?;
         for peer_route in &peer_routes {
+            // A route naming no peer is `peering_admission`'s refusal, made
+            // below with the other binding rules.
             let Some(peer) = peers.iter().find(|peer| peer.id() == peer_route.peer_id()) else {
-                return Err(ConfigError::UnknownPeerId {
-                    prefix: peer_route.prefix().to_string(),
-                    peer_id: peer_route.peer_id().to_string(),
-                });
+                continue;
             };
             // The intersection rule, in the one direction this connector's
             // own file can decide (`peer-carriage-spec.md` §2.2, §6.4(1)):
@@ -399,30 +398,31 @@ impl Config {
                 });
             }
         }
-        // Orphaned rows first, then unbound peers: a mistyped `peer_id`
-        // produces both at once, and "this row names a peer that does not
-        // exist" is the one that names the typo.
-        for channel in &peer_channels {
-            if !peers.iter().any(|peer| peer.id() == channel.peer_id()) {
-                return Err(ConfigError::PeerChannelOrphaned {
-                    peer_id: channel.peer_id().to_string(),
-                });
-            }
-        }
-        // P2 (§1.2): a peering with no channel binding can never take the
-        // peer role, so its counterparty would be admitted as an ordinary
-        // client and its claims judged in the wrong namespace. Refused at
-        // load, because the runtime symptom is silence.
-        for peer in &peers {
-            if !peer_channels
+        // Unknown peer, orphaned `[[peer_channels]]` rows and unbound
+        // peerings (P2, §1.2: a peering with no channel binding can never
+        // take the peer role) need no pay row, so they are refused here,
+        // where they always were, ahead of the whole-set check below.
+        let mut admission = PeeringSet {
+            peerings: peers
                 .iter()
-                .any(|channel| channel.peer_id() == peer.id())
-            {
-                return Err(ConfigError::PeerChannelUnbound {
-                    id: peer.id().to_string(),
-                });
-            }
-        }
+                .map(|peer| PeeringFacts::new(peer.id()))
+                .collect(),
+            inbound: peer_channels
+                .iter()
+                .map(|channel| ChannelFact {
+                    peer_id: channel.peer_id().to_string(),
+                    channel: channel.inbound_channel().map(ToString::to_string),
+                    chain: Some(channel.chain().name()),
+                    network: channel.network().map(ToString::to_string),
+                })
+                .collect(),
+            routes: peer_routes
+                .iter()
+                .map(|route| PeerRouteFacts::new(route.prefix(), route.peer_id()))
+                .collect(),
+            ..PeeringSet::default()
+        };
+        check_bindings(&admission).map_err(ConfigError::from)?;
         if raw.peer_sale.is_some() {
             return Err(ConfigError::PeerSaleRemoved);
         }
@@ -465,46 +465,6 @@ impl Config {
             peer_allow_plaintext_endpoints,
             &settlement_tables,
         )?;
-        for pay_channel in &pay_channels {
-            // A row for a peering that does not exist pays nobody -- the
-            // same reasoning `PeerChannelOrphaned` applies, and the same
-            // typo it catches.
-            if !peers.iter().any(|peer| peer.id() == pay_channel.peer_id()) {
-                return Err(ConfigError::PayChannelOrphaned {
-                    peer_id: pay_channel.peer_id().to_string(),
-                });
-            }
-            // An x402 channel moves value one way (ADR 0075): a channel this
-            // node pays on cannot also be one a peer pays it on. The two
-            // spellings are canonicalized by the same parser, so this
-            // compares like with like.
-            if peer_channels
-                .iter()
-                .any(|channel| channel.inbound_channel() == Some(pay_channel.outbound_channel()))
-            {
-                return Err(ConfigError::ChannelInBothDirections {
-                    value: pay_channel.outbound_channel().to_string(),
-                });
-            }
-            // A peering is on one network, both of its channels (ADR 0086
-            // decision 11): this row and the peer's own row on the same
-            // chain must name one network.
-            if let Some(outbound) = pay_channel.network() {
-                let inbound = peer_channels.iter().find_map(|row| {
-                    row.network()
-                        .filter(|_| row.peer_id() == pay_channel.peer_id())
-                        .filter(|inbound| inbound.chain() == outbound.chain())
-                        .filter(|inbound| *inbound != outbound)
-                });
-                if let Some(inbound) = inbound {
-                    return Err(ConfigError::PeeringNetworksDiffer {
-                        peer_id: pay_channel.peer_id().to_string(),
-                        inbound: inbound.to_string(),
-                        outbound: outbound.to_string(),
-                    });
-                }
-            }
-        }
         // ADR 0042, and the load-time half of issue #1145: **a connector
         // covers every PREPARE it sends**, so a peering this node has a
         // route to must name the channel it pays that hop from. This is the
@@ -525,36 +485,23 @@ impl Config {
         // receives from -- `local/mixed-chain`'s B holds one, and every
         // accept-only peering is one -- owes nothing and needs no row. What
         // is checked is the same `peer_id` a `[[routes]]` entry names.
-        // The rule itself is `connector_domain::peering_admission` (issue
-        // #1691), shared with the runtime's route write; this only maps its
-        // refusal to the named one operators already know.
-        let admission = PeeringSet {
-            peerings: peers
-                .iter()
-                .map(|peer| PeeringFacts {
-                    id: peer.id().to_string(),
-                    inbound: Vec::new(),
-                    pay: pay_channels
-                        .iter()
-                        .filter(|pay_channel| pay_channel.peer_id() == peer.id())
-                        .map(|pay_channel| ChannelFact {
-                            network: pay_channel
-                                .network()
-                                .map(ToString::to_string)
-                                .unwrap_or_default(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            routes: peer_routes
-                .iter()
-                .map(|route| PeerRouteFacts {
-                    prefix: route.prefix().to_string(),
-                    peer_id: route.peer_id().to_string(),
-                })
-                .collect(),
-            settlement_networks: Default::default(),
-        };
+        // Every cross-table rule of a peering -- unknown peer, orphaned and
+        // unbound channel rows, a channel in both directions, differing
+        // networks, a pay channel on an unsettled chain, a route with no
+        // channel to pay from -- is `connector_domain::peering_admission`'s
+        // (issues #1691, #1692), the same code the runtime's writes run.
+        // This only states the facts and maps its refusal to the named one
+        // operators already know.
+        admission.pay = pay_channels
+            .iter()
+            .map(|channel| ChannelFact {
+                peer_id: channel.peer_id().to_string(),
+                channel: Some(channel.outbound_channel().to_string()),
+                chain: Some(channel.chain().name()),
+                network: channel.network().map(ToString::to_string),
+            })
+            .collect();
+        admission.settled_chains = settlement_tables.settled_chains();
         admit_peerings(&admission).map_err(ConfigError::from)?;
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.
