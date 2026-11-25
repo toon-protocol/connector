@@ -1037,15 +1037,24 @@ impl Connector {
     /// store -- the two must always be given together, since a table
     /// replayed from `peers`/`routes` but not armed to persist further
     /// writes would silently stop being durable after the first mutation.
-    /// Every replayed peering is also **re-armed**, exactly as establishing
-    /// it did: the peer's voucher signer is bound to it again, its outbound
+    /// Every replayed peering goes through the same admit operation
+    /// `POST /peers` uses, so it is **re-armed** exactly as establishing it
+    /// was: the peer's voucher signer is bound to it again, its outbound
     /// x402 channel is registered again as the hop every forward to it is
     /// covered on (ADR 0075 decision 6), and its carriage goes back into
     /// the registrar. A durable row that came back as a name would be the
-    /// hollow row ADR 0058 exists to remove, one restart later. Call this
-    /// after [`Connector::with_peer_registrar`], or the carriages replay
-    /// nowhere, and after [`Connector::with_outbound_channels`], or the
-    /// forwards have no channel to be signed on.
+    /// hollow row ADR 0058 exists to remove, one restart later.
+    ///
+    /// A stored peering that admit refuses, or that fails while being wired
+    /// (a voucher signer that already proves another peering), is **skipped
+    /// whole**: no hop, binding, carriage or table row, and the routes
+    /// naming it are dropped. It is logged by name at error level and the
+    /// node serves its other peerings. Call this after
+    /// [`Connector::with_config_peer_ids`] (a stored peering whose id the
+    /// config file owns is skipped), after [`Connector::with_peer_registrar`],
+    /// or the carriages replay nowhere, and after
+    /// [`Connector::with_outbound_channels`], or the forwards have no
+    /// channel to be signed on.
     ///
     /// A row with no `client_edge_url` -- the shape rows written before
     /// issue #1217 have -- has no claim-state to restore its watermark from,
@@ -9190,18 +9199,14 @@ mod tests {
             );
         }
 
-        /// ADR 0058's second runtime twin: a route forwarding to a peering
-        /// with no channel to pay from is refused, the runtime analogue of
-        /// ADR 0042's `[[pay_channels]]` load rule.
-        ///
-        /// Reached here through a peering replayed out of a durable
-        /// snapshot written before ADR 0058 -- the one way a channel-less
-        /// runtime peering can still exist, since the write above refuses
-        /// to create one. A route to it would produce nothing but refused
-        /// packets: a forward this node cannot cover is refused rather
-        /// than carried.
+        /// A peering stored before ADR 0058 has no channel to pay from. Boot
+        /// replay goes through admit (#1694), which refuses it by name, so it
+        /// is skipped whole rather than replayed as a row no packet can use
+        /// (the pay-channel twin, `PeerHasNoPayChannel`, is tested where a
+        /// peering with a channel but no paying hop is reached). A route to
+        /// it is refused as naming an unknown peer.
         #[test]
-        fn a_route_forwarding_to_a_peering_with_no_pay_channel_is_refused() {
+        fn a_stored_peering_with_no_channel_is_skipped_at_boot() {
             let dir = tempfile::tempdir().expect("temp dir");
             let path = dir.path().join("runtime_peers.json");
             // Exactly the bytes the pre-ADR-0058 snapshot format wrote.
@@ -9221,22 +9226,14 @@ mod tests {
             )
             .with_runtime_peer_route_store(store, peers, routes);
 
+            assert!(connector.peers().is_empty(), "skipped whole");
             let error = connector
                 .upsert_runtime_peer_route("g.example.runtime", "legacy-hop", Price::flat(25), None)
                 .unwrap_err();
-
             assert!(
-                matches!(
-                    error,
-                    PeerRouteTableError::PeerHasNoPayChannel { ref peer_id, .. }
-                        if peer_id == "legacy-hop"
-                ),
-                "expected the pay-channel twin to fire, got {error:?}"
+                matches!(error, PeerRouteTableError::UnknownPeerId { .. }),
+                "expected an unknown peer, got {error:?}"
             );
-            // Distinct from `UnknownPeerId`: the peering is known, and
-            // saying so is what tells an operator to fix the peering
-            // rather than the route's `peer_id`.
-            assert!(!matches!(error, PeerRouteTableError::UnknownPeerId { .. }));
         }
 
         #[test]
@@ -9475,6 +9472,284 @@ mod tests {
                 Arc::clone(&receiver) as Arc<dyn VoucherStateSource>,
             );
             (connector, next_hop, receiver, outbound, channel)
+        }
+
+        // -- Boot replay goes through admit (spec #1686, ticket #1694) --
+
+        const STORED_NETWORK: &str = "eip155:31337";
+
+        /// The node's outbound channel toward `0x02`, and the channel's id:
+        /// what a stored peering's row names. Shared across "restarts" the
+        /// way the journal behind it would be.
+        async fn outbound_with_channel() -> (Arc<OutboundChannels>, String) {
+            let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+            let payer = Arc::new(InMemoryBatchSettlement::on(
+                Arc::clone(&chain),
+                0x01,
+                86_400,
+            ));
+            payer.fund(100_000);
+            let counterparty = InMemoryBatchSettlement::on(chain, 0x02, 86_400);
+            let outbound = Arc::new(
+                OutboundChannels::restore(
+                    Arc::new(InMemoryJournal::new()),
+                    vec![(
+                        STORED_NETWORK.parse().expect("a CAIP-2 network"),
+                        payer as Arc<dyn BatchSettlementPayer>,
+                    )],
+                )
+                .await
+                .expect("an empty journal"),
+            );
+            let (opened, _) = outbound
+                .open(counterparty.published_terms(), 50_000)
+                .await
+                .expect("open");
+            (outbound, opened.on_chain.id.0.clone())
+        }
+
+        /// A stored runtime peering paid on `channel`, whose peer proves
+        /// itself with the voucher signer `signer`. Its client edge is
+        /// nowhere, so the claim-state ask fails and the journaled
+        /// watermark stands.
+        fn stored_peering(channel: &str, signer: u8) -> RuntimePeering {
+            RuntimePeering {
+                client_edge_url: Some("http://127.0.0.1:1/ilp".to_string()),
+                channels: vec![RuntimePeerChannel::EvmVoucher {
+                    outbound_channel_id: channel.to_string(),
+                    voucher_signer: format!("0x{}", format!("{signer:02x}").repeat(20)),
+                    network: STORED_NETWORK.to_string(),
+                }],
+                ..RuntimePeering::default()
+            }
+        }
+
+        fn a_node_over(next_hop: &Arc<NextHop>, outbound: &Arc<OutboundChannels>) -> Connector {
+            Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::clone(next_hop) as Arc<dyn PeerTransport>,
+                test_clock(),
+            )
+            .with_outbound_channels(
+                Arc::clone(outbound),
+                vec![(SettlementChain::Evm, STORED_NETWORK.to_string())],
+            )
+        }
+
+        fn a_next_hop() -> Arc<NextHop> {
+            Arc::new(NextHop {
+                covered: Mutex::new(Vec::new()),
+                ack: Mutex::new(ClaimAckOutcome::Accepted),
+                outcomes: Mutex::new(std::collections::VecDeque::new()),
+            })
+        }
+
+        fn prepare_to(destination: &str, amount: u64) -> Prepare {
+            Prepare {
+                destination: destination.to_string(),
+                ..prepare(amount)
+            }
+        }
+
+        /// What a registrar holds, by peer id.
+        #[derive(Default)]
+        struct HeldCarriages(Mutex<std::collections::BTreeSet<String>>);
+
+        impl crate::peer_transport::PeerRegistrar for HeldCarriages {
+            fn register(&self, peer_id: &str, _peering: &RuntimePeering) {
+                self.0.lock().unwrap().insert(peer_id.to_string());
+            }
+
+            fn deregister(&self, peer_id: &str) {
+                self.0.lock().unwrap().remove(peer_id);
+            }
+        }
+
+        /// A subscriber that keeps each event's message and fields as text.
+        struct EventLog(Arc<Mutex<Vec<String>>>);
+
+        struct Fields<'a>(&'a mut String);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+
+        impl tracing::Subscriber for EventLog {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut line = format!("{} ", event.metadata().level());
+                event.record(&mut Fields(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        /// A peering stored by `POST /peers`'s own admit carries a paid
+        /// packet after a restart, wired exactly as it was before it: the
+        /// same hop, the same signer binding, the same carriage.
+        #[tokio::test]
+        async fn a_stored_peering_carries_a_paid_packet_after_a_restart() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("runtime_peers.json");
+            let next_hop = a_next_hop();
+            let (outbound, channel) = outbound_with_channel().await;
+
+            let carriages = Arc::new(HeldCarriages::default());
+            let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
+            let before = a_node_over(&next_hop, &outbound)
+                .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
+                .with_runtime_peer_route_store(store, peers, routes);
+            before
+                .peerings
+                .admit("next-hop", stored_peering(&channel, 0x02))
+                .expect("admit");
+            before
+                .upsert_runtime_peer_route("g.example.next", "next-hop", Price::FREE, None)
+                .expect("route");
+            let signer = VoucherSigner::Evm([0x02; 20]);
+            let hop_before = before.peerings.hop("next-hop").expect("a hop").channel_id;
+            drop(before);
+
+            let after_carriages = Arc::new(HeldCarriages::default());
+            let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("re-open");
+            let after = a_node_over(&next_hop, &outbound)
+                .with_peer_registrar(Arc::clone(&after_carriages) as Arc<dyn PeerRegistrar>)
+                .with_runtime_peer_route_store(store, peers, routes);
+
+            assert_eq!(
+                after.peerings.hop("next-hop").map(|hop| hop.channel_id),
+                Some(hop_before),
+                "the same hop"
+            );
+            assert_eq!(
+                after.peerings.voucher_bindings().peer_for(&signer),
+                Some("next-hop".to_string()),
+                "the same binding"
+            );
+            assert_eq!(
+                *after_carriages.0.lock().unwrap(),
+                *carriages.0.lock().unwrap(),
+                "the same carriage"
+            );
+            assert!(matches!(
+                after
+                    .handle_prepare(prepare_to("g.example.next.app", 110))
+                    .await,
+                PacketResponse::Fulfill(_)
+            ));
+            let covered = next_hop.covered.lock().unwrap().clone();
+            assert_eq!(covered.len(), 1);
+            assert_eq!(voucher_amount(&covered[0]), 110);
+        }
+
+        /// A stored peering whose signer binding fails is skipped whole --
+        /// no hop, binding, carriage, table row or route -- and logged by
+        /// name with the reason; the node's other stored peering still
+        /// carries a paid packet.
+        #[tokio::test]
+        async fn a_stored_peering_whose_signer_binding_fails_is_skipped_whole() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("runtime_peers.json");
+            let next_hop = a_next_hop();
+            let (outbound, channel) = outbound_with_channel().await;
+
+            // Two peerings that claim one signer: replay is in id order, so
+            // "holder" keeps it and "rival" fails to bind it.
+            let (store, _, _) = crate::PeerRouteStore::open(&path).expect("open");
+            let peers: RuntimePeers = [
+                ("holder".to_string(), stored_peering(&channel, 0x02)),
+                ("rival".to_string(), stored_peering(&channel, 0x02)),
+            ]
+            .into();
+            let routes: HashMap<String, PeerRoute> = [
+                (
+                    "g.example.holder".to_string(),
+                    PeerRoute::new("g.example.holder", "holder"),
+                ),
+                (
+                    "g.example.rival".to_string(),
+                    PeerRoute::new("g.example.rival", "rival"),
+                ),
+            ]
+            .into();
+            store.persist(&peers, &routes).expect("store");
+            let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("re-open");
+
+            let carriages = Arc::new(HeldCarriages::default());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let node = {
+                let _logging = tracing::subscriber::set_default(EventLog(Arc::clone(&log)));
+                tracing::callsite::rebuild_interest_cache();
+                a_node_over(&next_hop, &outbound)
+                    .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
+                    .with_runtime_peer_route_store(store, peers, routes)
+            };
+
+            let signer = VoucherSigner::Evm([0x02; 20]);
+            assert_eq!(
+                node.peerings.voucher_bindings().peer_for(&signer),
+                Some("holder".to_string())
+            );
+            assert!(node.peerings.hop("rival").is_none(), "no hop");
+            assert!(
+                node.peerings
+                    .voucher_bindings()
+                    .signers_of("rival")
+                    .is_empty(),
+                "no binding"
+            );
+            assert_eq!(
+                *carriages.0.lock().unwrap(),
+                ["holder".to_string()].into(),
+                "no carriage"
+            );
+            assert!(node.runtime_peering("rival").is_none(), "no table row");
+            assert_eq!(
+                node.peer_routes_view()
+                    .iter()
+                    .map(|route| route.peer_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["holder"],
+                "no route to it"
+            );
+            let log = log.lock().unwrap().clone();
+            assert!(
+                log.iter().any(|line| line.starts_with("ERROR")
+                    && line.contains("peer_id=rival ")
+                    && line.contains("error=")),
+                "an error naming the peering and the reason is logged: {log:?}"
+            );
+
+            assert!(matches!(
+                node.handle_prepare(prepare_to("g.example.holder.app", 110))
+                    .await,
+                PacketResponse::Fulfill(_)
+            ));
+            assert_eq!(next_hop.covered.lock().unwrap().len(), 1);
+            assert!(matches!(
+                node.handle_prepare(prepare_to("g.example.rival.app", 110))
+                    .await,
+                PacketResponse::Reject(_)
+            ));
+            assert_eq!(
+                next_hop.covered.lock().unwrap().len(),
+                1,
+                "nothing was forwarded to the skipped peering"
+            );
         }
 
         /// A `[[pay_channels]]` row must name a channel that pays the

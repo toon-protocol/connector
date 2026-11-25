@@ -221,6 +221,17 @@ price a paid request would be charged.
 it takes the carriage away with the row, so it is immediate and needs no restart.
 A peering still referenced by a runtime route is refused until the route goes.
 
+Peerings you added with `POST /peers` come back when the node restarts with the same
+`state_dir`, each wired exactly as `POST /peers` wired it. Each one goes through the
+same checks again, and **one that fails is skipped whole**: it gets no hop, no
+signer binding, no carriage and no table row, and the routes that name it are not
+restored. The node logs an `ERROR` naming the peering and the reason — for
+example `stored peering skipped` with `peer_id=<id>` and `voucher signer 0x… is already
+bound to peer '<other>'` — then starts and serves the rest. Before this, a failed
+signer binding only logged a warning and left the peering half-wired. A skipped
+peering is not written back on restart; it leaves the stored table with the next
+write to it, so re-peer it with `POST /peers` once the reason is fixed.
+
 > A peering committed to a **config file** is the same two channels, recorded
 > differently: `[[peers]]`; a `[[peer_channels]]` row naming the key the peer
 > signs its vouchers with (its settlement address on EVM, its settlement key on
