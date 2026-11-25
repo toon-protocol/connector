@@ -1,7 +1,12 @@
 # Wire vectors: the invariants behind them
 
 **Status:** **Live — the vector companion, role unchanged** (wayfinder map #1049, issue #1065).
-**`schema_version` 15** (issue #1708, [ADR 0040](../adr/0040-a-verified-payment-is-stated-to-the-app.md)): a
+**`schema_version` 16** (issue #1709, ND-05b): a new top-level `required_carriage` section pins the
+carriage a payer must use for a destination -- the longest-prefix route's own `requiredTransport`,
+else the node-wide one, else none (`null`) -- in a pinned route, an unpinned route on a pinned node,
+routes that disagree (the devnet relay), an uncovered destination and nested prefixes. Generated from
+`connector_domain::required_carriage`; what the connector publishes and enforces is unchanged. Before
+that, **`schema_version` 15** (issue #1708, [ADR 0040](../adr/0040-a-verified-payment-is-stated-to-the-app.md)): a
 new top-level `attribution` section pins the `X-TOON-*` headers an app receives — EVM, Solana and
 XRPL vouchers, an allowance claim (no payer; the Mina network as chain), a peer arrival at a payment
 route, a free route, a forwarded or unclaimed packet, a network the node does not hold
