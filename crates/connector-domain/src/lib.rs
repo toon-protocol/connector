@@ -79,4 +79,4 @@ pub use rate_table::{
     Freshness, GuardError, GuardOverride, Guards, MaxMove, RateLookup, RateTable, Refresh,
     RefusedRefresh, Spread, Ttl,
 };
-pub use route::select_route;
+pub use route::{resolve_route, select_route, ResolvedRoute, RouteKind};

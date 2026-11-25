@@ -1,6 +1,5 @@
 //! `pub struct Connector` -- the packet plane. See ADR 0001.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,8 +14,9 @@ use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, refuse_oversize,
-    select_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
-    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, FORWARDING_MESSAGE_WINDOW,
+    resolve_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
+    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, ResolvedRoute, RouteKind,
+    FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -208,66 +208,6 @@ impl FixedWindowRateLimiter {
     }
 }
 
-/// Which kind of routing-table entry matched a packet's destination, and
-/// where in its own table -- resolved by [`Connector::handle_prepare`]
-/// before dispatch, so priority among same-length matches (issue #427: a
-/// static route always outranks a leased route) is decided in exactly one
-/// place.
-enum RouteTarget {
-    App(usize),
-    Peer(usize),
-    /// Indexes into the caller's own filtered `Vec` of currently-active
-    /// leased routes, not `Connector::leased_routes` directly -- see
-    /// [`Connector::leased_routes_snapshot`].
-    Leased(usize),
-    /// A runtime peer-forwarding route (issue #884), owned rather than
-    /// indexed: unlike `leased_routes_snapshot`'s caller-held `Vec`, the
-    /// snapshot this was matched out of is loaded and dropped inside
-    /// `select_configured_route` itself, so the one matched
-    /// [`PeerRoute`] is cloned out of it rather than borrowed -- a single,
-    /// bounded-size clone per packet, not the whole-collection copy ADR
-    /// 0015 warns against.
-    RuntimePeer(PeerRoute),
-}
-
-/// How permanent a matched routing-table entry is, least to most -- the
-/// one place route precedence is written down, read by both
-/// [`RouteTarget`] and [`ConfiguredTarget`] so what the router prefers and
-/// what the client edge prices can never drift apart.
-///
-/// A lease (issue #427) is TTL-bound and pushed by an automated
-/// controller, so it is outranked by everything durable. A runtime
-/// peer-forwarding route (issue #884) IS durable -- a deliberate, paid
-/// relationship, not an automated push -- so it outranks a lease at the
-/// same prefix, but a config-file row always wins over anything written at
-/// runtime, which `upsert_runtime_peer_route` enforces by refusing a
-/// runtime write that collides with a config-file prefix in the first
-/// place, rather than by ranking them here. Peer routes (config or
-/// runtime) fall between leases and app routes: also forwarding rather
-/// than terminating, but static.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum RouteRank {
-    Leased = 0,
-    RuntimePeer = 1,
-    Peer = 2,
-    App = 3,
-}
-
-impl RouteTarget {
-    /// Break a tie in matched prefix length -- see [`RouteRank`].
-    fn rank(&self) -> RouteRank {
-        match self {
-            RouteTarget::Leased(_) => RouteRank::Leased,
-            RouteTarget::RuntimePeer(_) => RouteRank::RuntimePeer,
-            RouteTarget::Peer(_) => RouteRank::Peer,
-            // A config-file entry -- durable and priced, never shadowed
-            // by a lease or a runtime peer route at the same prefix
-            // length.
-            RouteTarget::App(_) => RouteRank::App,
-        }
-    }
-}
-
 /// A fresh random id for this hop's own `"packet"` tracing span, minted at
 /// packet entry and never placed on the wire (ADR 0014, amended by issue
 /// #1269 / ADR 0069).
@@ -288,11 +228,10 @@ fn correlation_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Which of the two configured route kinds matched, as
-/// [`Connector::select_configured_route`] resolves it -- the subset of
-/// [`RouteTarget`] that exists in configuration, so a caller reading
-/// configured routes alone (the client edge) needs no arm for a leased
-/// route it can never be handed.
+/// Which of the configured route kinds matched, as
+/// [`Connector::select_configured_route`] resolves it -- every kind but a
+/// lease, so a caller reading configured routes alone (the client edge)
+/// needs no arm for a route it can never be handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfiguredTarget {
     App(usize),
@@ -300,32 +239,11 @@ enum ConfiguredTarget {
     /// A runtime peer-forwarding route (issue #884) -- "configured" in the
     /// sense this type means it (priced, static, unlike a lease), even
     /// though its row lives in the runtime table rather than the config
-    /// file. See [`RouteTarget::RuntimePeer`] for why this is owned
-    /// rather than indexed.
+    /// file. Owned rather than indexed: the snapshot it was matched out of
+    /// is dropped inside `select_configured_route`, so the one matched
+    /// [`PeerRoute`] is cloned out of it -- a single, bounded-size clone,
+    /// not the whole-collection copy ADR 0015 warns against.
     RuntimePeer(PeerRoute),
-}
-
-impl ConfiguredTarget {
-    fn into_route_target(self) -> RouteTarget {
-        match self {
-            ConfiguredTarget::App(index) => RouteTarget::App(index),
-            ConfiguredTarget::Peer(index) => RouteTarget::Peer(index),
-            ConfiguredTarget::RuntimePeer(route) => RouteTarget::RuntimePeer(route),
-        }
-    }
-
-    /// The same tie-break [`RouteTarget::rank`] applies, off the same
-    /// [`RouteRank`] ordering rather than one restated here, so
-    /// configured-route precedence cannot drift between the router and the
-    /// client edge -- and read without cloning the matched route to reach
-    /// it.
-    fn rank(&self) -> RouteRank {
-        match self {
-            ConfiguredTarget::App(_) => RouteRank::App,
-            ConfiguredTarget::Peer(_) => RouteRank::Peer,
-            ConfiguredTarget::RuntimePeer(_) => RouteRank::RuntimePeer,
-        }
-    }
 }
 
 /// Whether the route a client's destination resolves to terminates at this
@@ -2521,40 +2439,21 @@ impl Connector {
             return self.finish(PacketResponse::Reject(reject), trace, None);
         }
 
-        // Issue #452: `leased_routes_snapshot` is one lock-free `Arc`
-        // clone. Every active route below is a reference borrowed
-        // straight out of that snapshot -- expiry is still checked fresh
-        // against the clock so a lapsed lease stops being selected
-        // immediately, matching #427's guarantee, but nothing here
-        // allocates a copy of the routes themselves.
-        let leased_routes = self.leased_routes_snapshot();
-        let now = self.clock.now();
-        let active_leased: Vec<&LeasedRoute> = leased_routes
-            .values()
-            .filter(|route| !is_expired(route.expires_at(), now))
-            .collect();
-
-        let leased_prefixes: Vec<&str> = active_leased.iter().map(|route| route.prefix()).collect();
-
-        // Configured routes -- terminated and forwarded -- are selected by
-        // the same method the client edge's own price lookup calls (ADR
+        // Issue #452: both snapshots are one lock-free `Arc` clone, and
+        // every route below is borrowed straight out of them -- expiry is
+        // checked fresh against the clock inside the resolution, so a lapsed
+        // lease stops being selected immediately (#427), and nothing here
+        // allocates a copy of the routes themselves (ADR 0015). Precedence
+        // is the domain's, shared with the client edge's price lookup (ADR
         // 0028), so what a packet is charged and where it is then sent can
         // never come from two different answers to the same question.
-        let configured_match = self
-            .select_configured_route(&prepare.destination)
-            .map(|(len, target)| (len, target.into_route_target()));
-        let leased_match = select_route(&prepare.destination, &leased_prefixes).map(|index| {
-            (
-                active_leased[index].prefix().len(),
-                RouteTarget::Leased(index),
-            )
-        });
-
-        let Some((_, target)) = [configured_match, leased_match]
-            .into_iter()
-            .flatten()
-            .max_by_key(|(len, target)| (*len, target.rank()))
-        else {
+        let leased_routes = self.leased_routes_snapshot();
+        let runtime_peer_routes = self.runtime_peer_routes_snapshot();
+        let Some(resolved) = self.resolve(
+            &prepare.destination,
+            &runtime_peer_routes,
+            Some(&leased_routes),
+        ) else {
             return self.finish(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
@@ -2569,32 +2468,28 @@ impl Connector {
             );
         };
 
-        // A `Cow`, not a plain clone (issue #884): the `RuntimePeer` arm
-        // owns its [`PeerRoute`] already -- cloned once out of the runtime
-        // snapshot inside `select_configured_route`, which drops that
-        // snapshot before returning -- while the other two arms still
-        // borrow straight out of the table that holds them, so a forwarded
-        // packet allocates nothing here it did not before this route
-        // source existed (ADR 0015).
-        let peer_route: Cow<'_, PeerRoute> = match target {
-            RouteTarget::App(index) => {
-                tracing::debug!(handler_url = %self.routes[index].handler_url(), "routed to app");
+        let peer_route: &PeerRoute = match resolved.kind {
+            RouteKind::App => {
+                let route = &self.routes[resolved.index];
+                tracing::debug!(handler_url = %route.handler_url(), "routed to app");
                 if let Some(trace) = trace.as_mut() {
                     trace.direction.get_or_insert(Direction::Delivered);
                 }
                 let response = self
-                    .deliver_to_app(
-                        &self.routes[index],
-                        prepare,
-                        client_channel_id,
-                        peer_channel,
-                    )
+                    .deliver_to_app(route, prepare, client_channel_id, peer_channel)
                     .await;
                 return self.finish(response, trace, None);
             }
-            RouteTarget::Peer(index) => Cow::Borrowed(&self.peer_routes[index]),
-            RouteTarget::Leased(index) => Cow::Borrowed(active_leased[index].as_peer_route()),
-            RouteTarget::RuntimePeer(route) => Cow::Owned(route),
+            RouteKind::ConfigPeer => &self.peer_routes[resolved.index],
+            RouteKind::RuntimePeer => runtime_peer_routes
+                .values()
+                .nth(resolved.index)
+                .expect("resolution indexes the snapshot it was given"),
+            RouteKind::Leased => leased_routes
+                .values()
+                .nth(resolved.index)
+                .expect("resolution indexes the snapshot it was given")
+                .as_peer_route(),
         };
         tracing::debug!(peer_id = %peer_route.peer_id(), "routed to peer");
         if let Some(trace) = trace.as_mut() {
@@ -2602,7 +2497,7 @@ impl Connector {
             trace.to_peer = Some(peer_route.peer_id().to_string());
         }
         let response = self
-            .forward_via_peer_route(&peer_route, prepare, arrived)
+            .forward_via_peer_route(peer_route, prepare, arrived)
             .await;
         let mut fee = None;
         if matches!(response, PacketResponse::Fulfill(_))
@@ -4058,56 +3953,61 @@ impl Connector {
         }
     }
 
-    /// The index into `self.routes` that `destination` longest-prefix
-    /// matches against, if any.
-    fn select_app_route(&self, destination: &str) -> Option<usize> {
-        let app_prefixes: Vec<&str> = self.routes.iter().map(StaticRoute::prefix).collect();
-        select_route(destination, &app_prefixes)
+    /// Resolve `destination` across the route tables, through the domain's
+    /// one precedence (`connector_domain::resolve_route`). `leased` is
+    /// `None` for a caller that does not weigh leases -- the client edge
+    /// (ADR 0028). Indexes in the answer are positions in `self.routes`,
+    /// `self.peer_routes`, and the iteration order of the two snapshots the
+    /// caller passes, which must outlive their use.
+    fn resolve(
+        &self,
+        destination: &str,
+        runtime_peer_routes: &HashMap<String, PeerRoute>,
+        leased: Option<&HashMap<String, LeasedRoute>>,
+    ) -> Option<ResolvedRoute> {
+        resolve_route(
+            destination,
+            self.clock.now(),
+            self.routes.iter().map(StaticRoute::prefix),
+            self.peer_routes.iter().map(PeerRoute::prefix),
+            runtime_peer_routes.values().map(PeerRoute::prefix),
+            leased
+                .into_iter()
+                .flat_map(|leased| leased.values())
+                .map(|route| (route.prefix(), route.expires_at())),
+        )
     }
 
     /// The configured route -- terminated or forwarded -- `destination`
-    /// longest-prefix matches, with the length of the prefix that matched.
+    /// resolves to, with the length of the prefix that matched.
     ///
     /// The one place configured-route selection lives, shared by
-    /// [`Self::handle_prepare_traced`] (which then weighs a leased route
-    /// against the answer) and [`Self::client_route`] (which does not, ADR
-    /// 0028). That sharing is the point: the client edge's claim gate
-    /// (issue #522) and x402 greeting must price the route the router will
-    /// actually use, and a forwarded route being priced at all (issue #620)
-    /// makes "app routes only" no longer a safe simplification for either.
+    /// [`Self::client_route`] (ADR 0028) and the pre-admission probes. The
+    /// client edge's claim gate (issue #522) and x402 greeting must price
+    /// the route the router will actually use, and a forwarded route being
+    /// priced at all (issue #620) makes "app routes only" no longer a safe
+    /// simplification for either.
     ///
     /// Includes runtime peer-forwarding routes (issue #884) alongside the
     /// config file's own: both are static, priced, durable rows, so both
     /// belong in "configured" as this method means it -- only a lease
     /// (issue #427), with no price and no durability, is excluded.
-    ///
     fn select_configured_route(&self, destination: &str) -> Option<(usize, ConfiguredTarget)> {
-        let app_match = self.select_app_route(destination).map(|index| {
-            (
-                self.routes[index].prefix().len(),
-                ConfiguredTarget::App(index),
-            )
-        });
-        let peer_prefixes: Vec<&str> = self.peer_routes.iter().map(PeerRoute::prefix).collect();
-        let peer_match = select_route(destination, &peer_prefixes).map(|index| {
-            (
-                self.peer_routes[index].prefix().len(),
-                ConfiguredTarget::Peer(index),
-            )
-        });
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
-        let runtime_list: Vec<&PeerRoute> = runtime_peer_routes.values().collect();
-        let runtime_prefixes: Vec<&str> = runtime_list.iter().map(|route| route.prefix()).collect();
-        let runtime_match = select_route(destination, &runtime_prefixes).map(|index| {
-            (
-                runtime_list[index].prefix().len(),
-                ConfiguredTarget::RuntimePeer(runtime_list[index].clone()),
-            )
-        });
-        [app_match, peer_match, runtime_match]
-            .into_iter()
-            .flatten()
-            .max_by_key(|(len, target)| (*len, target.rank()))
+        let resolved = self.resolve(destination, &runtime_peer_routes, None)?;
+        let target = match resolved.kind {
+            RouteKind::App => ConfiguredTarget::App(resolved.index),
+            RouteKind::ConfigPeer => ConfiguredTarget::Peer(resolved.index),
+            RouteKind::RuntimePeer => ConfiguredTarget::RuntimePeer(
+                runtime_peer_routes
+                    .values()
+                    .nth(resolved.index)
+                    .expect("resolution indexes the snapshot it was given")
+                    .clone(),
+            ),
+            RouteKind::Leased => unreachable!("no leases were offered"),
+        };
+        Some((resolved.prefix_len, target))
     }
 
     /// Price, transport policy and route kind for the configured route
@@ -4255,18 +4155,28 @@ impl Connector {
     /// [`Self::deliver_to_app`]'s decision: it repeats the same
     /// open-and-decode work, on the same immutable `prepare.data`, and it
     /// resolves the winning route by the same rule
-    /// [`Self::handle_prepare_traced`] applies (longest prefix,
-    /// [`RouteRank`] on a tie), so the two can never disagree about where
+    /// [`Self::handle_prepare_traced`] applies (`connector_domain::resolve_route`), so the two can never disagree about where
     /// this packet actually goes.
     pub fn envelope_target_would_be_refused(&self, prepare: &Prepare) -> bool {
-        let Some((configured_len, ConfiguredTarget::App(index))) =
-            self.select_configured_route(&prepare.destination)
+        // Resolved with leases, as the router does: when a lease wins, the
+        // packet is *forwarded* with its data opaque at this hop, so there
+        // is no refusal to predict -- and answering `true` off an outranked
+        // app route would let the forwarded packet skip claim admission and
+        // ride for free (the review's findings on issues #869 and #944).
+        let leased_routes = self.leased_routes_snapshot();
+        let runtime_peer_routes = self.runtime_peer_routes_snapshot();
+        let Some(ResolvedRoute {
+            kind: RouteKind::App,
+            index,
+            ..
+        }) = self.resolve(
+            &prepare.destination,
+            &runtime_peer_routes,
+            Some(&leased_routes),
+        )
         else {
             return false;
         };
-        if self.active_lease_outranks(&prepare.destination, configured_len) {
-            return false;
-        }
         let Some(request) = self.opened_envelope_request(&prepare.data) else {
             return false;
         };
@@ -4286,38 +4196,10 @@ impl Connector {
     /// adds the one source this connector cannot see, a client session
     /// bound to the destination.
     pub fn has_route(&self, destination: &str) -> bool {
-        if self.select_configured_route(destination).is_some() {
-            return true;
-        }
         let leased_routes = self.leased_routes_snapshot();
-        let now = self.clock.now();
-        leased_routes.values().any(|route| {
-            !is_expired(route.expires_at(), now)
-                && select_route(destination, &[route.prefix()]).is_some()
-        })
-    }
-
-    /// Whether a strictly longer-prefix active lease beats the configured
-    /// route of prefix length `configured_len` that `destination` already
-    /// resolved to -- the same winner rule the router applies (equal
-    /// length ties break to the configured route, `RouteRank::App >
-    /// RouteRank::Leased`). Both pre-admission probes below ask this
-    /// before they judge anything: when a lease wins, the packet is
-    /// *forwarded* with its data opaque at this hop, so there is no
-    /// refusal to predict -- and answering `true` off the outranked
-    /// configured route would let the forwarded packet skip claim
-    /// admission entirely and ride for free (the review's findings on
-    /// issues #869 and #944).
-    fn active_lease_outranks(&self, destination: &str, configured_len: usize) -> bool {
-        let leased_routes = self.leased_routes_snapshot();
-        let now = self.clock.now();
-        let active_leased: Vec<&LeasedRoute> = leased_routes
-            .values()
-            .filter(|route| !is_expired(route.expires_at(), now))
-            .collect();
-        let leased_prefixes: Vec<&str> = active_leased.iter().map(|route| route.prefix()).collect();
-        select_route(destination, &leased_prefixes)
-            .is_some_and(|index| active_leased[index].prefix().len() > configured_len)
+        let runtime_peer_routes = self.runtime_peer_routes_snapshot();
+        self.resolve(destination, &runtime_peer_routes, Some(&leased_routes))
+            .is_some()
     }
 
     /// Open a terminated packet's gift wrap with this node's identity key
