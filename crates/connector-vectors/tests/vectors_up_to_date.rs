@@ -1155,3 +1155,56 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
         }
     }
 }
+
+/// Schema 14 (issue #1708): the committed `attribution` cases hold the
+/// contract an app reads -- a sender's `X-TOON-*` headers are gone from
+/// every case, and nothing is stated for a delivery with no payment.
+#[test]
+fn the_committed_attribution_cases_state_only_what_the_connector_verified() {
+    let committed = committed();
+    let cases = committed["attribution"]["cases"].as_array().expect("cases");
+    let owned = [
+        "x-toon-payer",
+        "x-toon-amount",
+        "x-toon-chain",
+        "x-toon-network",
+    ];
+    let owned_in = |headers: &serde_json::Value| -> Vec<String> {
+        headers
+            .as_array()
+            .expect("headers")
+            .iter()
+            .map(|h| h[0].as_str().expect("name").to_string())
+            .filter(|name| owned.contains(&name.to_ascii_lowercase().as_str()))
+            .collect()
+    };
+    for case in cases {
+        let received = owned_in(&case["received_headers"]);
+        if case["payment"].is_null() || case["payment"]["charge"] == "0" {
+            assert!(received.is_empty(), "case {}", case["name"]);
+        }
+        for name in &received {
+            assert!(
+                name.starts_with("X-TOON-"),
+                "case {}: {name} is not the connector's own spelling",
+                case["name"]
+            );
+        }
+    }
+    for needed in [
+        "evm_voucher",
+        "solana_voucher",
+        "xrpl_voucher",
+        "allowance_claim",
+        "peer_arrival_at_a_payment_route",
+        "free_route",
+        "forwarded_or_unclaimed",
+        "network_not_held",
+        "evm_voucher_with_spoofed_headers",
+    ] {
+        assert!(
+            cases.iter().any(|c| c["name"] == needed),
+            "missing {needed}"
+        );
+    }
+}
