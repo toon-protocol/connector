@@ -648,7 +648,7 @@ async fn two_nodes_peer_over_two_xrpl_channels() {
     // is held in `connector-settlement-xrpl`'s watch tests and ends a
     // channel before this payer's second call.
     let bystander = chain.funded_wallet(&rpc, FUNDED).await;
-    let mut terms = serde_json::to_value(&a.runtime.batch_settlements[0]).expect("A's terms");
+    let mut terms = serde_json::to_value(&a.runtime.batch_settlements()[0]).expect("A's terms");
     terms["payTo"] = json!(bystander.address);
     let opened = b
         .write(
@@ -833,7 +833,7 @@ async fn a_retried_open_after_a_crash_resumes_the_journaled_channel() {
         .await
         .expect("the open lands");
 
-    let terms = serde_json::to_value(&a.runtime.batch_settlements[0]).expect("A's terms");
+    let terms = serde_json::to_value(&a.runtime.batch_settlements()[0]).expect("A's terms");
     let opened = b
         .write(
             Method::POST,

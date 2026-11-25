@@ -182,10 +182,12 @@ pub fn evm_voucher_on(
 /// it names the network read from the chain (ADR 0086 decision 1).
 pub fn solana_network(runtime: &connector_cli::Runtime) -> String {
     runtime
-        .batch_settlement_solana
-        .as_ref()
+        .settlement_networks
+        .iter()
+        .find(|held| held.network().chain() == connector_domain::AssetChain::Solana)
         .expect("the node settles on Solana")
-        .caip2_network()
+        .network()
+        .to_string()
 }
 
 /// `network` is the CAIP-2 network the channel is on ([`solana_network`]).
