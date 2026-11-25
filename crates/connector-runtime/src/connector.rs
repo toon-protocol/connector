@@ -2104,7 +2104,7 @@ impl Connector {
                 vec![ChannelFact::new(&peer_id)],
             ))
         } else {
-            self.runtime_peers_snapshot().get(&peer_id).map(|bound| {
+            self.runtime_peers_snapshot().get(&peer_id).map(|_| {
                 let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
                     vec![ChannelFact::new(&peer_id)]
                 } else {
@@ -2112,11 +2112,11 @@ impl Connector {
                 };
                 (
                     self.runtime_peering_facts(&peer_id),
-                    bound
-                        .channels
-                        .iter()
-                        .map(|_| ChannelFact::new(&peer_id))
-                        .collect(),
+                    // `upsert_runtime_peer` refused a peering with no
+                    // binding when it was written, and this write is not
+                    // that rule's to re-judge: a peering replayed from a
+                    // pre-ADR-0058 snapshot reaches the pay-channel rule.
+                    vec![ChannelFact::new(&peer_id)],
                     pay,
                 )
             })
