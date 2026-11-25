@@ -325,8 +325,8 @@ Scripts, none of them part of the binary.
 
 `packages/faucet` and `tools/fund-peers` are the npm workspaces named in
 `package.json`, and they are the only reason npm and `package.json` are still in this
-repository. **`npm test` does not test the connector** — it runs those packages, each with its
-own runner (`node --test` for the faucet; the one Jest project
+repository. **`npm test` does not test the connector** — it runs those packages' tests, and only the
+faucet has any (`node --test`; the one Jest project
 went with `packages/mina-zkapp`, [ADR 0065](../adr/0065-mina-leaves-the-repository.md)). The
 connector's gate is `cargo test --workspace`.
 

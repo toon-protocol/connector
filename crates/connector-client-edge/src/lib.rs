@@ -1356,7 +1356,7 @@ async fn handle_ilp(
         headers.contains_key(CLAIM_HEADER) || headers.contains_key(CLAIM_WRAPPED_HEADER);
     // Issue #807 / #1269: a greeting probe can never be routed regardless of
     // destination, so it is answered here rather than falling through to
-    // `Connector::handle_prepare`. the retired announcer sidecar's
+    // `Connector::handle_prepare`. The retired announcer sidecar's
     // greeting probe built exactly this shape. A client whose genesis peer
     // seed is stale or missing has no `[[routes]]`-matching destination to
     // probe with either, so gating the greeting on a route match at all (the

@@ -1233,7 +1233,7 @@ pub enum ConfigError {
          this node's client edge for claim-state over HTTP, whichever carriage a packet \
          rides): a node behind TLS termination cannot learn its own public name, so this is \
          an operator fact and there is deliberately no default. The retired announcer sidecar \
-         DID default it, and its compiled-in fallback still names a `/rust/ilp` path that \
+         DID default it, and its compiled-in fallback named a `/rust/ilp` path that \
          answers 410 Gone on both devnet boxes -- a default here is how a node ends up \
          publishing a dead URL to whoever asks (ADR 0050, issue #1220)"
     )]
