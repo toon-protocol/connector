@@ -6,6 +6,10 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
+use connector_domain::peering_admission::{
+    admit as admit_peerings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
+};
+
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
 use crate::denomination::{
     resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
@@ -521,17 +525,37 @@ impl Config {
         // receives from -- `local/mixed-chain`'s B holds one, and every
         // accept-only peering is one -- owes nothing and needs no row. What
         // is checked is the same `peer_id` a `[[routes]]` entry names.
-        for peer_route in &peer_routes {
-            if !pay_channels
+        // The rule itself is `connector_domain::peering_admission` (issue
+        // #1691), shared with the runtime's route write; this only maps its
+        // refusal to the named one operators already know.
+        let admission = PeeringSet {
+            peerings: peers
                 .iter()
-                .any(|pay_channel| pay_channel.peer_id() == peer_route.peer_id())
-            {
-                return Err(ConfigError::PayChannelUnbound {
-                    prefix: peer_route.prefix().to_string(),
-                    peer_id: peer_route.peer_id().to_string(),
-                });
-            }
-        }
+                .map(|peer| PeeringFacts {
+                    id: peer.id().to_string(),
+                    inbound: Vec::new(),
+                    pay: pay_channels
+                        .iter()
+                        .filter(|pay_channel| pay_channel.peer_id() == peer.id())
+                        .map(|pay_channel| ChannelFact {
+                            network: pay_channel
+                                .network()
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            routes: peer_routes
+                .iter()
+                .map(|route| PeerRouteFacts {
+                    prefix: route.prefix().to_string(),
+                    peer_id: route.peer_id().to_string(),
+                })
+                .collect(),
+            settlement_networks: Default::default(),
+        };
+        admit_peerings(&admission).map_err(ConfigError::from)?;
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.
         // Resolved against the networks this node settles on (ADR 0086
