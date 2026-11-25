@@ -4,7 +4,6 @@
   "private": true,
   "description": "Rust connector — plus the devnet faucet and fund-peers tooling around it",
   "workspaces": [
-    "packages/announcer",
     "packages/faucet",
     "tools/fund-peers"
   ],

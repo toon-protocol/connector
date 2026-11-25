@@ -1356,8 +1356,8 @@ async fn handle_ilp(
         headers.contains_key(CLAIM_HEADER) || headers.contains_key(CLAIM_WRAPPED_HEADER);
     // Issue #807 / #1269: a greeting probe can never be routed regardless of
     // destination, so it is answered here rather than falling through to
-    // `Connector::handle_prepare`. `packages/announcer/src/edge-client.ts`'s
-    // `fetchGreeting` builds exactly this shape. A client whose genesis peer
+    // `Connector::handle_prepare`. the retired announcer sidecar's
+    // greeting probe built exactly this shape. A client whose genesis peer
     // seed is stale or missing has no `[[routes]]`-matching destination to
     // probe with either, so gating the greeting on a route match at all (the
     // pre-#807 behaviour, still required for a real, non-greeting PREPARE
@@ -2711,8 +2711,8 @@ mod tests {
     /// route this connector serves and prices is answered with terms
     /// "instead of being routed at all" (§1.4), so the flag on a PREPARE
     /// that never gets routed changes nothing else about it. This is what
-    /// `packages/announcer`'s x402 probe (`edge-client.ts`'s
-    /// `fetchGreeting`) relies on.
+    /// the retired announcer sidecar's x402 probe
+    /// relied on, and any client's greeting probe still does.
     #[tokio::test]
     async fn an_unpaid_greeting_prepare_to_a_priced_route_is_still_greeted() {
         let route = StaticRoute::new_priced("g.example.app", "http://localhost:4000", 100).unwrap();
@@ -3021,8 +3021,8 @@ mod tests {
         }
     }
 
-    /// The core fix for issue #807: `packages/announcer/src/edge-client.ts`'s
-    /// `fetchGreeting` probe builds exactly this shape -- a well-formed,
+    /// The core fix for issue #807: the retired announcer sidecar's
+    /// greeting probe built exactly this shape -- a well-formed,
     /// zero-amount, `greeting`-flagged PREPARE -- and expects `402` back,
     /// even when its destination matches no configured route. Before this
     /// fix, such a destination fell through the old `price > 0`-gated

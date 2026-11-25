@@ -13,7 +13,7 @@ TypeScript prototype — [ADR 0017](../adr/0017-the-typescript-connector-is-a-pr
 ```
 connector/
   crates/          the connector — eighteen crates producing the `connector` binary
-  packages/        not the connector: devnet tooling (the faucet and the announcer sidecar)
+  packages/        not the connector: devnet tooling (the faucet)
   tools/           scripts: CI guards, chain helpers, the RFC vendoring script
   local/           the shipped image run against real containerised chains
   infra/           the devnet boxes and local chain provisioning
@@ -280,10 +280,9 @@ There is no separate test tree for unit tests. Following Rust convention:
 
 ### `packages/`
 
-| Directory   | What it is                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `faucet`    | Devnet token faucet service (plain JavaScript).                                                                                                                                                                                                                                                                                                                                                                        |
-| `announcer` | A standalone `kind:10032` announcer sidecar. It is not the connector and never was: it never links against connector crates, never reads connector config and never runs in the connector process. It only asks the client edge's already-public answers and republishes them ([ADR 0022](../adr/0022-a-connector-answers-it-does-not-announce.md), [ADR 0006](../adr/0006-the-connector-is-mechanism-not-policy.md)). |
+| Directory | What it is                                      |
+| --------- | ----------------------------------------------- |
+| `faucet`  | Devnet token faucet service (plain JavaScript). |
 
 **TOON's contracts and Solana program are not in this repository either, any more.**
 `contracts` held the Solidity `TokenNetwork`, `TokenNetworkRegistry` and `RollingSwapChannel`
@@ -324,10 +323,10 @@ Scripts, none of them part of the binary.
 
 ### Why npm still exists
 
-`packages/announcer`, `packages/faucet` and `tools/fund-peers` are the npm workspaces named in
+`packages/faucet` and `tools/fund-peers` are the npm workspaces named in
 `package.json`, and they are the only reason npm and `package.json` are still in this
 repository. **`npm test` does not test the connector** — it runs those packages, each with its
-own runner (`node --test` for the faucet, `tsx --test` for the announcer; the one Jest project
+own runner (`node --test` for the faucet; the one Jest project
 went with `packages/mina-zkapp`, [ADR 0065](../adr/0065-mina-leaves-the-repository.md)). The
 connector's gate is `cargo test --workspace`.
 
