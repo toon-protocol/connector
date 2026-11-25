@@ -60,7 +60,7 @@ pub(crate) struct RawLegacySettlementConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawKeyedSettlementConfig {
     #[serde(default)]
-    eip155: Option<BTreeMap<String, RawEvmSettlementTable>>,
+    eip155: Option<BTreeMap<String, <Eip155Tables as NetworkTables>::Entry>>,
     #[serde(default)]
     solana: Option<RawSolanaSettlementTable>,
     /// `[settlement.xrpl.<id>]` (ADR 0087): read as bare TOML so a table
@@ -68,7 +68,7 @@ pub(crate) struct RawKeyedSettlementConfig {
     /// directly) is refused by name, which a typed map could only fail as
     /// a type error.
     #[serde(default)]
-    xrpl: Option<toml::Table>,
+    xrpl: Option<toml::Table>, // entries are `<XrplTables as NetworkTables>::Entry`
     #[serde(default)]
     #[allow(dead_code)]
     evm: Option<toml::Value>,
@@ -843,6 +843,22 @@ impl SettlementTables {
         }
     }
 
+    /// Whether this node settles on `network` (ADR 0086 decision 2, issue
+    /// #1598): each EVM table's `eip155:<chainId>`, each XRPL table's
+    /// network, and the one Solana table, which answers for any `solana:`
+    /// network because config cannot know its cluster's genesis prefix;
+    /// boot asserts the prefix against the cluster, exactly as it asserts an
+    /// EVM table's key against `eth_chainId`.
+    pub(crate) fn settles(&self, network: &Network) -> bool {
+        match network {
+            Network::Eip155(chain_id) => self.eip155.contains(chain_id),
+            Network::Solana(_) => self.solana,
+            // No settlement backend holds MINA (ADR 0080 decision 7).
+            Network::Mina(_) => false,
+            Network::Xrpl(network) => self.xrpl.contains(network),
+        }
+    }
+
     /// The chains this node pays and is paid on x402 channels on, by name:
     /// [`Self::x402`] for each, as `peering_admission` asks it.
     pub(crate) fn settled_chains(&self) -> BTreeSet<&'static str> {
@@ -928,67 +944,6 @@ impl SettlementTables {
                 })
             }
             _ => Ok(Some(network)),
-        }
-    }
-}
-
-/// Which networks this node has a settlement table for, as an asset's
-/// network asks it (ADR 0086 decision 2, issue #1598): each EVM table's
-/// `eip155:<chainId>`, and the one Solana table.
-///
-/// The Solana table answers for any `solana:` network, because config cannot
-/// know its cluster's genesis prefix; boot asserts the prefix against the
-/// cluster, exactly as it asserts an EVM table's key against `eth_chainId`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SettledNetworks {
-    eip155: Vec<u64>,
-    solana: bool,
-    xrpl: Vec<XrplNetwork>,
-}
-
-impl SettledNetworks {
-    /// Read off an already-resolved settlement list.
-    pub(crate) fn of(settlements: &[SettlementConfig]) -> Self {
-        SettledNetworks {
-            eip155: settlements
-                .iter()
-                .filter_map(|settlement| match settlement {
-                    SettlementConfig::Evm(evm) => Some(evm.chain_id()),
-                    SettlementConfig::Solana(_) | SettlementConfig::Xrpl(_) => None,
-                })
-                .collect(),
-            solana: settlements
-                .iter()
-                .any(|settlement| settlement.chain() == SettlementChain::Solana),
-            xrpl: settlements
-                .iter()
-                .filter_map(|settlement| match settlement {
-                    SettlementConfig::Xrpl(xrpl) => Some(xrpl.network()),
-                    _ => None,
-                })
-                .collect(),
-        }
-    }
-
-    /// The same answer, stated directly, for a unit test about the rows that
-    /// ask it rather than about how a settlement table parses.
-    #[cfg(test)]
-    pub(crate) fn for_tests(eip155: &[u64], solana: bool) -> Self {
-        SettledNetworks {
-            eip155: eip155.to_vec(),
-            solana,
-            xrpl: Vec::new(),
-        }
-    }
-
-    /// Whether this node settles on `network`.
-    pub(crate) fn settles(&self, network: &Network) -> bool {
-        match network {
-            Network::Eip155(chain_id) => self.eip155.contains(chain_id),
-            Network::Solana(_) => self.solana,
-            // No settlement backend holds MINA (ADR 0080 decision 7).
-            Network::Mina(_) => false,
-            Network::Xrpl(network) => self.xrpl.contains(network),
         }
     }
 }
@@ -1132,59 +1087,6 @@ fn resolve_solana_fields(
     })
 }
 
-/// Resolve `[settlement.xrpl]`: one table per network (ADR 0087 decision 5),
-/// in network-id order. Each is refused by name when it is not a table of a
-/// known network, writes its key inline, or breaks a bound on its terms; an
-/// unknown key is refused by `deny_unknown_fields`, naming the key.
-fn resolve_xrpl_tables(raw: toml::Table) -> Result<Vec<XrplSettlementConfig>, ConfigError> {
-    if raw.is_empty() {
-        return Err(ConfigError::SettlementXrplEmpty);
-    }
-    // `[settlement.xrpl] rpc_url = ...` and `[settlement.xrpl.key]`: a table
-    // with no network, whose entries are a network table's own keys where
-    // its networks would be.
-    const TABLE_KEYS: [&str; 6] = [
-        "rpc_url",
-        "key",
-        "rpc_via_socks_proxy",
-        "min_settle_delay_secs",
-        "redemption_safety_secs",
-        "max_fee_drops",
-    ];
-    if let Some((key, _)) = raw
-        .iter()
-        .find(|(key, value)| !value.is_table() || TABLE_KEYS.contains(&key.as_str()))
-    {
-        return Err(ConfigError::SettlementXrplBareTable { key: key.clone() });
-    }
-    let mut tables = Vec::with_capacity(raw.len());
-    for (key, value) in raw {
-        let toml::Value::Table(table) = value else {
-            unreachable!("a non-table entry was refused above");
-        };
-        let network = key
-            .parse::<XrplNetwork>()
-            .map_err(|_| ConfigError::SettlementXrplUnknownNetwork { key: key.clone() })?;
-        let name = xrpl_table_name(network);
-        if table
-            .get("key")
-            .is_some_and(|key| !matches!(key, toml::Value::Table(_)))
-        {
-            return Err(ConfigError::SettlementXrplInlineKey { table: name });
-        }
-        let parsed: RawXrplSettlementTable =
-            table
-                .try_into()
-                .map_err(|source| ConfigError::SettlementXrplTableInvalid {
-                    table: name.clone(),
-                    source: Box::new(source),
-                })?;
-        tables.push(resolve_xrpl_fields(network, parsed)?);
-    }
-    tables.sort_by_key(|table| table.network().network_id());
-    Ok(tables)
-}
-
 fn resolve_xrpl_fields(
     network: XrplNetwork,
     table: RawXrplSettlementTable,
@@ -1227,6 +1129,205 @@ fn resolve_xrpl_fields(
     })
 }
 
+/// The chain families whose settlement tables are one table per network
+/// (ADR 0086 decision 4, ADR 0087 decision 5), named by the refusals the
+/// generic parser raises for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkTableFamily {
+    /// `[settlement.eip155.<chainId>]`.
+    Eip155,
+    /// `[settlement.xrpl.<id>]`.
+    Xrpl,
+}
+
+impl NetworkTableFamily {
+    /// The words of "`[settlement.<family>]` holds no network".
+    pub(crate) fn empty_message(self) -> &'static str {
+        match self {
+            NetworkTableFamily::Eip155 => {
+                "[settlement.eip155] names no network: add a [settlement.eip155.<chainId>] table under \
+                 it (e.g. [settlement.eip155.8453] for Base), or remove the heading (ADR 0086)"
+            }
+            NetworkTableFamily::Xrpl => {
+                "[settlement.xrpl] names no network: add a [settlement.xrpl.<id>] table under it, \
+                 where <id> is the server_info network_id of the ledger its rpc_url answers (0 \
+                 mainnet, 1 testnet, 2 devnet, 1000 stand-alone), or remove the heading (ADR 0087)"
+            }
+        }
+    }
+
+    /// The words of "`[settlement.<family>.<key>]` is no network of this
+    /// family".
+    pub(crate) fn unknown_network_message(self, key: &str) -> String {
+        match self {
+            NetworkTableFamily::Eip155 => format!(
+                "[settlement.eip155.{key}] is not keyed by a chain id: an EVM settlement table is \
+                 [settlement.eip155.<chainId>], with the network's EIP-155 chain id in decimal, no \
+                 leading zero (e.g. [settlement.eip155.8453] for Base), checked against eth_chainId at \
+                 boot (ADR 0086)"
+            ),
+            NetworkTableFamily::Xrpl => format!(
+                "[settlement.xrpl.{key}] is not a network this build knows: the XRPL networks are 0 \
+                 (mainnet), 1 (testnet), 2 (devnet) and 1000 (the stand-alone harness), keyed by the \
+                 ledger's server_info network_id (ADR 0087, ADR 0085). A network with no row is \
+                 refused, never guessed"
+            ),
+        }
+    }
+}
+
+/// One chain family's side of the generic network-keyed table parser: what
+/// a table key names, how an entry is read, and how it resolves. A new
+/// family (Mina, ADR 0089) is one more implementation, and gets the shared
+/// refusals (empty table, unknown network key) from
+/// [`resolve_network_tables`].
+pub(crate) trait NetworkTables {
+    /// A table's network, as its key names it.
+    type Network: Copy;
+    /// An entry as the section holds it before it resolves: the typed raw
+    /// table, or bare TOML where a family must refuse an ambiguous bare
+    /// table by name.
+    type Entry;
+    /// The resolved table.
+    type Config;
+
+    const FAMILY: NetworkTableFamily;
+
+    /// The network a table key names, `None` when it names none.
+    fn parse_key(key: &str) -> Option<Self::Network>;
+
+    /// The refusal for an entry that is a bare table (its own keys written
+    /// where networks belong), for a family that reads entries untyped.
+    fn refuse_bare(_key: &str, _entry: &Self::Entry) -> Option<ConfigError> {
+        None
+    }
+
+    fn resolve(network: Self::Network, entry: Self::Entry) -> Result<Self::Config, ConfigError>;
+
+    /// Sort key: tables resolve and load in network order.
+    fn order(network: Self::Network) -> u64;
+}
+
+/// Resolve one family's network-keyed table (ADR 0086 decision 4): refuse it
+/// empty, refuse an ambiguous bare table, refuse a key naming no network,
+/// then resolve each entry in network order.
+pub(crate) fn resolve_network_tables<F: NetworkTables>(
+    entries: Vec<(String, F::Entry)>,
+) -> Result<Vec<F::Config>, ConfigError> {
+    if entries.is_empty() {
+        return Err(ConfigError::SettlementNetworkTableEmpty { family: F::FAMILY });
+    }
+    if let Some(refusal) = entries
+        .iter()
+        .find_map(|(key, entry)| F::refuse_bare(key, entry))
+    {
+        return Err(refusal);
+    }
+    let mut networks = Vec::with_capacity(entries.len());
+    for (key, entry) in entries {
+        let network = F::parse_key(&key).ok_or(ConfigError::SettlementNetworkKeyUnknown {
+            family: F::FAMILY,
+            key,
+        })?;
+        networks.push((network, entry));
+    }
+    networks.sort_by_key(|(network, _)| F::order(*network));
+    networks
+        .into_iter()
+        .map(|(network, entry)| F::resolve(network, entry))
+        .collect()
+}
+
+/// `[settlement.eip155.<chainId>]`: keyed by decimal chain id, entries typed
+/// when the file parses.
+pub(crate) struct Eip155Tables;
+
+impl NetworkTables for Eip155Tables {
+    type Network = u64;
+    type Entry = RawEvmSettlementTable;
+    type Config = EvmSettlementConfig;
+    const FAMILY: NetworkTableFamily = NetworkTableFamily::Eip155;
+
+    fn parse_key(key: &str) -> Option<u64> {
+        Network::parse_eip155_chain_id(key).ok()
+    }
+
+    fn resolve(
+        chain_id: u64,
+        entry: RawEvmSettlementTable,
+    ) -> Result<EvmSettlementConfig, ConfigError> {
+        resolve_evm_fields(chain_id, entry)
+    }
+
+    fn order(chain_id: u64) -> u64 {
+        chain_id
+    }
+}
+
+/// `[settlement.xrpl.<id>]`: keyed by network name, entries read as bare
+/// TOML so a table written without a network (`[settlement.xrpl]` holding
+/// `rpc_url` directly) is refused by name, which a typed map could only
+/// fail as a type error.
+pub(crate) struct XrplTables;
+
+impl NetworkTables for XrplTables {
+    type Network = XrplNetwork;
+    type Entry = toml::Value;
+    type Config = XrplSettlementConfig;
+    const FAMILY: NetworkTableFamily = NetworkTableFamily::Xrpl;
+
+    fn parse_key(key: &str) -> Option<XrplNetwork> {
+        key.parse::<XrplNetwork>().ok()
+    }
+
+    /// `[settlement.xrpl] rpc_url = ...` and `[settlement.xrpl.key]`: an
+    /// entry that is no table, or one of a network table's own keys, where
+    /// its networks would be.
+    fn refuse_bare(key: &str, entry: &toml::Value) -> Option<ConfigError> {
+        const TABLE_KEYS: [&str; 6] = [
+            "rpc_url",
+            "key",
+            "rpc_via_socks_proxy",
+            "min_settle_delay_secs",
+            "redemption_safety_secs",
+            "max_fee_drops",
+        ];
+        (!entry.is_table() || TABLE_KEYS.contains(&key)).then(|| {
+            ConfigError::SettlementXrplBareTable {
+                key: key.to_string(),
+            }
+        })
+    }
+
+    fn resolve(
+        network: XrplNetwork,
+        entry: toml::Value,
+    ) -> Result<XrplSettlementConfig, ConfigError> {
+        let toml::Value::Table(table) = entry else {
+            unreachable!("a non-table entry was refused as a bare table");
+        };
+        let name = xrpl_table_name(network);
+        if table
+            .get("key")
+            .is_some_and(|key| !matches!(key, toml::Value::Table(_)))
+        {
+            return Err(ConfigError::SettlementXrplInlineKey { table: name });
+        }
+        let parsed: RawXrplSettlementTable =
+            table
+                .try_into()
+                .map_err(|source| ConfigError::SettlementXrplTableInvalid {
+                    table: name.clone(),
+                    source: Box::new(source),
+                })?;
+        resolve_xrpl_fields(network, parsed)
+    }
+
+    fn order(network: XrplNetwork) -> u64 {
+        u64::from(network.network_id())
+    }
+}
+
 /// Validate an optional `[settlement]` section. Presence configures one
 /// x402 settlement backend per table; absence is a node that settles on no
 /// chain, and so takes no claim at all (every claim is a voucher, ADR
@@ -1255,25 +1356,15 @@ pub(crate) fn resolve_settlement(
             }
             let mut out = Vec::new();
             if let Some(eip155) = raw.eip155 {
-                if eip155.is_empty() {
-                    return Err(ConfigError::SettlementEip155Empty);
-                }
-                let mut networks = Vec::with_capacity(eip155.len());
-                for (key, table) in eip155 {
-                    let chain_id = Network::parse_eip155_chain_id(&key)
-                        .map_err(|_| ConfigError::SettlementEip155KeyNotAChainId { key })?;
-                    networks.push((chain_id, table));
-                }
-                networks.sort_by_key(|(chain_id, _)| *chain_id);
-                for (chain_id, table) in networks {
-                    out.push(SettlementConfig::Evm(resolve_evm_fields(chain_id, table)?));
+                for table in resolve_network_tables::<Eip155Tables>(eip155.into_iter().collect())? {
+                    out.push(SettlementConfig::Evm(table));
                 }
             }
             if let Some(solana) = raw.solana {
                 out.push(SettlementConfig::Solana(resolve_solana_fields(solana)?));
             }
             if let Some(xrpl) = raw.xrpl {
-                for table in resolve_xrpl_tables(xrpl)? {
+                for table in resolve_network_tables::<XrplTables>(xrpl.into_iter().collect())? {
                     out.push(SettlementConfig::Xrpl(table));
                 }
             }
@@ -1886,7 +1977,7 @@ key_file = "{}"
             assert!(
                 matches!(
                     error,
-                    ConfigError::SettlementXrplUnknownNetwork { key: ref named } if named == key
+                    ConfigError::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Xrpl, key: ref named } if named == key
                 ),
                 "{key}: {error:?}"
             );
@@ -1940,7 +2031,9 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
     fn an_empty_xrpl_heading_is_refused() {
         assert!(matches!(
             resolve("[xrpl]\n"),
-            Err(ConfigError::SettlementXrplEmpty)
+            Err(ConfigError::SettlementNetworkTableEmpty {
+                family: NetworkTableFamily::Xrpl
+            })
         ));
     }
 
@@ -2114,7 +2207,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
                 .replace("[eip155.31337.key]", &format!("[eip155.\"{key}\".key]"));
             let error = resolve(&body).expect_err("not a chain id");
             assert!(
-                matches!(&error, ConfigError::SettlementEip155KeyNotAChainId { key: named } if named == key),
+                matches!(&error, ConfigError::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Eip155, key: named } if named == key),
                 "{key}: {error}"
             );
             let message = error.to_string();
@@ -2130,7 +2223,12 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
     #[test]
     fn an_eip155_section_with_no_network_is_refused_by_name() {
         let error = resolve("[eip155]\n").expect_err("no network");
-        assert!(matches!(error, ConfigError::SettlementEip155Empty));
+        assert!(matches!(
+            error,
+            ConfigError::SettlementNetworkTableEmpty {
+                family: NetworkTableFamily::Eip155,
+            }
+        ));
         assert!(error.to_string().contains("[settlement.eip155]"));
     }
 
@@ -2200,5 +2298,150 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             None
         );
         assert_eq!(cluster_hint_for_rpc_url("https://example.com"), None);
+    }
+
+    /// The generic network-keyed parser, run for every family through the
+    /// config crate's load interface (`Config::from_toml_str`): the same
+    /// four rules, each family's own words.
+    mod network_keyed_tables {
+        use super::*;
+        use crate::config::Config;
+        use std::io::Write;
+
+        /// One family under test: how it writes a network table, a key no
+        /// network of the family has, and the bare table it refuses.
+        struct Family {
+            heading: &'static str,
+            network_a: &'static str,
+            network_b: &'static str,
+            unknown_key: &'static str,
+            /// What the family refuses an empty table with.
+            empty: NetworkTableFamily,
+            /// A body that writes the family's table bare, with its keys
+            /// where networks belong.
+            bare: &'static str,
+            /// The table body, `{key}` the key file, written under each
+            /// network's heading.
+            table: &'static str,
+            /// The `[[tokens]]` a node on this family must declare.
+            tokens: &'static str,
+        }
+
+        const FAMILIES: [Family; 2] = [
+            Family {
+                heading: "eip155",
+                network_a: "31337",
+                network_b: "31338",
+                unknown_key: "base",
+                empty: NetworkTableFamily::Eip155,
+                bare: "rpc_url = \"http://127.0.0.1:8545\"\ntoken_address = \"0x5FbDB2315678afecb367f032d93F642f64180aa3\"\ndecimals = 6\n",
+                table: "rpc_url = \"http://127.0.0.1:8545\"\ntoken_address = \"0x5FbDB2315678afecb367f032d93F642f64180aa3\"\ndecimals = 6\nasset_eip712_name = \"USDC\"\nasset_eip712_version = \"2\"\n",
+                tokens: "",
+            },
+            Family {
+                heading: "xrpl",
+                network_a: "0",
+                network_b: "1",
+                unknown_key: "mainnet",
+                empty: NetworkTableFamily::Xrpl,
+                bare: "rpc_url = \"http://127.0.0.1:5005\"\n",
+                table: "rpc_url = \"http://127.0.0.1:5005\"\n",
+                tokens: "[[tokens]]\nasset = \"xrpl:0/slip44:144\"\n\n[[tokens]]\nasset = \"xrpl:1/slip44:144\"\n\n",
+            },
+        ];
+
+        fn load(tokens: &str, settlement: &str, key_file: &Path) -> Result<Config, ConfigError> {
+            let text = format!(
+                "client_edge_addr = \"127.0.0.1:3000\"\nstate_dir = \"{state}\"\n\n[signer]\nkey_file = \"{key}\"\n\n\
+                 {tokens}{settlement}",
+                key = key_file.display(),
+                state = std::env::temp_dir().display()
+            );
+            Config::from_toml_str(&text, Path::new("test.toml"))
+        }
+
+        fn key_file() -> tempfile::NamedTempFile {
+            let mut file = tempfile::NamedTempFile::new().expect("key file");
+            file.write_all(b"not a real key").expect("write");
+            file
+        }
+
+        fn network_table(family: &Family, network: &str, key_file: &Path) -> String {
+            let heading = family.heading;
+            format!(
+                "[settlement.{heading}.{network}]\n{}\n[settlement.{heading}.{network}.key]\nkey_file = \"{}\"\n\n",
+                family.table,
+                key_file.display()
+            )
+        }
+
+        #[test]
+        fn an_empty_table_is_refused_for_every_family() {
+            let key = key_file();
+            for family in &FAMILIES {
+                let error = load(
+                    family.tokens,
+                    &format!("[settlement.{}]\n", family.heading),
+                    key.path(),
+                )
+                .expect_err("no network");
+                assert!(
+                    matches!(
+                        &error,
+                        ConfigError::SettlementNetworkTableEmpty { family: named } if *named == family.empty
+                    ),
+                    "{}: {error:?}",
+                    family.heading
+                );
+            }
+        }
+
+        #[test]
+        fn an_unknown_network_key_is_refused_for_every_family() {
+            let key = key_file();
+            for family in &FAMILIES {
+                let body = network_table(family, family.unknown_key, key.path());
+                let error = load(family.tokens, &body, key.path()).expect_err("no such network");
+                assert!(
+                    matches!(
+                        &error,
+                        ConfigError::SettlementNetworkKeyUnknown { family: named, key: written }
+                            if *named == family.empty && written == family.unknown_key
+                    ),
+                    "{}: {error:?}",
+                    family.heading
+                );
+            }
+        }
+
+        #[test]
+        fn an_ambiguous_bare_table_is_refused_for_every_family() {
+            let key = key_file();
+            for family in &FAMILIES {
+                let body = format!(
+                    "[settlement.{}]\n{}\n[settlement.{}.key]\nkey_file = \"{}\"\n",
+                    family.heading,
+                    family.bare,
+                    family.heading,
+                    key.path().display()
+                );
+                load(family.tokens, &body, key.path()).expect_err(family.heading);
+            }
+        }
+
+        #[test]
+        fn two_networks_in_one_family_both_load() {
+            let key = key_file();
+            for family in &FAMILIES {
+                let body = format!(
+                    "{}{}",
+                    network_table(family, family.network_b, key.path()),
+                    network_table(family, family.network_a, key.path())
+                );
+                let config = load(family.tokens, &body, key.path())
+                    .unwrap_or_else(|e| panic!("{}: {e}", family.heading));
+                assert_eq!(config.settlements().len(), 2, "{}", family.heading);
+            }
+        }
     }
 }
