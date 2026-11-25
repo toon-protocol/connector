@@ -394,7 +394,6 @@ key_file = "{key_file}"
     mod x402 {
         use super::*;
 
-        use async_trait::async_trait;
         use base64::Engine;
         use connector_domain::{Prepare, Reject};
         use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
@@ -408,10 +407,14 @@ key_file = "{key_file}"
         use ed25519_dalek::Signer as _;
         use libsecp256k1::{Message, PublicKey, SecretKey};
 
-        use crate::{
-            AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-            ChannelResolutionError, ClientClaimGate,
+        use connector_runtime::{InMemorySettlementNetwork, SettlementNetworks};
+        use connector_settlement::batch::{
+            ChannelPresentation, EvmChannelConfig, InMemoryBatchSettlement, PayerExit,
+            VoucherSigner as PortVoucherSigner,
         };
+        use connector_settlement::ChannelId;
+
+        use crate::ClientClaimGate;
 
         const CHAIN: u64 = 84_532;
 
@@ -472,61 +475,58 @@ key_file = "{key_file}"
         const PEER_ACCOUNT: [u8; 32] = [0xc3; 32];
         const STRANGER_ACCOUNT: [u8; 32] = [0xc4; 32];
 
-        /// Two channels on each chain, one the peer's and one a stranger's.
-        #[derive(Debug)]
-        struct TwoChannelsEachChain;
-
-        #[async_trait]
-        impl BatchSettlementChannels for TwoChannelsEachChain {
-            fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-                vec![domain()]
+        /// Two channels on each chain, one the peer's and one a stranger's,
+        /// on an EVM and a Solana network over the in-memory settlement.
+        fn two_channels_each_chain() -> SettlementNetworks {
+            let evm = Arc::new(InMemoryBatchSettlement::new(PayerExit::Withdrawal, 86_400));
+            for owner in [peer_key(), stranger_key()] {
+                let config = config_of(&owner);
+                evm.client_opened(
+                    &ChannelPresentation::Evm {
+                        channel: ChannelId(format!("0x{}", hex::encode(evm_channel(&owner)))),
+                        config: EvmChannelConfig {
+                            payer: config.payer,
+                            payer_authorizer: config.payer_authorizer,
+                            receiver: config.receiver,
+                            receiver_authorizer: config.receiver_authorizer,
+                            token: config.token,
+                            withdraw_delay: config.withdraw_delay,
+                            salt: config.salt,
+                        },
+                    },
+                    PortVoucherSigner::Evm(config.payer_authorizer),
+                    1_000_000,
+                );
             }
-
-            fn solana_network(&self) -> Option<connector_domain::Network> {
-                Some(
-                    "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-                        .parse()
-                        .expect("a CAIP-2 network"),
-                )
+            let solana = Arc::new(InMemoryBatchSettlement::new(PayerExit::Close, 86_400));
+            for (account, signer) in [
+                (PEER_ACCOUNT, peer_ed25519()),
+                (STRANGER_ACCOUNT, ed25519(0x22)),
+            ] {
+                solana.client_opened(
+                    &ChannelPresentation::Solana {
+                        channel: ChannelId(bs58::encode(account).into_string()),
+                    },
+                    PortVoucherSigner::Solana(signer.public.to_bytes()),
+                    1_000_000,
+                );
             }
-
-            async fn evm(
-                &self,
-                _network: &connector_domain::Network,
-                channel_id: &[u8; 32],
-                presented_config: Option<&BatchChannelConfig>,
-            ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-                // An EVM channel is found from its config alone: the chain
-                // stores it by id.
-                let Some(config) = presented_config else {
-                    return Ok(None);
-                };
-                let known = [config_of(&peer_key()), config_of(&stranger_key())];
-                Ok(known
-                    .into_iter()
-                    .find(|known| {
-                        known == config && evm_batch_channel_id(&domain(), known) == *channel_id
-                    })
-                    .map(|config| AdmittedEvmVoucherChannel {
-                        config,
-                        max_cumulative: 1_000_000,
-                    }))
-            }
-
-            async fn solana(
-                &self,
-                channel_account: &[u8; 32],
-            ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-                let signer = match *channel_account {
-                    PEER_ACCOUNT => peer_ed25519(),
-                    STRANGER_ACCOUNT => ed25519(0x22),
-                    _ => return Ok(None),
-                };
-                Ok(Some(AdmittedSolanaVoucherChannel {
-                    authorized_signer: signer.public.to_bytes(),
-                    max_cumulative: 1_000_000,
-                }))
-            }
+            SettlementNetworks::new()
+                .with(Arc::new(InMemorySettlementNetwork::new(
+                    connector_domain::Network::Eip155(CHAIN),
+                    evm,
+                    "this-node",
+                )))
+                .and_then(|networks| {
+                    networks.with(Arc::new(InMemorySettlementNetwork::new(
+                        "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+                            .parse()
+                            .expect("a CAIP-2 network"),
+                        solana,
+                        "this-node",
+                    )))
+                })
+                .expect("two networks")
         }
 
         fn config_json(config: &BatchChannelConfig) -> serde_json::Value {
@@ -676,7 +676,7 @@ key_file = "{key_file}"
             }
             let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
                 .expect("an empty journal")
-                .with_batch_settlement(Arc::new(TwoChannelsEachChain));
+                .with_settlement_networks(two_channels_each_chain());
             let carriages = PeerCarriages::from_config(
                 Arc::clone(&connector),
                 config.peers(),
@@ -962,7 +962,7 @@ key_file = "{key_file}"
                 );
                 let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
                     .expect("an empty journal")
-                    .with_batch_settlement(Arc::new(TwoChannelsEachChain));
+                    .with_settlement_networks(two_channels_each_chain());
                 PeerCarriages::from_config(
                     connector,
                     config.peers(),

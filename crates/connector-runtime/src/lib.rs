@@ -19,6 +19,7 @@ mod rate_poller;
 mod rate_table;
 mod route;
 mod self_description;
+mod settlement_network;
 mod voucher_binding;
 // Behind a feature rather than `#[cfg(test)]`, unlike `test_support` below:
 // both peer-carriage crates need it and a `#[cfg(test)]` item is invisible
@@ -97,4 +98,11 @@ pub use self_description::{
 // when its voucher signer is bound to that peering.
 #[cfg(any(test, feature = "test-support"))]
 pub use socks5_test_server::{Socks5TestServer, SocksConnect};
+// Spec #1684, issue #1714: every network this node settles on, one
+// collection keyed by CAIP-2 network.
+#[cfg(any(test, feature = "test-support"))]
+pub use settlement_network::InMemorySettlementNetwork;
+pub use settlement_network::{
+    NetworkAlreadySettled, SettlementNetwork, SettlementNetworks, VoucherCarriage, VoucherCarriages,
+};
 pub use voucher_binding::{VoucherBindingError, VoucherSigner, VoucherSignerBindings};

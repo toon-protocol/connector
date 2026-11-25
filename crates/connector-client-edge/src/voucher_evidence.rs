@@ -7,8 +7,8 @@
 //! # Why the claim gate
 //!
 //! It is the one component that holds both things a voucher's signer is
-//! resolved from: the batch-settlement backends (ADR 0074 decision 9's
-//! seam, [`crate::BatchSettlementChannels`]) and the journaled
+//! resolved from: the node's settlement networks (spec #1684, one
+//! collection keyed by CAIP-2 network) and the journaled
 //! `ChannelConfig` an EVM voucher that carries none is resolved from. The
 //! lookups are the very ones `POST /ilp/claim-state` makes for a
 //! `batch-settlement` entry ([`ClientClaimGate::evm_voucher_channel`],
@@ -171,13 +171,14 @@ impl ClientClaimGate {
     /// `signature` over `message` against its `authorized_signer`.
     async fn check_solana(
         &self,
+        network: &Network,
         channel_account: [u8; 32],
         message: SolanaMessage,
         signature: &[u8; 64],
         requester: &str,
     ) -> VoucherCheck {
         let Ok(Some(channel)) = self
-            .solana_voucher_channel(&channel_account, requester)
+            .solana_voucher_channel(network, &channel_account, requester)
             .await
         else {
             return VoucherCheck::Unresolved;
@@ -289,6 +290,7 @@ impl VoucherEvidence for ClientClaimGate {
                     return VoucherCheck::Unresolved;
                 };
                 self.check_solana(
+                    &voucher.network,
                     channel_account,
                     SolanaMessage::Voucher {
                         cumulative: voucher.max_claimable_amount,
@@ -374,12 +376,13 @@ impl VoucherEvidence for ClientClaimGate {
                 .await
             }
             PeerRoleChallenge::Solana {
-                network: _,
+                network,
                 channel_account,
                 expires,
                 signature,
             } => {
                 self.check_solana(
+                    network,
                     *channel_account,
                     SolanaMessage::Challenge { expires: *expires },
                     signature,

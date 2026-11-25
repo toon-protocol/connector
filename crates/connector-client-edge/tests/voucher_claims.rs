@@ -1,28 +1,26 @@
 //! ADR 0074, issue #1341: an x402 `batch-settlement` voucher through the
 //! client edge's real claim gate -- opt-in, freshness, retransmission,
-//! signature, collateral and the journal -- over a fake backend that
-//! answers the seam (`BatchSettlementChannels`) the way #1342/#1343's real
-//! ones must: with admitted channels only, and the signer read from the
+//! signature, collateral and the journal -- over settlement networks on the
+//! in-memory batch settlement (spec #1684), which answers the way the real
+//! adapters must: with admitted channels only, and the signer read from the
 //! chain.
 //!
-//! The fake is not a mock: it asserts no call sequence, and it holds the
-//! one fact a backend owns -- which channels exist and what they can pay.
-//! It counts lookups so a test can show a refusal that should cost nothing
-//! (a replay, an underpayment, a config that hashes wrong) really asked the
-//! backend nothing.
+//! The fake is not a mock: it asserts no call sequence, and it upholds the
+//! port's contract suites. It counts chain reads so a test can show a
+//! refusal that should cost nothing (a replay, an underpayment, a config
+//! that hashes wrong) really asked the chain nothing.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use connector_client_edge::{
-    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, ChannelResolutionError, ClaimIngestRejection, ClientClaimGate,
-    JournaledBatchChannel, UnresolvableLookupBudgetPolicy,
+    journaled_batch_channels, ClaimIngestRejection, ClientClaimGate, JournaledBatchChannel,
+    UnresolvableLookupBudgetPolicy,
 };
 use connector_domain::{JournalEntry, Network, Watermark, VOUCHER_WATERMARK_NONCE};
-use connector_runtime::{FileJournal, InMemoryJournal, Journal};
+use connector_runtime::{
+    FileJournal, InMemoryJournal, InMemorySettlementNetwork, Journal, SettlementNetwork,
+    SettlementNetworks,
+};
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_digest, solana_voucher_message,
     BatchChannelConfig, BatchSettlementDomain,
@@ -141,91 +139,62 @@ fn solana_voucher(amount: u64, signer: &ed25519_dalek::Keypair, expires_at: i64)
     .to_string()
 }
 
-/// A backend holding one EVM and one Solana channel, both admissible.
+/// One EVM network (`eip155:84532`) holding `evm_config`'s channel and one
+/// Solana network holding [`SOLANA_CHANNEL`], both admissible, over the
+/// in-memory batch settlement -- the fake both of the port's contract suites
+/// hold to the real adapters' rules (ADR 0007).
 ///
-/// It keeps the seam's one EVM rule a real backend cannot escape: an EVM
-/// channel is found only from its config, so an instance that has never
-/// been shown the config -- a fresh process, after a restart -- admits
-/// nothing when handed `None`.
-#[derive(Debug)]
-struct FakeBatchSettlement {
-    evm_config: BatchChannelConfig,
-    max_cumulative: u128,
-    lookups: AtomicUsize,
-    admitted: Mutex<HashSet<[u8; 32]>>,
+/// It keeps the one EVM rule a real network cannot escape: an EVM channel is
+/// found only from its config. It counts chain reads, so a test can show a
+/// refusal that should cost nothing (a replay, an underpayment, a config
+/// that hashes wrong) really asked the chain nothing.
+struct InMemoryNetworks {
+    evm: Arc<InMemorySettlementNetwork>,
+    solana: Arc<InMemorySettlementNetwork>,
 }
 
-impl FakeBatchSettlement {
-    fn new(max_cumulative: u128) -> FakeBatchSettlement {
-        FakeBatchSettlement::holding(config(), max_cumulative)
+impl InMemoryNetworks {
+    fn new(max_cumulative: u128) -> InMemoryNetworks {
+        InMemoryNetworks::holding(config(), max_cumulative)
     }
 
-    fn holding(evm_config: BatchChannelConfig, max_cumulative: u128) -> FakeBatchSettlement {
-        FakeBatchSettlement {
-            evm_config,
+    fn holding(evm_config: BatchChannelConfig, max_cumulative: u128) -> InMemoryNetworks {
+        let evm = InMemorySettlementNetwork::fresh(Network::Eip155(CHAIN_ID));
+        evm.open_evm(&evm_config, max_cumulative);
+        let solana =
+            InMemorySettlementNetwork::fresh(SOLANA_NETWORK.parse().expect("a CAIP-2 network"));
+        solana.open_solana(
+            SOLANA_CHANNEL,
+            solana_signer().public.to_bytes(),
             max_cumulative,
-            lookups: AtomicUsize::new(0),
-            admitted: Mutex::new(HashSet::new()),
+        );
+        InMemoryNetworks {
+            evm: Arc::new(evm),
+            solana: Arc::new(solana),
         }
     }
 
     fn lookups(&self) -> usize {
-        self.lookups.load(Ordering::SeqCst)
+        self.evm.settlement().reads() + self.solana.settlement().reads()
+    }
+
+    fn networks(&self) -> SettlementNetworks {
+        SettlementNetworks::new()
+            .with(Arc::clone(&self.evm) as Arc<dyn SettlementNetwork>)
+            .and_then(|networks| {
+                networks.with(Arc::clone(&self.solana) as Arc<dyn SettlementNetwork>)
+            })
+            .expect("two networks")
     }
 }
 
-#[async_trait]
-impl BatchSettlementChannels for FakeBatchSettlement {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![domain()]
-    }
-
-    fn solana_network(&self) -> Option<Network> {
-        Some(SOLANA_NETWORK.parse().expect("a CAIP-2 network"))
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
-        if *channel_id != evm_batch_channel_id(&domain(), &self.evm_config) {
-            return Ok(None);
-        }
-        let mut admitted = self.admitted.lock().unwrap();
-        if presented_config.is_none() && !admitted.contains(channel_id) {
-            return Ok(None);
-        }
-        admitted.insert(*channel_id);
-        Ok(Some(AdmittedEvmVoucherChannel {
-            config: self.evm_config,
-            max_cumulative: self.max_cumulative,
-        }))
-    }
-
-    async fn solana(
-        &self,
-        channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
-        Ok(
-            (*channel_account == SOLANA_CHANNEL).then_some(AdmittedSolanaVoucherChannel {
-                authorized_signer: solana_signer().public.to_bytes(),
-                max_cumulative: u64::try_from(self.max_cumulative).unwrap_or(u64::MAX),
-            }),
-        )
-    }
-}
-
-fn gate_over(journal: Arc<dyn Journal>, backend: &Arc<FakeBatchSettlement>) -> ClientClaimGate {
+fn gate_over(journal: Arc<dyn Journal>, backend: &Arc<InMemoryNetworks>) -> ClientClaimGate {
     ClientClaimGate::restore(journal)
         .expect("the journal replays")
-        .with_batch_settlement(Arc::clone(backend) as Arc<dyn BatchSettlementChannels>)
+        .with_settlement_networks(backend.networks())
 }
 
-fn gate_with(backend: &Arc<FakeBatchSettlement>) -> (ClientClaimGate, Arc<InMemoryJournal>) {
+fn gate_with(backend: &Arc<InMemoryNetworks>) -> (ClientClaimGate, Arc<InMemoryJournal>) {
     let journal = Arc::new(InMemoryJournal::new());
     (
         gate_over(Arc::clone(&journal) as Arc<dyn Journal>, backend),
@@ -260,7 +229,7 @@ async fn a_node_that_has_not_opted_in_refuses_a_voucher_by_name() {
 /// operator adds a network.
 #[tokio::test]
 async fn a_voucher_with_no_network_is_refused_by_name_on_a_single_network_node() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let evm = signed_evm_voucher(100).replace(r#""network":"eip155:84532","#, "");
     let solana = solana_voucher(100, &solana_signer(), 0)
@@ -282,7 +251,7 @@ async fn a_voucher_with_no_network_is_refused_by_name_on_a_single_network_node()
 /// no settlement table: refused naming it, before any lookup.
 #[tokio::test]
 async fn a_voucher_on_a_network_this_node_has_no_table_for_is_refused_by_name() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let base = signed_evm_voucher(100).replace("eip155:84532", "eip155:8453");
     let mainnet_beta = solana_voucher(100, &solana_signer(), 0)
@@ -309,7 +278,7 @@ async fn a_voucher_on_a_network_this_node_has_no_table_for_is_refused_by_name() 
 /// refused naming the network it claimed -- and nothing is credited.
 #[tokio::test]
 async fn an_evm_voucher_whose_network_is_not_its_channels_domain_is_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let elsewhere = BatchSettlementDomain::x402(31_337);
     let channel = evm_batch_channel_id(&elsewhere, &config());
@@ -389,7 +358,7 @@ async fn the_committed_claim_network_refusals_match_the_real_gate() {
             node.contains(&"eip155:84532") && node.contains(&SOLANA_NETWORK),
             "case {name} is judged by a node this gate stands in for"
         );
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         let refused = gate
             .ingest(case["claim_json"].as_str().expect("claim_json"), 0)
@@ -400,55 +369,6 @@ async fn the_committed_claim_network_refusals_match_the_real_gate() {
         replayed += 1;
     }
     assert_eq!(replayed, 3);
-}
-
-/// A port settling on every EVM network a vector case's node names (ADR
-/// 0086), admitting any channel whose presented config reproduces its id
-/// under the network the voucher was asked about -- and only under that one.
-#[derive(Debug)]
-struct EveryNetwork {
-    chain_ids: Vec<u64>,
-    asked_on: Mutex<Vec<Network>>,
-}
-
-#[async_trait]
-impl BatchSettlementChannels for EveryNetwork {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        self.chain_ids
-            .iter()
-            .map(|chain_id| BatchSettlementDomain::x402(*chain_id))
-            .collect()
-    }
-
-    fn solana_network(&self) -> Option<Network> {
-        None
-    }
-
-    async fn evm(
-        &self,
-        network: &Network,
-        channel_id: &[u8; 32],
-        presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        self.asked_on.lock().unwrap().push(network.clone());
-        let (Some(chain_id), Some(config)) = (network.eip155_chain_id(), presented_config) else {
-            return Ok(None);
-        };
-        Ok(
-            (evm_batch_channel_id(&BatchSettlementDomain::x402(chain_id), config) == *channel_id)
-                .then_some(AdmittedEvmVoucherChannel {
-                    config: *config,
-                    max_cumulative: u128::MAX,
-                }),
-        )
-    }
-
-    async fn solana(
-        &self,
-        _channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        Ok(None)
-    }
 }
 
 /// Schema 11's two-network acceptances (#1601), replayed against the real
@@ -480,18 +400,36 @@ async fn the_committed_two_network_acceptances_match_the_real_gate() {
             })
             .collect();
         assert!(chain_ids.len() > 1, "case {name} is a two-network node");
-        let backend = Arc::new(EveryNetwork {
-            chain_ids,
-            asked_on: Mutex::new(Vec::new()),
-        });
+        // The case's channel, opened toward this node on every network it
+        // settles on: only being asked of the right one tells them apart.
+        let config = vector_channel_config(claim_json);
+        let networks: Vec<Arc<InMemorySettlementNetwork>> = chain_ids
+            .iter()
+            .map(|chain_id| {
+                let network = InMemorySettlementNetwork::fresh(Network::Eip155(*chain_id));
+                network.open_evm(&config, u128::MAX);
+                Arc::new(network)
+            })
+            .collect();
+        let mut settled = SettlementNetworks::new();
+        for network in &networks {
+            settled
+                .insert(Arc::clone(network) as Arc<dyn SettlementNetwork>)
+                .expect("distinct networks");
+        }
         let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
             .expect("an empty journal")
-            .with_batch_settlement(Arc::clone(&backend) as Arc<dyn BatchSettlementChannels>);
+            .with_settlement_networks(settled);
         gate.ingest(claim_json, 0)
             .await
             .unwrap_or_else(|refused| panic!("case {name} is accepted: {refused:?}"));
+        let asked_on: Vec<Network> = networks
+            .iter()
+            .filter(|network| network.settlement().reads() > 0)
+            .map(|network| network.network().clone())
+            .collect();
         assert_eq!(
-            *backend.asked_on.lock().unwrap(),
+            asked_on,
             vec![claim.network().clone()],
             "case {name} is asked of its own network only"
         );
@@ -504,7 +442,7 @@ async fn the_committed_two_network_acceptances_match_the_real_gate() {
 
 #[tokio::test]
 async fn a_genuine_evm_voucher_is_accepted_and_journaled_like_a_claim() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, journal) = gate_with(&backend);
 
     gate.ingest(&signed_evm_voucher(100), 100)
@@ -548,7 +486,7 @@ async fn a_genuine_evm_voucher_is_accepted_and_journaled_like_a_claim() {
 
 #[tokio::test]
 async fn a_later_voucher_needs_no_channel_config() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     gate.ingest(&signed_evm_voucher(100), 0)
         .await
@@ -570,7 +508,7 @@ async fn a_later_voucher_needs_no_channel_config() {
 /// higher one accepted -- and the refusal costs no lookup and no signature.
 #[tokio::test]
 async fn an_equal_amount_is_refused_before_any_lookup_and_a_higher_one_accepted() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     gate.ingest(&signed_evm_voucher(100), 0)
         .await
@@ -601,7 +539,7 @@ async fn an_equal_amount_is_refused_before_any_lookup_and_a_higher_one_accepted(
 
 #[tokio::test]
 async fn a_lower_amount_is_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     gate.ingest(&signed_evm_voucher(100), 0)
         .await
@@ -616,7 +554,7 @@ async fn a_lower_amount_is_refused() {
 /// watermark is not an error, and records nothing.
 #[tokio::test]
 async fn a_byte_identical_resend_is_accepted_again_and_records_nothing() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, journal) = gate_with(&backend);
     let voucher = signed_evm_voucher(100);
     gate.ingest(&voucher, 100).await.expect("first");
@@ -639,7 +577,7 @@ async fn a_byte_identical_resend_is_accepted_again_and_records_nothing() {
 /// underpayment of the whole charge, or one voucher would pay forever.
 #[tokio::test]
 async fn a_byte_identical_resend_pays_for_nothing() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let voucher = signed_evm_voucher(100);
     gate.ingest(&voucher, 100).await.expect("first");
@@ -656,7 +594,7 @@ async fn a_byte_identical_resend_pays_for_nothing() {
 
 #[tokio::test]
 async fn value_binding_applies_to_a_voucher() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     assert_eq!(
         gate.ingest(&signed_evm_voucher(40), 50).await.unwrap_err(),
@@ -675,7 +613,7 @@ async fn value_binding_applies_to_a_voucher() {
 /// backend about it.
 #[tokio::test]
 async fn a_config_that_does_not_hash_to_the_channel_is_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let forged = BatchChannelConfig {
         payer_authorizer: [0x77; 20],
@@ -700,7 +638,7 @@ async fn a_config_that_does_not_hash_to_the_channel_is_refused() {
 /// is refused and advances nothing.
 #[tokio::test]
 async fn a_voucher_not_signed_by_the_channels_signer_is_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let stranger = SecretKey::parse(&[0x0b; 32]).unwrap();
     assert_eq!(
@@ -717,7 +655,7 @@ async fn a_voucher_not_signed_by_the_channels_signer_is_refused() {
 
 #[tokio::test]
 async fn a_voucher_above_the_channels_collateral_is_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     assert_eq!(
         gate.ingest(&signed_evm_voucher(1_001), 0)
@@ -733,7 +671,7 @@ async fn a_voucher_above_the_channels_collateral_is_refused() {
 
 #[tokio::test]
 async fn a_voucher_on_a_channel_the_backend_does_not_admit_is_unknown() {
-    let backend = Arc::new(FakeBatchSettlement::holding(
+    let backend = Arc::new(InMemoryNetworks::holding(
         BatchChannelConfig {
             salt: [0x01; 32],
             ..config()
@@ -756,7 +694,7 @@ async fn a_voucher_on_a_channel_the_backend_does_not_admit_is_unknown() {
 async fn an_evm_voucher_amount_above_u64_is_admitted_exactly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("client-claims.journal");
-    let backend = Arc::new(FakeBatchSettlement::new(u128::MAX));
+    let backend = Arc::new(InMemoryNetworks::new(u128::MAX));
     let above = u128::from(u64::MAX) + 1;
     assert_eq!(above.to_string(), "18446744073709551616");
     let exact = Some(Watermark {
@@ -810,7 +748,7 @@ async fn a_journal_written_before_the_widening_replays_to_the_same_state() {
     )
     .expect("an old-shape journal");
 
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let gate = gate_over(
         Arc::new(FileJournal::open(&path).expect("reopens")),
         &backend,
@@ -841,7 +779,7 @@ async fn a_journal_written_before_the_widening_replays_to_the_same_state() {
 /// refused, not truncated.
 #[tokio::test]
 async fn a_solana_voucher_amount_above_u64_is_refused_not_truncated() {
-    let backend = Arc::new(FakeBatchSettlement::new(u128::MAX));
+    let backend = Arc::new(InMemoryNetworks::new(u128::MAX));
     let (gate, _journal) = gate_with(&backend);
     let above = u128::from(u64::MAX) + 100;
     let wide = solana_voucher(100, &solana_signer(), 0).replace(
@@ -859,7 +797,7 @@ async fn a_solana_voucher_amount_above_u64_is_refused_not_truncated() {
 
 #[tokio::test]
 async fn a_genuine_solana_voucher_is_accepted_and_a_strangers_refused() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     let key = format!("solana:{}", bs58::encode(SOLANA_CHANNEL).into_string());
 
@@ -888,7 +826,7 @@ async fn a_genuine_solana_voucher_is_accepted_and_a_strangers_refused() {
 
 #[tokio::test]
 async fn a_solana_voucher_that_can_expire_is_refused_structurally() {
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let (gate, _journal) = gate_with(&backend);
     assert!(matches!(
         gate.ingest(&solana_voucher(100, &solana_signer(), 1_900_000_000), 0)
@@ -908,7 +846,7 @@ async fn a_solana_voucher_that_can_expire_is_refused_structurally() {
 async fn after_a_restart_a_resend_is_still_a_resend_and_a_replay_still_stale() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("client-claims.journal");
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let voucher = signed_evm_voucher(100);
     {
         let gate = gate_over(Arc::new(FileJournal::open(&path).expect("opens")), &backend);
@@ -948,7 +886,7 @@ async fn after_a_restart_a_voucher_without_its_config_is_still_admitted() {
     {
         let gate = gate_over(
             Arc::new(FileJournal::open(&path).expect("opens")),
-            &Arc::new(FakeBatchSettlement::new(1_000)),
+            &Arc::new(InMemoryNetworks::new(1_000)),
         );
         gate.ingest(&signed_evm_voucher(100), 100)
             .await
@@ -956,7 +894,7 @@ async fn after_a_restart_a_voucher_without_its_config_is_still_admitted() {
     }
 
     // A new process: a backend that has admitted nothing yet.
-    let restarted = Arc::new(FakeBatchSettlement::new(1_000));
+    let restarted = Arc::new(InMemoryNetworks::new(1_000));
     let gate = gate_over(
         Arc::new(FileJournal::open(&path).expect("reopens")),
         &restarted,
@@ -981,7 +919,7 @@ async fn after_a_restart_a_voucher_without_its_config_is_still_admitted() {
 #[tokio::test]
 async fn a_voucher_lookup_that_finds_nothing_is_metered() {
     // One lookup per hour, and no waiting for the next.
-    let backend = Arc::new(FakeBatchSettlement::new(1_000));
+    let backend = Arc::new(InMemoryNetworks::new(1_000));
     let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
         .expect("an empty journal")
         .with_lookup_budget(UnresolvableLookupBudgetPolicy {
@@ -990,7 +928,7 @@ async fn a_voucher_lookup_that_finds_nothing_is_metered() {
             window: std::time::Duration::from_secs(3_600),
             max_wait: std::time::Duration::ZERO,
         })
-        .with_batch_settlement(Arc::clone(&backend) as Arc<dyn BatchSettlementChannels>);
+        .with_settlement_networks(backend.networks());
 
     // Real channels resolve, so they give their slot back: any number of
     // first vouchers on them costs the budget nothing.
@@ -1147,7 +1085,7 @@ mod claim_state {
 
     #[tokio::test]
     async fn an_evm_voucher_channel_reports_its_amount_watermark_and_headroom() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         gate.ingest(&signed_evm_voucher(100), 100)
             .await
@@ -1184,7 +1122,7 @@ mod claim_state {
             evm_entry(evm_challenge(&authorizer(), channel_id()), Some(&config())),
             solana_entry(&solana_signer()),
         ] {
-            let backend = Arc::new(FakeBatchSettlement::new(1_000));
+            let backend = Arc::new(InMemoryNetworks::new(1_000));
             let (gate, _journal) = gate_with(&backend);
             let mut entry = entry;
             entry.as_object_mut().unwrap().remove("network");
@@ -1211,7 +1149,7 @@ mod claim_state {
                 "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
             ),
         ] {
-            let backend = Arc::new(FakeBatchSettlement::new(1_000));
+            let backend = Arc::new(InMemoryNetworks::new(1_000));
             let (gate, _journal) = gate_with(&backend);
             entry["network"] = network.into();
 
@@ -1234,7 +1172,7 @@ mod claim_state {
         {
             let gate = gate_over(
                 Arc::new(FileJournal::open(&path).expect("opens")),
-                &Arc::new(FakeBatchSettlement::new(1_000)),
+                &Arc::new(InMemoryNetworks::new(1_000)),
             );
             gate.ingest(&signed_evm_voucher(250), 250)
                 .await
@@ -1242,7 +1180,7 @@ mod claim_state {
         }
         let gate = gate_over(
             Arc::new(FileJournal::open(&path).expect("reopens")),
-            &Arc::new(FakeBatchSettlement::new(1_000)),
+            &Arc::new(InMemoryNetworks::new(1_000)),
         );
 
         let entry = claim_state(
@@ -1260,7 +1198,7 @@ mod claim_state {
     /// the signer still read from what the backend admitted.
     #[tokio::test]
     async fn a_channel_with_no_voucher_yet_is_answered_from_a_presented_config() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
 
         let entry = claim_state(
@@ -1276,7 +1214,7 @@ mod claim_state {
 
     #[tokio::test]
     async fn a_channel_with_no_record_and_no_config_is_unverified() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
 
         let entry = claim_state(
@@ -1291,7 +1229,7 @@ mod claim_state {
 
     #[tokio::test]
     async fn a_config_that_does_not_hash_to_the_channel_is_unverified() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         let other = BatchChannelConfig {
             salt: [0x77; 32],
@@ -1312,7 +1250,7 @@ mod claim_state {
     /// named a separate `payerAuthorizer`, and the payer's own key is not it.
     #[tokio::test]
     async fn a_challenge_not_signed_by_the_voucher_signer_is_unverified() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         gate.ingest(&signed_evm_voucher(100), 100)
             .await
@@ -1336,7 +1274,7 @@ mod claim_state {
     /// controls.
     #[tokio::test]
     async fn a_toon_channel_entry_is_refused_by_name_without_a_lookup() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let signature = evm_challenge(&authorizer(), channel_id());
         for scheme in [None, Some("toon-channel")] {
             let mut evm = evm_entry(signature.clone(), Some(&config()));
@@ -1375,7 +1313,7 @@ mod claim_state {
     async fn the_committed_claim_state_toon_channel_refused_vectors_match_the_real_endpoint() {
         let vectors: serde_json::Value =
             serde_json::from_str(WIRE_VECTORS).expect("the committed vectors parse");
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let cases = vectors["claim_state_toon_channel_refused"]["cases"]
             .as_array()
             .expect("claim_state_toon_channel_refused.cases is an array");
@@ -1407,7 +1345,7 @@ mod claim_state {
 
     #[tokio::test]
     async fn a_solana_voucher_channel_reports_its_amount_watermark() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         gate.ingest(&solana_voucher(300, &solana_signer(), 0), 300)
             .await
@@ -1433,7 +1371,7 @@ mod claim_state {
 
     #[tokio::test]
     async fn a_solana_challenge_by_anyone_but_the_authorized_signer_is_unverified() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         let secret = ed25519_dalek::SecretKey::from_bytes(&[0x22; 32]).expect("seed");
         let public = (&secret).into();
@@ -1526,7 +1464,7 @@ mod claim_state {
     /// the same challenge that proves the peer role (decision 5).
     #[tokio::test]
     async fn a_voucher_challenge_is_answered_for_a_peer_bound_channel() {
-        let backend = Arc::new(FakeBatchSettlement::new(1_000));
+        let backend = Arc::new(InMemoryNetworks::new(1_000));
         let (gate, _journal) = gate_with(&backend);
         gate.ingest(&signed_evm_voucher(100), 100)
             .await
@@ -1557,5 +1495,30 @@ mod claim_state {
         let solana = claim_state_on(connector, gate, solana_entry(&solana_signer())).await;
         assert_eq!(solana["ok"], true, "{solana}");
         assert_eq!(solana["cumulativeClaimed"], "70");
+    }
+}
+
+/// The `ChannelConfig` a vector case's EVM voucher carries.
+fn vector_channel_config(claim_json: &str) -> BatchChannelConfig {
+    let claim: serde_json::Value = serde_json::from_str(claim_json).expect("JSON");
+    let config = &claim["channelConfig"];
+    let bytes = |field: &str| -> Vec<u8> {
+        hex::decode(
+            config[field]
+                .as_str()
+                .expect("a hex field")
+                .trim_start_matches("0x"),
+        )
+        .expect("hex")
+    };
+    let address = |field: &str| -> [u8; 20] { bytes(field).try_into().expect("20 bytes") };
+    BatchChannelConfig {
+        payer: address("payer"),
+        payer_authorizer: address("payerAuthorizer"),
+        receiver: address("receiver"),
+        receiver_authorizer: address("receiverAuthorizer"),
+        token: address("token"),
+        withdraw_delay: config["withdrawDelay"].as_u64().expect("withdrawDelay"),
+        salt: bytes("salt").try_into().expect("32 bytes"),
     }
 }
