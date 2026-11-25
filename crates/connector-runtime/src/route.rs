@@ -1,6 +1,6 @@
 //! A routing-table entry whose next hop is another connector rather than
 //! this one's own app. Paired with `connector_config::StaticRoute` at the
-//! [`crate::Connector`] level -- `connector_domain::select_route` picks the
+//! [`crate::Connector`] level -- `connector_domain::resolve_route` picks the
 //! most specific prefix across both kinds without caring which one it is.
 
 use chrono::{DateTime, Utc};
