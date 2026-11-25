@@ -1234,3 +1234,59 @@ fn the_committed_attribution_cases_state_only_what_the_connector_verified() {
         assert!(by_name(&spoofed).is_some(), "missing {spoofed}");
     }
 }
+
+/// Schema 16 (issue #1709): the committed `required_carriage` cases replay
+/// through `connector_domain::required_carriage`, never answer `"both"`, and
+/// include every shape the spec names.
+#[test]
+fn the_committed_required_carriage_cases_replay_against_the_domain_function() {
+    use connector_domain::{required_carriage, NodeFacts, NodeSelfDescription, RoutePrice};
+
+    let committed = committed();
+    let cases = committed["required_carriage"]["cases"]
+        .as_array()
+        .expect("cases");
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let routes = case["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .map(|r| RoutePrice {
+                prefix: r["prefix"].as_str().expect("prefix").to_string(),
+                price: "1".to_string(),
+                price_per_kib: None,
+                request: None,
+                max_bytes: None,
+                payment: None,
+                required_transport: r["requiredTransport"].as_str().map(str::to_string),
+            })
+            .collect();
+        let document = NodeSelfDescription::describe(
+            &NodeFacts::default(),
+            None,
+            routes,
+            case["node_required_transport"].as_str().map(str::to_string),
+        );
+        let destination = case["destination"].as_str().expect("destination");
+        assert_eq!(
+            required_carriage(&document, destination),
+            case["required_carriage"].as_str(),
+            "case {name}"
+        );
+        assert_ne!(case["required_carriage"], "both", "case {name}");
+    }
+    for needed in [
+        "pinned_route",
+        "unpinned_route_on_a_pinned_node",
+        "routes_that_disagree_pinned",
+        "routes_that_disagree_unpinned",
+        "uncovered_destination_with_a_node_value",
+        "nested_prefixes_longer_decides",
+    ] {
+        assert!(
+            cases.iter().any(|c| c["name"] == needed),
+            "missing {needed}"
+        );
+    }
+}

@@ -32,6 +32,7 @@
 //!   ADR 0043): a self-description endpoint that grows a write is purchasable
 //!   peering through a side door.
 
+use crate::route::select_route;
 use serde::{Deserialize, Serialize};
 
 use crate::x402::{X402BatchSettlementTerms, X402ZkNoteTerms};
@@ -387,6 +388,36 @@ pub fn agreed_required_transport<'a>(
     published_required_transport(first)
 }
 
+/// The carriage a payer must use to reach `destination`, from the document a
+/// node published: `Some("http")`, `Some("btp")`, or `None` when the node
+/// names no requirement (either carriage will do).
+///
+/// The rule, stated once (ND-05b, issue #1709):
+///
+///   1. the route that governs `destination` by longest prefix
+///      ([`select_route`], the lookup the client edge enforces the pin from)
+///      decides, by its own [`RoutePrice::required_transport`];
+///   2. a governing route that names no pin, or no governing route at all,
+///      falls to the node-wide [`NodeSelfDescription::required_transport`];
+///   3. neither names one: no requirement.
+///
+/// Rule 1 holds even when the node-wide value disagrees: the pin is enforced
+/// per route, so the route's own answer is the honest one. The vectors'
+/// `required_carriage` group is generated from this function.
+pub fn required_carriage<'a>(
+    description: &'a NodeSelfDescription,
+    destination: &str,
+) -> Option<&'a str> {
+    let prefixes: Vec<&str> = description
+        .routes
+        .iter()
+        .map(|route| route.prefix.as_str())
+        .collect();
+    select_route(destination, &prefixes)
+        .and_then(|index| description.routes[index].required_transport.as_deref())
+        .or(description.required_transport.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +722,99 @@ mod tests {
     /// `"both"` is the absence of a requirement, so it is spelled as an
     /// absence -- one rule, in one place, for the per-route field and the
     /// per-node scalar alike.
+    fn route_pinned(prefix: &str, pin: Option<&str>) -> RoutePrice {
+        RoutePrice {
+            prefix: prefix.to_string(),
+            price: "1".to_string(),
+            price_per_kib: None,
+            request: None,
+            max_bytes: None,
+            payment: None,
+            required_transport: pin.map(str::to_string),
+        }
+    }
+
+    fn described(routes: Vec<RoutePrice>, node: Option<&str>) -> NodeSelfDescription {
+        NodeSelfDescription::describe(&facts(), None, routes, node.map(str::to_string))
+    }
+
+    #[test]
+    fn the_devnet_relay_has_a_carriage_per_address_and_none_node_wide() {
+        let doc = described(
+            vec![
+                route_pinned("g.toon.relay", Some("btp")),
+                route_pinned("g.toon.relay.ephemeral", None),
+            ],
+            None,
+        );
+        assert_eq!(required_carriage(&doc, "g.toon.relay"), Some("btp"));
+        assert_eq!(required_carriage(&doc, "g.toon.relay.x"), Some("btp"));
+        assert_eq!(required_carriage(&doc, "g.toon.relay.ephemeral"), None);
+        assert_eq!(required_carriage(&doc, "g.toon.other"), None);
+    }
+
+    mod required_carriage_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn prefix() -> impl Strategy<Value = String> {
+            proptest::collection::vec("[ab]{1,2}", 1..4).prop_map(|l| format!("g.{}", l.join(".")))
+        }
+        fn pin() -> impl Strategy<Value = Option<&'static str>> {
+            prop_oneof![Just(None), Just(Some("http")), Just(Some("btp"))]
+        }
+        fn covers(prefix: &str, dest: &str) -> bool {
+            dest == prefix || dest.starts_with(&format!("{prefix}."))
+        }
+
+        proptest! {
+            #[test]
+            fn a_routes_own_pin_beats_the_nodes(dest in prefix(), own in pin(), node in pin()) {
+                prop_assume!(own.is_some());
+                let doc = described(vec![route_pinned(&dest, own)], node);
+                prop_assert_eq!(required_carriage(&doc, &dest), own);
+            }
+
+            #[test]
+            fn the_longest_covering_prefix_decides(
+                dest in prefix(),
+                routes in proptest::collection::vec((prefix(), pin()), 0..5),
+                node in pin(),
+            ) {
+                // One entry per prefix, so "longest" names exactly one route.
+                let mut seen = std::collections::HashSet::new();
+                let routes: Vec<_> = routes.into_iter().filter(|(p, _)| seen.insert(p.clone())).collect();
+                let doc = described(
+                    routes.iter().map(|(p, pin)| route_pinned(p, *pin)).collect(),
+                    node,
+                );
+                let longest = routes
+                    .iter()
+                    .filter(|(p, _)| covers(p, &dest))
+                    .max_by_key(|(p, _)| p.len());
+                let expected = match longest {
+                    Some((_, Some(own))) => Some(*own),
+                    _ => node,
+                };
+                prop_assert_eq!(required_carriage(&doc, &dest), expected);
+            }
+
+            #[test]
+            fn an_uncovered_destination_falls_to_the_node_wide_value(
+                dest in prefix(),
+                routes in proptest::collection::vec((prefix(), pin()), 0..5),
+                node in pin(),
+            ) {
+                let routes: Vec<_> = routes.into_iter().filter(|(p, _)| !covers(p, &dest)).collect();
+                let doc = described(
+                    routes.iter().map(|(p, pin)| route_pinned(p, *pin)).collect(),
+                    node,
+                );
+                prop_assert_eq!(required_carriage(&doc, &dest), node);
+            }
+        }
+    }
+
     #[test]
     fn the_permissive_default_is_published_as_no_field_at_all() {
         assert_eq!(published_required_transport("btp"), Some("btp".to_string()));
