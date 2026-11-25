@@ -18,8 +18,8 @@ use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, refuse_oversize,
     resolve_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
-    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, ResolvedRoute, RouteKind,
-    FORWARDING_MESSAGE_WINDOW,
+    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, Resolution, ResolvedRoute,
+    RouteKind, FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -2482,11 +2482,14 @@ impl Connector {
         // never come from two different answers to the same question.
         let leased_routes = self.leased_routes_snapshot();
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
-        let Some(resolved) = self.resolve(
-            &prepare.destination,
-            &runtime_peer_routes,
-            Some(&leased_routes),
-        ) else {
+        let Some(resolved) = self
+            .resolve(
+                &prepare.destination,
+                &runtime_peer_routes,
+                Some(&leased_routes),
+            )
+            .target
+        else {
             return self.finish(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
@@ -3997,7 +4000,7 @@ impl Connector {
         destination: &str,
         runtime_peer_routes: &HashMap<String, PeerRoute>,
         leased: Option<&HashMap<String, LeasedRoute>>,
-    ) -> Option<ResolvedRoute> {
+    ) -> Resolution {
         resolve_route(
             destination,
             self.clock.now(),
@@ -4027,7 +4030,9 @@ impl Connector {
     /// (issue #427), with no price and no durability, is excluded.
     fn select_configured_route(&self, destination: &str) -> Option<(usize, ConfiguredTarget)> {
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
-        let resolved = self.resolve(destination, &runtime_peer_routes, None)?;
+        let resolved = self
+            .resolve(destination, &runtime_peer_routes, None)
+            .price_route?;
         let target = match resolved.kind {
             RouteKind::App => ConfiguredTarget::App(resolved.index),
             RouteKind::ConfigPeer => ConfiguredTarget::Peer(resolved.index),
@@ -4203,11 +4208,13 @@ impl Connector {
             kind: RouteKind::App,
             index,
             ..
-        }) = self.resolve(
-            &prepare.destination,
-            &runtime_peer_routes,
-            Some(&leased_routes),
-        )
+        }) = self
+            .resolve(
+                &prepare.destination,
+                &runtime_peer_routes,
+                Some(&leased_routes),
+            )
+            .target
         else {
             return false;
         };
@@ -4233,7 +4240,7 @@ impl Connector {
         let leased_routes = self.leased_routes_snapshot();
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
         self.resolve(destination, &runtime_peer_routes, Some(&leased_routes))
-            .is_some()
+            .has_route()
     }
 
     /// Open a terminated packet's gift wrap with this node's identity key
