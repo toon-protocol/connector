@@ -64,7 +64,7 @@ const RUST_STEPS: readonly GateStep[] = [
 
 /**
  * npm gate — what implement-prompt.md already described, now enforced. Since
- * ADR 0017 the npm surface is devnet tooling only (faucet, announcer,
+ * ADR 0017 the npm surface is devnet tooling only (faucet,
  * tools/fund-peers); ADR 0065 removed the last workspace that needed a
  * hand-ordered build, so `npm run build` is now just `--workspaces`.
  */

@@ -106,8 +106,8 @@ jobs:
           fi
 
   # The connector itself is Rust (ADR 0017) — `rust-gate` below is this repo's
-  # real gate. The npm surface that remains is devnet tooling only (the faucet,
-  # the announcer, and tools/fund-peers), so this job just keeps it lint-clean
+  # real gate. The npm surface that remains is devnet tooling only (the faucet
+  # and tools/fund-peers), so this job just keeps it lint-clean
   # and formatted.
   lint-and-format:
     name: Lint and Format Check

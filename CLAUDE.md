@@ -16,8 +16,7 @@ disagree, the ADR wins too (`docs/adr/`).
 The connector is the Rust workspace under `crates/`, built as the `connector`
 binary. Nothing else in this repository is the connector:
 
-- `packages/faucet`, `packages/announcer` — devnet tooling and a standalone
-  announcer sidecar. These are the only reason npm and `package.json` still exist
+- `packages/faucet` — devnet tooling. It is the only reason npm and `package.json` still exist
   here. `npm test` runs them; it does not test the connector.
 
 Mina is **gone from this repository** (ADR 0065-mina, _Mina leaves the repository_ — the number
@@ -44,7 +43,7 @@ Do not use "terminator", "BLS", or "agent runtime"; all three are retired names.
 ```bash
 make rust-build     # cargo build --workspace
 make rust-test      # cargo test --workspace  (the gate)
-make test           # npm: the faucet and the announcer — NOT the connector
+make test           # npm: the faucet — NOT the connector
 make lint           # ESLint only. CI also runs cargo fmt --check and clippy -D warnings.
 
 make local-verify   # the shipped IMAGE against real chains: up, send a packet, down
