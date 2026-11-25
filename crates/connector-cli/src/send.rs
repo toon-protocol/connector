@@ -197,7 +197,8 @@ pub enum SendError {
     /// The payload could not be sealed to that identity.
     Seal(String),
     /// Nothing was sent: the operator surface could not be dialed, or it
-    /// refused the write with a non-2xx before any packet was formed.
+    /// refused the write with a non-2xx, so no packet was taken in for
+    /// forwarding.
     Transport { url: String, reason: String },
     /// A packet left and its answer was lost: the request was written and the
     /// connection failed before an answer was read.
@@ -210,8 +211,8 @@ pub enum SendError {
 
 impl SendError {
     /// Whether a packet may have left this process. `false` means nothing
-    /// was sent, so a retry cannot duplicate it; `true` means the packet
-    /// went out and the caller must not assume it did not arrive.
+    /// was sent, so a retry cannot duplicate it; `true` means the packet may
+    /// have gone out and the caller must not assume it did not arrive.
     pub fn was_sent(&self) -> bool {
         match self {
             SendError::KeyFile { .. }
@@ -243,13 +244,9 @@ impl std::fmt::Display for SendError {
                  given to --operator."
             ),
             SendError::Seal(reason) => write!(f, "could not seal the payload: {reason}"),
-            SendError::Transport { url, reason } => {
+            SendError::Transport { url, reason } | SendError::AnswerLost { url, reason } => {
                 write!(f, "POST {url}: {reason}")
             }
-            SendError::AnswerLost { url, reason } => write!(
-                f,
-                "POST {url}: the packet was sent and its answer was lost: {reason}"
-            ),
             SendError::Undecodable(reason) => write!(
                 f,
                 "the operator surface answered with neither a FULFILL nor a REJECT: {reason}"
@@ -506,13 +503,15 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
         .headers()
         .get(connector_btp::ACCUMULATED_COST_HEADER)
         .map(|value| value.as_bytes().to_vec());
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| SendError::AnswerLost {
-            url: url.clone(),
-            reason: error.to_string(),
-        })?;
+    let bytes = response.bytes().await.map_err(|error| {
+        // A non-2xx is a refused write whether or not its body arrives.
+        let (url, reason) = (url.clone(), error.to_string());
+        if status.is_success() {
+            SendError::AnswerLost { url, reason }
+        } else {
+            SendError::Transport { url, reason }
+        }
+    })?;
 
     // A non-2xx here is the operator surface refusing the WRITE -- an
     // unallowlisted key, a stale signature, a replayed one -- and never a
@@ -1111,19 +1110,11 @@ mod tests {
             "the clearnet operator surface at {operator} must never appear as a CONNECT target"
         );
     }
-    /// A real socket answering `POST /packets` with a fixed status and body.
-    fn serve_operator_status(status: u16) -> std::net::SocketAddr {
+
+    /// A real socket serving `app`.
+    fn serve_app(app: Router) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-        let app = Router::new().route(
-            "/packets",
-            post(move || async move {
-                (
-                    axum::http::StatusCode::from_u16(status).expect("a status"),
-                    "refused",
-                )
-            }),
-        );
         tokio::spawn(async move {
             let _ = axum::Server::from_tcp(listener)
                 .expect("serve the bound listener")
@@ -1131,6 +1122,19 @@ mod tests {
                 .await;
         });
         addr
+    }
+
+    /// A real socket answering `POST /packets` with a fixed status and body.
+    fn serve_operator_status(status: u16) -> std::net::SocketAddr {
+        serve_app(Router::new().route(
+            "/packets",
+            post(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).expect("a status"),
+                    "refused",
+                )
+            }),
+        ))
     }
 
     /// The operator surface refusing the write -- 401, 403, 400 -- means no
@@ -1166,11 +1170,31 @@ mod tests {
         let key_file = operator_key_file();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0u8; 65536];
-            // Read the request, then drop the connection without answering.
-            let _ = stream.read(&mut buffer);
+            // Read the whole request -- headers and body -- then drop the
+            // connection without answering.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read the request");
+                assert!(read > 0, "the request ended before it was written");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .expect("a content-length")
+                    .trim()
+                    .parse()
+                    .expect("a numeric content-length");
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
         });
 
         let error = send(&send_options(
@@ -1181,6 +1205,9 @@ mod tests {
         ))
         .await
         .expect_err("no answer came back");
+        server
+            .join()
+            .expect("the whole request was written before the close");
 
         assert!(
             matches!(error, SendError::AnswerLost { .. }),
@@ -1214,9 +1241,7 @@ mod tests {
     async fn a_fulfill_with_the_wrong_fulfillment_is_reported_as_such() {
         let seal_to = serve_identity(a_real_identity());
         let key_file = operator_key_file();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let app = Router::new().route(
+        let addr = serve_app(Router::new().route(
             "/packets",
             post(|| async {
                 Fulfill {
@@ -1225,13 +1250,7 @@ mod tests {
                 }
                 .encode()
             }),
-        );
-        tokio::spawn(async move {
-            let _ = axum::Server::from_tcp(listener)
-                .expect("serve the bound listener")
-                .serve(app.into_make_service())
-                .await;
-        });
+        ));
 
         let outcome = send(&send_options(
             &format!("http://{addr}"),
