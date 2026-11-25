@@ -66,8 +66,8 @@ pub use identity::{
 pub use journal_entry::{AllowanceSubsidy, JournalEntry};
 pub use network::{MinaNetwork, Network, NetworkError, SolanaGenesisPrefix, XrplNetwork};
 pub use node::{
-    agreed_required_transport, published_required_transport, EdgeIdentity, NodeFacts,
-    NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,
+    agreed_required_transport, published_required_transport, required_carriage, EdgeIdentity,
+    NodeFacts, NodeSelfDescription, RoutePrice, VoucherSignerFact, CLIENT_EDGE_DEFAULT_VERSION,
     CLIENT_EDGE_SUPPORTED_VERSIONS,
 };
 pub use packet::{Fulfill, PacketResponse, Prepare, Reject, RejectCode, RejectReason};

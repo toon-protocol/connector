@@ -1,5 +1,5 @@
 {
-  "schema_version": 15,
+  "schema_version": 16,
   "envelope": {
     "valid": [
       {
@@ -1869,6 +1869,158 @@
           ["X-TOON-Amount", "7"],
           ["X-TOON-Chain", "solana"]
         ]
+      }
+    ]
+  },
+  "required_carriage": {
+    "cases": [
+      {
+        "name": "pinned_route",
+        "description": "A route pinned to HTTP: its own pin is the answer.",
+        "routes": [
+          {
+            "prefix": "g.toon.app",
+            "requiredTransport": "http"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.app",
+        "required_carriage": "http"
+      },
+      {
+        "name": "pinned_route_beats_the_node",
+        "description": "A route's own pin beats a node-wide value that says otherwise.",
+        "routes": [
+          {
+            "prefix": "g.toon.app",
+            "requiredTransport": "http"
+          }
+        ],
+        "node_required_transport": "btp",
+        "destination": "g.toon.app",
+        "required_carriage": "http"
+      },
+      {
+        "name": "unpinned_route_on_a_pinned_node",
+        "description": "A route that names no pin falls to the node-wide requirement.",
+        "routes": [
+          {
+            "prefix": "g.toon.app"
+          }
+        ],
+        "node_required_transport": "btp",
+        "destination": "g.toon.app",
+        "required_carriage": "btp"
+      },
+      {
+        "name": "routes_that_disagree_pinned",
+        "description": "The devnet relay's shape: g.toon.relay is pinned to BTP and the node-wide field is silent because the routes disagree.",
+        "routes": [
+          {
+            "prefix": "g.toon.relay",
+            "requiredTransport": "btp"
+          },
+          {
+            "prefix": "g.toon.relay.ephemeral"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.relay",
+        "required_carriage": "btp"
+      },
+      {
+        "name": "routes_that_disagree_unpinned",
+        "description": "The devnet relay's other address: g.toon.relay.ephemeral is not pinned, so a payer has no requirement for it.",
+        "routes": [
+          {
+            "prefix": "g.toon.relay",
+            "requiredTransport": "btp"
+          },
+          {
+            "prefix": "g.toon.relay.ephemeral"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.relay.ephemeral",
+        "required_carriage": null
+      },
+      {
+        "name": "uncovered_destination_with_a_node_value",
+        "description": "A destination no route covers falls to the node-wide value.",
+        "routes": [
+          {
+            "prefix": "g.toon.app"
+          }
+        ],
+        "node_required_transport": "btp",
+        "destination": "g.toon.elsewhere",
+        "required_carriage": "btp"
+      },
+      {
+        "name": "uncovered_destination_with_no_node_value",
+        "description": "A destination no route covers, on a node that pins nothing: no requirement.",
+        "routes": [
+          {
+            "prefix": "g.toon.app",
+            "requiredTransport": "btp"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.elsewhere",
+        "required_carriage": null
+      },
+      {
+        "name": "sibling_label_is_not_covered",
+        "description": "A prefix covers whole labels only: g.toon.appx is not under g.toon.app.",
+        "routes": [
+          {
+            "prefix": "g.toon.app",
+            "requiredTransport": "btp"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.appx",
+        "required_carriage": null
+      },
+      {
+        "name": "nested_prefixes_longer_decides",
+        "description": "Nested prefixes: the longer one governs a destination under both, here unpinned over a pinned parent.",
+        "routes": [
+          {
+            "prefix": "g.toon",
+            "requiredTransport": "btp"
+          },
+          {
+            "prefix": "g.toon.relay"
+          },
+          {
+            "prefix": "g.toon.relay.ephemeral",
+            "requiredTransport": "http"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.relay.x",
+        "required_carriage": null
+      },
+      {
+        "name": "nested_prefixes_deepest_decides",
+        "description": "Nested prefixes: the deepest covering prefix decides.",
+        "routes": [
+          {
+            "prefix": "g.toon",
+            "requiredTransport": "btp"
+          },
+          {
+            "prefix": "g.toon.relay"
+          },
+          {
+            "prefix": "g.toon.relay.ephemeral",
+            "requiredTransport": "http"
+          }
+        ],
+        "node_required_transport": null,
+        "destination": "g.toon.relay.ephemeral.x",
+        "required_carriage": "http"
       }
     ]
   }
