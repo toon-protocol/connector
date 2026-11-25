@@ -2478,8 +2478,10 @@ impl Connector {
         // lease stops being selected immediately (#427), and nothing here
         // allocates a copy of the routes themselves (ADR 0015). Precedence
         // is the domain's, shared with the client edge's price lookup (ADR
-        // 0028), so what a packet is charged and where it is then sent can
-        // never come from two different answers to the same question.
+        // 0028): the resolution answers both the forwarding target and the
+        // price route, which differ only where a lease wins the target, so
+        // what a packet is charged and where it is then sent never come
+        // from two different rankings.
         let leased_routes = self.leased_routes_snapshot();
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
         let Some(resolved) = self
@@ -3990,11 +3992,13 @@ impl Connector {
     }
 
     /// Resolve `destination` across the route tables, through the domain's
-    /// one precedence (`connector_domain::resolve_route`). `leased` is
-    /// `None` for a caller that does not weigh leases -- the client edge
-    /// (ADR 0028). Indexes in the answer are positions in `self.routes`,
-    /// `self.peer_routes`, and the iteration order of the two snapshots the
-    /// caller passes, which must outlive their use.
+    /// one precedence (`connector_domain::resolve_route`), answering both the
+    /// forwarding target and the price route. `leased` is `None` for a
+    /// caller that reads only the price route -- the client edge (ADR 0028)
+    /// -- since the price route never weighs leases and the lease snapshot
+    /// is then not worth taking. Indexes in the answer are positions in
+    /// `self.routes`, `self.peer_routes`, and the iteration order of the two
+    /// snapshots the caller passes, which must outlive their use.
     fn resolve(
         &self,
         destination: &str,
@@ -4017,8 +4021,9 @@ impl Connector {
     /// The configured route -- terminated or forwarded -- `destination`
     /// resolves to, with the length of the prefix that matched.
     ///
-    /// Configured-route selection for [`Self::client_route`] (ADR 0028),
-    /// ranked by `connector_domain::resolve_route` like every other lookup. The
+    /// Configured-route selection for [`Self::client_route`] (ADR 0028): the
+    /// resolution's price route, ranked by `connector_domain::resolve_route`
+    /// like every other lookup. The
     /// client edge's claim gate (issue #522) and x402 greeting must price
     /// the route the router will actually use, and a forwarded route being
     /// priced at all (issue #620) makes "app routes only" no longer a safe
@@ -4043,7 +4048,7 @@ impl Connector {
                     .expect("resolution indexes the snapshot it was given")
                     .clone(),
             ),
-            RouteKind::Leased => unreachable!("no leases were offered"),
+            RouteKind::Leased => unreachable!("the price route is never a lease"),
         };
         Some((resolved.prefix_len, target))
     }
