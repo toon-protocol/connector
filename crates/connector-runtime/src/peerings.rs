@@ -768,30 +768,64 @@ impl Peerings {
     // -- boot ----------------------------------------------------------------
 
     /// Replay a durable runtime table into this node and arm it to persist
-    /// future writes. Every replayed peering is re-armed: its signer bound,
-    /// its hop registered, its carriage registered. Call after the registrar
-    /// and the socks proxy are set.
+    /// future writes: every stored peering goes through [`Self::admit`], the
+    /// same operation `POST /peers` uses, so a replayed peering is wired
+    /// exactly as establishing it wired it (spec #1686, ticket #1694).
     ///
-    /// Boot replay still wires its own way here; routing it through
-    /// [`Self::admit`] is #1694.
+    /// **A stored peering that fails is skipped whole.** One that admit
+    /// refuses, or that fails while being wired (its voucher signer already
+    /// proves another peering, say), leaves no hop, binding, carriage or
+    /// table row, and the routes that name it are not replayed either. Each
+    /// is logged at error level with the peering's id and the reason, and
+    /// the node starts and serves its other peerings. Peerings replay in id
+    /// order, so which of two peerings that claim one signer keeps it does
+    /// not depend on the hash order of the stored table.
+    ///
+    /// Nothing is written back to the store while replaying: a skipped
+    /// peering stays on disk until the table's next write, which persists
+    /// the table as it now stands.
+    ///
+    /// Call after the config file's peerings are admitted
+    /// ([`Self::admit_config`], which reserves their ids) and the registrar
+    /// and socks proxy are set: admit reads all three.
     pub(crate) fn replay(
         &mut self,
         store: PeerRouteStore,
         peers: RuntimePeers,
         routes: HashMap<String, PeerRoute>,
     ) {
-        for (id, peering) in &peers {
-            for binding in &peering.channels {
-                if let Err(error) = self.bind_runtime_voucher_signer(id, binding) {
-                    tracing::warn!(peer_id = %id, %error, "peering's voucher signer is not bound");
-                }
-                if let Some(client_edge_url) = &peering.client_edge_url {
-                    self.register_voucher_hop(id, binding, client_edge_url);
-                }
+        // Admit persists through `self.store`, which is not armed yet: the
+        // table is rebuilt in memory, and the durable copy is not rewritten
+        // half-replayed.
+        self.store = None;
+        let mut ids: Vec<&String> = peers.keys().collect();
+        ids.sort();
+        let mut skipped: BTreeSet<&str> = BTreeSet::new();
+        for id in ids {
+            if let Err(error) = self.admit(id, peers[id].clone()) {
+                tracing::error!(
+                    peer_id = %id,
+                    %error,
+                    "stored peering skipped: it was not admitted at boot, so none of it is \
+                     wired and the routes naming it are dropped"
+                );
+                skipped.insert(id);
             }
-            self.register_carriage(id, peering);
         }
-        self.runtime_peers = ArcSwap::from_pointee(peers);
+        let routes: HashMap<String, PeerRoute> = routes
+            .into_iter()
+            .filter(|(prefix, route)| {
+                let kept = !skipped.contains(route.peer_id());
+                if !kept {
+                    tracing::error!(
+                        prefix = %prefix,
+                        peer_id = %route.peer_id(),
+                        "stored route dropped: its peering was skipped at boot"
+                    );
+                }
+                kept
+            })
+            .collect();
         self.runtime_peer_routes = ArcSwap::from_pointee(routes);
         self.store = Some(store);
     }

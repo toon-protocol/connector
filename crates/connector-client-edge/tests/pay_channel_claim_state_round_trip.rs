@@ -39,35 +39,32 @@
 //! `connector-cli/tests/solana_peering_from_a_url.rs` against a real
 //! validator.
 
-use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use url::Url;
 
-use connector_client_edge::{
-    router_with_gate, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    BatchSettlementChannels, ChannelResolutionError, ClientClaimGate,
-};
+use connector_client_edge::{router_with_gate, ClientClaimGate};
 use connector_config::StaticRoute;
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
 use connector_peer_http::{HttpPeerTransport, PeerRelation, ReqwestPeerClient};
 use connector_runtime::{
     AppOutcome, ConfigPayChannel, ConfigPeerChannel, ConfigPeering, Connector, FakeAppClient,
-    FileJournal, HttpVoucherState, InMemoryJournal, InProcessPeerTransport, Journal,
-    OutboundChannels, PeerRoute, PeerTransport, SettlementChain, SystemClock, VoucherStateSource,
+    FileJournal, HttpVoucherState, InMemoryJournal, InMemorySettlementNetwork,
+    InProcessPeerTransport, Journal, OutboundChannels, PeerRoute, PeerTransport, SettlementChain,
+    SettlementNetwork, SettlementNetworks, SystemClock, VoucherStateSource,
 };
-use connector_settlement::batch::{BatchSettlementPayer, EvmReceiverTerms, ReceiverTerms};
+use connector_settlement::batch::{
+    BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
+    VoucherSigner as PortVoucherSigner,
+};
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{
     require_anvil, Anvil, COUNTERPARTY_PRIVATE_KEY, DEPLOYER_PRIVATE_KEY,
 };
 use connector_signer::giftwrap::{open_response, seal_request};
-use connector_signer::{
-    BatchChannelConfig, BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer,
-};
+use connector_signer::{BatchSettlementDomain, LocalSigner, PublicKeyBytes, Signer};
 use ethers::signers::{LocalWallet, Signer as _};
 use ethers::types::Address;
 
@@ -98,61 +95,32 @@ fn address_of(key: &str) -> Address {
         .address()
 }
 
-/// The payee's batch-settlement seam: it admits any channel a presented
-/// config names **this payee** as receiver of, backed by [`DEPOSIT`]. The
-/// gate above it re-hashes the config to the voucher's channel id and
-/// verifies the voucher against the config's `payerAuthorizer`, so what it
-/// accepts is exactly what a real backend's admission would let through.
-#[derive(Debug)]
-struct PaysThisNode {
-    domain: BatchSettlementDomain,
-    receiver: [u8; 20],
-    admitted: std::sync::Mutex<HashMap<[u8; 32], BatchChannelConfig>>,
-}
-
-#[async_trait]
-impl BatchSettlementChannels for PaysThisNode {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![self.domain]
-    }
-
-    fn solana_network(&self) -> Option<connector_domain::Network> {
-        None
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        let mut admitted = self.admitted.lock().expect("lock");
-        let config = match presented_config {
-            Some(config) if config.receiver == self.receiver => *config,
-            Some(_) => return Ok(None),
-            None => match admitted.get(channel_id) {
-                Some(config) => *config,
-                None => return Ok(None),
-            },
-        };
-        admitted.insert(*channel_id, config);
-        Ok(Some(AdmittedEvmVoucherChannel {
-            config,
-            max_cumulative: DEPOSIT,
-        }))
-    }
-
-    async fn solana(
-        &self,
-        _channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        Ok(None)
-    }
+/// The payee's settlement network learns of `channel`, the payer's own
+/// outbound channel toward it, as a chain would once the payer's open landed:
+/// the payee's claim gate then admits it like any channel paying this node.
+fn payee_holds(network: &InMemorySettlementNetwork, outbound: &OutboundChannels, channel: &str) {
+    let presentation = outbound.presentation(channel).expect("a journaled channel");
+    let ChannelPresentation::Evm { config, .. } = &presentation else {
+        panic!("an EVM channel");
+    };
+    network.settlement().client_opened(
+        &presentation,
+        PortVoucherSigner::Evm(config.payer_authorizer),
+        DEPOSIT,
+    );
 }
 
 /// The payee: a real `Connector` terminating one priced app route, behind a
-/// real client edge on a real socket, its claim gate over [`PaysThisNode`].
-fn spawn_payee(domain: BatchSettlementDomain) -> (std::net::SocketAddr, PublicKeyBytes) {
+/// real client edge on a real socket, its claim gate over one EVM network on
+/// the in-memory batch settlement, which [`payee_holds`] tells of the payer's
+/// channel.
+fn spawn_payee(
+    domain: BatchSettlementDomain,
+) -> (
+    std::net::SocketAddr,
+    PublicKeyBytes,
+    Arc<InMemorySettlementNetwork>,
+) {
     let app_route =
         StaticRoute::new_priced(PREFIX, "http://app.example/", ROUTE_PRICE).expect("a route");
     let app_client = Arc::new(FakeAppClient::new());
@@ -178,14 +146,16 @@ fn spawn_payee(domain: BatchSettlementDomain) -> (std::net::SocketAddr, PublicKe
         )
         .with_identity_signer(Arc::new(identity)),
     );
-    let seam = Arc::new(PaysThisNode {
-        domain,
-        receiver: address_of(COUNTERPARTY_PRIVATE_KEY).to_fixed_bytes(),
-        admitted: std::sync::Mutex::new(HashMap::new()),
-    });
+    let network = Arc::new(InMemorySettlementNetwork::fresh(
+        connector_domain::Network::Eip155(domain.chain_id),
+    ));
     let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
         .expect("a fresh journal")
-        .with_batch_settlement(seam as Arc<dyn BatchSettlementChannels>);
+        .with_settlement_networks(
+            SettlementNetworks::new()
+                .with(Arc::clone(&network) as Arc<dyn SettlementNetwork>)
+                .expect("one network"),
+        );
     let router_signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("payee-router"));
     let app = router_with_gate(connector, router_signer, None, gate);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind payee socket");
@@ -195,7 +165,7 @@ fn spawn_payee(domain: BatchSettlementDomain) -> (std::net::SocketAddr, PublicKe
             .expect("serve")
             .serve(app.into_make_service()),
     );
-    (addr, identity_public_key)
+    (addr, identity_public_key, network)
 }
 
 fn sealed_prepare(body: &[u8], receiver: &PublicKeyBytes) -> (Prepare, [u8; 32]) {
@@ -365,7 +335,7 @@ async fn successive_covered_packets_each_advance_the_payees_watermark() {
         return;
     }
     let chain = Chain::spawn().await;
-    let (payee, payee_identity) = spawn_payee(chain.x402.domain());
+    let (payee, payee_identity, payee_network) = spawn_payee(chain.x402.domain());
     let network = format!("eip155:{}", chain.x402.chain_id());
     let state = tempfile::tempdir().expect("state dir");
     let outbound = chain
@@ -376,6 +346,7 @@ async fn successive_covered_packets_each_advance_the_payees_watermark() {
         .await
         .expect("open the payer's own channel toward the payee");
     let channel = opened.on_chain.id.0.clone();
+    payee_holds(&payee_network, &outbound, &channel);
     let payer = payer(Arc::clone(&outbound), &network, &channel, payee);
 
     for crossing_number in 1..=2u64 {
@@ -399,7 +370,7 @@ async fn a_lost_journal_is_recovered_from_the_next_hops_claim_state() {
         return;
     }
     let chain = Chain::spawn().await;
-    let (payee, payee_identity) = spawn_payee(chain.x402.domain());
+    let (payee, payee_identity, payee_network) = spawn_payee(chain.x402.domain());
     let network = format!("eip155:{}", chain.x402.chain_id());
     let state = tempfile::tempdir().expect("state dir");
     let journal = state.path().join("outbound-channels.log");
@@ -409,6 +380,7 @@ async fn a_lost_journal_is_recovered_from_the_next_hops_claim_state() {
         .await
         .expect("open");
     let channel = opened.on_chain.id.0.clone();
+    payee_holds(&payee_network, &outbound, &channel);
     // What a backup taken right after the open holds: the channel, and no
     // voucher signed on it.
     let snapshot = std::fs::read(&journal).expect("read the journal");

@@ -17,16 +17,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use connector_client_edge::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelResolutionError, ClientClaimGate, ClientPayoutLedger,
-};
+use connector_client_edge::{ClientClaimGate, ClientPayoutLedger};
 use connector_domain::{Fulfill, Prepare};
 use connector_runtime::{
-    Connector, FakeAppClient, FileJournal, InProcessPeerTransport, Journal, OutboundChannels,
-    TestClock,
+    Connector, FakeAppClient, FileJournal, InMemorySettlementNetwork, InProcessPeerTransport,
+    Journal, OutboundChannels, SettlementNetworks, TestClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
@@ -165,52 +161,29 @@ fn client_solana_voucher(amount: u64) -> String {
     .to_string()
 }
 
-/// The client's inbound channels as the gate's backend finds them: the
-/// signer is the chain's record, never the voucher's say-so.
-#[derive(Debug)]
-struct ClientChannels;
-
-#[async_trait]
-impl BatchSettlementChannels for ClientChannels {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![domain()]
+/// The client's inbound channels, as the gate's settlement networks find
+/// them: an EVM and a Solana network over the in-memory batch settlement,
+/// where the signer is the chain's record, never the voucher's say-so.
+fn client_channels() -> SettlementNetworks {
+    let evm =
+        InMemorySettlementNetwork::fresh(connector_domain::Network::Eip155(domain().chain_id));
+    for secret in [client_secret(), other_secret()] {
+        evm.open_evm(&channel_config_of(&secret), u128::from(CLIENT_COLLATERAL));
     }
-
-    fn solana_network(&self) -> Option<connector_domain::Network> {
-        Some(
-            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-                .parse()
-                .expect("a CAIP-2 network"),
-        )
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        _presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        Ok([client_secret(), other_secret()]
-            .iter()
-            .map(channel_config_of)
-            .find(|config| *channel_id == evm_batch_channel_id(&domain(), config))
-            .map(|config| AdmittedEvmVoucherChannel {
-                config,
-                max_cumulative: u128::from(CLIENT_COLLATERAL),
-            }))
-    }
-
-    async fn solana(
-        &self,
-        channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        Ok(
-            (*channel_account == CLIENT_SOLANA_CHANNEL).then_some(AdmittedSolanaVoucherChannel {
-                authorized_signer: client_ed25519().public.to_bytes(),
-                max_cumulative: CLIENT_COLLATERAL,
-            }),
-        )
-    }
+    let solana = InMemorySettlementNetwork::fresh(
+        "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
+            .parse()
+            .expect("a CAIP-2 network"),
+    );
+    solana.open_solana(
+        CLIENT_SOLANA_CHANNEL,
+        client_ed25519().public.to_bytes(),
+        u128::from(CLIENT_COLLATERAL),
+    );
+    SettlementNetworks::new()
+        .with(Arc::new(evm))
+        .and_then(|networks| networks.with(Arc::new(solana)))
+        .expect("two networks")
 }
 
 // ─── one chain, per test: the payout channel and the client's landing ───
@@ -328,7 +301,7 @@ async fn serve(outbound: Arc<OutboundChannels>) -> SocketAddr {
     ));
     let gate = ClientClaimGate::restore(Arc::new(connector_runtime::InMemoryJournal::new()))
         .expect("an empty journal")
-        .with_batch_settlement(Arc::new(ClientChannels))
+        .with_settlement_networks(client_channels())
         .with_payout_ledger(Arc::new(ClientPayoutLedger::new(outbound)));
     let app = connector_client_edge::router_with_gate(connector, signer, None, gate);
     let server = axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());

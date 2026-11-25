@@ -11,17 +11,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use connector_client_edge::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelResolutionError, ClientClaimGate, SESSION_LEASE_BACKSTOP_TTL,
-};
+use connector_client_edge::{ClientClaimGate, SESSION_LEASE_BACKSTOP_TTL};
 use connector_config::{StaticRoute, TransportPolicy};
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, Fulfill, Prepare, Reject};
 use connector_runtime::{
-    AppOutcome, Connector, FakeAppClient, InMemoryJournal, InProcessPeerTransport, PeerRoute,
-    TestClock,
+    AppOutcome, Connector, FakeAppClient, InMemoryJournal, InMemorySettlementNetwork,
+    InProcessPeerTransport, PeerRoute, SettlementNetworks, TestClock,
 };
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_digest, BatchChannelConfig,
@@ -231,58 +227,23 @@ fn evm_claim_json(amount: u64) -> String {
     .to_string()
 }
 
-/// A settlement backend admitting [`config`]'s channel with `max_cumulative`
-/// collateral (unbounded unless a test is about the bound): the chain these
-/// tests do not need, which only ever answers what a real backend would for
-/// that one channel.
-#[derive(Debug)]
-struct OneChannel {
-    max_cumulative: u128,
-}
-
-#[async_trait]
-impl BatchSettlementChannels for OneChannel {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![domain()]
-    }
-
-    fn solana_network(&self) -> Option<connector_domain::Network> {
-        None
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        _presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        Ok(
-            (*channel_id == evm_batch_channel_id(&domain(), &config())).then_some(
-                AdmittedEvmVoucherChannel {
-                    config: config(),
-                    max_cumulative: self.max_cumulative,
-                },
-            ),
-        )
-    }
-
-    async fn solana(
-        &self,
-        _channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        Ok(None)
-    }
-}
-
 /// A gate over `journal` admitting vouchers on [`config`]'s channel, which
-/// holds `max_cumulative` of collateral.
+/// holds `max_cumulative` of collateral (unbounded unless a test is about the
+/// bound): one EVM network over the in-memory batch settlement, the chain
+/// these tests do not need.
 fn voucher_gate(
     journal: Arc<dyn connector_runtime::Journal>,
     max_cumulative: u128,
 ) -> ClientClaimGate {
+    let network = InMemorySettlementNetwork::fresh(connector_domain::Network::Eip155(EVM_CHAIN_ID));
+    network.open_evm(&config(), max_cumulative);
     ClientClaimGate::restore(journal)
         .expect("the journal replays")
-        .with_batch_settlement(Arc::new(OneChannel { max_cumulative }))
+        .with_settlement_networks(
+            SettlementNetworks::new()
+                .with(Arc::new(network))
+                .expect("one network"),
+        )
 }
 
 fn test_clock() -> Arc<TestClock> {

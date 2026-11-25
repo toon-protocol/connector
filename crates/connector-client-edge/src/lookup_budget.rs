@@ -7,7 +7,7 @@
 //! path"* real: a buyer who has opened a channel on chain pays without the
 //! operator hand-editing a config file, because the claim gate resolves the
 //! channel from the chain through its settlement backend
-//! ([`crate::BatchSettlementChannels`] since ADR 0075; the retired
+//! (the settlement networks since spec #1684; the retired
 //! `toon-channel` registry before it). That resolution costs one chain read
 //! per **previously-unseen** channel id, and before this module nothing
 //! bounded how many a sender could cause.
