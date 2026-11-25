@@ -870,6 +870,7 @@ mod tests {
                         data: Vec::new(),
                         accumulated_cost: 0,
                         reason: None,
+                        watermark: None,
                     }
                     .encode(),
                 )

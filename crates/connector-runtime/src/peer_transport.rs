@@ -267,6 +267,7 @@ pub(crate) fn peer_unreachable(peer_id: &str) -> PacketResponse {
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     })
 }
 

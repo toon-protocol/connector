@@ -824,13 +824,14 @@ async fn stale_over_budget_and_wrongly_signed_claims_are_refused() {
     );
     assert_eq!(
         gate.ingest(&payer.claim(id, 900), 0).await.unwrap_err(),
-        ClaimIngestRejection::AmountNotAdvancing
+        ClaimIngestRejection::AmountNotAdvancing { watermark: 1_000 }
     );
     assert_eq!(
         gate.ingest(&payer.claim(id, 1_050), 100).await.unwrap_err(),
         ClaimIngestRejection::Underpayment {
             advanced: 50,
-            price: 100
+            price: 100,
+            watermark: 1_000
         }
     );
     assert_eq!(
@@ -898,7 +899,7 @@ async fn open_allowances_and_their_watermarks_survive_a_restart() {
             .ingest(&payer.claim(id, 400), 0)
             .await
             .unwrap_err(),
-        ClaimIngestRejection::AmountNotAdvancing
+        ClaimIngestRejection::AmountNotAdvancing { watermark: 500 }
     );
     restarted
         .ingest(&payer.claim(id, 600), 100)

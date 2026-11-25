@@ -343,6 +343,7 @@ pub fn payment_required(
                 ClientRouteKind::Forwarded => 0,
             },
             reason: None,
+            watermark: None,
         },
         // A peering has no bootstrap identity to advertise and no client
         // session to lease: the peer already knows this node, and what it
@@ -421,6 +422,7 @@ fn payment_route_refusal(
             data: Vec::new(),
             accumulated_cost: charge,
             reason: None,
+            watermark: None,
         },
         terms: connector_domain::x402::terms_body(&GreetingTerms {
             destination,

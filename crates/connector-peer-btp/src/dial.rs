@@ -438,6 +438,7 @@ fn unreachable_at(peer_id: &str, endpoint: &Url) -> PeerForward {
             data: Vec::new(),
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         }),
         ..PeerForward::unreachable(peer_id)
     }
@@ -651,6 +652,7 @@ mod tests {
             data: Vec::new(),
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         }
     }
 

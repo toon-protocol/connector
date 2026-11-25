@@ -93,6 +93,14 @@ pub const ACCUMULATED_COST_HEADER: &str = "toon-accumulated-cost";
 /// BTP reject response ...
 pub const REJECT_REASON_PROTOCOL: &str = "toon-reject-reason";
 
+/// The connector's watermark for the voucher's channel, a decimal amount, on
+/// the two refusals about it (`amount_not_advancing`, `underpayment`):
+/// placed exactly like `toon-reject-reason`.
+pub const WATERMARK_PROTOCOL: &str = "toon-watermark";
+
+/// The HTTP twin of [`WATERMARK_PROTOCOL`]. Client carriages only.
+pub const WATERMARK_HEADER: &str = "toon-watermark";
+
 /// ... and the HTTP header (`Toon-Reject-Reason`) on the same responses that
 /// carry the cost. Client carriages only; a peer never sends or reads one.
 pub const REJECT_REASON_HEADER: &str = "toon-reject-reason";

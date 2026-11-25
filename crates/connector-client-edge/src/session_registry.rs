@@ -293,6 +293,7 @@ fn no_live_session_reject(address: &str) -> Reject {
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     }
 }
 

@@ -153,6 +153,7 @@ const PAYMENT_REQUIRED_HEADER: &str = connector_btp::PAYMENT_REQUIRED_HEADER;
 /// with (issue #548).
 const ACCUMULATED_COST_HEADER: &str = connector_btp::ACCUMULATED_COST_HEADER;
 const REJECT_REASON_HEADER: &str = connector_btp::REJECT_REASON_HEADER;
+const WATERMARK_HEADER: &str = connector_btp::WATERMARK_HEADER;
 /// client-edge-spec.md §1.2: a configured peer names itself with this
 /// header. Its absence is what makes a request anonymous -- a first-class
 /// path, not a fallback.
@@ -1129,6 +1130,15 @@ pub fn packet_response(response: PacketResponse) -> Response {
                     header::HeaderValue::from_static(reason.as_str()),
                 );
             }
+            // `Toon-Watermark`: the watermark the journal holds, on the two
+            // refusals about it.
+            if let Some(watermark) = &reject.watermark {
+                response.headers_mut().insert(
+                    header::HeaderName::from_static(WATERMARK_HEADER),
+                    header::HeaderValue::from_str(&watermark.to_string())
+                        .expect("a decimal is a valid header value"),
+                );
+            }
             response
         }
     }
@@ -1236,27 +1246,38 @@ fn over_carried_reject(
         data: Vec::new(),
         accumulated_cost: charge,
         reason: Some(RejectReason::AmountOverCharge),
+        watermark: None,
     })
 }
 
 fn claim_rejection_reject(rejection: ClaimIngestRejection, charge: u64) -> Reject {
-    let (code, accumulated_cost, reason) = match rejection {
-        ClaimIngestRejection::Underpayment { .. } => (
+    let (code, accumulated_cost, reason, watermark) = match rejection {
+        ClaimIngestRejection::AmountNotAdvancing { watermark } => (
+            RejectCode::f01_invalid_packet(),
+            0,
+            Some(RejectReason::AmountNotAdvancing),
+            Some(Box::new(watermark)),
+        ),
+        ClaimIngestRejection::Underpayment { watermark, .. } => (
             RejectCode::f03_invalid_amount(),
             charge,
             Some(RejectReason::Underpayment),
+            Some(Box::new(watermark)),
         ),
         ClaimIngestRejection::Undercollateralized { .. } => (
             RejectCode::f03_invalid_amount(),
             0,
             Some(RejectReason::Undercollateralized),
+            None,
         ),
-        ClaimIngestRejection::NotDurable => (RejectCode::t00_internal_error(), 0, None),
-        ClaimIngestRejection::ChannelLookupFailed(_) => (RejectCode::t00_internal_error(), 0, None),
-        ClaimIngestRejection::LookupBudgetExhausted { .. } => {
-            (RejectCode::t05_rate_limited(), 0, None)
+        ClaimIngestRejection::NotDurable => (RejectCode::t00_internal_error(), 0, None, None),
+        ClaimIngestRejection::ChannelLookupFailed(_) => {
+            (RejectCode::t00_internal_error(), 0, None, None)
         }
-        _ => (RejectCode::f01_invalid_packet(), 0, None),
+        ClaimIngestRejection::LookupBudgetExhausted { .. } => {
+            (RejectCode::t05_rate_limited(), 0, None, None)
+        }
+        _ => (RejectCode::f01_invalid_packet(), 0, None, None),
     };
     Reject {
         code,
@@ -1265,6 +1286,7 @@ fn claim_rejection_reject(rejection: ClaimIngestRejection, charge: u64) -> Rejec
         data: Vec::new(),
         accumulated_cost,
         reason,
+        watermark,
     }
 }
 
@@ -5258,6 +5280,13 @@ mod tests {
                 .map(|value| value.to_str().unwrap().parse::<u64>().unwrap())
         }
 
+        fn watermark_header(response: &Response) -> Option<String> {
+            response
+                .headers()
+                .get(WATERMARK_HEADER)
+                .map(|value| value.to_str().unwrap().to_string())
+        }
+
         fn reason_header(response: &Response) -> Option<String> {
             response
                 .headers()
@@ -5274,7 +5303,8 @@ mod tests {
             assert_eq!(
                 reason(ClaimIngestRejection::Underpayment {
                     advanced: 1,
-                    price: 7
+                    price: 7,
+                    watermark: 0
                 }),
                 Some(RejectReason::Underpayment)
             );
@@ -5284,6 +5314,10 @@ mod tests {
                     deposited: 1
                 }),
                 Some(RejectReason::Undercollateralized)
+            );
+            assert_eq!(
+                reason(ClaimIngestRejection::AmountNotAdvancing { watermark: 3 }),
+                Some(RejectReason::AmountNotAdvancing)
             );
             assert_eq!(reason(ClaimIngestRejection::NotDurable), None);
             assert_eq!(reason(ClaimIngestRejection::SignatureInvalid), None);
@@ -5385,6 +5419,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(cost_header(&response), Some(PRICE));
             assert_eq!(reason_header(&response).as_deref(), Some("underpayment"));
+            assert_eq!(watermark_header(&response).as_deref(), Some("0"));
             let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
             assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F03");
             assert!(app_client.deliveries().is_empty());
@@ -5403,6 +5438,36 @@ mod tests {
 
             assert_eq!(cost_header(&response), Some(0));
             assert_eq!(reason_header(&response), None);
+            assert_eq!(watermark_header(&response), None);
+        }
+
+        /// A replayed voucher is `F01` with the reason `amount_not_advancing`
+        /// and the watermark the journal holds.
+        #[tokio::test]
+        async fn a_replayed_voucher_carries_its_reason_and_the_watermark() {
+            let (app, _app_client, _signer) = priced_route_router();
+
+            let paid = request_with_claim_header(
+                &sample_prepare("g.example.app"),
+                CLAIM_HEADER,
+                &evm_claim_json(2 * PRICE),
+            );
+            app.clone().oneshot(paid).await.unwrap();
+            let replay = request_with_claim_header(
+                &sample_prepare("g.example.app"),
+                CLAIM_HEADER,
+                &evm_claim_json(PRICE),
+            );
+            let response = app.oneshot(replay).await.unwrap();
+
+            assert_eq!(cost_header(&response), Some(0));
+            assert_eq!(
+                reason_header(&response).as_deref(),
+                Some("amount_not_advancing")
+            );
+            assert_eq!(watermark_header(&response), Some((2 * PRICE).to_string()));
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert_eq!(Reject::decode(&bytes).unwrap().code.as_str(), "F01");
         }
 
         /// Issue #1532 over HTTP: a voucher above what the channel can pay

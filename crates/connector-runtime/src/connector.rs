@@ -68,6 +68,7 @@ fn unsealed_termination_reject(message: &str) -> Reject {
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     }
 }
 
@@ -2156,6 +2157,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             });
         }
         self.refuse_oversize(prepare)
@@ -2363,6 +2365,7 @@ impl Connector {
                     // their fees to (as `handle_probe` does at the edge).
                     accumulated_cost: charge,
                     reason: None,
+                    watermark: None,
                 });
                 let mut trace = self.trace(&prepare, arrived_from.map(Arrival::Peer));
                 if let Some(trace) = trace.as_mut() {
@@ -2507,6 +2510,7 @@ impl Connector {
                     // here is an F03 too, but not this reason's situation.
                     reason: (route.kind == ClientRouteKind::Terminated)
                         .then_some(RejectReason::ProbeTerminatesHere),
+                    watermark: None,
                 }));
             }
         }
@@ -2562,6 +2566,7 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: 0,
                     reason: None,
+                    watermark: None,
                 }),
                 trace,
                 None,
@@ -2768,6 +2773,7 @@ impl Connector {
             data: Vec::new(),
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         };
 
         // A node with no table at all is a node that declared no rate for
@@ -2794,6 +2800,7 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: 0,
                     reason: None,
+                    watermark: None,
                 });
             }
             RateLookup::NotDeclared => return Err(undeclared()),
@@ -2830,6 +2837,7 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: threshold,
                     reason: None,
+                    watermark: None,
                 })
             }
             None => Err(Reject {
@@ -2844,6 +2852,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             }),
         }
     }
@@ -3069,6 +3078,7 @@ impl Connector {
                         // gets past this hop. `R01` marks a partial sum.
                         accumulated_cost: fee,
                         reason: None,
+                        watermark: None,
                     });
                 };
                 forwarded_amount
@@ -3108,6 +3118,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             });
         }
 
@@ -3152,6 +3163,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             });
         };
 
@@ -3201,6 +3213,7 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: 0,
                     reason: None,
+                    watermark: None,
                 });
             }
         };
@@ -3579,6 +3592,7 @@ impl Connector {
             data: Vec::new(),
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         }
     }
 
@@ -3911,6 +3925,7 @@ impl Connector {
                     data: Vec::new(),
                     accumulated_cost: termination.charge,
                     reason: None,
+                    watermark: None,
                 });
             }
         };
@@ -3938,6 +3953,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             });
         };
 
@@ -3985,6 +4001,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: termination.charge,
                 reason: None,
+                watermark: None,
             });
         };
 
@@ -4012,6 +4029,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             }),
             // Issue #596: distinguishable from both an undecodable envelope
             // (F01, above) and an app's own answer -- including a 404,
@@ -4026,6 +4044,7 @@ impl Connector {
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             }),
         }
     }
@@ -6498,6 +6517,7 @@ mod tests {
                     data: Vec::new(),
                     accumulated_cost: 0,
                     reason: None,
+                    watermark: None,
                 }),
                 ClaimAckOutcome::NotSent,
             )
@@ -7603,6 +7623,7 @@ mod tests {
                     data: Vec::new(),
                     accumulated_cost: self.quotes,
                     reason: None,
+                    watermark: None,
                 }),
                 ClaimAckOutcome::NotSent,
             )
@@ -9879,6 +9900,7 @@ mod tests {
                                 data: Vec::new(),
                                 accumulated_cost: 0,
                                 reason: None,
+                                watermark: None,
                             }),
                             ack,
                         )
@@ -10762,6 +10784,7 @@ mod tests {
                             data: Vec::new(),
                             accumulated_cost: self.states,
                             reason: None,
+                            watermark: None,
                         }),
                         ClaimAckOutcome::NotSent,
                         // What the forwarded packet itself carries: a retry
