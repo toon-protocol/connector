@@ -79,7 +79,7 @@ const ATTRIBUTION_HEADERS: [&str; 4] = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADE
 
 /// A payment this connector verified for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaymentAttribution<'a> {
+pub struct PaymentAttribution<'a> {
     /// The claim key the covering claim was admitted under: a voucher's
     /// chain-namespaced channel key (`evm:0x<64 hex>` or `solana:<base58>`),
     /// or an allowance's claim key (`zk-note:<allowance id>`).
@@ -154,7 +154,7 @@ fn chain_of(channel_key: &str) -> Option<&str> {
 /// arrival exactly as it runs for a paid client-edge delivery, so a sender
 /// cannot smuggle an attribution claim into an app by addressing a
 /// destination that has none to state.
-pub(crate) fn apply_payment_attribution(
+pub fn apply_payment_attribution(
     request: &mut EnvelopeRequest,
     attribution: Option<PaymentAttribution<'_>>,
 ) {

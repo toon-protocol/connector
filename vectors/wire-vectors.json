@@ -1,5 +1,5 @@
 {
-  "schema_version": 14,
+  "schema_version": 15,
   "envelope": {
     "valid": [
       {
@@ -1557,5 +1557,319 @@
         "verificationKeyHash": "1"
       }
     }
+  },
+  "attribution": {
+    "cases": [
+      {
+        "name": "evm_voucher",
+        "description": "An EVM voucher at the client edge: payer, amount, chain and network.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "evm:0x1111111111111111111111111111111111111111111111111111111111111111",
+          "charge": "1000",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          [
+            "X-TOON-Payer",
+            "evm:0x1111111111111111111111111111111111111111111111111111111111111111"
+          ],
+          ["X-TOON-Amount", "1000"],
+          ["X-TOON-Chain", "evm"],
+          ["X-TOON-Network", "eip155:8453"]
+        ]
+      },
+      {
+        "name": "solana_voucher",
+        "description": "A Solana voucher at the client edge.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+          "charge": "7",
+          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"],
+          ["X-TOON-Amount", "7"],
+          ["X-TOON-Chain", "solana"],
+          ["X-TOON-Network", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"]
+        ]
+      },
+      {
+        "name": "xrpl_voucher",
+        "description": "An XRPL voucher at the client edge.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "xrpl:2222222222222222222222222222222222222222222222222222222222222222",
+          "charge": "25",
+          "network": "xrpl:0",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "xrpl:2222222222222222222222222222222222222222222222222222222222222222"],
+          ["X-TOON-Amount", "25"],
+          ["X-TOON-Chain", "xrpl"],
+          ["X-TOON-Network", "xrpl:0"]
+        ]
+      },
+      {
+        "name": "allowance_claim",
+        "description": "An allowance claim: no payer, and the Mina network as both chain and network.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "zk-note:00112233445566778899aabbccddeeff",
+          "charge": "250",
+          "network": null,
+          "zk_note_network": "mina:devnet"
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Amount", "250"],
+          ["X-TOON-Chain", "mina:devnet"],
+          ["X-TOON-Network", "mina:devnet"]
+        ]
+      },
+      {
+        "name": "peer_arrival_at_a_payment_route",
+        "description": "A peer arrival at a payment route (ADR 0083): the packet's own amount, and the last hop's peering channel as payer.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "evm:0x3333333333333333333333333333333333333333333333333333333333333333",
+          "charge": "40",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          [
+            "X-TOON-Payer",
+            "evm:0x3333333333333333333333333333333333333333333333333333333333333333"
+          ],
+          ["X-TOON-Amount", "40"],
+          ["X-TOON-Chain", "evm"],
+          ["X-TOON-Network", "eip155:8453"]
+        ]
+      },
+      {
+        "name": "free_route",
+        "description": "A route priced at zero took no payment, even with a claim riding along.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "evm:0x1111111111111111111111111111111111111111111111111111111111111111",
+          "charge": "0",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [["Content-Type", "application/json"]]
+      },
+      {
+        "name": "forwarded_or_unclaimed",
+        "description": "A forwarded or unclaimed packet admitted no claim here: no headers.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": null,
+        "received_headers": [["Content-Type", "application/json"]]
+      },
+      {
+        "name": "network_not_held",
+        "description": "A node that holds no network for the channel's chain omits X-TOON-Network.",
+        "request_headers": [["Content-Type", "application/json"]],
+        "payment": {
+          "claim_key": "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+          "charge": "7",
+          "network": null,
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"],
+          ["X-TOON-Amount", "7"],
+          ["X-TOON-Chain", "solana"]
+        ]
+      },
+      {
+        "name": "evm_voucher_with_spoofed_headers",
+        "description": "An EVM voucher at the client edge: payer, amount, chain and network. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "evm:0x1111111111111111111111111111111111111111111111111111111111111111",
+          "charge": "1000",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          [
+            "X-TOON-Payer",
+            "evm:0x1111111111111111111111111111111111111111111111111111111111111111"
+          ],
+          ["X-TOON-Amount", "1000"],
+          ["X-TOON-Chain", "evm"],
+          ["X-TOON-Network", "eip155:8453"]
+        ]
+      },
+      {
+        "name": "solana_voucher_with_spoofed_headers",
+        "description": "A Solana voucher at the client edge. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+          "charge": "7",
+          "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"],
+          ["X-TOON-Amount", "7"],
+          ["X-TOON-Chain", "solana"],
+          ["X-TOON-Network", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"]
+        ]
+      },
+      {
+        "name": "xrpl_voucher_with_spoofed_headers",
+        "description": "An XRPL voucher at the client edge. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "xrpl:2222222222222222222222222222222222222222222222222222222222222222",
+          "charge": "25",
+          "network": "xrpl:0",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "xrpl:2222222222222222222222222222222222222222222222222222222222222222"],
+          ["X-TOON-Amount", "25"],
+          ["X-TOON-Chain", "xrpl"],
+          ["X-TOON-Network", "xrpl:0"]
+        ]
+      },
+      {
+        "name": "allowance_claim_with_spoofed_headers",
+        "description": "An allowance claim: no payer, and the Mina network as both chain and network. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "zk-note:00112233445566778899aabbccddeeff",
+          "charge": "250",
+          "network": null,
+          "zk_note_network": "mina:devnet"
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Amount", "250"],
+          ["X-TOON-Chain", "mina:devnet"],
+          ["X-TOON-Network", "mina:devnet"]
+        ]
+      },
+      {
+        "name": "peer_arrival_at_a_payment_route_with_spoofed_headers",
+        "description": "A peer arrival at a payment route (ADR 0083): the packet's own amount, and the last hop's peering channel as payer. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "evm:0x3333333333333333333333333333333333333333333333333333333333333333",
+          "charge": "40",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          [
+            "X-TOON-Payer",
+            "evm:0x3333333333333333333333333333333333333333333333333333333333333333"
+          ],
+          ["X-TOON-Amount", "40"],
+          ["X-TOON-Chain", "evm"],
+          ["X-TOON-Network", "eip155:8453"]
+        ]
+      },
+      {
+        "name": "free_route_with_spoofed_headers",
+        "description": "A route priced at zero took no payment, even with a claim riding along. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "evm:0x1111111111111111111111111111111111111111111111111111111111111111",
+          "charge": "0",
+          "network": "eip155:8453",
+          "zk_note_network": null
+        },
+        "received_headers": [["Content-Type", "application/json"]]
+      },
+      {
+        "name": "forwarded_or_unclaimed_with_spoofed_headers",
+        "description": "A forwarded or unclaimed packet admitted no claim here: no headers. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": null,
+        "received_headers": [["Content-Type", "application/json"]]
+      },
+      {
+        "name": "network_not_held_with_spoofed_headers",
+        "description": "A node that holds no network for the channel's chain omits X-TOON-Network. The sender's own X-TOON-* headers are stripped.",
+        "request_headers": [
+          ["Content-Type", "application/json"],
+          ["x-toon-payer", "evm:0xvictim"],
+          ["X-TOON-AMOUNT", "1"],
+          ["X-Toon-Chain", "solana"],
+          ["x-toon-network", "eip155:1"]
+        ],
+        "payment": {
+          "claim_key": "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+          "charge": "7",
+          "network": null,
+          "zk_note_network": null
+        },
+        "received_headers": [
+          ["Content-Type", "application/json"],
+          ["X-TOON-Payer", "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"],
+          ["X-TOON-Amount", "7"],
+          ["X-TOON-Chain", "solana"]
+        ]
+      }
+    ]
   }
 }

@@ -1155,3 +1155,82 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
         }
     }
 }
+
+/// Schema 15 (issue #1708): the committed `attribution` cases hold the
+/// contract an app reads -- only the connector's own `X-TOON-*` headers
+/// survive, in its own spelling and stating what it verified; a sender's
+/// spoofed ones change nothing; and nothing is stated for a delivery with
+/// no payment.
+#[test]
+fn the_committed_attribution_cases_state_only_what_the_connector_verified() {
+    use connector_runtime::{AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER, PAYER_HEADER};
+
+    let committed = committed();
+    let cases = committed["attribution"]["cases"].as_array().expect("cases");
+    let canonical = [PAYER_HEADER, AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER];
+    let owned_in = |case: &serde_json::Value| -> Vec<(String, String)> {
+        case["received_headers"]
+            .as_array()
+            .expect("headers")
+            .iter()
+            .map(|h| {
+                (
+                    h[0].as_str().expect("name").to_string(),
+                    h[1].as_str().expect("value").to_string(),
+                )
+            })
+            .filter(|(name, _)| name.to_ascii_lowercase().starts_with("x-toon-"))
+            .collect()
+    };
+    let by_name = |name: &str| cases.iter().find(|c| c["name"] == name);
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let received = owned_in(case);
+        for (header, _) in &received {
+            assert!(
+                canonical.contains(&header.as_str()),
+                "case {name}: {header} is not the connector's own spelling"
+            );
+        }
+        let value_of = |header: &str| {
+            received
+                .iter()
+                .find(|(h, _)| h == header)
+                .map(|(_, v)| v.as_str())
+        };
+        let payment = &case["payment"];
+        if payment.is_null() || payment["charge"] == "0" {
+            assert!(received.is_empty(), "case {name}");
+        } else {
+            assert_eq!(
+                value_of(AMOUNT_HEADER),
+                payment["charge"].as_str(),
+                "case {name}"
+            );
+            let claim_key = payment["claim_key"].as_str().expect("claim_key");
+            if claim_key.starts_with("zk-note:") {
+                assert_eq!(value_of(PAYER_HEADER), None, "case {name}");
+            } else {
+                assert_eq!(value_of(PAYER_HEADER), Some(claim_key), "case {name}");
+            }
+        }
+        if let Some(plain) = name.strip_suffix("_with_spoofed_headers") {
+            let twin = by_name(plain).unwrap_or_else(|| panic!("no plain twin of {name}"));
+            assert_eq!(received, owned_in(twin), "case {name}");
+        }
+    }
+    for needed in [
+        "evm_voucher",
+        "solana_voucher",
+        "xrpl_voucher",
+        "allowance_claim",
+        "peer_arrival_at_a_payment_route",
+        "free_route",
+        "forwarded_or_unclaimed",
+        "network_not_held",
+    ] {
+        assert!(by_name(needed).is_some(), "missing {needed}");
+        let spoofed = format!("{needed}_with_spoofed_headers");
+        assert!(by_name(&spoofed).is_some(), "missing {spoofed}");
+    }
+}
