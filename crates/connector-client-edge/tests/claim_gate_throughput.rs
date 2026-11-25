@@ -24,17 +24,12 @@
 //! what a fleet box's gate would sustain on this disk (ADR 0075: every claim
 //! is a voucher).
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use connector_client_edge::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-    ChannelResolutionError, ClientClaimGate,
-};
-use connector_runtime::FileJournal;
+use connector_client_edge::ClientClaimGate;
+use connector_runtime::{FileJournal, InMemorySettlementNetwork, SettlementNetworks};
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_digest, BatchChannelConfig,
     BatchSettlementDomain,
@@ -73,56 +68,23 @@ fn config(index: u32) -> BatchChannelConfig {
     }
 }
 
-/// A backend admitting every session's channel with unbounded collateral,
-/// so no chain is ever consulted -- the measurement is of the gate and its
-/// journal, not of an RPC endpoint.
-#[derive(Debug)]
-struct Channels(HashMap<[u8; 32], BatchChannelConfig>);
-
-#[async_trait]
-impl BatchSettlementChannels for Channels {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![domain()]
-    }
-
-    fn solana_network(&self) -> Option<connector_domain::Network> {
-        None
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        _presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        Ok(self
-            .0
-            .get(channel_id)
-            .map(|config| AdmittedEvmVoucherChannel {
-                config: *config,
-                max_cumulative: u128::MAX,
-            }))
-    }
-
-    async fn solana(
-        &self,
-        _channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        Ok(None)
-    }
-}
-
+/// A gate whose one EVM network, over the in-memory batch settlement, holds
+/// every session's channel with unbounded collateral, so no chain is ever
+/// consulted -- the measurement is of the gate and its journal, not of an
+/// RPC endpoint.
 fn gate_over(journal: FileJournal, sessions: u32) -> Arc<ClientClaimGate> {
-    let channels = (0..sessions)
-        .map(|index| {
-            let config = config(index);
-            (evm_batch_channel_id(&domain(), &config), config)
-        })
-        .collect();
+    let network = InMemorySettlementNetwork::fresh(connector_domain::Network::Eip155(84_532));
+    for index in 0..sessions {
+        network.open_evm(&config(index), u128::MAX);
+    }
     Arc::new(
         ClientClaimGate::restore(Arc::new(journal))
             .expect("a fresh journal has nothing to replay")
-            .with_batch_settlement(Arc::new(Channels(channels))),
+            .with_settlement_networks(
+                SettlementNetworks::new()
+                    .with(Arc::new(network))
+                    .expect("one network"),
+            ),
     )
 }
 

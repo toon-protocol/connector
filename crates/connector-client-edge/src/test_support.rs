@@ -1,20 +1,19 @@
-//! Shared fixtures for this crate's own unit tests: a fake
-//! [`BatchSettlementChannels`] holding one EVM x402 channel and one Solana
-//! `payment-channels` channel, and the voucher and claim-state challenge
-//! signers a client would use on them (ADR 0074, ADR 0075: every claim is a
-//! voucher).
+//! Shared fixtures for this crate's own unit tests: settlement networks over
+//! the in-memory batch settlement, holding one EVM x402 channel (and a
+//! second, salted one) and one Solana `payment-channels` channel, and the
+//! voucher and claim-state challenge signers a client would use on them (ADR
+//! 0074, ADR 0075: every claim is a voucher).
 //!
-//! The fake is not a mock: it asserts no call sequence, and holds the one
-//! fact a backend owns -- which channels exist, who signs on them, and what
-//! they can pay. It counts lookups so a test can show a refusal cost
-//! nothing.
+//! The in-memory settlement is not a mock: it asserts no call sequence, and
+//! upholds the port's contract suites. It counts chain reads so a test can
+//! show a refusal cost nothing.
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-use connector_runtime::{InMemoryJournal, Journal};
+use connector_domain::Network;
+use connector_runtime::{
+    InMemoryJournal, InMemorySettlementNetwork, Journal, SettlementNetwork, SettlementNetworks,
+};
 use connector_signer::{
     derive_evm_address, evm_batch_channel_id, evm_voucher_claim_state_challenge_digest,
     evm_voucher_digest, solana_voucher_claim_state_challenge_message, solana_voucher_message,
@@ -23,10 +22,6 @@ use connector_signer::{
 use ed25519_dalek::Signer as _;
 use libsecp256k1::{Message, PublicKey, SecretKey};
 
-use crate::batch_settlement::{
-    AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-};
-use crate::channels::{ChannelLookupFailed, ChannelResolutionError};
 use crate::ClientClaimGate;
 
 /// The EVM chain every channel below is on.
@@ -238,127 +233,85 @@ pub(crate) fn solana_challenge(signer: &ed25519_dalek::Keypair, expires: u64) ->
     })
 }
 
-/// A backend holding the EVM channels named by `configs` and the Solana
-/// channel, each able to pay `max_cumulative`.
+/// The settlement networks every unit test's gate settles on: one EVM
+/// network (`eip155:84532`) holding the channels named by `configs`, and the
+/// Solana network holding [`SOLANA_CHANNEL`], each over the in-memory batch
+/// settlement -- the fake both of the port's contract suites hold to the
+/// same rules as the real adapters (ADR 0007) -- and each channel able to
+/// pay `max_cumulative`.
 ///
-/// It keeps the seam's one EVM rule a real backend cannot escape: an EVM
-/// channel is found only from its config, so an instance that has never
-/// been shown the config admits nothing when handed `None`.
-#[derive(Debug)]
-pub(crate) struct FakeBatchSettlement {
-    configs: Vec<BatchChannelConfig>,
-    max_cumulative: u128,
-    lookups: AtomicUsize,
-    admitted: Mutex<HashSet<[u8; 32]>>,
-    /// When set, every lookup fails as an unreachable endpoint would.
-    failing: bool,
+/// It keeps the one EVM rule a real network cannot escape: an EVM channel
+/// is found only from its config.
+pub(crate) struct InMemoryNetworks {
+    evm: Arc<InMemorySettlementNetwork>,
+    solana: Arc<InMemorySettlementNetwork>,
 }
 
-impl FakeBatchSettlement {
-    pub(crate) fn new(max_cumulative: u128) -> FakeBatchSettlement {
-        FakeBatchSettlement::holding(vec![config(), config_salted(0x77)], max_cumulative)
+impl InMemoryNetworks {
+    pub(crate) fn new(max_cumulative: u128) -> InMemoryNetworks {
+        InMemoryNetworks::holding(vec![config(), config_salted(0x77)], max_cumulative)
     }
 
     pub(crate) fn holding(
         configs: Vec<BatchChannelConfig>,
         max_cumulative: u128,
-    ) -> FakeBatchSettlement {
-        FakeBatchSettlement {
-            configs,
+    ) -> InMemoryNetworks {
+        let evm = InMemorySettlementNetwork::fresh(Network::Eip155(CHAIN_ID));
+        for config in &configs {
+            evm.open_evm(config, max_cumulative);
+        }
+        let solana =
+            InMemorySettlementNetwork::fresh(SOLANA_NETWORK.parse().expect("a CAIP-2 network"));
+        solana.open_solana(
+            SOLANA_CHANNEL,
+            solana_signer().public.to_bytes(),
             max_cumulative,
-            lookups: AtomicUsize::new(0),
-            admitted: Mutex::new(HashSet::new()),
-            failing: false,
+        );
+        InMemoryNetworks {
+            evm: Arc::new(evm),
+            solana: Arc::new(solana),
         }
     }
 
-    /// A backend whose every lookup fails -- an unreachable RPC endpoint.
-    pub(crate) fn unreachable() -> FakeBatchSettlement {
-        FakeBatchSettlement {
-            failing: true,
-            ..FakeBatchSettlement::new(u128::from(u64::MAX))
-        }
+    /// Networks whose every read fails -- an unreachable RPC endpoint.
+    pub(crate) fn unreachable() -> InMemoryNetworks {
+        let networks = InMemoryNetworks::new(u128::from(u64::MAX));
+        networks.evm.settlement().set_unreachable(true);
+        networks.solana.settlement().set_unreachable(true);
+        networks
     }
 
+    /// Every chain read either network has made.
     pub(crate) fn lookups(&self) -> usize {
-        self.lookups.load(Ordering::SeqCst)
+        self.evm.settlement().reads() + self.solana.settlement().reads()
+    }
+
+    /// The two networks, as a gate is given them.
+    pub(crate) fn networks(&self) -> SettlementNetworks {
+        SettlementNetworks::new()
+            .with(Arc::clone(&self.evm) as Arc<dyn SettlementNetwork>)
+            .and_then(|networks| {
+                networks.with(Arc::clone(&self.solana) as Arc<dyn SettlementNetwork>)
+            })
+            .expect("two distinct networks")
     }
 }
 
-#[async_trait]
-impl BatchSettlementChannels for FakeBatchSettlement {
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-        vec![domain()]
-    }
-
-    fn solana_network(&self) -> Option<connector_domain::Network> {
-        Some(SOLANA_NETWORK.parse().expect("a CAIP-2 network"))
-    }
-
-    async fn evm(
-        &self,
-        _network: &connector_domain::Network,
-        channel_id: &[u8; 32],
-        presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
-        if self.failing {
-            return Err(ChannelResolutionError::LookupFailed(ChannelLookupFailed(
-                "rpc unreachable".to_string(),
-            )));
-        }
-        let Some(config) = self
-            .configs
-            .iter()
-            .find(|config| channel_id_of(config) == *channel_id)
-        else {
-            return Ok(None);
-        };
-        let mut admitted = self.admitted.lock().unwrap();
-        if presented_config.is_none() && !admitted.contains(channel_id) {
-            return Ok(None);
-        }
-        admitted.insert(*channel_id);
-        Ok(Some(AdmittedEvmVoucherChannel {
-            config: *config,
-            max_cumulative: self.max_cumulative,
-        }))
-    }
-
-    async fn solana(
-        &self,
-        channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        self.lookups.fetch_add(1, Ordering::SeqCst);
-        if self.failing {
-            return Err(ChannelResolutionError::LookupFailed(ChannelLookupFailed(
-                "rpc unreachable".to_string(),
-            )));
-        }
-        Ok(
-            (*channel_account == SOLANA_CHANNEL).then_some(AdmittedSolanaVoucherChannel {
-                authorized_signer: solana_signer().public.to_bytes(),
-                max_cumulative: u64::try_from(self.max_cumulative).unwrap_or(u64::MAX),
-            }),
-        )
-    }
-}
-
-/// A gate over `journal`, admitting vouchers through `backend`.
+/// A gate over `journal`, admitting vouchers on `networks`.
 pub(crate) fn gate_over(
     journal: Arc<dyn Journal>,
-    backend: &Arc<FakeBatchSettlement>,
+    networks: &Arc<InMemoryNetworks>,
 ) -> ClientClaimGate {
     ClientClaimGate::restore(journal)
         .expect("the journal replays")
-        .with_batch_settlement(Arc::clone(backend) as Arc<dyn BatchSettlementChannels>)
+        .with_settlement_networks(networks.networks())
 }
 
-/// A gate over an in-memory journal and a backend that can pay a great
+/// A gate over an in-memory journal and networks that can pay a great
 /// deal.
 pub(crate) fn voucher_gate() -> ClientClaimGate {
     gate_over(
         Arc::new(InMemoryJournal::new()),
-        &Arc::new(FakeBatchSettlement::new(1_000_000_000)),
+        &Arc::new(InMemoryNetworks::new(1_000_000_000)),
     )
 }

@@ -16,7 +16,7 @@
 //! watermark, under the canonical (blockchain, channel) key; a
 //! byte-identical resend at its watermark is answered without advancing or
 //! journaling anything; its signer is read from the backend's verified
-//! channel ([`BatchSettlementChannels`]), never from the voucher; and its
+//! channel (its settlement network, spec #1684), never from the voucher; and its
 //! acceptance is journaled. A channel's first accepted voucher also
 //! journals the channel itself ([`JournalEntry::BatchChannelAdmitted`]),
 //! because on EVM the config it carries is the only way to land any voucher
@@ -88,7 +88,7 @@ use connector_domain::{
     VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
 use connector_peer_auth::SessionRole;
-use connector_runtime::{Journal, JournalError};
+use connector_runtime::{Journal, JournalError, SettlementNetworks};
 use connector_signer::{
     evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, verify_solana_voucher,
     verify_xrpl_claim, BatchChannelConfig, BatchSettlementDomain,
@@ -96,7 +96,7 @@ use connector_signer::{
 
 use crate::batch_settlement::{
     journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    AdmittedXrplVoucherChannel, BatchSettlementChannels, JournaledBatchChannel,
+    AdmittedXrplVoucherChannel, JournaledBatchChannel, VoucherChannels,
 };
 use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
 use crate::lookup_budget::{
@@ -461,11 +461,11 @@ pub struct ClientClaimGate {
     /// the chain when the voucher was verified, never from the voucher. How
     /// an accepted voucher teaches a session its payee.
     voucher_signers: RwLock<HashMap<String, VoucherSigner>>,
-    /// The x402 `batch-settlement` backend vouchers are admitted through
-    /// (ADR 0074, issue #1341) -- `None`, every constructor's default, on a
-    /// node that settles on no chain, and then every voucher is refused by
-    /// name. See [`crate::batch_settlement`].
-    batch_settlement: Option<Arc<dyn BatchSettlementChannels>>,
+    /// The settlement networks vouchers are admitted through (ADR 0074,
+    /// spec #1684) -- none, every constructor's default, on a node that
+    /// settles on no chain, and then every voucher is refused by name. See
+    /// [`crate::batch_settlement`].
+    voucher_channels: VoucherChannels,
     /// Every batch-settlement channel this gate has accepted a voucher on,
     /// by canonical key (ADR 0074): replayed from the journal's
     /// [`JournalEntry::BatchChannelAdmitted`] records, and added to under
@@ -504,8 +504,8 @@ struct SessionPayee {
 
 impl ClientClaimGate {
     /// A gate resuming from the watermarks `journal` already records (issue
-    /// #605), accepting no voucher until [`Self::with_batch_settlement`]
-    /// gives it a backend.
+    /// #605), accepting no voucher until [`Self::with_settlement_networks`]
+    /// gives it a network to settle on.
     ///
     /// This is the only way to build a gate, and it always replays: there
     /// is deliberately no constructor that starts a gate at no watermarks
@@ -541,20 +541,20 @@ impl ClientClaimGate {
             payout_ledger: None,
             session_payees: RwLock::new(HashMap::new()),
             voucher_signers: RwLock::new(HashMap::new()),
-            batch_settlement: None,
+            voucher_channels: VoucherChannels::new(SettlementNetworks::new()),
             batch_channels: RwLock::new(batch_channels),
         })
     }
 
-    /// Accept x402 `batch-settlement` vouchers through `backend`. Without
-    /// this, a voucher is refused as
-    /// [`ClaimIngestRejection::BatchSettlementNotAccepted`]. `connector-cli`'s
-    /// runtime calls it for every chain this node settles on.
-    pub fn with_batch_settlement(
-        mut self,
-        backend: Arc<dyn BatchSettlementChannels>,
-    ) -> ClientClaimGate {
-        self.batch_settlement = Some(backend);
+    /// Accept x402 `batch-settlement` vouchers on each of `networks`, each
+    /// voucher's channel found on the network it names and no other (ADR
+    /// 0086). A voucher on a chain none of them is on is refused as
+    /// [`ClaimIngestRejection::BatchSettlementNotAccepted`], and one on
+    /// another network of a chain they are on as
+    /// [`ClaimIngestRejection::NetworkNotSettled`]. `connector-cli`'s runtime
+    /// hands it every network this node settles on.
+    pub fn with_settlement_networks(mut self, networks: SettlementNetworks) -> ClientClaimGate {
+        self.voucher_channels = VoucherChannels::new(networks);
         self
     }
 
@@ -792,15 +792,10 @@ impl ClientClaimGate {
         requester: &str,
     ) -> Result<Option<(BatchSettlementDomain, AdmittedEvmVoucherChannel)>, ChannelResolutionError>
     {
-        let Some(backend) = self.batch_settlement.as_deref() else {
-            return Ok(None);
-        };
+        let channels = &self.voucher_channels;
         // ADR 0086: verified under the named network's own domain, and
-        // asked of that network's backend only.
-        let Some(domain) = network
-            .eip155_chain_id()
-            .and_then(|chain_id| backend.evm_domain_on(chain_id))
-        else {
+        // asked of that network only.
+        let Some(domain) = channels.evm_domain_on(network) else {
             return Ok(None);
         };
         let key = format!("{EVM_NAMESPACE}:0x{}", hex::encode(channel_id));
@@ -818,7 +813,7 @@ impl ClientClaimGate {
             .metered_voucher_lookup(
                 recorded.is_none(),
                 requester,
-                backend.evm(network, channel_id, Some(&config)),
+                channels.evm(network, channel_id, Some(&config)),
             )
             .await?;
         // As in `verify_voucher`: the signer is read from the backend's
@@ -829,26 +824,28 @@ impl ClientClaimGate {
     }
 
     /// As [`Self::evm_voucher_channel`], for the Solana channel account
-    /// `channel_account`: every field is on chain, so nothing is presented.
+    /// `channel_account` on `network`: every field is on chain, so nothing
+    /// is presented.
     pub(crate) async fn solana_voucher_channel(
         &self,
+        network: &Network,
         channel_account: &[u8; 32],
         requester: &str,
     ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        let Some(backend) = self
-            .batch_settlement
-            .as_deref()
-            .filter(|backend| backend.accepts_solana())
-        else {
+        if !self.voucher_channels.settles_on(network) {
             return Ok(None);
-        };
+        }
         let key = JournaledBatchChannel::Solana {
             channel_account: *channel_account,
         }
         .channel_key();
         let unseen = self.known_batch_channel(&key).is_none();
-        self.metered_voucher_lookup(unseen, requester, backend.solana(channel_account))
-            .await
+        self.metered_voucher_lookup(
+            unseen,
+            requester,
+            self.voucher_channels.solana(network, channel_account),
+        )
+        .await
     }
 
     /// As [`Self::solana_voucher_channel`], for the XRPL channel `channel_id`
@@ -860,30 +857,30 @@ impl ClientClaimGate {
         channel_id: &[u8; 32],
         requester: &str,
     ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
-        let (Some(backend), Network::Xrpl(xrpl)) = (
-            self.batch_settlement
-                .as_deref()
-                .filter(|backend| backend.accepts_xrpl()),
-            network,
-        ) else {
+        let Network::Xrpl(xrpl) = network else {
             return Ok(None);
         };
+        if !self.voucher_channels.settles_on(network) {
+            return Ok(None);
+        }
         let key = format!(
             "{}:{}",
             connector_domain::client_claim::XRPL_CHANNEL_NAMESPACE,
             hex::encode(channel_id)
         );
         let unseen = self.known_batch_channel(&key).is_none();
-        self.metered_voucher_lookup(unseen, requester, backend.xrpl(xrpl, channel_id))
-            .await
+        self.metered_voucher_lookup(
+            unseen,
+            requester,
+            self.voucher_channels.xrpl(xrpl, channel_id),
+        )
+        .await
     }
 
     /// Whether `network` names a settlement table this node has (ADR 0086
     /// decision 1) -- `false` on a node that settles on nothing.
     pub(crate) fn settles_on(&self, network: &Network) -> bool {
-        self.batch_settlement
-            .as_deref()
-            .is_some_and(|backend| backend.settles_on(network))
+        self.voucher_channels.settles_on(network)
     }
 
     fn known_batch_channel(&self, key: &str) -> Option<JournaledBatchChannel> {
@@ -1155,9 +1152,9 @@ impl ClientClaimGate {
     /// collateral, then the authoritative re-check, the advance and the
     /// journal.
     ///
-    /// * **A chain this node settles on, first.** A gate with no
-    ///   [`BatchSettlementChannels`] for the voucher's chain refuses it by
-    ///   name, before anything about it is judged.
+    /// * **A chain this node settles on, first.** A gate with no settlement
+    ///   network on the voucher's chain refuses it by name, before anything
+    ///   about it is judged.
     /// * **Freshness** is [`validate_voucher`]'s amount-only watermark, keyed
     ///   by the same canonical (blockchain, channel) tuple as a claim's.
     /// * **A byte-identical resend** of the voucher at the watermark, at no
@@ -1172,20 +1169,18 @@ impl ClientClaimGate {
         claim: ClientClaim,
         price: u64,
     ) -> Result<(ClientClaim, DurabilityTicket), ClaimIngestRejection> {
-        let Some(backend) = self.batch_settlement.as_deref() else {
-            return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
+        let channels = &self.voucher_channels;
+        let chain = match &claim {
+            ClientClaim::EvmVoucher(_) => connector_domain::AssetChain::Evm,
+            ClientClaim::SolanaVoucher(_) => connector_domain::AssetChain::Solana,
+            ClientClaim::XrplVoucher(_) => connector_domain::AssetChain::Xrpl,
         };
-        let accepted_here = match &claim {
-            ClientClaim::EvmVoucher(_) => backend.accepts_evm(),
-            ClientClaim::SolanaVoucher(_) => backend.accepts_solana(),
-            ClientClaim::XrplVoucher(_) => backend.accepts_xrpl(),
-        };
-        if !accepted_here {
+        if !channels.settles_on_chain(chain) {
             return Err(ClaimIngestRejection::BatchSettlementNotAccepted);
         }
         // ADR 0086 decision 1: the voucher's network must name a table this
         // node has, before anything about the voucher is judged.
-        if !backend.settles_on(claim.network()) {
+        if !channels.settles_on(claim.network()) {
             return Err(ClaimIngestRejection::NetworkNotSettled {
                 network: claim.network().clone(),
             });
@@ -1220,7 +1215,7 @@ impl ClientClaimGate {
         // a discovery the unresolvable-lookup budget meters.
         let known = self.known_batch_channel(&key);
         let verified = verify_voucher(
-            backend,
+            channels,
             &claim,
             signature,
             &requester,
@@ -1900,7 +1895,7 @@ struct VerifiedVoucher {
 /// metered against `budget` (issue #613): charged before the backend is
 /// asked, and given back if the backend found a channel.
 async fn verify_voucher(
-    backend: &dyn BatchSettlementChannels,
+    channels: &VoucherChannels,
     claim: &ClientClaim,
     signature: VoucherSignature,
     requester: &str,
@@ -1921,13 +1916,11 @@ async fn verify_voucher(
         (ClientClaim::EvmVoucher(voucher), VoucherSignature::Evm(signature)) => {
             // ADR 0086: the voucher's own network picks the domain it is
             // verified under, and the backend that resolves its channel.
-            let domain = voucher
-                .network
-                .eip155_chain_id()
-                .and_then(|chain_id| backend.evm_domain_on(chain_id))
-                .ok_or_else(|| ClaimIngestRejection::NetworkNotSettled {
+            let domain = channels.evm_domain_on(&voucher.network).ok_or_else(|| {
+                ClaimIngestRejection::NetworkNotSettled {
                     network: voucher.network.clone(),
-                })?;
+                }
+            })?;
             let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
                 return Err(ClaimIngestRejection::UnknownChannel);
             };
@@ -1950,7 +1943,7 @@ async fn verify_voucher(
                 });
             }
             let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = backend
+            let found = channels
                 .evm(&voucher.network, &channel_id, presented.as_ref())
                 .await
                 .map_err(refuse_resolution)?;
@@ -1988,8 +1981,8 @@ async fn verify_voucher(
                 return Err(ClaimIngestRejection::UnknownChannel);
             };
             let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = backend
-                .solana(&channel_account)
+            let found = channels
+                .solana(&voucher.network, &channel_account)
                 .await
                 .map_err(refuse_resolution)?;
             refund_if_found(budget, reservation, found.is_some());
@@ -2024,7 +2017,7 @@ async fn verify_voucher(
                 });
             };
             let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = backend
+            let found = channels
                 .xrpl(network, &channel_id)
                 .await
                 .map_err(refuse_resolution)?;
@@ -2126,12 +2119,12 @@ mod tests {
     use super::*;
     use crate::test_support::{
         self, channel_key, config_salted, gate_over, signed_voucher, signed_voucher_on,
-        FakeBatchSettlement,
+        InMemoryNetworks,
     };
     use connector_runtime::{FileJournal, InMemoryJournal};
 
-    fn backend() -> Arc<FakeBatchSettlement> {
-        Arc::new(FakeBatchSettlement::new(1_000_000))
+    fn backend() -> Arc<InMemoryNetworks> {
+        Arc::new(InMemoryNetworks::new(1_000_000))
     }
 
     fn gate() -> ClientClaimGate {

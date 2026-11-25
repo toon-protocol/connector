@@ -104,8 +104,7 @@ pub mod zk_note;
 mod zk_note_http;
 pub use batch_settlement::{
     first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
-    AdmittedSolanaVoucherChannel, AdmittedXrplVoucherChannel, BatchSettlementChannels,
-    JournaledBatchChannel,
+    AdmittedSolanaVoucherChannel, AdmittedXrplVoucherChannel, JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
@@ -1641,7 +1640,7 @@ mod tests {
     /// store that lives no longer than the test does. These tests are about
     /// the HTTP surface in front of the gate; that a watermark survives a
     /// restart is `claim_gate`'s own tests, over a real file.
-    fn test_gate(backend: Arc<crate::test_support::FakeBatchSettlement>) -> ClientClaimGate {
+    fn test_gate(backend: Arc<crate::test_support::InMemoryNetworks>) -> ClientClaimGate {
         crate::test_support::gate_over(Arc::new(InMemoryJournal::new()), &backend)
     }
 
@@ -4102,14 +4101,14 @@ mod tests {
     /// HTTP seam rather than against `ClientClaimGate` directly.
     mod claim_headers {
         use super::*;
-        use crate::test_support::{self, FakeBatchSettlement};
+        use crate::test_support::{self, InMemoryNetworks};
         use libsecp256k1::{PublicKey, SecretKey};
 
         /// The backend every voucher below is judged by: it holds the one EVM
         /// channel `test_support::config()` names (and a second, salted one),
         /// and the Solana channel, each able to pay a great deal.
-        pub(super) fn test_channels() -> Arc<FakeBatchSettlement> {
-            Arc::new(FakeBatchSettlement::new(1_000_000_000))
+        pub(super) fn test_channels() -> Arc<InMemoryNetworks> {
+            Arc::new(InMemoryNetworks::new(1_000_000_000))
         }
 
         /// The payer's genuine voucher for cumulative `amount` on the EVM
@@ -5042,7 +5041,7 @@ mod tests {
                 connector,
                 test_signer(),
                 None,
-                test_gate(Arc::new(FakeBatchSettlement::holding(
+                test_gate(Arc::new(InMemoryNetworks::holding(
                     vec![test_support::config_salted(0x77)],
                     1_000_000_000,
                 ))),
@@ -5120,7 +5119,7 @@ mod tests {
                 connector,
                 test_signer(),
                 None,
-                test_gate(Arc::new(FakeBatchSettlement::unreachable())),
+                test_gate(Arc::new(InMemoryNetworks::unreachable())),
             );
 
             let request = request_with_claim_header(
@@ -5436,7 +5435,7 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             ));
-            let channels = Arc::new(crate::test_support::FakeBatchSettlement::new(u128::from(
+            let channels = Arc::new(crate::test_support::InMemoryNetworks::new(u128::from(
                 PRICE - 1,
             )));
             let app = router_with_gate(connector, test_signer(), None, test_gate(channels));

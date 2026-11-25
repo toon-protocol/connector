@@ -163,7 +163,7 @@ fn voucher_gate() -> (Arc<ClientClaimGate>, Arc<InMemoryJournal>) {
     let journal = Arc::new(InMemoryJournal::new());
     let gate = test_support::gate_over(
         Arc::clone(&journal) as Arc<dyn Journal>,
-        &Arc::new(test_support::FakeBatchSettlement::new(1_000_000_000)),
+        &Arc::new(test_support::InMemoryNetworks::new(1_000_000_000)),
     );
     (Arc::new(gate), journal)
 }

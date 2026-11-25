@@ -184,7 +184,14 @@ connector-runtime                the packet plane and its ports
   │                               runtime-mutable peer/route table
   ├─ peering.rs, self_description.rs  establishing a peering from a URL (ADR 0058) by
   │                               reading the other node's self-description (ADR 0050)
+  ├─ peerings.rs                 `Peerings`: how a peering comes to exist. One admit
+  │                               (rules, then hop, signer binding, carriage, table row,
+  │                               store; undone on failure) and one remove; owns the hops,
+  │                               bindings, runtime table, registrar, caps and fees
   ├─ batch_channels.rs           the x402 channels this node pays on, journaled (ADR 0075)
+  ├─ settlement_network.rs       every network this node settles on, one collection
+  │                               keyed by CAIP-2 network, and the handle a chain's
+  │                               binding implements (spec #1684)
   ├─ outbound_voucher.rs         a voucher or peer-role challenge on this node's own
   │                               x402 channel, and the next hop's claim-state asked
   │                               where it stands (ADR 0075 decisions 5 and 6)
@@ -222,7 +229,9 @@ connector-operator               axum Router: bearer-gated reads, RFC 9421-signe
 connector-cli                    config → runtime → merged routers → bound listeners,
                                   plus the `send` verb; the binary itself branches on
                                   nothing. Mounts POST /ilp/batch-settlement/solana/open,
-                                  the public Solana sponsor endpoint (ADR 0074)
+                                  the public Solana sponsor endpoint (ADR 0074). Its
+                                  settlement_networks.rs binds each chain's backend as a
+                                  settlement network, one per table (spec #1684)
 connector-bin                    bin/connector, bin/stub-app — and the workspace's
                                   cross-cutting integration tests (see below)
 connector-vectors                bin/generate-vectors → vectors/wire-vectors.json
