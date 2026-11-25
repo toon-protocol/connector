@@ -122,6 +122,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Run the implement runner
+        id: runner
         timeout-minutes: 170
         env:
           SANDCASTLE_ISSUE_NUMBER: ${{ matrix.issue }}
@@ -148,9 +149,12 @@ jobs:
           GH_TOKEN: ${{ steps.fail-token.outputs.token }}
           ISSUE: ${{ matrix.issue }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Set by the runner only when a failed final push left HEAD on its rescue ref (#1677).
+          RESCUE_REF: ${{ steps.runner.outputs.rescue_ref }}
         run: |
           gh issue edit "$ISSUE" --remove-label ready-for-agent --add-label needs-triage
-          gh issue comment "$ISSUE" --body "The AFK run for this issue failed: $RUN_URL. Any committed work is on \`sandcastle/issue-$ISSUE\`. Put \`ready-for-agent\` back on the issue to retry."
+          WORK_REF="${RESCUE_REF:-sandcastle/issue-$ISSUE}"
+          gh issue comment "$ISSUE" --body "The AFK run for this issue failed: $RUN_URL. Any committed work is on \`$WORK_REF\`. Put \`ready-for-agent\` back on the issue to retry."
 
       # REDACT BEFORE UPLOAD. This repository is public, and Actions masks secrets
       # in step logs but not in uploaded artifacts. Three passes, since none is
