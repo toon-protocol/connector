@@ -3981,8 +3981,8 @@ impl Connector {
     /// The configured route -- terminated or forwarded -- `destination`
     /// resolves to, with the length of the prefix that matched.
     ///
-    /// The one place configured-route selection lives, shared by
-    /// [`Self::client_route`] (ADR 0028) and the pre-admission probes. The
+    /// Configured-route selection for [`Self::client_route`] (ADR 0028),
+    /// ranked by `connector_domain::resolve_route` like every other lookup. The
     /// client edge's claim gate (issue #522) and x402 greeting must price
     /// the route the router will actually use, and a forwarded route being
     /// priced at all (issue #620) makes "app routes only" no longer a safe
@@ -4155,8 +4155,9 @@ impl Connector {
     /// [`Self::deliver_to_app`]'s decision: it repeats the same
     /// open-and-decode work, on the same immutable `prepare.data`, and it
     /// resolves the winning route by the same rule
-    /// [`Self::handle_prepare_traced`] applies (`connector_domain::resolve_route`), so the two can never disagree about where
-    /// this packet actually goes.
+    /// [`Self::handle_prepare_traced`] applies
+    /// (`connector_domain::resolve_route`), so the two can never disagree
+    /// about where this packet actually goes.
     pub fn envelope_target_would_be_refused(&self, prepare: &Prepare) -> bool {
         // Resolved with leases, as the router does: when a lease wins, the
         // packet is *forwarded* with its data opaque at this hop, so there
@@ -8427,7 +8428,7 @@ mod tests {
             assert!(!connector.envelope_target_would_be_refused(&to_leased_prefix));
 
             // An equal-length lease changes nothing: the app route wins
-            // that tie (issue #427, `RouteRank`), the packet terminates
+            // that tie (issue #427, `RouteKind`), the packet terminates
             // here, and the probe still predicts the refusal.
             connector
                 .upsert_leased_route("g.example.app", "leased-peer", Duration::seconds(60))

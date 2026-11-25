@@ -50,9 +50,10 @@ pub struct ResolvedRoute {
 ///
 /// Each table is an iterator of prefixes (leases carry their expiry), and
 /// `index` counts positions in that iterator, so the caller pairs the answer
-/// back up with whatever it stores beside each prefix. Nothing is collected
-/// or copied (and `index` counts a lapsed lease, which is simply skipped): a per-packet lookup allocates nothing (ADR 0015). A caller
-/// that does not hold one of the tables passes `std::iter::empty()`.
+/// back up with whatever it stores beside each prefix (a lapsed lease is
+/// skipped but still counted). Nothing is collected or copied: a per-packet
+/// lookup allocates nothing (ADR 0015). A caller that does not hold one of
+/// the tables passes `std::iter::empty()`.
 pub fn resolve_route<'a>(
     destination: &str,
     now: DateTime<Utc>,
@@ -94,29 +95,36 @@ fn best<'a>(
     kind: RouteKind,
     prefixes: impl Iterator<Item = (&'a str, bool)>,
 ) -> Option<ResolvedRoute> {
-    let mut found: Option<ResolvedRoute> = None;
-    for (index, (prefix, live)) in prefixes.enumerate() {
-        if live && matches(prefix, destination) && found.is_none_or(|f| prefix.len() > f.prefix_len)
-        {
-            found = Some(ResolvedRoute {
-                kind,
-                index,
-                prefix_len: prefix.len(),
-            });
-        }
-    }
-    found
+    longest_match(
+        destination,
+        prefixes.map(|(prefix, live)| live.then_some(prefix)),
+    )
+    .map(|(index, prefix_len)| ResolvedRoute {
+        kind,
+        index,
+        prefix_len,
+    })
+}
+
+/// The longest-prefix step [`select_route`] and [`resolve_route`] share:
+/// the position and prefix length of the most specific entry governing
+/// `destination`. A `None` entry is skipped but still counted.
+fn longest_match<'a>(
+    destination: &str,
+    prefixes: impl Iterator<Item = Option<&'a str>>,
+) -> Option<(usize, usize)> {
+    prefixes
+        .enumerate()
+        .filter_map(|(index, prefix)| prefix.map(|prefix| (index, prefix)))
+        .filter(|(_, prefix)| matches(prefix, destination))
+        .max_by_key(|(_, prefix)| prefix.len())
+        .map(|(index, prefix)| (index, prefix.len()))
 }
 
 /// Select the most specific (longest-prefix) route governing `destination`,
 /// or `None` if no `prefixes` entry governs it.
 pub fn select_route(destination: &str, prefixes: &[&str]) -> Option<usize> {
-    prefixes
-        .iter()
-        .enumerate()
-        .filter(|(_, prefix)| matches(prefix, destination))
-        .max_by_key(|(_, prefix)| prefix.len())
-        .map(|(index, _)| index)
+    longest_match(destination, prefixes.iter().copied().map(Some)).map(|(index, _)| index)
 }
 
 #[cfg(test)]
