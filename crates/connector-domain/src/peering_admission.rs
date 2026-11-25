@@ -191,14 +191,14 @@ pub fn check_config_ownership(set: &PeeringSet) -> Result<(), PeeringRefusal> {
     Ok(())
 }
 
-/// Admit the set, or name the first rule it breaks. Rules run in a fixed
-/// order, and each walks its rows in the order given, so the same input
-/// always yields the same refusal. A rule judges only the rows it names, so
-/// adding an unrelated valid peering never changes another's verdict.
-pub fn admit(set: &PeeringSet) -> Result<(), PeeringRefusal> {
+/// The rules that need only the peerings, their routes and the rows peers
+/// pay this node on: unknown peer, orphaned inbound rows and unbound
+/// peerings. A caller that has those tables before its pay rows (config load,
+/// which refuses them where it always has) can run them alone; [`admit`] runs
+/// them after [`check_config_ownership`].
+pub fn check_bindings(set: &PeeringSet) -> Result<(), PeeringRefusal> {
     let has_peering = |id: &str| set.peerings.iter().any(|p| p.id == id);
 
-    check_config_ownership(set)?;
     for route in &set.routes {
         if !has_peering(&route.peer_id) {
             return Err(PeeringRefusal::UnknownPeer {
@@ -222,48 +222,54 @@ pub fn admit(set: &PeeringSet) -> Result<(), PeeringRefusal> {
             return Err(PeeringRefusal::PeeringWithoutChannel(peering.id.clone()));
         }
     }
-    for row in &set.pay {
-        if !has_peering(&row.peer_id) {
-            return Err(PeeringRefusal::PayChannelOrphaned {
-                peer_id: row.peer_id.clone(),
-            });
-        }
-    }
+    Ok(())
+}
+
+/// Admit the set, or name the first rule it breaks. Rules run in a fixed
+/// order, and each walks its rows in the order given, so the same input
+/// always yields the same refusal. A rule judges only the rows it names, so
+/// adding an unrelated valid peering never changes another's verdict.
+pub fn admit(set: &PeeringSet) -> Result<(), PeeringRefusal> {
+    check_config_ownership(set)?;
+    check_bindings(set)?;
     for row in &set.pay {
         if let Some(chain) = row.chain {
             check_pay_chain_settled(&row.peer_id, chain, &set.settled_chains)?;
         }
     }
+    // A pay row is judged whole -- its peering, its direction, its network
+    // -- before the next row is looked at.
     for row in &set.pay {
-        let Some(channel) = &row.channel else {
-            continue;
-        };
-        if set
-            .inbound
-            .iter()
-            .any(|inbound| inbound.channel.as_ref() == Some(channel))
-        {
-            return Err(PeeringRefusal::ChannelInBothDirections {
-                channel: channel.clone(),
+        if !set.peerings.iter().any(|p| p.id == row.peer_id) {
+            return Err(PeeringRefusal::PayChannelOrphaned {
+                peer_id: row.peer_id.clone(),
             });
         }
-    }
-    for row in &set.pay {
-        let (Some(outbound), Some(namespace)) = (&row.network, row.namespace()) else {
-            continue;
-        };
-        let differing = set
-            .inbound
-            .iter()
-            .filter(|inbound| inbound.peer_id == row.peer_id)
-            .filter(|inbound| inbound.namespace() == Some(namespace))
-            .find_map(|inbound| inbound.network.as_ref().filter(|n| *n != outbound));
-        if let Some(inbound) = differing {
-            return Err(PeeringRefusal::PeeringNetworksDiffer {
-                peer_id: row.peer_id.clone(),
-                inbound: inbound.clone(),
-                outbound: outbound.clone(),
-            });
+        if let Some(channel) = &row.channel {
+            if set
+                .inbound
+                .iter()
+                .any(|inbound| inbound.channel.as_ref() == Some(channel))
+            {
+                return Err(PeeringRefusal::ChannelInBothDirections {
+                    channel: channel.clone(),
+                });
+            }
+        }
+        if let (Some(outbound), Some(namespace)) = (&row.network, row.namespace()) {
+            let differing = set
+                .inbound
+                .iter()
+                .filter(|inbound| inbound.peer_id == row.peer_id)
+                .filter(|inbound| inbound.namespace() == Some(namespace))
+                .find_map(|inbound| inbound.network.as_ref().filter(|n| *n != outbound));
+            if let Some(inbound) = differing {
+                return Err(PeeringRefusal::PeeringNetworksDiffer {
+                    peer_id: row.peer_id.clone(),
+                    inbound: inbound.clone(),
+                    outbound: outbound.clone(),
+                });
+            }
         }
     }
     // Keyed on ROUTES, not on peerings: a peering this node only ever
@@ -395,6 +401,21 @@ mod tests {
         assert_eq!(admit(&set), Ok(()));
     }
 
+    #[test]
+    fn a_pay_row_is_judged_whole_before_the_next() {
+        // Row 0 is in both directions, row 1 is orphaned: row 0 is named,
+        // as `Config::load` named it before the rules moved here.
+        let mut set = valid(1);
+        set.pay[0].channel = set.inbound[0].channel.clone();
+        set.pay.push(row("ghost", None, None));
+        assert_eq!(
+            admit(&set),
+            Err(PeeringRefusal::ChannelInBothDirections {
+                channel: "in0".into()
+            })
+        );
+    }
+
     proptest! {
         #[test]
         fn a_route_to_no_peering_is_refused(n in 0usize..4, at in 0usize..5) {
@@ -512,23 +533,33 @@ mod tests {
         #[test]
         fn the_same_input_always_yields_the_same_first_refusal(set in any_set()) {
             prop_assert_eq!(admit(&set), admit(&set.clone()));
+            // Config load runs the binding rules early and `admit` later; on
+            // one input the two entry points name the same first refusal.
+            if let Err(refusal) = check_config_ownership(&set).and_then(|()| check_bindings(&set)) {
+                prop_assert_eq!(admit(&set), Err(refusal));
+            }
         }
 
         #[test]
         fn adding_an_unrelated_valid_peering_never_changes_a_verdict(set in any_set()) {
+            // Valid on its own: its pay row is on a chain the set already
+            // settles, or on no chain at all when it settles none.
+            let (network, chain) = match set.settled_chains.iter().next() {
+                Some(&"solana") => (Some("solana:zz"), Some("solana")),
+                Some(&"xrpl") => (Some("xrpl:zz"), Some("xrpl")),
+                Some(_) => (Some("eip155:9"), Some("evm")),
+                None => (None, None),
+            };
             let mut extended = set.clone();
             extended.peerings.push(PeeringFacts::new("zz"));
-            extended.inbound.push(row("zz", Some("zz-in"), Some("eip155:9")));
-            extended.pay.push(row("zz", Some("zz-out"), Some("eip155:9")));
+            extended.inbound.push(row("zz", Some("zz-in"), network));
+            let mut pay = row("zz", Some("zz-out"), network);
+            pay.chain = chain;
+            extended.pay.push(pay);
             extended.routes.push(PeerRouteFacts::new("g.zz", "zz"));
-            extended.settled_chains.extend(["evm"]);
-            // Settling evm can only ever clear a refusal on an evm row, so
-            // compare against the base set with evm settled too.
-            let mut base = set;
-            base.settled_chains.insert("evm");
             // The new peering sits last in every walk, so a refusal in the
-            // base set is the one the extension reports as well.
-            prop_assert_eq!(admit(&base), admit(&extended));
+            // set is the one the extension reports as well.
+            prop_assert_eq!(admit(&set), admit(&extended));
         }
     }
 }

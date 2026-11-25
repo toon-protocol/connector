@@ -7,7 +7,7 @@ use serde::Deserialize;
 use url::Url;
 
 use connector_domain::peering_admission::{
-    admit as admit_peerings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
+    admit as admit_peerings, check_bindings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
 };
 
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
@@ -381,7 +381,7 @@ impl Config {
         let peer_channels = resolve_peer_channels(raw.peer_channels, &settlement_tables)?;
         for peer_route in &peer_routes {
             // A route naming no peer is `peering_admission`'s refusal, made
-            // once every table is resolved.
+            // below with the other binding rules.
             let Some(peer) = peers.iter().find(|peer| peer.id() == peer_route.peer_id()) else {
                 continue;
             };
@@ -398,6 +398,31 @@ impl Config {
                 });
             }
         }
+        // Unknown peer, orphaned `[[peer_channels]]` rows and unbound
+        // peerings (P2, §1.2: a peering with no channel binding can never
+        // take the peer role) need no pay row, so they are refused here,
+        // where they always were, ahead of the whole-set check below.
+        let mut admission = PeeringSet {
+            peerings: peers
+                .iter()
+                .map(|peer| PeeringFacts::new(peer.id()))
+                .collect(),
+            inbound: peer_channels
+                .iter()
+                .map(|channel| ChannelFact {
+                    peer_id: channel.peer_id().to_string(),
+                    channel: channel.inbound_channel().map(ToString::to_string),
+                    chain: Some(channel.chain().name()),
+                    network: channel.network().map(ToString::to_string),
+                })
+                .collect(),
+            routes: peer_routes
+                .iter()
+                .map(|route| PeerRouteFacts::new(route.prefix(), route.peer_id()))
+                .collect(),
+            ..PeeringSet::default()
+        };
+        check_bindings(&admission).map_err(ConfigError::from)?;
         if raw.peer_sale.is_some() {
             return Err(ConfigError::PeerSaleRemoved);
         }
@@ -467,36 +492,16 @@ impl Config {
         // (issues #1691, #1692), the same code the runtime's writes run.
         // This only states the facts and maps its refusal to the named one
         // operators already know.
-        let admission = PeeringSet {
-            peerings: peers
-                .iter()
-                .map(|peer| PeeringFacts::new(peer.id()))
-                .collect(),
-            inbound: peer_channels
-                .iter()
-                .map(|channel| ChannelFact {
-                    peer_id: channel.peer_id().to_string(),
-                    channel: channel.inbound_channel().map(ToString::to_string),
-                    chain: Some(channel.chain().name()),
-                    network: channel.network().map(ToString::to_string),
-                })
-                .collect(),
-            pay: pay_channels
-                .iter()
-                .map(|channel| ChannelFact {
-                    peer_id: channel.peer_id().to_string(),
-                    channel: Some(channel.outbound_channel().to_string()),
-                    chain: Some(channel.chain().name()),
-                    network: channel.network().map(ToString::to_string),
-                })
-                .collect(),
-            routes: peer_routes
-                .iter()
-                .map(|route| PeerRouteFacts::new(route.prefix(), route.peer_id()))
-                .collect(),
-            settled_chains: settlement_tables.settled_chains(),
-            ..PeeringSet::default()
-        };
+        admission.pay = pay_channels
+            .iter()
+            .map(|channel| ChannelFact {
+                peer_id: channel.peer_id().to_string(),
+                channel: Some(channel.outbound_channel().to_string()),
+                chain: Some(channel.chain().name()),
+                network: channel.network().map(ToString::to_string),
+            })
+            .collect();
+        admission.settled_chains = settlement_tables.settled_chains();
         admit_peerings(&admission).map_err(ConfigError::from)?;
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.

@@ -1004,6 +1004,12 @@ impl Connector {
         if id.trim().is_empty() {
             return Err(PeerRouteTableError::InvalidPeerId);
         }
+        self.refuse_config_owned_peer_id(id)
+    }
+
+    /// ADR 0034 for a write naming peer `id` alone: `peering_admission`'s
+    /// ownership rule, the same code every other runtime write runs.
+    fn refuse_config_owned_peer_id(&self, id: &str) -> Result<(), PeerRouteTableError> {
         peering_admission::check_config_ownership(&PeeringSet {
             peerings: vec![self.runtime_peering_facts(id)],
             config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
@@ -1924,9 +1930,7 @@ impl Connector {
     /// orphaned-row shape `connector-config`'s `UnknownPeerId` check
     /// exists to prevent at load, enforced here instead at mutation time.
     pub fn remove_runtime_peer(&self, id: &str) -> Result<(), PeerRouteTableError> {
-        if self.config_peer_ids.contains(id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id.to_string()));
-        }
+        self.refuse_config_owned_peer_id(id)?;
         let _write_guard = self
             .runtime_table_lock
             .lock()
@@ -2039,15 +2043,9 @@ impl Connector {
         u64::try_from(self.clock.now().timestamp()).unwrap_or(0)
     }
 
-    /// Whether `prefix` is defined by the config file, as either an app
-    /// route or a peer-forwarding route -- the set of prefixes a runtime
-    /// write may never add, update or remove.
-    fn config_owns_prefix(&self, prefix: &str) -> bool {
-        self.config_prefixes().any(|owned| owned == prefix)
-    }
-
     /// Every prefix the config file itself serves: app routes and peer
-    /// forwarding routes.
+    /// forwarding routes -- the set of prefixes a runtime write may never
+    /// add, update or remove.
     fn config_prefixes(&self) -> impl Iterator<Item = &str> {
         self.routes
             .iter()
@@ -2159,9 +2157,16 @@ impl Connector {
     /// `DELETE /routes/peers/:prefix`. Refused when `prefix` is defined by
     /// the config file, or when no such runtime route exists.
     pub fn remove_runtime_peer_route(&self, prefix: &str) -> Result<(), PeerRouteTableError> {
-        if self.config_owns_prefix(prefix) {
-            return Err(PeerRouteTableError::OwnedByConfig(prefix.to_string()));
-        }
+        // ADR 0034 is `peering_admission`'s, the same code the route write
+        // runs; the route's peer is not this rule's concern.
+        peering_admission::check_config_ownership(&PeeringSet {
+            routes: vec![PeerRouteFacts {
+                source: peering_admission::Source::Runtime,
+                ..PeerRouteFacts::new(prefix, "")
+            }],
+            config_prefixes: self.config_prefixes().map(str::to_string).collect(),
+            ..PeeringSet::default()
+        })?;
         let _write_guard = self
             .runtime_table_lock
             .lock()
