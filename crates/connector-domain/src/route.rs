@@ -41,7 +41,29 @@ pub struct ResolvedRoute {
     pub prefix_len: usize,
 }
 
-/// Resolve the forwarding target for `destination` across every route table.
+/// What a destination resolves to, from one look at the tables: where a
+/// packet to it is sent, and which route prices it. They differ only when a
+/// lease wins the forwarding target -- a lease carries no price, so it must
+/// never zero the price of a configured route it outranks (issue #557).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolution {
+    /// The route forwarding uses, leases included.
+    pub target: Option<ResolvedRoute>,
+    /// The route pricing uses: the same ranking with leases left out, so it
+    /// is never [`RouteKind::Leased`].
+    pub price_route: Option<ResolvedRoute>,
+}
+
+impl Resolution {
+    /// Whether anything carries the destination -- exactly when forwarding
+    /// has a target.
+    pub fn has_route(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
+/// Resolve `destination` across every route table: the forwarding target
+/// and the price route ([`Resolution`]).
 ///
 /// The precedence, which is the one place it is written down: the longest
 /// matching prefix wins; at equal length [`RouteKind`] breaks the tie; a
@@ -61,7 +83,7 @@ pub fn resolve_route<'a>(
     config_peer: impl IntoIterator<Item = &'a str>,
     runtime_peer: impl IntoIterator<Item = &'a str>,
     leased: impl IntoIterator<Item = (&'a str, DateTime<Utc>)>,
-) -> Option<ResolvedRoute> {
+) -> Resolution {
     let always = |prefix| (prefix, true);
     let app = best(destination, RouteKind::App, app.into_iter().map(always));
     let config_peer = best(
@@ -81,10 +103,17 @@ pub fn resolve_route<'a>(
             .into_iter()
             .map(|(prefix, expires_at)| (prefix, !is_expired(expires_at, now))),
     );
-    [app, config_peer, runtime_peer, leased]
-        .into_iter()
-        .flatten()
-        .max_by_key(|route| (route.prefix_len, route.kind))
+    let strongest = |routes: &[Option<ResolvedRoute>]| {
+        routes
+            .iter()
+            .copied()
+            .flatten()
+            .max_by_key(|route| (route.prefix_len, route.kind))
+    };
+    Resolution {
+        target: strongest(&[app, config_peer, runtime_peer, leased]),
+        price_route: strongest(&[app, config_peer, runtime_peer]),
+    }
 }
 
 /// The longest-prefix match within one table, over `(prefix, live)` pairs.
@@ -198,7 +227,7 @@ mod tests {
             cfg: &[String],
             rt: &[String],
             ls: &[(String, i64)],
-        ) -> Option<ResolvedRoute> {
+        ) -> Resolution {
             resolve_route(
                 dest,
                 t(0),
@@ -214,7 +243,7 @@ mod tests {
             fn a_longer_matching_prefix_always_wins(
                 dest in prefix(), app in table(), cfg in table(), rt in table(), ls in leases()
             ) {
-                let got = run(&dest, &app, &cfg, &rt, &ls);
+                let got = run(&dest, &app, &cfg, &rt, &ls).target;
                 let longest = app.iter().chain(&cfg).chain(&rt)
                     .map(String::as_str)
                     .chain(ls.iter().filter(|(_, e)| *e > 0).map(|(p, _)| p.as_str()))
@@ -235,7 +264,7 @@ mod tests {
                         if cfg { &one } else { &[] },
                         if rt { &one } else { &[] },
                         if lease { &live } else { &[] },
-                    ).map(|r| r.kind)
+                    ).target.map(|r| r.kind)
                 };
                 prop_assert_eq!(pick(true, true, true, true), Some(RouteKind::App));
                 prop_assert_eq!(pick(false, true, true, true), Some(RouteKind::ConfigPeer));
@@ -249,7 +278,7 @@ mod tests {
                 dest in prefix(), app in table(), ls in leases()
             ) {
                 let one = vec![dest.clone()];
-                let got = run(&dest, &app, &one, &one, &ls).unwrap();
+                let got = run(&dest, &app, &one, &one, &ls).target.unwrap();
                 prop_assert_ne!(got.kind, RouteKind::RuntimePeer);
             }
 
@@ -257,10 +286,37 @@ mod tests {
             fn an_expired_lease_is_never_the_target(
                 dest in prefix(), app in table(), cfg in table(), rt in table(), ls in leases()
             ) {
-                let got = run(&dest, &app, &cfg, &rt, &ls);
+                let got = run(&dest, &app, &cfg, &rt, &ls).target;
                 if let Some(ResolvedRoute { kind: RouteKind::Leased, index, .. }) = got {
                     prop_assert!(ls[index].1 > 0);
                 }
+            }
+
+            #[test]
+            fn the_price_route_is_never_a_lease(
+                dest in prefix(), app in table(), cfg in table(), rt in table(), ls in leases()
+            ) {
+                let got = run(&dest, &app, &cfg, &rt, &ls).price_route;
+                prop_assert!(got.is_none_or(|r| r.kind != RouteKind::Leased));
+            }
+
+            #[test]
+            fn has_route_exactly_when_forwarding_has_a_target(
+                dest in prefix(), app in table(), cfg in table(), rt in table(), ls in leases()
+            ) {
+                let got = run(&dest, &app, &cfg, &rt, &ls);
+                prop_assert_eq!(got.has_route(), got.target.is_some());
+                let live = app.iter().chain(&cfg).chain(&rt).any(|p| matches(p, &dest))
+                    || ls.iter().any(|(p, e)| *e > 0 && matches(p, &dest));
+                prop_assert_eq!(got.has_route(), live);
+            }
+
+            #[test]
+            fn with_no_leases_the_price_route_is_the_target(
+                dest in prefix(), app in table(), cfg in table(), rt in table()
+            ) {
+                let got = run(&dest, &app, &cfg, &rt, &[]);
+                prop_assert_eq!(got.price_route, got.target);
             }
 
             #[test]
@@ -269,7 +325,7 @@ mod tests {
                 ls in leases(), extra in prefix(), which in 0usize..4
             ) {
                 prop_assume!(!matches(&extra, &dest));
-                let before = run(&dest, &app, &cfg, &rt, &ls);
+                let before = run(&dest, &app, &cfg, &rt, &ls).target;
                 // Appended last, so existing indices are undisturbed.
                 let (mut a, mut c, mut r, mut l) = (app.clone(), cfg.clone(), rt.clone(), ls.clone());
                 match which {
@@ -278,14 +334,14 @@ mod tests {
                     2 => r.push(extra),
                     _ => l.push((extra, 1)),
                 }
-                prop_assert_eq!(run(&dest, &a, &c, &r, &l), before);
+                prop_assert_eq!(run(&dest, &a, &c, &r, &l).target, before);
             }
         }
 
         #[test]
         fn a_lease_expiring_exactly_now_has_lapsed() {
             let got = resolve_route("g.a", t(0), [], [], [], [("g.a", t(0))]);
-            assert_eq!(got, None);
+            assert_eq!(got.target, None);
         }
     }
 }

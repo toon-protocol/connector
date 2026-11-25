@@ -370,7 +370,7 @@ mod tests {
     }
 
     /// Neither endpoint defaults, unlike the retired sidecar's -- whose
-    /// compiled-in fallbacks still name a `/rust/ilp` prefix that answers 410.
+    /// compiled-in fallbacks named a `/rust/ilp` prefix that answers 410.
     /// Exercised with `peer_expose = "both"` so a missing endpoint is the
     /// only thing wrong -- the exposed-but-undeclared case, not the
     /// unexposed-but-declared one below.

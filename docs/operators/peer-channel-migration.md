@@ -162,8 +162,7 @@ rollback means reverting the edit, not the on-chain state.
   `counterparty_key`, both name the _same_ `channel_id` and the _same_ new `token_network`. A
   mismatch here is exactly the split-brain this migration exists to end, just moved to a new
   contract instead of resolved.
-- **(c) Both connectors restarted and healthy.** `GET /ilp/identity` (or the announcer sidecar's
-  poll of it) returns 200 on both boxes after the restart in Order step 6.
+- **(c) Both connectors restarted and healthy.** `GET /ilp/identity` returns 200 on both boxes after the restart in Order step 6.
 - **(d) Routing intact.** Both apex-served prefixes that forward across this peering
   (`g.toon.ario`, and `g.toon.relay` if it forwards at the time of migration) still answer x402
   greetings at their committed prices — a broken peer binding fails closed at the connector's own
