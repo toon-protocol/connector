@@ -1565,17 +1565,14 @@
         "description": "An XRPL voucher at the client edge.",
         "request_headers": [["Content-Type", "application/json"]],
         "payment": {
-          "claim_key": "xrpl:0x2222222222222222222222222222222222222222222222222222222222222222",
+          "claim_key": "xrpl:2222222222222222222222222222222222222222222222222222222222222222",
           "charge": "25",
           "network": "xrpl:0",
           "zk_note_network": null
         },
         "received_headers": [
           ["Content-Type", "application/json"],
-          [
-            "X-TOON-Payer",
-            "xrpl:0x2222222222222222222222222222222222222222222222222222222222222222"
-          ],
+          ["X-TOON-Payer", "xrpl:2222222222222222222222222222222222222222222222222222222222222222"],
           ["X-TOON-Amount", "25"],
           ["X-TOON-Chain", "xrpl"],
           ["X-TOON-Network", "xrpl:0"]
@@ -1717,17 +1714,14 @@
           ["x-toon-network", "eip155:1"]
         ],
         "payment": {
-          "claim_key": "xrpl:0x2222222222222222222222222222222222222222222222222222222222222222",
+          "claim_key": "xrpl:2222222222222222222222222222222222222222222222222222222222222222",
           "charge": "25",
           "network": "xrpl:0",
           "zk_note_network": null
         },
         "received_headers": [
           ["Content-Type", "application/json"],
-          [
-            "X-TOON-Payer",
-            "xrpl:0x2222222222222222222222222222222222222222222222222222222222222222"
-          ],
+          ["X-TOON-Payer", "xrpl:2222222222222222222222222222222222222222222222222222222222222222"],
           ["X-TOON-Amount", "25"],
           ["X-TOON-Chain", "xrpl"],
           ["X-TOON-Network", "xrpl:0"]

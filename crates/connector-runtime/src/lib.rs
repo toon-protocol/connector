@@ -33,10 +33,11 @@ pub mod covering_fake;
 mod test_support;
 
 pub use app_client::{AppClient, AppOutcome, Delivery, FakeAppClient, HttpAppClient};
-// The three request headers a terminating connector states to the app
-// about the payment that brought a packet to it (ADR 0040) -- exported so
-// a test, an operator tool or a second implementation names them from one
-// place rather than retyping a string literal.
+// The request headers a terminating connector states to the app about the
+// payment that brought a packet to it (ADR 0040) -- exported so a test, an
+// operator tool or a second implementation names them from one place rather
+// than retyping a string literal -- and the function that states them, so
+// the wire vectors pin what it emits (#1708).
 pub use attribution::{
     apply_payment_attribution, PaymentAttribution, AMOUNT_HEADER, CHAIN_HEADER, NETWORK_HEADER,
     PAYER_HEADER,

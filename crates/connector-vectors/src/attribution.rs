@@ -18,7 +18,7 @@ use connector_runtime::{apply_payment_attribution, PaymentAttribution};
 use serde::Serialize;
 
 /// The payment a connector verified for a delivery, as the case states it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerifiedPayment {
     /// The claim key the covering claim was admitted under.
     pub claim_key: String,
@@ -52,7 +52,7 @@ pub struct AttributionVectors {
 
 const EVM_KEY: &str = "evm:0x1111111111111111111111111111111111111111111111111111111111111111";
 const SOLANA_KEY: &str = "solana:Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS";
-const XRPL_KEY: &str = "xrpl:0x2222222222222222222222222222222222222222222222222222222222222222";
+const XRPL_KEY: &str = "xrpl:2222222222222222222222222222222222222222222222222222222222222222";
 const ALLOWANCE_KEY: &str = "zk-note:00112233445566778899aabbccddeeff";
 const PEERING_KEY: &str = "evm:0x3333333333333333333333333333333333333333333333333333333333333333";
 
@@ -187,14 +187,7 @@ pub fn generate_attribution_vectors() -> AttributionVectors {
                     c.description
                 ),
                 spoofed_headers(),
-                c.payment.as_ref().map(|p| {
-                    payment(
-                        &p.claim_key,
-                        p.charge.parse().expect("a fixture charge is a u64"),
-                        p.network.as_deref(),
-                        p.zk_note_network.as_deref(),
-                    )
-                }),
+                c.payment.clone(),
             )
         })
         .collect();
