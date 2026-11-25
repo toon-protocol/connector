@@ -103,6 +103,7 @@ use crate::batch_channels::{receiver_terms, BatchChannelError, DepositGate};
 use crate::connector::{hex_lower, Connector, PeerRouteTableError};
 use crate::operator_view::PeerView;
 use crate::peer_route_store::{RuntimePeerChannel, RuntimePeering};
+use crate::peerings::AdmitError;
 use crate::self_description::SelfDescriptionError;
 use crate::voucher_binding::{VoucherBindingError, VoucherSigner};
 
@@ -230,6 +231,15 @@ pub enum EstablishPeeringError {
     Table(#[from] PeerRouteTableError),
 }
 
+impl From<AdmitError> for EstablishPeeringError {
+    fn from(error: AdmitError) -> Self {
+        match error {
+            AdmitError::Table(error) => Self::Table(error),
+            AdmitError::Binding(error) => Self::Binding(error),
+        }
+    }
+}
+
 impl Connector {
     /// Establish a peering with whoever answers `url`: ADR 0058's whole
     /// operator write, as ADR 0075 decision 4 amends it.
@@ -274,7 +284,7 @@ impl Connector {
         gate: Option<&dyn DepositGate>,
     ) -> Result<PeeringEstablished, EstablishPeeringError> {
         let id = id.into();
-        self.refuse_unlandable_peering(&id)?;
+        self.peerings.refuse_unlandable(&id)?;
 
         let document = self.self_description_source().fetch(url).await?;
 
@@ -309,17 +319,10 @@ impl Connector {
             channels: vec![binding.clone()],
         };
 
-        // Wire the peering before the durable write, so a row that lands is
-        // a row this node can already act on; and write the row last, so
-        // the durable table never names a peering the running process has
-        // not wired up. The hop every forward to the peer is covered on (ADR
-        // 0075 decision 6), then the carriage, then the row.
-        self.register_voucher_hop(&id, &binding, &client_edge_url);
-        self.register_runtime_peering(&id, &peering);
-        let peer = self.upsert_runtime_peer(id.clone(), peering)?;
-        // After the row, because a signer is bound only to a peering that
-        // exists; refused before any channel was opened if it could not be.
-        self.bind_runtime_voucher_signer(&id, &binding)?;
+        // One admit: the rules, then the voucher hop every forward to the
+        // peer is covered on (ADR 0075 decision 6), the signer binding, the
+        // carriage, the table row and the store -- or none of them.
+        let peer = self.peerings.admit(&id, peering)?;
 
         Ok(PeeringEstablished { peer, channel })
     }
@@ -709,7 +712,7 @@ mod tests {
     use crate::batch_channels::OutboundChannels;
     use crate::clock::TestClock;
     use crate::journal::InMemoryJournal;
-    use crate::peer_transport::InProcessPeerTransport;
+    use crate::peer_transport::{InProcessPeerTransport, PeerRegistrar};
     use crate::self_description::SelfDescriptionSource;
 
     const NETWORK: &str = "eip155:31337";
@@ -1367,6 +1370,148 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(payer.balance(), 9_000, "the refused write opened nothing");
+    }
+
+    /// Records which peers were registered and deregistered, in order.
+    #[derive(Default)]
+    struct RecordingRegistrar {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PeerRegistrar for RecordingRegistrar {
+        fn register(&self, peer_id: &str, _peering: &RuntimePeering) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("register {peer_id}"));
+        }
+
+        fn deregister(&self, peer_id: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("deregister {peer_id}"));
+        }
+    }
+
+    /// Spec #1686: admit never leaves a peering half-wired. A voucher signer
+    /// that already proves another peering fails the signer binding -- after
+    /// the voucher hop was wired -- and the refused peering leaves no trace:
+    /// no hop, binding, carriage, table row or store entry. The peering that
+    /// holds the signer is untouched.
+    #[tokio::test]
+    async fn a_failed_signer_binding_leaves_no_trace_of_the_peering() {
+        let (connector, _payer) = paying_node(Some([0x02; 20])).await;
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("runtime_peers.json");
+        let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
+        let connector = connector
+            .with_peer_registrar(Arc::clone(&registrar) as Arc<dyn PeerRegistrar>)
+            .with_runtime_peer_route_store(store, peers, routes);
+        connector
+            .establish_peering("node-b", &url(), 0, 0, None, Some(1_000))
+            .await
+            .expect("establish");
+        let signer = VoucherSigner::Evm([0x02; 20]);
+
+        // `establish_peering` reads the signer's holder before it opens
+        // anything, so the failure reaches admit directly: a second
+        // peering whose voucher signer node-b already holds.
+        let rival = connector.runtime_peering("node-b").expect("node-b's row");
+        let error = connector
+            .peerings
+            .admit("node-b-again", rival)
+            .expect_err("the signer already proves node-b");
+        assert!(
+            matches!(
+                error,
+                crate::peerings::AdmitError::Binding(
+                    VoucherBindingError::SignerBoundElsewhere { .. }
+                )
+            ),
+            "{error:?}"
+        );
+
+        let peerings = &connector.peerings;
+        assert!(peerings.hop("node-b-again").is_none(), "no hop");
+        assert!(
+            peerings
+                .voucher_bindings()
+                .signers_of("node-b-again")
+                .is_empty(),
+            "no binding"
+        );
+        assert_eq!(
+            *registrar.events.lock().unwrap(),
+            vec![
+                "register node-b".to_string(),
+                "deregister node-b-again".to_string()
+            ],
+            "no carriage is left behind"
+        );
+        assert!(
+            connector.runtime_peering("node-b-again").is_none(),
+            "no row"
+        );
+        let (_, stored, _) = crate::PeerRouteStore::open(&path).expect("re-open");
+        assert_eq!(
+            stored.keys().collect::<Vec<_>>(),
+            vec!["node-b"],
+            "no store entry"
+        );
+        assert!(peerings.hop("node-b").is_some(), "node-b still pays");
+        assert_eq!(
+            peerings.voucher_bindings().peer_for(&signer).as_deref(),
+            Some("node-b"),
+            "node-b still holds its signer"
+        );
+    }
+
+    /// The same promise at the last step: a store that cannot be written
+    /// fails admit after the hop, binding and carriage were wired, and each
+    /// is undone.
+    #[tokio::test]
+    async fn a_failed_store_write_leaves_no_trace_of_the_peering() {
+        let (connector, _payer) = paying_node(Some([0x02; 20])).await;
+        let registrar = Arc::new(RecordingRegistrar::default());
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The parent of the store is a file, so every write fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("a file");
+        let path = blocker.join("runtime_peers.json");
+        let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
+        let connector = connector
+            .with_peer_registrar(Arc::clone(&registrar) as Arc<dyn PeerRegistrar>)
+            .with_runtime_peer_route_store(store, peers, routes);
+
+        let error = connector
+            .establish_peering("node-b", &url(), 0, 0, None, Some(1_000))
+            .await
+            .expect_err("the store cannot be written");
+        assert!(
+            matches!(error, EstablishPeeringError::Table(_)),
+            "{error:?}"
+        );
+
+        assert!(connector.peerings.hop("node-b").is_none(), "no hop");
+        assert!(
+            connector
+                .peerings
+                .voucher_bindings()
+                .signers_of("node-b")
+                .is_empty(),
+            "no binding"
+        );
+        assert_eq!(
+            *registrar.events.lock().unwrap(),
+            vec![
+                "register node-b".to_string(),
+                "deregister node-b".to_string()
+            ],
+            "the carriage was withdrawn"
+        );
+        assert!(connector.runtime_peering("node-b").is_none(), "no row");
     }
 
     // -- ADR 0075 decisions 3 and 4 on Solana, over the in-memory fake --
