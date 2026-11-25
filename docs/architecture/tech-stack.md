@@ -76,7 +76,7 @@ All of it lives in `connector-signer`; no other crate takes a crypto dependency 
 
 ## What is still JavaScript
 
-`packages/faucet` (plain JS), `packages/announcer` (TypeScript) and `tools/fund-peers`
+`packages/faucet` (plain JS) and `tools/fund-peers`
 (TypeScript) are devnet tooling, not the connector. They are why `package.json`, ESLint,
 Prettier and Husky still exist at the root. `npm test` runs those; it does not touch the
 connector.

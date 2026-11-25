@@ -457,7 +457,7 @@ condition at all since [ADR 0069](../adr/0069-the-execution-condition-leaves-the
 which issue #417's `reject_ineligible` refused outright before any route was selected; that rule
 and the field it checked are both gone, and the probe is now identified by its own explicit
 `greeting` flag instead, whatever it addresses
-(`packages/announcer/src/edge-client.ts`'s `fetchGreeting` builds exactly this shape: zero
+(the retired announcer sidecar's greeting probe built exactly this shape: zero
 amount, `greeting: true`). Answering it the same way lets a client whose genesis peer seed is
 stale or missing learn this node's settlement facts by asking the edge directly, rather than
 needing a `[[routes]]`-matching, priced destination to probe with — which is precisely what such
