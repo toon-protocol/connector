@@ -172,9 +172,8 @@ fn voucher(amount: u64) -> String {
     test_support::signed_voucher(u128::from(amount))
 }
 
-/// A paid `POST /ilp` to `destination`, sealed to `signer`, carrying
-/// `claim_json` in the plaintext claim header.
-fn paid_request(destination: &str, signer: &Arc<dyn Signer>, claim_json: &str) -> Request<Body> {
+/// A PREPARE to `destination` at [`PRICE`], sealed to `signer`.
+fn paid_prepare(destination: &str, signer: &Arc<dyn Signer>) -> Prepare {
     let envelope = EnvelopeRequest {
         method: "POST".to_string(),
         target: "/".to_string(),
@@ -185,18 +184,23 @@ fn paid_request(destination: &str, signer: &Arc<dyn Signer>, claim_json: &str) -
     let (data, _shared_secret) =
         connector_signer::giftwrap::seal_request(&envelope, &signer.public_key().unwrap())
             .expect("seal");
-    let prepare = Prepare {
+    Prepare {
         amount: PRICE,
         expires_at: Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
         greeting: false,
         destination: destination.to_string(),
         data,
-    };
+    }
+}
+
+/// A paid `POST /ilp` to `destination`, sealed to `signer`, carrying
+/// `claim_json` in the plaintext claim header.
+fn paid_request(destination: &str, signer: &Arc<dyn Signer>, claim_json: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/ilp")
         .header(crate::CLAIM_HEADER, BASE64.encode(claim_json.as_bytes()))
-        .body(Body::from(prepare.encode()))
+        .body(Body::from(paid_prepare(destination, signer).encode()))
         .unwrap()
 }
 
@@ -378,62 +382,6 @@ async fn a_terminated_apps_rejection_stays_counted() {
     );
 }
 
-/// The client drops its request while the forward is in flight: the handle
-/// is dropped without an outcome, which counts as not carried.
-#[tokio::test]
-async fn a_cancelled_forward_rolls_the_claim_back_and_the_voucher_is_good_again() {
-    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
-    let (gate, journal) = voucher_gate();
-    let reached = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let inner = FakeAppClient::new();
-    inner.respond(
-        StaticRoute::new(REMOTE_APP, "http://localhost:4000")
-            .unwrap()
-            .handler_url(),
-        answered(b"carried the second time"),
-    );
-    let remote_app = Arc::new(HangsOnce {
-        inner,
-        hung: AtomicBool::new(false),
-        reached: Arc::clone(&reached),
-        release: Arc::clone(&release),
-    });
-    let connector = payer_over_a_priced_peering(&signer, Some(remote_app));
-    let app = edge(connector, Arc::clone(&signer), Arc::clone(&gate));
-
-    let mut forward = Box::pin(app.clone().oneshot(paid_request(
-        REMOTE_APP,
-        &signer,
-        &voucher(PRICE),
-    )));
-    tokio::select! {
-        _ = &mut forward => panic!("the first forward never answers"),
-        () = reached.notified() => {}
-    }
-    assert_eq!(
-        gate.watermark(&test_support::channel_key())
-            .map(|watermark| watermark.cumulative_amount),
-        Some(100),
-        "counted while in flight"
-    );
-    drop(forward);
-
-    assert_eq!(gate.watermark(&test_support::channel_key()), None);
-    assert_eq!(gate.forwards_in_flight(), 0);
-    release.notify_one();
-
-    let retried = app
-        .oneshot(paid_request(REMOTE_APP, &signer, &voucher(PRICE)))
-        .await
-        .unwrap();
-    assert_eq!(answer(retried).await, Answer::Fulfill);
-    assert_eq!(
-        claim_entries(&journal),
-        vec![accepted(100), reset(), accepted(100)]
-    );
-}
-
 /// A voucher already admitted for a carried packet buys nothing a second
 /// time: refused before anything is routed, and nothing journaled.
 #[tokio::test]
@@ -460,15 +408,13 @@ async fn an_already_admitted_claim_is_refused() {
     assert_eq!(gate.forwards_in_flight(), 0);
 }
 
-/// ADR 0080 decision 4: an allowance claim's forward is in flight while
-/// the packet is, and released once it resolves -- fulfilled or cancelled.
-#[tokio::test]
-async fn a_zk_edge_claims_in_flight_forward_is_released() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = allowance_fixtures::keypair(21);
-    let (gate, id) = allowance_fixtures::edge_with_allowance(dir.path(), &session).await;
-    let gate = Arc::new(gate);
-    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+/// An app behind the peering that holds the first packet until released,
+/// with `reached` notified once that packet is at the app.
+fn held_remote_app() -> (
+    Arc<HangsOnce>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
     let reached = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let inner = FakeAppClient::new();
@@ -478,43 +424,198 @@ async fn a_zk_edge_claims_in_flight_forward_is_released() {
             .handler_url(),
         answered(b"carried"),
     );
-    let remote_app = Arc::new(HangsOnce {
+    let app = Arc::new(HangsOnce {
         inner,
         hung: AtomicBool::new(false),
         reached: Arc::clone(&reached),
         release: Arc::clone(&release),
     });
+    (app, reached, release)
+}
+
+/// Send `request` and drop it -- the client disconnecting -- once the
+/// packet it paid for has reached the app behind the peering.
+async fn disconnect_once_forwarded(
+    app: &Router,
+    request: Request<Body>,
+    reached: &tokio::sync::Notify,
+) {
+    let mut forward = Box::pin(app.clone().oneshot(request));
+    tokio::select! {
+        _ = &mut forward => panic!("the held forward does not answer"),
+        () = reached.notified() => {}
+    }
+    drop(forward);
+}
+
+/// A client that disconnects once its packet has been forwarded is still
+/// charged when the next hop fulfils: the packet is carried in its own task,
+/// so the disconnect cancels nothing, and the outcome -- not the dropped
+/// request -- decides the charge.
+#[tokio::test]
+async fn a_client_that_disconnects_after_the_forward_is_charged_when_it_fulfils() {
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let (gate, journal) = voucher_gate();
+    let (remote_app, reached, release) = held_remote_app();
+    let connector = payer_over_a_priced_peering(&signer, Some(remote_app));
+    let app = edge(connector, Arc::clone(&signer), Arc::clone(&gate));
+
+    disconnect_once_forwarded(
+        &app,
+        paid_request(REMOTE_APP, &signer, &voucher(PRICE)),
+        &reached,
+    )
+    .await;
+    release.notify_one();
+    // Let the detached carriage run to its outcome.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(claim_entries(&journal), vec![accepted(100)]);
+    assert_eq!(
+        gate.watermark(&test_support::channel_key())
+            .map(|watermark| watermark.cumulative_amount),
+        Some(100)
+    );
+    let replayed = app
+        .oneshot(paid_request(REMOTE_APP, &signer, &voucher(PRICE)))
+        .await
+        .unwrap();
+    assert_eq!(
+        answer(replayed).await,
+        reject("F03", PRICE),
+        "the fulfilled packet's voucher stays spent"
+    );
+}
+
+/// The same on a zk edge, where the forward's completion is observable:
+/// the allowance's forward stays in flight after the client has gone, is
+/// released only once the next hop fulfils, and the claim stays counted
+/// (ADR 0080 decision 4).
+#[tokio::test]
+async fn a_zk_edge_claims_forward_outlives_the_client_and_is_released_by_its_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = allowance_fixtures::keypair(21);
+    let (gate, id) = allowance_fixtures::edge_with_allowance(dir.path(), &session).await;
+    let gate = Arc::new(gate);
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let (remote_app, reached, release) = held_remote_app();
     let connector = payer_over_a_priced_peering(&signer, Some(remote_app));
     let app = edge(connector, Arc::clone(&signer), Arc::clone(&gate));
     let claim = allowance_fixtures::claim(&session, id, PRICE);
 
-    let mut forward = Box::pin(
-        app.clone()
-            .oneshot(paid_request(REMOTE_APP, &signer, &claim)),
-    );
-    tokio::select! {
-        _ = &mut forward => panic!("the first forward never answers"),
-        () = reached.notified() => {}
-    }
+    disconnect_once_forwarded(&app, paid_request(REMOTE_APP, &signer, &claim), &reached).await;
     assert_eq!(
         gate.forwards_in_flight(),
         1,
-        "in flight while the packet is"
+        "still in flight once the client has gone"
     );
-    drop(forward);
-    assert_eq!(gate.forwards_in_flight(), 0, "released when cancelled");
-    assert_eq!(gate.watermark(&id.claim_key()), None, "and rolled back");
-    release.notify_one();
 
-    let carried = app
-        .oneshot(paid_request(REMOTE_APP, &signer, &claim))
-        .await
-        .unwrap();
-    assert_eq!(answer(carried).await, Answer::Fulfill);
-    assert_eq!(gate.forwards_in_flight(), 0, "released when fulfilled");
+    release.notify_one();
+    while gate.forwards_in_flight() > 0 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         gate.watermark(&id.claim_key())
             .map(|watermark| watermark.cumulative_amount),
-        Some(u128::from(PRICE))
+        Some(u128::from(PRICE)),
+        "charged by its outcome"
     );
+}
+
+/// A client edge state over `connector` and `gate`, for driving the
+/// pipeline's halves directly.
+fn state_over(connector: Arc<Connector>, gate: Arc<ClientClaimGate>) -> ClientEdgeState {
+    ClientEdgeState {
+        connector,
+        signer: Arc::new(LocalSigner::generate("paid-packet")),
+        claim_gate: gate,
+        wrap_receiver_secret: None,
+        node: Arc::new(connector_domain::NodeFacts::default()),
+        btp_session_window: DEFAULT_BTP_SESSION_WINDOW,
+        session_registry: Arc::new(crate::session_registry::SessionRegistry::new()),
+        peers: None,
+        identities: Arc::from([]),
+    }
+}
+
+/// Admit `claim_json` for a packet to [`REMOTE_APP`] and drop the handle
+/// before anything is forwarded: what a pipeline cancelled or panicking
+/// between admission and its forward leaves behind.
+async fn admit_and_drop(state: &ClientEdgeState, signer: &Arc<dyn Signer>, claim_json: &str) {
+    let prepare = paid_prepare(REMOTE_APP, signer);
+    let admitted = admit(
+        state,
+        &prepare,
+        Some(|| Ok(claim_json.to_string())),
+        PRICE,
+        &SessionRole::Client,
+    )
+    .await
+    .expect("the claim admits")
+    .expect("a claim was presented");
+    drop(admitted);
+}
+
+/// A packet whose handle is dropped before anything is forwarded leaves no
+/// value counted and no hold held, and the same voucher is good again.
+#[tokio::test]
+async fn a_packet_dropped_before_its_forward_leaves_nothing_counted() {
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let (gate, journal) = voucher_gate();
+    let connector =
+        payer_over_a_priced_peering(&signer, Some(remote_app_answering(answered(b"carried"))));
+    let state = state_over(Arc::clone(&connector), Arc::clone(&gate));
+
+    admit_and_drop(&state, &signer, &voucher(PRICE)).await;
+
+    assert_eq!(gate.watermark(&test_support::channel_key()), None);
+    assert_eq!(gate.forwards_in_flight(), 0);
+    let app = edge(connector, Arc::clone(&signer), Arc::clone(&gate));
+    let retried = app
+        .oneshot(paid_request(REMOTE_APP, &signer, &voucher(PRICE)))
+        .await
+        .unwrap();
+    assert_eq!(answer(retried).await, Answer::Fulfill);
+    // The rollback's entry is journaled once the committer gets to it; by
+    // the time a later acceptance is durable, it is.
+    assert_eq!(
+        claim_entries(&journal),
+        vec![accepted(100), reset(), accepted(100)]
+    );
+}
+
+/// The same on a zk edge: no hold is left held.
+#[tokio::test]
+async fn a_zk_edge_packet_dropped_before_its_forward_holds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = allowance_fixtures::keypair(22);
+    let (gate, id) = allowance_fixtures::edge_with_allowance(dir.path(), &session).await;
+    let gate = Arc::new(gate);
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let connector =
+        payer_over_a_priced_peering(&signer, Some(remote_app_answering(answered(b"carried"))));
+    let state = state_over(Arc::clone(&connector), Arc::clone(&gate));
+
+    admit_and_drop(
+        &state,
+        &signer,
+        &allowance_fixtures::claim(&session, id, PRICE),
+    )
+    .await;
+
+    assert_eq!(gate.forwards_in_flight(), 0);
+    assert_eq!(gate.watermark(&id.claim_key()), None);
+    let app = edge(connector, Arc::clone(&signer), Arc::clone(&gate));
+    let carried = app
+        .oneshot(paid_request(
+            REMOTE_APP,
+            &signer,
+            &allowance_fixtures::claim(&session, id, PRICE),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(answer(carried).await, Answer::Fulfill);
+    assert_eq!(gate.forwards_in_flight(), 0);
 }

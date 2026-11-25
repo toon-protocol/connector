@@ -18,16 +18,21 @@
 //!   rolls the claim's watermark back (ADR 0028, #1012); every outcome then
 //!   releases the zk edge's in-flight hold (ADR 0080 decision 4).
 //! - **A handle dropped without an outcome counts as not carried.** Its
-//!   rollback is made synchronously in `Drop`, so a cancelled or panicked
-//!   forward never leaves value counted or a hold held, and the same voucher
-//!   is good again.
+//!   rollback is made synchronously in `Drop`, so a pipeline that panics or
+//!   is cancelled from inside never leaves value counted or a hold held, and
+//!   the same voucher is good again.
+//! - **A client going away is not such a cancellation.** Once admitted, a
+//!   packet is carried in its own task, so it always reaches an outcome and
+//!   is charged by that outcome: a client cannot be refunded for work the
+//!   app or the next hop did by disconnecting before the answer arrived.
 //!
 //! [`carry`] is the pipeline both carriages share: packet, claim, price and
 //! role in; response out. Each carriage keeps only its framing. It is split
 //! at [`admit`] and [`carry_admitted`] because the BTP carriage must admit a
 //! session's claims inline, in arrival order, and finish them in a windowed
-//! task -- the split it moves onto in #1720. The HTTP carriage calls the two
-//! back to back.
+//! task -- the split it moves onto in #1720. The HTTP carriage calls
+//! [`carry`], which admits on the request's future and carries in a task of
+//! its own.
 
 use std::sync::Arc;
 
@@ -265,8 +270,18 @@ pub(crate) async fn carry_admitted(
 /// The shared pipeline: admit `claim` for `packet` on an interaction of
 /// `role`, carry it, and answer with the response. An `Err` is a claim
 /// refusal, which the carriage frames as its own refusal response.
+///
+/// **Once admitted, the packet is carried in its own task**, so the
+/// caller going away cannot cancel it: a client that disconnects from
+/// `POST /ilp` mid-flight still has its packet reach an outcome, and is
+/// charged by that outcome -- a forward the next hop fulfils stays counted,
+/// as it would have had the client waited. Admission itself stays on the
+/// caller's future: its last suspension point comes before anything is
+/// advanced, so a caller dropped during admission leaves nothing counted,
+/// and nothing is held. A handle dropped without an outcome inside the task
+/// -- the task panicked, or the runtime shut it down -- still rolls back.
 pub(crate) async fn carry<F>(
-    state: &ClientEdgeState,
+    state: &Arc<ClientEdgeState>,
     packet: Packet,
     claim: Option<F>,
     role: &SessionRole,
@@ -275,7 +290,20 @@ where
     F: FnOnce() -> Result<String, ClaimIngestRejection>,
 {
     let admitted = admit(state, &packet.prepare, claim, packet.charge, role).await?;
-    carry_admitted(state, packet, admitted).await
+    let state = Arc::clone(state);
+    let carrying = tokio::spawn(async move { carry_admitted(&state, packet, admitted).await });
+    match carrying.await {
+        Ok(carried) => carried,
+        // A panic in the pipeline is this request's panic, as it was before
+        // the pipeline had a task of its own; the handle it dropped has
+        // already rolled back.
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // Cancelled only by the runtime shutting down: the handle rolled
+            // back, so the packet was not carried and nothing is charged.
+            Err(_) => Err(ClaimIngestRejection::NotDurable),
+        },
+    }
 }
 
 #[cfg(test)]

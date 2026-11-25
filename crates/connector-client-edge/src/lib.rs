@@ -1456,7 +1456,7 @@ async fn handle_ilp(
 /// known, so a wrapped-only claim is never a source for one, by
 /// construction -- this is the one place that rule is enforced.
 async fn carry_over_http(
-    state: &ClientEdgeState,
+    state: &Arc<ClientEdgeState>,
     headers: &HeaderMap,
     packet: paid_packet::Packet,
 ) -> Result<(PacketResponse, Option<String>), ClaimIngestRejection> {
@@ -6331,7 +6331,9 @@ mod tests {
         /// pipeline call.
         #[tokio::test]
         async fn a_plaintext_claim_admits_with_its_self_declared_signer() {
-            let state = state_with_claim_gate(test_gate(super::claim_headers::test_channels()));
+            let state = Arc::new(state_with_claim_gate(test_gate(
+                super::claim_headers::test_channels(),
+            )));
             let claim_json = super::claim_headers::evm_claim_json(100);
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -6355,7 +6357,9 @@ mod tests {
         /// however successfully it unwraps and admits.
         #[tokio::test]
         async fn a_wrapped_claim_admits_with_no_plaintext_signer() {
-            let state = state_with_claim_gate(test_gate(super::claim_headers::test_channels()));
+            let state = Arc::new(state_with_claim_gate(test_gate(
+                super::claim_headers::test_channels(),
+            )));
             let sender_secret = SecretKey::parse(&[1u8; 32]).unwrap();
             let receiver_secret = SecretKey::parse(&[2u8; 32]).unwrap();
             let receiver_public = PublicKey::from_secret_key(&receiver_secret);
