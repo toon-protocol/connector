@@ -426,7 +426,7 @@ own Solidity contracts and payment-channel program, with the separate Foundry jo
 solana-test` target that ran the latter:
 
 - **`npm test`** (and `make test`) — the surviving npm workspaces, which are devnet tooling only:
-  the faucet and the announcer sidecar. It does **not** test the connector.
+  the faucet. It does **not** test the connector.
 - **[`local/`](local/README.md)** — the shipped **image**, as uid 10001, on a mounted config,
   against real containerised chains. A separate gate answering a question `cargo test`
   structurally cannot: run one with

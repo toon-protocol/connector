@@ -51,6 +51,8 @@ use crate::error::ConfigError;
 use crate::peer::plaintext_permitted;
 use connector_domain::Network;
 
+use connector_domain::peering_admission::check_pay_chain_settled;
+
 use crate::settlement::{SettlementChain, SettlementTables};
 use crate::x402_row::{parse_x402_channel, RemovedToonFields};
 
@@ -222,12 +224,9 @@ fn resolve_pay_channel(
             value: written,
         });
     };
-    if !tables.x402(channel.chain) {
-        return Err(ConfigError::PayChannelWithoutX402 {
-            peer_id: raw.peer_id,
-            chain: channel.chain.name(),
-        });
-    }
+    // The rule is `peering_admission`'s, so the row's own resolver and
+    // `Config::load`'s whole-set check cannot disagree about it (#1692).
+    check_pay_chain_settled(&raw.peer_id, channel.chain.name(), &tables.settled_chains())?;
     let network = tables.row_network(
         "pay_channels",
         &raw.peer_id,

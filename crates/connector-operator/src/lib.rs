@@ -662,6 +662,7 @@ fn peer_route_table_error_response(error: PeerRouteTableError) -> Response {
         | PeerRouteTableError::InvalidPeerId
         | PeerRouteTableError::InvalidRequest(_)
         | PeerRouteTableError::PeerChannelUnbound(_)
+        | PeerRouteTableError::Inadmissible(_)
         | PeerRouteTableError::PeerHasNoPayChannel { .. } => {
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
