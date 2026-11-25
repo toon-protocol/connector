@@ -24,10 +24,11 @@ use connector_config::{
 use connector_domain::Network;
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
-    BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector, DeclaredRates,
-    FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError, OutboundChannels,
-    OutboundRestoreError, PeerRegistrar, PeerRoute, PeerRouteStore, PeerRouteStoreError,
-    PeerTransport, QuotePathUnusable, RatePoller, RateSources, SharedRateTable, SystemClock,
+    BatchChannels, BoundedHttpSelfDescription, ConfigPayChannel, ConfigPeerChannel, ConfigPeering,
+    ConfigPeeringError, Connector, DeclaredRates, FileJournal, HttpAppClient, InMemoryJournal,
+    Journal, JournalError, OutboundChannels, OutboundRestoreError, PeerRegistrar, PeerRoute,
+    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources,
+    SharedRateTable, SystemClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
@@ -1231,38 +1232,6 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         config
             .operator()
             .map_or(0, |operator| operator.packet_history()),
-    )
-    // Issue #884: the routing table IS the relationship set enforced at
-    // load (`connector-config`'s `UnknownPeerId` check), so a runtime
-    // write must never be able to add, update or remove a peer id the
-    // config file already owns. `Connector` needs every config peer id
-    // to enforce that, even though it stores nothing else about a
-    // config peer (see `PeerView`'s own docs).
-    .with_config_peer_ids(config.peers().iter().map(|peer| peer.id().to_string()))
-    // ADR 0042's cap: the largest amount this node will forward to each
-    // peer in ONE packet, straight off its `[[peers]]` row. Defaulted at
-    // the config layer (`connector_config::DEFAULT_MAX_PACKET_AMOUNT`), so
-    // a row that writes nothing still arrives here bounded -- and a peer
-    // this call never names (one added at runtime over the operator
-    // surface, issue #884) is bounded by the same figure inside
-    // `Connector` itself.
-    .with_peer_packet_caps(
-        config
-            .peers()
-            .iter()
-            .map(|peer| (peer.id().to_string(), peer.max_packet_amount())),
-    )
-    // ADR 0010's flat per-packet fee, straight off each `[[peers]]` row
-    // (ADR 0061): what this node retains for carrying one packet to that
-    // counterparty, whichever prefix it was addressed to. Defaulted to zero
-    // at the config layer, so a row that writes nothing carries for free --
-    // and so does a peer this call never names, one added at runtime over
-    // the operator surface with a fee on its own row instead.
-    .with_peer_fees(
-        config
-            .peers()
-            .iter()
-            .map(|peer| (peer.id().to_string(), peer.fee())),
     );
     // ADR 0074 decision 8, issue #1345: this node's x402 batch-settlement
     // facts, one entry per chain whose settlement table opted in, off the
@@ -1636,72 +1605,81 @@ async fn build_zk_edge(
     })
 }
 
-/// Wire the config file's peerings onto x402 channels (ADR 0075 decisions 4,
-/// 6 and 9, issue #1380).
+/// Admit the config file's peerings (spec #1686, issue #1695): one
+/// `Connector::admit_config_peering` call per `[[peers]]` row, the path every
+/// peering takes (ADR 0075 decisions 4, 6 and 9, issue #1380).
 ///
-/// * Each `[[peer_channels]]` row binds its **voucher signer** to its
-///   peering -- on its one `inbound_channel`, when the row names one -- so a
-///   voucher on a channel the chain records that signer for, or the
-///   claim-state challenge it signs for a packet that moves no value,
-///   proves the peer role on either carriage (decision 5). The peer's
-///   channel itself is admitted by the claim gate exactly as a client's is.
-/// * Each `[[pay_channels]]` row registers this node's own **outbound x402
-///   channel** as the one every forward to that peering is covered on, with
-///   the next hop's `POST /ilp/claim-state` as the watermark authority on
-///   restore (decision 6). The channel must be one this node's
-///   outbound-channel journal holds: a row naming anything else is refused
-///   here, by name, rather than refusing every forward at packet time.
+/// A peering's admission wires, in the one fixed order: its **voucher hop**
+/// (each `[[pay_channels]]` row registers this node's own outbound x402
+/// channel as the one every forward is covered on, with the next hop's
+/// `POST /ilp/claim-state` as the watermark authority on restore, decision
+/// 6), its **voucher signer binding** (each `[[peer_channels]]` row, on its
+/// one `inbound_channel` when it names one, so a voucher on a channel the
+/// chain records that signer for, or the claim-state challenge it signs for
+/// a packet that moves no value, proves the peer role on either carriage,
+/// decision 5), its **carriage** and its id, cap and fee. The ask takes the
+/// peering's own `peer_answer_timeout_ms`, and leaves on `socks_proxy` when
+/// the next hop's client edge is an onion host
+/// (`Connector::with_socks_proxy`, set before this runs).
 ///
-/// The claim-state ask takes the peering's own `peer_answer_timeout_ms`,
-/// and leaves on `socks_proxy` when the next hop's client edge is an onion
-/// host (`Connector::with_socks_proxy`, set before this runs).
+/// `Config::load` has refused every config admission would refuse, so a
+/// refusal here is a bug, and is returned as a named error.
 fn wire_config_peerings(
     mut connector: Connector,
     config: &Config,
 ) -> Result<Connector, RuntimeError> {
-    for row in config.peer_channels() {
+    for peer in config.peers() {
+        let peering = ConfigPeering {
+            id: peer.id().to_string(),
+            fee: peer.fee(),
+            max_packet_amount: peer.max_packet_amount(),
+            // Only a peering whose endpoint selects a carriage this node
+            // dials: an accept-only one registers none.
+            dial_endpoint: peer.dial().and(peer.endpoint().cloned()),
+            answer_timeout: std::time::Duration::from_millis(peer.peer_answer_timeout_ms()),
+            peer_channels: config
+                .peer_channels()
+                .iter()
+                .filter(|row| row.peer_id() == peer.id())
+                .map(|row| ConfigPeerChannel {
+                    chain: row.chain(),
+                    voucher_signer: row.voucher_signer().to_string(),
+                    inbound_channel: row.inbound_channel().map(str::to_string),
+                    network: row.network().cloned(),
+                })
+                .collect(),
+            pay_channels: config
+                .pay_channels()
+                .iter()
+                .filter(|row| row.peer_id() == peer.id())
+                .map(|row| ConfigPayChannel {
+                    outbound_channel: row.outbound_channel().to_string(),
+                    client_edge_url: row.client_edge_url().clone(),
+                    network: row.network().cloned(),
+                })
+                .collect(),
+        };
         connector = connector
-            .with_config_voucher_signer(
-                row.peer_id(),
-                row.chain(),
-                row.voucher_signer(),
-                row.inbound_channel(),
-                row.network(),
-            )
+            .admit_config_peering(&peering)
             .map_err(RuntimeError::ConfigPeering)?;
-        tracing::info!(
-            peer_id = row.peer_id(),
-            chain = ?row.chain(),
-            voucher_signer = row.voucher_signer(),
-            inbound_channel = row.inbound_channel().unwrap_or("any"),
-            "a voucher by this signer proves this config peering (ADR 0075)"
-        );
-    }
-    for row in config.pay_channels() {
-        // Every row names a configured peering -- `Config::load` refuses a
-        // `PayChannelOrphaned` one -- so this lookup cannot miss.
-        let answer_timeout = config
-            .peers()
-            .iter()
-            .find(|peer| peer.id() == row.peer_id())
-            .expect("Config::load refuses a [[pay_channels]] row naming no [[peers]] entry")
-            .peer_answer_timeout_ms();
-        connector = connector
-            .with_config_pay_channel(
-                row.peer_id(),
-                row.outbound_channel(),
-                row.client_edge_url(),
-                std::time::Duration::from_millis(answer_timeout),
-                row.network(),
-            )
-            .map_err(RuntimeError::ConfigPeering)?;
-        tracing::info!(
-            peer_id = row.peer_id(),
-            channel = row.outbound_channel(),
-            client_edge = %row.client_edge_url(),
-            "covering every PREPARE forwarded to this peer with a voucher on this node's own \
-             outbound x402 channel (ADR 0042, ADR 0075)"
-        );
+        for row in &peering.peer_channels {
+            tracing::info!(
+                peer_id = %peering.id,
+                chain = ?row.chain,
+                voucher_signer = row.voucher_signer,
+                inbound_channel = row.inbound_channel.as_deref().unwrap_or("any"),
+                "a voucher by this signer proves this config peering (ADR 0075)"
+            );
+        }
+        for row in &peering.pay_channels {
+            tracing::info!(
+                peer_id = %peering.id,
+                channel = row.outbound_channel,
+                client_edge = %row.client_edge_url,
+                "covering every PREPARE forwarded to this peer with a voucher on this node's own \
+                 outbound x402 channel (ADR 0042, ADR 0075)"
+            );
+        }
     }
     Ok(connector)
 }
