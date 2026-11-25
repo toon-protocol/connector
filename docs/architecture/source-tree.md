@@ -184,6 +184,10 @@ connector-runtime                the packet plane and its ports
   │                               runtime-mutable peer/route table
   ├─ peering.rs, self_description.rs  establishing a peering from a URL (ADR 0058) by
   │                               reading the other node's self-description (ADR 0050)
+  ├─ peerings.rs                 `Peerings`: how a peering comes to exist. One admit
+  │                               (rules, then hop, signer binding, carriage, table row,
+  │                               store; undone on failure) and one remove; owns the hops,
+  │                               bindings, runtime table, registrar, caps and fees
   ├─ batch_channels.rs           the x402 channels this node pays on, journaled (ADR 0075)
   ├─ outbound_voucher.rs         a voucher or peer-role challenge on this node's own
   │                               x402 channel, and the next hop's claim-state asked
