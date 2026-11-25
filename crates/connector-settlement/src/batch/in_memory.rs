@@ -7,7 +7,7 @@ use super::port::{
     AdmissionRefusal, BatchChannelState, BatchChannelStatus, BatchSettlementBackend,
     BatchSettlementError, BatchSettlementPayer, ChannelPresentation, EvmChannelConfig,
     EvmReceiverTerms, Landed, OpenedChannel, OutboundChannelRecord, OutboundChannelState,
-    ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner,
+    ReceiverTerms, SolanaReceiverTerms, Voucher, VoucherSigner, XrplReceiverTerms,
 };
 use crate::ChannelId;
 
@@ -106,26 +106,60 @@ struct Ledger {
     now: u64,
 }
 
+/// Which chain's spelling a fake chain speaks: its presentations, channel
+/// ids and voucher signers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Evm,
+    Solana,
+    /// Receiving half only: a channel id is 64 lowercase hex, its signer a
+    /// 33-byte `PayChannel` public key, and its payer leaves by closing.
+    Xrpl,
+}
+
 /// "The chain" several [`InMemoryBatchSettlement`] nodes share: channels,
 /// the token balances of the accounts that pay into them, and a clock. It
 /// is what lets one fake node's outbound channel be another's inbound one,
 /// as a peering is (ADR 0075 decision 4).
 pub struct InMemoryBatchChain {
     exit: PayerExit,
+    shape: Shape,
     ledger: Mutex<Ledger>,
+    /// When set, every receiving-half call fails as an unreachable RPC
+    /// endpoint would.
+    unreachable: std::sync::atomic::AtomicBool,
 }
 
 impl InMemoryBatchChain {
-    /// An empty chain whose payers leave by `exit`.
+    /// An empty chain whose payers leave by `exit`: EVM-shaped for a
+    /// withdrawal, Solana-shaped for a close.
     pub fn new(exit: PayerExit) -> Arc<Self> {
+        let shape = match exit {
+            PayerExit::Withdrawal => Shape::Evm,
+            PayerExit::Close => Shape::Solana,
+        };
+        Self::shaped(exit, shape)
+    }
+
+    /// An empty XRPL-shaped chain (ADR 0087): [`ChannelPresentation::Xrpl`]
+    /// presentations and [`VoucherSigner::Xrpl`] signers, its payers leaving
+    /// by a close. Only the receiving half is faked: a node on it refuses
+    /// every paying-half call.
+    pub fn xrpl() -> Arc<Self> {
+        Self::shaped(PayerExit::Close, Shape::Xrpl)
+    }
+
+    fn shaped(exit: PayerExit, shape: Shape) -> Arc<Self> {
         Arc::new(InMemoryBatchChain {
             exit,
+            shape,
             ledger: Mutex::new(Ledger {
                 channels: HashMap::new(),
                 next_index: 0,
                 accounts: HashMap::new(),
                 now: 0,
             }),
+            unreachable: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -141,10 +175,31 @@ impl InMemoryBatchChain {
     }
 
     fn chain_name(&self) -> &'static str {
-        match self.exit {
-            PayerExit::Withdrawal => "evm",
-            PayerExit::Close => "solana",
+        match self.shape {
+            Shape::Evm => "evm",
+            Shape::Solana => "solana",
+            Shape::Xrpl => "xrpl",
         }
+    }
+
+    /// Refuse a paying-half call on a chain whose paying half is not faked.
+    fn require_payer(&self) -> Result<(), BatchSettlementError> {
+        if self.shape == Shape::Xrpl {
+            return Err(BatchSettlementError::Backend(
+                "the in-memory fake has no XRPL paying half".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fail as an unreachable endpoint would, when the chain is set so.
+    fn reachable(&self) -> Result<(), BatchSettlementError> {
+        if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(BatchSettlementError::Backend(
+                "the in-memory chain is unreachable".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse anything for a chain other than this one.
@@ -160,16 +215,18 @@ impl InMemoryBatchChain {
     }
 
     fn channel_id(&self, index: usize) -> ChannelId {
-        match self.exit {
-            PayerExit::Withdrawal => ChannelId(format!("0x{index:064x}")),
-            PayerExit::Close => ChannelId(format!("batch-channel-{index}")),
+        match self.shape {
+            Shape::Evm => ChannelId(format!("0x{index:064x}")),
+            Shape::Solana => ChannelId(format!("batch-channel-{index}")),
+            Shape::Xrpl => ChannelId(format!("{index:064x}")),
         }
     }
 
     fn voucher_signer(&self, party: Party) -> VoucherSigner {
-        match self.exit {
-            PayerExit::Withdrawal => VoucherSigner::Evm([party; 20]),
-            PayerExit::Close => VoucherSigner::Solana([party; 32]),
+        match self.shape {
+            Shape::Evm => VoucherSigner::Evm([party; 20]),
+            Shape::Solana => VoucherSigner::Solana([party; 32]),
+            Shape::Xrpl => VoucherSigner::Xrpl([party; 33]),
         }
     }
 
@@ -184,8 +241,8 @@ impl InMemoryBatchChain {
         let index = ledger.next_index;
         ledger.next_index += 1;
         let id = self.channel_id(index);
-        let config = match self.exit {
-            PayerExit::Withdrawal => {
+        let config = match self.shape {
+            Shape::Evm => {
                 let mut salt = [0u8; 32];
                 salt[..8].copy_from_slice(&(index as u64).to_be_bytes());
                 Some(EvmChannelConfig {
@@ -202,7 +259,7 @@ impl InMemoryBatchChain {
                     salt,
                 })
             }
-            PayerExit::Close => None,
+            Shape::Solana | Shape::Xrpl => None,
         };
         (id, config)
     }
@@ -246,12 +303,13 @@ impl InMemoryBatchChain {
                 exit_due_at: None,
             },
         );
-        let presentation = match config {
-            Some(config) => ChannelPresentation::Evm {
+        let presentation = match (self.shape, config) {
+            (_, Some(config)) => ChannelPresentation::Evm {
                 channel: id,
                 config,
             },
-            None => ChannelPresentation::Solana { channel: id },
+            (Shape::Xrpl, None) => ChannelPresentation::Xrpl { channel: id },
+            (_, None) => ChannelPresentation::Solana { channel: id },
         };
         OpenedChannel {
             presentation,
@@ -334,6 +392,9 @@ pub struct InMemoryBatchSettlement {
     /// Every channel this node opened, with the highest amount it has
     /// signed on it.
     outbound: Mutex<HashMap<ChannelId, u128>>,
+    /// Receiving-half calls that read the chain: `admit`, `restore` and
+    /// `channel_state`.
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryBatchSettlement {
@@ -355,7 +416,66 @@ impl InMemoryBatchSettlement {
             min_sponsored_deposit: 0,
             admitted: Mutex::new(HashSet::new()),
             outbound: Mutex::new(HashMap::new()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Stand in for a client that opened `presentation`'s channel toward
+    /// this node elsewhere -- under an id, and a voucher signer, the caller
+    /// derived itself (an EVM id hashed from its config, a real key) --
+    /// funded with `deposit`. The channel is one this node admits: payable
+    /// to it, in its token, at its minimum delay. Not on the port: on a real
+    /// chain this is the client's own transaction.
+    pub fn client_opened(
+        &self,
+        presentation: &ChannelPresentation,
+        voucher_signer: VoucherSigner,
+        deposit: u128,
+    ) -> ChannelId {
+        let channel = presentation.channel().clone();
+        let config = match presentation {
+            ChannelPresentation::Evm { config, .. } => Some(config.clone()),
+            ChannelPresentation::Solana { .. } | ChannelPresentation::Xrpl { .. } => None,
+        };
+        self.chain.ledger().channels.insert(
+            channel.clone(),
+            FakeChannel {
+                payer: CLIENT,
+                receiver: self.node,
+                in_settled_token: true,
+                delay_secs: self.minimum_delay_secs,
+                config,
+                voucher_signer,
+                deposit,
+                landed: 0,
+                pending_withdrawal: 0,
+                status: BatchChannelStatus::Open,
+                exit_due_at: None,
+            },
+        );
+        channel
+    }
+
+    /// Make every receiving-half call on this node's chain fail as an
+    /// unreachable RPC endpoint would (`true`), or answer again (`false`).
+    pub fn set_unreachable(&self, unreachable: bool) {
+        self.chain
+            .unreachable
+            .store(unreachable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times this node has read the chain as receiver -- `admit`,
+    /// `restore` and `channel_state`, answered or failed -- so a test can
+    /// show a refusal cost no chain read.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count one receiving-half read, and fail it if the chain is
+    /// unreachable.
+    fn read(&self) -> Result<(), BatchSettlementError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.chain.reachable()
     }
 
     /// Publish, and have this node's sponsor enforce, a minimum opening
@@ -385,13 +505,17 @@ impl InMemoryBatchSettlement {
     /// What this node publishes about the channels it receives on: the
     /// terms another node opens toward it under (ADR 0075 decision 3).
     pub fn published_terms(&self) -> ReceiverTerms {
-        match self.chain.exit {
-            PayerExit::Withdrawal => ReceiverTerms::Evm(EvmReceiverTerms {
+        match self.chain.shape {
+            Shape::Evm => ReceiverTerms::Evm(EvmReceiverTerms {
                 receiver: [self.node; 20],
                 token: [SETTLED_TOKEN; 20],
                 min_withdraw_delay_secs: self.minimum_delay_secs,
             }),
-            PayerExit::Close => ReceiverTerms::Solana(SolanaReceiverTerms {
+            Shape::Xrpl => ReceiverTerms::Xrpl(XrplReceiverTerms {
+                receiver: format!("rInMemoryNode{:02x}", self.node),
+                min_settle_delay_secs: self.minimum_delay_secs,
+            }),
+            Shape::Solana => ReceiverTerms::Solana(SolanaReceiverTerms {
                 sponsor: [self.node; 32],
                 receiver: [self.node; 32],
                 mint: [SETTLED_TOKEN; 32],
@@ -432,8 +556,8 @@ impl InMemoryBatchSettlement {
     /// A presentation, for this fake's chain, of a channel nobody opened.
     pub fn unopened_presentation(&self) -> ChannelPresentation {
         let channel = ChannelId(format!("unopened-{}", self.chain.chain_name()));
-        match self.chain.exit {
-            PayerExit::Withdrawal => ChannelPresentation::Evm {
+        match self.chain.shape {
+            Shape::Evm => ChannelPresentation::Evm {
                 channel,
                 config: EvmChannelConfig {
                     payer: [CLIENT; 20],
@@ -445,7 +569,10 @@ impl InMemoryBatchSettlement {
                     salt: [0xff; 32],
                 },
             },
-            PayerExit::Close => ChannelPresentation::Solana { channel },
+            Shape::Solana => ChannelPresentation::Solana { channel },
+            Shape::Xrpl => ChannelPresentation::Xrpl {
+                channel: ChannelId("ff".repeat(32)),
+            },
         }
     }
 
@@ -494,9 +621,10 @@ impl InMemoryBatchSettlement {
     fn judge(&self, stored: &FakeChannel) -> Option<AdmissionRefusal> {
         if stored.receiver != self.node {
             return Some(AdmissionRefusal::NotPayableToThisNode {
-                field: match self.chain.exit {
-                    PayerExit::Withdrawal => "receiver",
-                    PayerExit::Close => "payee",
+                field: match self.chain.shape {
+                    Shape::Evm => "receiver",
+                    Shape::Solana => "payee",
+                    Shape::Xrpl => "Destination",
                 },
             });
         }
@@ -605,6 +733,7 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         &self,
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
+        self.read()?;
         let id = self.locate(&presentation)?;
         let ledger = self.chain.ledger();
         let stored = ledger
@@ -627,6 +756,7 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         &self,
         presentation: ChannelPresentation,
     ) -> Result<BatchChannelState, BatchSettlementError> {
+        self.read()?;
         let id = self.locate(&presentation)?;
         let ledger = self.chain.ledger();
         let stored = ledger
@@ -643,6 +773,7 @@ impl BatchSettlementBackend for InMemoryBatchSettlement {
         &self,
         channel: &ChannelId,
     ) -> Result<BatchChannelState, BatchSettlementError> {
+        self.read()?;
         self.require_admitted(channel)?;
         let ledger = self.chain.ledger();
         let stored = ledger
@@ -701,6 +832,7 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         deposit: u128,
     ) -> Result<OutboundChannelRecord, BatchSettlementError> {
         let chain = &self.chain;
+        chain.require_payer()?;
         chain.require(terms.chain())?;
         let (token, receiver) = match &terms {
             ReceiverTerms::Evm(evm) => (evm.token[0], evm.receiver[0]),
@@ -758,6 +890,7 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         record: &OutboundChannelRecord,
     ) -> Result<OpenedChannel, BatchSettlementError> {
         let chain = &self.chain;
+        chain.require_payer()?;
         chain.require(record.chain())?;
         let channel = record.channel().clone();
         let deposit = record.deposit();
@@ -829,6 +962,7 @@ impl BatchSettlementPayer for InMemoryBatchSettlement {
         record: &OutboundChannelRecord,
         signed: u128,
     ) -> Result<OutboundChannelState, BatchSettlementError> {
+        self.chain.require_payer()?;
         self.chain.require(record.chain())?;
         let channel = record.channel().clone();
         let ledger = self.chain.ledger();
@@ -1023,6 +1157,47 @@ mod tests {
             cumulative_amount,
             signature: vec![0u8; 64],
         }
+    }
+
+    /// A channel a client opened elsewhere -- named by its own id, signed
+    /// for by its own key -- is admitted as it stands, and reports that key.
+    #[tokio::test]
+    async fn a_channel_opened_elsewhere_is_admitted_with_its_own_signer() {
+        let config = EvmChannelConfig {
+            payer: [0x11; 20],
+            payer_authorizer: [0x12; 20],
+            receiver: [0x33; 20],
+            receiver_authorizer: [0x33; 20],
+            token: [0x55; 20],
+            withdraw_delay: ONE_DAY,
+            salt: [0x66; 32],
+        };
+        let presentation = ChannelPresentation::Evm {
+            channel: ChannelId(format!("0x{}", "ab".repeat(32))),
+            config,
+        };
+        let fake = InMemoryBatchSettlement::new(PayerExit::Withdrawal, ONE_DAY);
+        fake.client_opened(&presentation, VoucherSigner::Evm([0x12; 20]), 700);
+
+        let state = fake.admit(presentation).await.expect("admitted");
+        assert_eq!(state.voucher_signer, VoucherSigner::Evm([0x12; 20]));
+        assert_eq!(state.voucher_ceiling(), 700);
+    }
+
+    /// An unreachable chain answers every read with a backend failure,
+    /// never with "no such channel", and every read is counted.
+    #[tokio::test]
+    async fn an_unreachable_chain_fails_every_read() {
+        let fake = InMemoryBatchSettlement::new(PayerExit::Close, ONE_DAY);
+        let opened = fake.client_open(admissible());
+        fake.set_unreachable(true);
+        let err = fake.admit(opened.presentation.clone()).await.unwrap_err();
+        assert!(matches!(err, BatchSettlementError::Backend(_)), "{err:?}");
+        fake.set_unreachable(false);
+        fake.admit(opened.presentation)
+            .await
+            .expect("reachable again");
+        assert_eq!(fake.reads(), 2);
     }
 
     /// Solana: once the payer asks to close, only `settle_and_seal` can

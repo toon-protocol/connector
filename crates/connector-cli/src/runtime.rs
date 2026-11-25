@@ -27,7 +27,8 @@ use connector_runtime::{
     BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector, DeclaredRates,
     FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError, OutboundChannels,
     OutboundRestoreError, PeerRegistrar, PeerRoute, PeerRouteStore, PeerRouteStoreError,
-    PeerTransport, QuotePathUnusable, RatePoller, RateSources, SharedRateTable, SystemClock,
+    PeerTransport, QuotePathUnusable, RatePoller, RateSources, SettlementNetwork,
+    SettlementNetworks, SharedRateTable, SystemClock,
 };
 use connector_settlement::batch::{
     BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
@@ -39,10 +40,12 @@ use connector_settlement_xrpl::{XrplBatchSettlement, XrplBatchWatcher};
 use connector_signer::{LocalSigner, Signer, SignerError, XrplSigner};
 
 use crate::batch_settlement::{
-    restore_journaled_channels, BatchSettlementChannelsAdapter, ClaimGateVouchers,
-    GateChannelNetworks, NetworkVouchers,
+    restore_journaled_channels, ClaimGateVouchers, GateChannelNetworks, NetworkVouchers,
 };
 use crate::peer_transport;
+use crate::settlement_networks::{
+    EvmSettlementNetwork, SolanaSettlementNetwork, XrplSettlementNetwork,
+};
 use solana_sdk::pubkey::Pubkey;
 
 /// Everything that can stop a validated [`Config`] from producing a live
@@ -211,6 +214,10 @@ pub enum RuntimeError {
         channel_id: String,
         network: Option<Network>,
     },
+    /// Two settlement tables built a handle for one network (spec #1684).
+    /// Config load and the per-chain boot checks refuse every way to write
+    /// that, so this is a wiring fault, refused rather than guessed between.
+    NetworkSettledTwice(connector_runtime::NetworkAlreadySettled),
     /// ADR 0086 decision 10: a version-1 outbound record more than one
     /// table's domain reproduces. Never assigned by guess.
     OutboundChannelOnSeveralNetworks {
@@ -423,6 +430,7 @@ impl fmt::Display for RuntimeError {
                     network: network.clone(),
                 }
             ),
+            RuntimeError::NetworkSettledTwice(error) => write!(f, "{error}"),
             RuntimeError::OutboundChannelOnSeveralNetworks {
                 channel_id,
                 networks,
@@ -1090,6 +1098,11 @@ pub struct Runtime {
     /// CAIP-2 network, which is also that network's payer among the outbound
     /// channels'.
     pub batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>>,
+    /// Every network this node settles on, one handle per settlement table
+    /// (spec #1684, ADR 0086), keyed by CAIP-2 network and built once at
+    /// boot over the backends above: what the client edge's claim gate finds
+    /// a voucher's channel through.
+    pub settlement_networks: SettlementNetworks,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
     /// over the paying half of the backends above and journaled to
     /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when either backend is.
@@ -1274,6 +1287,8 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         BTreeMap::new();
     let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
     let mut batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>> = BTreeMap::new();
+    // Spec #1684: each table's network, built once, in table order.
+    let mut settlement_networks = SettlementNetworks::new();
     // ADR 0087 decision 4, before any ledger is dialed: one account is one
     // network, and two tables on one are refused by name.
     check_xrpl_accounts_are_distinct(config)?;
@@ -1299,14 +1314,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 let settlement_address = format!("{:#x}", backend.own_address());
                 let token_address =
                     format!("{:#x}", ethers::types::Address::from(evm.token_address()));
-                // ADR 0075 decisions 3 and 10: the settlement key signs this
-                // node's vouchers (`payerAuthorizer == payer`), so the
-                // settlement address is the voucher signer a peer binds this
-                // node's channel toward it by.
-                voucher_signers.push(connector_domain::VoucherSignerFact {
-                    network: network.clone(),
-                    signer: settlement_address.clone(),
-                });
+                let handle = Arc::new(EvmSettlementNetwork::new(Arc::clone(&backend)));
+                voucher_signers.push(handle.voucher_signer());
+                settlement_networks
+                    .insert(handle)
+                    .map_err(RuntimeError::NetworkSettledTwice)?;
                 // ADR 0074 decision 8, issue #1345: this chain's
                 // batch-settlement facts, the greeting's `accepts[]` entry.
                 batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
@@ -1343,13 +1355,11 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // is published. Issue #1357 adds x402's required
                 // `tokenProgram` and where the sponsor is served.
                 let sponsor = backend.sponsor().to_string();
-                // ADR 0075 decisions 3 and 10: the Solana settlement key is
-                // `authorized_signer` on every channel this node opens, and
-                // what a peer binds that channel by (#1379).
-                voucher_signers.push(connector_domain::VoucherSignerFact {
-                    network: backend.caip2_network(),
-                    signer: sponsor.clone(),
-                });
+                let handle = Arc::new(SolanaSettlementNetwork::new(Arc::clone(&backend)));
+                voucher_signers.push(handle.voucher_signer());
+                settlement_networks
+                    .insert(handle)
+                    .map_err(RuntimeError::NetworkSettledTwice)?;
                 batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Solana(
                     connector_client_edge::X402BatchSettlementSolanaTerms {
                         network: backend.caip2_network(),
@@ -1373,13 +1383,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 // reserve are checked by name before the backend is bound.
                 let backend = build_xrpl_batch_settlement(xrpl, transport).await?;
                 let network = xrpl.network().caip2().to_string();
-                // ADR 0087 decision 9: the channel key is the settlement
-                // account's own public key -- the one a payer's channel
-                // names as its destination is the address derived from it.
-                voucher_signers.push(connector_domain::VoucherSignerFact {
-                    network: network.clone(),
-                    signer: backend.public_key_hex(),
-                });
+                let handle = Arc::new(XrplSettlementNetwork::new(
+                    Network::Xrpl(xrpl.network()),
+                    Arc::clone(&backend),
+                ));
+                voucher_signers.push(handle.voucher_signer());
+                settlement_networks
+                    .insert(handle)
+                    .map_err(RuntimeError::NetworkSettledTwice)?;
                 batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Xrpl(
                     connector_client_edge::X402BatchSettlementXrplTerms {
                         network,
@@ -1406,18 +1417,14 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     )
     .await?;
     if let Some(outbound) = &outbound_channels {
-        let networks = batch_settlements
+        // Each network's chain, read off the network itself: never recovered
+        // from the terms built above (spec #1684).
+        let networks = settlement_networks
             .iter()
-            .map(|terms| match terms {
-                connector_client_edge::X402BatchSettlementTerms::Evm(evm) => {
-                    (SettlementChain::Evm, evm.network.clone())
-                }
-                connector_client_edge::X402BatchSettlementTerms::Solana(solana) => {
-                    (SettlementChain::Solana, solana.network.clone())
-                }
-                connector_client_edge::X402BatchSettlementTerms::Xrpl(xrpl) => {
-                    (SettlementChain::Xrpl, xrpl.network.clone())
-                }
+            .filter_map(|held| {
+                let network = held.network();
+                let chain = SettlementChain::try_from(network.chain()).ok()?;
+                Some((chain, network.to_string()))
             })
             .collect();
         connector = connector.with_outbound_channels(Arc::clone(outbound), networks);
@@ -1545,6 +1552,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         batch_settlement_evm,
         batch_settlement_solana,
         batch_settlement_xrpl,
+        settlement_networks,
         outbound_channels,
         state_dir_lock,
         zk_edge,
@@ -1844,41 +1852,6 @@ fn solana_network_of(backend: &SolanaBatchSettlement) -> Network {
         .caip2_network()
         .parse()
         .expect("a connected Solana backend names a CAIP-2 network")
-}
-
-/// The claim gate's view of this node's batch-settlement backends (ADR
-/// 0074), or `None` when no chain has opted in -- and a gate given `None`
-/// refuses every voucher by name.
-fn batch_settlement_channels(runtime: &Runtime) -> Option<BatchSettlementChannelsAdapter> {
-    BatchSettlementChannelsAdapter::new(
-        runtime
-            .batch_settlement_evm
-            .values()
-            .map(|backend| {
-                (
-                    Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-                    backend.domain(),
-                )
-            })
-            .collect(),
-        runtime.batch_settlement_solana.as_ref().map(|backend| {
-            (
-                Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-                solana_network_of(backend),
-            )
-        }),
-        runtime
-            .batch_settlement_xrpl
-            .iter()
-            .filter_map(|(network, backend)| match network {
-                Network::Xrpl(xrpl) => Some((
-                    Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-                    *xrpl,
-                )),
-                _ => None,
-            })
-            .collect(),
-    )
 }
 
 /// Start one background poller per declared quote path, each refreshing its
@@ -2400,17 +2373,15 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // a receiver public key, a sender can wrap to no other one. No new
     // config section exists or is needed for this.
     let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
-    let mut claim_gate = client_claim_gate(
+    let claim_gate = client_claim_gate(
         config,
         runtime.outbound_channels.clone(),
         runtime.zk_edge.as_ref(),
     )?;
-    // Vouchers are accepted on exactly the chains whose `batch_settlement`
-    // table is written, and refused by name on the rest.
-    if let Some(channels) = batch_settlement_channels(runtime) {
-        claim_gate = claim_gate.with_batch_settlement(Arc::new(channels));
-    }
-    let claim_gate = Arc::new(claim_gate);
+    // Vouchers are accepted on exactly the networks whose settlement table is
+    // written, and refused by name on the rest.
+    let claim_gate =
+        Arc::new(claim_gate.with_settlement_networks(runtime.settlement_networks.clone()));
     // ADR 0086 decision 14: which network a payment's channel is on, for an
     // app's `X-TOON-Network`, is the gate's to say -- it verified the
     // channel under that network's domain.
@@ -3100,44 +3071,12 @@ key_file = "{}"
     /// more, however many vouchers they present.
     #[tokio::test]
     async fn the_configured_lookup_budget_reaches_the_claim_gate() {
-        use connector_client_edge::{
-            AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel, BatchSettlementChannels,
-            ChannelResolutionError,
-        };
-        use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use connector_runtime::{InMemorySettlementNetwork, SettlementNetworks};
+        use connector_signer::{evm_batch_channel_id, BatchChannelConfig, BatchSettlementDomain};
 
-        /// A chain that knows about no channel at all -- which is what a
-        /// walk of the id space looks like from the connector's side.
-        #[derive(Debug, Default)]
-        struct EmptyCountingBackend {
-            lookups: AtomicUsize,
-        }
-
-        #[async_trait::async_trait]
-        impl BatchSettlementChannels for EmptyCountingBackend {
-            fn evm_domains(&self) -> Vec<BatchSettlementDomain> {
-                vec![BatchSettlementDomain::x402(84_532)]
-            }
-            fn solana_network(&self) -> Option<connector_domain::Network> {
-                None
-            }
-            async fn evm(
-                &self,
-                _network: &connector_domain::Network,
-                _channel_id: &[u8; 32],
-                _presented_config: Option<&BatchChannelConfig>,
-            ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-                self.lookups.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            }
-            async fn solana(
-                &self,
-                _channel_account: &[u8; 32],
-            ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-                Ok(None)
-            }
-        }
+        // A chain that knows about no channel at all -- which is what a walk
+        // of the id space looks like from the connector's side.
+        let network = Arc::new(InMemorySettlementNetwork::fresh(Network::Eip155(84_532)));
 
         let (config, _key_path) = config_with_raw_key_file(|key_path| {
             format!(
@@ -3155,15 +3094,32 @@ key_file = "{}"
             )
         });
 
-        let backend = Arc::new(EmptyCountingBackend::default());
         let gate = client_claim_gate(&config, None, None)
             .expect("a fresh in-memory journal has nothing to replay")
-            .with_batch_settlement(backend.clone());
+            .with_settlement_networks(
+                SettlementNetworks::new()
+                    .with(Arc::clone(&network) as Arc<dyn SettlementNetwork>)
+                    .expect("one network"),
+            );
 
-        // A fresh channel id per voucher, which is the whole shape of the
+        // A fresh channel per voucher, which is the whole shape of the
         // attack: nothing this connector has ever seen, and nothing it ever
-        // will resolve.
+        // will resolve. Each carries the config its id hashes from, so the
+        // chain is asked about it.
         let voucher = |n: u64| {
+            let mut salt = [0u8; 32];
+            salt[..8].copy_from_slice(&n.to_be_bytes());
+            let config = BatchChannelConfig {
+                payer: [0x11; 20],
+                payer_authorizer: [0x11; 20],
+                receiver: [0x33; 20],
+                receiver_authorizer: [0x33; 20],
+                token: [0x55; 20],
+                withdraw_delay: 86_400,
+                salt,
+            };
+            let channel_id = evm_batch_channel_id(&BatchSettlementDomain::x402(84_532), &config);
+            let address = |bytes: &[u8; 20]| format!("0x{}", hex::encode(bytes));
             serde_json::json!({
                 "version": "1.0",
                 "blockchain": "evm",
@@ -3172,9 +3128,18 @@ key_file = "{}"
                 "messageId": format!("msg-{n}"),
                 "timestamp": "2026-02-02T12:00:00.000Z",
                 "senderId": "0x1111111111111111111111111111111111111111",
-                "channelId": format!("0x{n:064x}"),
+                "channelId": format!("0x{}", hex::encode(channel_id)),
                 "maxClaimableAmount": "10",
                 "signature": format!("0x{}", "cd".repeat(65)),
+                "channelConfig": {
+                    "payer": address(&config.payer),
+                    "payerAuthorizer": address(&config.payer_authorizer),
+                    "receiver": address(&config.receiver),
+                    "receiverAuthorizer": address(&config.receiver_authorizer),
+                    "token": address(&config.token),
+                    "withdrawDelay": config.withdraw_delay,
+                    "salt": format!("0x{}", hex::encode(config.salt)),
+                },
             })
             .to_string()
         };
@@ -3189,7 +3154,7 @@ key_file = "{}"
         }
 
         assert_eq!(
-            backend.lookups.load(Ordering::SeqCst),
+            network.settlement().reads(),
             2,
             "twenty vouchers on twenty channels cost the configured allowance and no more"
         );

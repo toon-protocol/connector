@@ -9,7 +9,7 @@
 //! retired that claim scheme (decision 8, issue #1384), so the registry, its
 //! sources, its liveness memo and `[[client_channels]]` are deleted with its
 //! last caller. A voucher's channel is resolved by the batch-settlement
-//! backend ([`crate::BatchSettlementChannels`]), and what survives here is
+//! network (spec #1684, the settlement-network collection), and what survives here is
 //! the vocabulary that backend reports a failed lookup in.
 
 use crate::lookup_budget::LookupBudgetExhausted;

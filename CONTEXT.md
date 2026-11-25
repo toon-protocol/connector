@@ -697,6 +697,16 @@ The chain-specific implementation of the settlement port for one chain: opening,
 and withdrawing on its outbound channels, and admitting and landing vouchers on its inbound ones
 (ADR 0075).
 
+**Settlement network**:
+One network the node settles on, built from one settlement table
+([ADR 0086](docs/adr/0086-a-node-settles-on-more-than-one-evm-network.md)), and the unit a chain
+adapter plugs in at: a chain's **settlement backend** is bound as one settlement network per table.
+The node holds them as one collection keyed by CAIP-2 network, and every caller finds a channel's
+network by looking it up there, never by matching on the chain. Its handle exposes the batch port's
+receiving and paying halves, the outbound voucher signer, and the carriages that accept its vouchers.
+Two EVM networks are two settlement networks; one chain is not one network (spec #1684).
+_Avoid_: settlement chain, backend (for the network rather than the chain's implementation)
+
 ### Storage
 
 **Store**:
