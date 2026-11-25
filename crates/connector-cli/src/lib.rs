@@ -46,6 +46,11 @@ use url::Url;
 // decision 3 puts a token's pools on that token's own chain (issue #1302).
 pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 
+// Typed `connector send` (issue #1703): the verb's own entry point, so a caller
+// that originates a packet does not shell out. `SendError::was_sent` says
+// whether a failed send may have left a packet behind.
+pub use send::{send, Outcome, SendError, SendOptions, SendOutcome};
+
 // What a reject code says about cost, on its own (issue #1475): a dependent
 // crate holding only a reject's code asks here rather than keep its own copy
 // of the codes. `connector probe` reaches its verdict through the same rule.
