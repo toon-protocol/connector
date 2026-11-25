@@ -134,6 +134,12 @@ pub enum PeerRouteTableError {
     /// only ever produce refused packets.
     #[error("route '{prefix}' forwards to peering '{peer_id}', which has no channel to pay from")]
     PeerHasNoPayChannel { prefix: String, peer_id: String },
+    /// A rule of `connector_domain::peering_admission` that no runtime write
+    /// can break today (an orphaned row cannot arise from `POST /peers`),
+    /// named here rather than left unmapped so the mapping from the domain's
+    /// refusals stays total.
+    #[error("{0}")]
+    Inadmissible(PeeringRefusal),
     #[error("no such runtime peer '{0}'")]
     PeerNotFound(String),
     #[error("no such runtime route '{0}'")]
@@ -147,11 +153,29 @@ pub enum PeerRouteTableError {
 
 impl From<PeeringRefusal> for PeerRouteTableError {
     /// The one place a domain refusal becomes the runtime error the operator
-    /// surface maps to an HTTP status (issue #1691).
+    /// surface maps to an HTTP status (issues #1691, #1692). No wildcard arm:
+    /// a new rule does not compile until it is named here.
     fn from(refusal: PeeringRefusal) -> Self {
         match refusal {
+            PeeringRefusal::PeerIdOwnedByConfig(value)
+            | PeeringRefusal::PrefixOwnedByConfig(value) => {
+                PeerRouteTableError::OwnedByConfig(value)
+            }
+            PeeringRefusal::UnknownPeer { prefix, peer_id } => {
+                PeerRouteTableError::UnknownPeerId { prefix, peer_id }
+            }
+            PeeringRefusal::PeeringWithoutChannel(id) => {
+                PeerRouteTableError::PeerChannelUnbound(id)
+            }
             PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
                 PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id }
+            }
+            PeeringRefusal::PeerChannelOrphaned { .. }
+            | PeeringRefusal::PayChannelOrphaned { .. }
+            | PeeringRefusal::PayChannelOnUnsettledChain { .. }
+            | PeeringRefusal::ChannelInBothDirections { .. }
+            | PeeringRefusal::PeeringNetworksDiffer { .. } => {
+                PeerRouteTableError::Inadmissible(refusal)
             }
         }
     }
@@ -980,10 +1004,20 @@ impl Connector {
         if id.trim().is_empty() {
             return Err(PeerRouteTableError::InvalidPeerId);
         }
-        if self.config_peer_ids.contains(id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id.to_string()));
-        }
+        peering_admission::check_config_ownership(&PeeringSet {
+            peerings: vec![self.runtime_peering_facts(id)],
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            ..PeeringSet::default()
+        })?;
         Ok(())
+    }
+
+    /// A peering written at runtime, as `peering_admission` sees it.
+    fn runtime_peering_facts(&self, id: &str) -> PeeringFacts {
+        PeeringFacts {
+            source: peering_admission::Source::Runtime,
+            ..PeeringFacts::new(id)
+        }
     }
 
     /// Narrow a fetched self-description's published x402 terms to the one
@@ -1844,12 +1878,19 @@ impl Connector {
         if id.trim().is_empty() {
             return Err(PeerRouteTableError::InvalidPeerId);
         }
-        if self.config_peer_ids.contains(&id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id));
-        }
-        if peering.channels.is_empty() {
-            return Err(PeerRouteTableError::PeerChannelUnbound(id));
-        }
+        // Ownership by the config file (ADR 0034) and a missing channel
+        // binding (ADR 0058) are `peering_admission`'s, the same code
+        // `Config::load` runs.
+        peering_admission::admit(&PeeringSet {
+            peerings: vec![self.runtime_peering_facts(&id)],
+            inbound: peering
+                .channels
+                .iter()
+                .map(|_| ChannelFact::new(&id))
+                .collect(),
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            ..PeeringSet::default()
+        })?;
         let view = PeerView {
             id: id.clone(),
             fee: peering.fee,
@@ -2046,40 +2087,56 @@ impl Connector {
         if !is_valid_ilp_address(&prefix) {
             return Err(PeerRouteTableError::InvalidPrefix(prefix));
         }
-        if self.config_owns_prefix(&prefix) {
-            return Err(PeerRouteTableError::OwnedByConfig(prefix));
-        }
         let _write_guard = self
             .runtime_table_lock
             .lock()
             .expect("runtime peer/route table lock poisoned");
-        if !self.config_peer_ids.contains(&peer_id) {
-            if self.runtime_peers_snapshot().get(&peer_id).is_none() {
-                return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id });
-            }
-            // The pay-channel rule is `connector_domain::peering_admission`'s,
-            // the same code `Config::load` runs (issue #1691). What the
-            // runtime knows of a peering's pay channels is its paying hop.
-            let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
-                vec![ChannelFact {
-                    network: String::new(),
-                }]
-            } else {
-                Vec::new()
-            };
-            peering_admission::admit(&PeeringSet {
-                peerings: vec![PeeringFacts {
-                    id: peer_id.clone(),
-                    inbound: Vec::new(),
+        // Every cross-table rule of a route -- config ownership of the prefix
+        // (ADR 0034), the peer it names, a channel to pay that peer from --
+        // is `connector_domain::peering_admission`'s, the same code
+        // `Config::load` runs (issues #1691, #1692). A config peering was
+        // admitted at load, so it is stated as the facts load established; a
+        // runtime peering is stated as the runtime knows it, its paying hop.
+        let peering = if self.config_peer_ids.contains(&peer_id) {
+            Some((
+                PeeringFacts::new(&peer_id),
+                vec![ChannelFact::new(&peer_id)],
+                vec![ChannelFact::new(&peer_id)],
+            ))
+        } else {
+            self.runtime_peers_snapshot().get(&peer_id).map(|bound| {
+                let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
+                    vec![ChannelFact::new(&peer_id)]
+                } else {
+                    Vec::new()
+                };
+                (
+                    self.runtime_peering_facts(&peer_id),
+                    bound
+                        .channels
+                        .iter()
+                        .map(|_| ChannelFact::new(&peer_id))
+                        .collect(),
                     pay,
-                }],
-                routes: vec![PeerRouteFacts {
-                    prefix: prefix.clone(),
-                    peer_id: peer_id.clone(),
-                }],
-                settlement_networks: Default::default(),
-            })?;
-        }
+                )
+            })
+        };
+        let (peerings, inbound, pay) = match peering {
+            Some((peering, inbound, pay)) => (vec![peering], inbound, pay),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        peering_admission::admit(&PeeringSet {
+            peerings,
+            inbound,
+            pay,
+            routes: vec![PeerRouteFacts {
+                source: peering_admission::Source::Runtime,
+                ..PeerRouteFacts::new(&prefix, &peer_id)
+            }],
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            config_prefixes: self.config_prefixes().map(str::to_string).collect(),
+            ..PeeringSet::default()
+        })?;
         if request.as_ref().is_some_and(|value| !value.is_object()) {
             return Err(PeerRouteTableError::InvalidRequest(prefix));
         }

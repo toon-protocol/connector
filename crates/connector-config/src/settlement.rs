@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use connector_domain::{AssetChain, AssetId, AssetNamespace, Network, XrplNetwork};
@@ -841,6 +841,20 @@ impl SettlementTables {
             SettlementChain::Solana => self.solana,
             SettlementChain::Xrpl => !self.xrpl.is_empty(),
         }
+    }
+
+    /// The chains this node pays and is paid on x402 channels on, by name:
+    /// [`Self::x402`] for each, as `peering_admission` asks it.
+    pub(crate) fn settled_chains(&self) -> BTreeSet<&'static str> {
+        [
+            SettlementChain::Evm,
+            SettlementChain::Solana,
+            SettlementChain::Xrpl,
+        ]
+        .into_iter()
+        .filter(|chain| self.x402(*chain))
+        .map(SettlementChain::name)
+        .collect()
     }
 
     /// The network a channel row on `chain` is on (ADR 0086 decision 8),
