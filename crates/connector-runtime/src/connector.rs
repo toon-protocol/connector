@@ -10,6 +10,9 @@ use connector_config::{
     ClientChannelAssets, PeeringAssets, SettlementChain, StaticRoute, TransportPolicy,
     DEFAULT_MAX_PACKET_AMOUNT,
 };
+use connector_domain::peering_admission::{
+    self, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringRefusal, PeeringSet,
+};
 use connector_domain::x402::X402PaymentRequired;
 use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
@@ -140,6 +143,18 @@ pub enum PeerRouteTableError {
     /// in-memory table and the durable copy can never diverge.
     #[error("could not persist the runtime peer/route table: {0}")]
     Persistence(#[from] PeerRouteStoreError),
+}
+
+impl From<PeeringRefusal> for PeerRouteTableError {
+    /// The one place a domain refusal becomes the runtime error the operator
+    /// surface maps to an HTTP status (issue #1691).
+    fn from(refusal: PeeringRefusal) -> Self {
+        match refusal {
+            PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
+                PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id }
+            }
+        }
+    }
 }
 
 /// Why [`Connector::handle_probe`] declined to route a packet at all,
@@ -1957,13 +1972,31 @@ impl Connector {
             .lock()
             .expect("runtime peer/route table lock poisoned");
         if !self.config_peer_ids.contains(&peer_id) {
-            match self.runtime_peers_snapshot().get(&peer_id) {
-                None => return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id }),
-                Some(_) if !self.outbound_voucher_hops.load().contains_key(&peer_id) => {
-                    return Err(PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id })
-                }
-                Some(_) => {}
+            if self.runtime_peers_snapshot().get(&peer_id).is_none() {
+                return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id });
             }
+            // The pay-channel rule is `connector_domain::peering_admission`'s,
+            // the same code `Config::load` runs (issue #1691). What the
+            // runtime knows of a peering's pay channels is its paying hop.
+            let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
+                vec![ChannelFact {
+                    network: String::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            peering_admission::admit(&PeeringSet {
+                peerings: vec![PeeringFacts {
+                    id: peer_id.clone(),
+                    inbound: Vec::new(),
+                    pay,
+                }],
+                routes: vec![PeerRouteFacts {
+                    prefix: prefix.clone(),
+                    peer_id: peer_id.clone(),
+                }],
+                settlement_networks: Default::default(),
+            })?;
         }
         if request.as_ref().is_some_and(|value| !value.is_object()) {
             return Err(PeerRouteTableError::InvalidRequest(prefix));

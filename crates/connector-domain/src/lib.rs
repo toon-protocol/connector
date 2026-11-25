@@ -39,6 +39,7 @@ pub mod node;
 mod oer;
 mod packet;
 pub mod payload_limit;
+pub mod peering_admission;
 pub mod price;
 pub mod rate;
 pub mod rate_table;

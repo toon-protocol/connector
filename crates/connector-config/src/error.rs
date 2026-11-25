@@ -1813,3 +1813,16 @@ pub enum ConfigError {
     )]
     ZkNoteRateMissing { from: AssetId, to: String },
 }
+
+impl From<connector_domain::peering_admission::PeeringRefusal> for ConfigError {
+    /// The one place a domain refusal becomes the named refusal an operator
+    /// reads at boot (ADR 0009); the message is the variant's own.
+    fn from(refusal: connector_domain::peering_admission::PeeringRefusal) -> Self {
+        use connector_domain::peering_admission::PeeringRefusal;
+        match refusal {
+            PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
+                ConfigError::PayChannelUnbound { prefix, peer_id }
+            }
+        }
+    }
+}
