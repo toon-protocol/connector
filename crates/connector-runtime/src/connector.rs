@@ -18,8 +18,8 @@ use connector_domain::{
     amount_after_fee, amount_after_rate_and_fee, cost_before_rate_and_fee, delivery_budget,
     forward_wait_budget, forwarded_expiry, is_expired, is_valid_ilp_address, refuse_oversize,
     resolve_route, AssetId, EnvelopeRequest, Fulfill, PacketResponse, PayloadLimit, Prepare, Price,
-    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, ResolvedRoute, RouteKind,
-    FORWARDING_MESSAGE_WINDOW,
+    RateLookup, Reject, RejectCode, RejectReason, RequestLimit, Resolution, ResolvedRoute,
+    RouteKind, FORWARDING_MESSAGE_WINDOW,
 };
 use connector_settlement::ChannelId;
 use connector_signer::giftwrap::{derive_fulfillment, open_request, seal_response};
@@ -135,6 +135,12 @@ pub enum PeerRouteTableError {
     /// only ever produce refused packets.
     #[error("route '{prefix}' forwards to peering '{peer_id}', which has no channel to pay from")]
     PeerHasNoPayChannel { prefix: String, peer_id: String },
+    /// A rule of `connector_domain::peering_admission` that no runtime write
+    /// can break today (an orphaned row cannot arise from `POST /peers`),
+    /// named here rather than left unmapped so the mapping from the domain's
+    /// refusals stays total.
+    #[error("{0}")]
+    Inadmissible(PeeringRefusal),
     #[error("no such runtime peer '{0}'")]
     PeerNotFound(String),
     #[error("no such runtime route '{0}'")]
@@ -148,11 +154,29 @@ pub enum PeerRouteTableError {
 
 impl From<PeeringRefusal> for PeerRouteTableError {
     /// The one place a domain refusal becomes the runtime error the operator
-    /// surface maps to an HTTP status (issue #1691).
+    /// surface maps to an HTTP status (issues #1691, #1692). No wildcard arm:
+    /// a new rule does not compile until it is named here.
     fn from(refusal: PeeringRefusal) -> Self {
         match refusal {
+            PeeringRefusal::PeerIdOwnedByConfig(value)
+            | PeeringRefusal::PrefixOwnedByConfig(value) => {
+                PeerRouteTableError::OwnedByConfig(value)
+            }
+            PeeringRefusal::UnknownPeer { prefix, peer_id } => {
+                PeerRouteTableError::UnknownPeerId { prefix, peer_id }
+            }
+            PeeringRefusal::PeeringWithoutChannel(id) => {
+                PeerRouteTableError::PeerChannelUnbound(id)
+            }
             PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
                 PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id }
+            }
+            PeeringRefusal::PeerChannelOrphaned { .. }
+            | PeeringRefusal::PayChannelOrphaned { .. }
+            | PeeringRefusal::PayChannelOnUnsettledChain { .. }
+            | PeeringRefusal::ChannelInBothDirections { .. }
+            | PeeringRefusal::PeeringNetworksDiffer { .. } => {
+                PeerRouteTableError::Inadmissible(refusal)
             }
         }
     }
@@ -899,10 +923,26 @@ impl Connector {
         if id.trim().is_empty() {
             return Err(PeerRouteTableError::InvalidPeerId);
         }
-        if self.config_peer_ids.contains(id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id.to_string()));
-        }
+        self.refuse_config_owned_peer_id(id)
+    }
+
+    /// ADR 0034 for a write naming peer `id` alone: `peering_admission`'s
+    /// ownership rule, the same code every other runtime write runs.
+    fn refuse_config_owned_peer_id(&self, id: &str) -> Result<(), PeerRouteTableError> {
+        peering_admission::check_config_ownership(&PeeringSet {
+            peerings: vec![self.runtime_peering_facts(id)],
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            ..PeeringSet::default()
+        })?;
         Ok(())
+    }
+
+    /// A peering written at runtime, as `peering_admission` sees it.
+    fn runtime_peering_facts(&self, id: &str) -> PeeringFacts {
+        PeeringFacts {
+            source: peering_admission::Source::Runtime,
+            ..PeeringFacts::new(id)
+        }
     }
 
     /// Narrow a fetched self-description's published x402 terms to the one
@@ -1763,12 +1803,19 @@ impl Connector {
         if id.trim().is_empty() {
             return Err(PeerRouteTableError::InvalidPeerId);
         }
-        if self.config_peer_ids.contains(&id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id));
-        }
-        if peering.channels.is_empty() {
-            return Err(PeerRouteTableError::PeerChannelUnbound(id));
-        }
+        // Ownership by the config file (ADR 0034) and a missing channel
+        // binding (ADR 0058) are `peering_admission`'s, the same code
+        // `Config::load` runs.
+        peering_admission::admit(&PeeringSet {
+            peerings: vec![self.runtime_peering_facts(&id)],
+            inbound: peering
+                .channels
+                .iter()
+                .map(|_| ChannelFact::new(&id))
+                .collect(),
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            ..PeeringSet::default()
+        })?;
         let view = PeerView {
             id: id.clone(),
             fee: peering.fee,
@@ -1802,9 +1849,7 @@ impl Connector {
     /// orphaned-row shape `connector-config`'s `UnknownPeerId` check
     /// exists to prevent at load, enforced here instead at mutation time.
     pub fn remove_runtime_peer(&self, id: &str) -> Result<(), PeerRouteTableError> {
-        if self.config_peer_ids.contains(id) {
-            return Err(PeerRouteTableError::OwnedByConfig(id.to_string()));
-        }
+        self.refuse_config_owned_peer_id(id)?;
         let _write_guard = self
             .runtime_table_lock
             .lock()
@@ -1917,15 +1962,9 @@ impl Connector {
         u64::try_from(self.clock.now().timestamp()).unwrap_or(0)
     }
 
-    /// Whether `prefix` is defined by the config file, as either an app
-    /// route or a peer-forwarding route -- the set of prefixes a runtime
-    /// write may never add, update or remove.
-    fn config_owns_prefix(&self, prefix: &str) -> bool {
-        self.config_prefixes().any(|owned| owned == prefix)
-    }
-
     /// Every prefix the config file itself serves: app routes and peer
-    /// forwarding routes.
+    /// forwarding routes -- the set of prefixes a runtime write may never
+    /// add, update or remove.
     fn config_prefixes(&self) -> impl Iterator<Item = &str> {
         self.routes
             .iter()
@@ -1965,40 +2004,56 @@ impl Connector {
         if !is_valid_ilp_address(&prefix) {
             return Err(PeerRouteTableError::InvalidPrefix(prefix));
         }
-        if self.config_owns_prefix(&prefix) {
-            return Err(PeerRouteTableError::OwnedByConfig(prefix));
-        }
         let _write_guard = self
             .runtime_table_lock
             .lock()
             .expect("runtime peer/route table lock poisoned");
-        if !self.config_peer_ids.contains(&peer_id) {
-            if self.runtime_peers_snapshot().get(&peer_id).is_none() {
-                return Err(PeerRouteTableError::UnknownPeerId { prefix, peer_id });
-            }
-            // The pay-channel rule is `connector_domain::peering_admission`'s,
-            // the same code `Config::load` runs (issue #1691). What the
-            // runtime knows of a peering's pay channels is its paying hop.
-            let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
-                vec![ChannelFact {
-                    network: String::new(),
-                }]
-            } else {
-                Vec::new()
-            };
-            peering_admission::admit(&PeeringSet {
-                peerings: vec![PeeringFacts {
-                    id: peer_id.clone(),
-                    inbound: Vec::new(),
+        // Every cross-table rule of a route -- config ownership of the prefix
+        // (ADR 0034), the peer it names, a channel to pay that peer from --
+        // is `connector_domain::peering_admission`'s, the same code
+        // `Config::load` runs (issues #1691, #1692). A config peering was
+        // admitted at load, so it is stated as the facts load established; a
+        // runtime peering is stated as the runtime knows it, its paying hop.
+        let peering = if self.config_peer_ids.contains(&peer_id) {
+            Some((
+                PeeringFacts::new(&peer_id),
+                vec![ChannelFact::new(&peer_id)],
+                vec![ChannelFact::new(&peer_id)],
+            ))
+        } else {
+            self.runtime_peers_snapshot().get(&peer_id).map(|_| {
+                let pay = if self.outbound_voucher_hops.load().contains_key(&peer_id) {
+                    vec![ChannelFact::new(&peer_id)]
+                } else {
+                    Vec::new()
+                };
+                (
+                    self.runtime_peering_facts(&peer_id),
+                    // `upsert_runtime_peer` refused a peering with no
+                    // binding when it was written, and this write is not
+                    // that rule's to re-judge: a peering replayed from a
+                    // pre-ADR-0058 snapshot reaches the pay-channel rule.
+                    vec![ChannelFact::new(&peer_id)],
                     pay,
-                }],
-                routes: vec![PeerRouteFacts {
-                    prefix: prefix.clone(),
-                    peer_id: peer_id.clone(),
-                }],
-                settlement_networks: Default::default(),
-            })?;
-        }
+                )
+            })
+        };
+        let (peerings, inbound, pay) = match peering {
+            Some((peering, inbound, pay)) => (vec![peering], inbound, pay),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        peering_admission::admit(&PeeringSet {
+            peerings,
+            inbound,
+            pay,
+            routes: vec![PeerRouteFacts {
+                source: peering_admission::Source::Runtime,
+                ..PeerRouteFacts::new(&prefix, &peer_id)
+            }],
+            config_peer_ids: self.config_peer_ids.iter().cloned().collect(),
+            config_prefixes: self.config_prefixes().map(str::to_string).collect(),
+            ..PeeringSet::default()
+        })?;
         if request.as_ref().is_some_and(|value| !value.is_object()) {
             return Err(PeerRouteTableError::InvalidRequest(prefix));
         }
@@ -2021,9 +2076,16 @@ impl Connector {
     /// `DELETE /routes/peers/:prefix`. Refused when `prefix` is defined by
     /// the config file, or when no such runtime route exists.
     pub fn remove_runtime_peer_route(&self, prefix: &str) -> Result<(), PeerRouteTableError> {
-        if self.config_owns_prefix(prefix) {
-            return Err(PeerRouteTableError::OwnedByConfig(prefix.to_string()));
-        }
+        // ADR 0034 is `peering_admission`'s, the same code the route write
+        // runs; the route's peer is not this rule's concern.
+        peering_admission::check_config_ownership(&PeeringSet {
+            routes: vec![PeerRouteFacts {
+                source: peering_admission::Source::Runtime,
+                ..PeerRouteFacts::new(prefix, "")
+            }],
+            config_prefixes: self.config_prefixes().map(str::to_string).collect(),
+            ..PeeringSet::default()
+        })?;
         let _write_guard = self
             .runtime_table_lock
             .lock()
@@ -2482,15 +2544,20 @@ impl Connector {
         // lease stops being selected immediately (#427), and nothing here
         // allocates a copy of the routes themselves (ADR 0015). Precedence
         // is the domain's, shared with the client edge's price lookup (ADR
-        // 0028), so what a packet is charged and where it is then sent can
-        // never come from two different answers to the same question.
+        // 0028): the resolution answers both the forwarding target and the
+        // price route, which differ only where a lease wins the target, so
+        // what a packet is charged and where it is then sent never come
+        // from two different rankings.
         let leased_routes = self.leased_routes_snapshot();
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
-        let Some(resolved) = self.resolve(
-            &prepare.destination,
-            &runtime_peer_routes,
-            Some(&leased_routes),
-        ) else {
+        let Some(resolved) = self
+            .resolve(
+                &prepare.destination,
+                &runtime_peer_routes,
+                Some(&leased_routes),
+            )
+            .target
+        else {
             return self.finish(
                 PacketResponse::Reject(Reject {
                     code: RejectCode::f02_unreachable(),
@@ -4006,17 +4073,19 @@ impl Connector {
     }
 
     /// Resolve `destination` across the route tables, through the domain's
-    /// one precedence (`connector_domain::resolve_route`). `leased` is
-    /// `None` for a caller that does not weigh leases -- the client edge
-    /// (ADR 0028). Indexes in the answer are positions in `self.routes`,
-    /// `self.peer_routes`, and the iteration order of the two snapshots the
-    /// caller passes, which must outlive their use.
+    /// one precedence (`connector_domain::resolve_route`), answering both the
+    /// forwarding target and the price route. `leased` is `None` for a
+    /// caller that reads only the price route -- the client edge (ADR 0028)
+    /// -- since the price route never weighs leases and the lease snapshot
+    /// is then not worth taking. Indexes in the answer are positions in
+    /// `self.routes`, `self.peer_routes`, and the iteration order of the two
+    /// snapshots the caller passes, which must outlive their use.
     fn resolve(
         &self,
         destination: &str,
         runtime_peer_routes: &HashMap<String, PeerRoute>,
         leased: Option<&HashMap<String, LeasedRoute>>,
-    ) -> Option<ResolvedRoute> {
+    ) -> Resolution {
         resolve_route(
             destination,
             self.clock.now(),
@@ -4033,8 +4102,9 @@ impl Connector {
     /// The configured route -- terminated or forwarded -- `destination`
     /// resolves to, with the length of the prefix that matched.
     ///
-    /// Configured-route selection for [`Self::client_route`] (ADR 0028),
-    /// ranked by `connector_domain::resolve_route` like every other lookup. The
+    /// Configured-route selection for [`Self::client_route`] (ADR 0028): the
+    /// resolution's price route, ranked by `connector_domain::resolve_route`
+    /// like every other lookup. The
     /// client edge's claim gate (issue #522) and x402 greeting must price
     /// the route the router will actually use, and a forwarded route being
     /// priced at all (issue #620) makes "app routes only" no longer a safe
@@ -4046,7 +4116,9 @@ impl Connector {
     /// (issue #427), with no price and no durability, is excluded.
     fn select_configured_route(&self, destination: &str) -> Option<(usize, ConfiguredTarget)> {
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
-        let resolved = self.resolve(destination, &runtime_peer_routes, None)?;
+        let resolved = self
+            .resolve(destination, &runtime_peer_routes, None)
+            .price_route?;
         let target = match resolved.kind {
             RouteKind::App => ConfiguredTarget::App(resolved.index),
             RouteKind::ConfigPeer => ConfiguredTarget::Peer(resolved.index),
@@ -4057,7 +4129,7 @@ impl Connector {
                     .expect("resolution indexes the snapshot it was given")
                     .clone(),
             ),
-            RouteKind::Leased => unreachable!("no leases were offered"),
+            RouteKind::Leased => unreachable!("the price route is never a lease"),
         };
         Some((resolved.prefix_len, target))
     }
@@ -4222,11 +4294,13 @@ impl Connector {
             kind: RouteKind::App,
             index,
             ..
-        }) = self.resolve(
-            &prepare.destination,
-            &runtime_peer_routes,
-            Some(&leased_routes),
-        )
+        }) = self
+            .resolve(
+                &prepare.destination,
+                &runtime_peer_routes,
+                Some(&leased_routes),
+            )
+            .target
         else {
             return false;
         };
@@ -4252,7 +4326,7 @@ impl Connector {
         let leased_routes = self.leased_routes_snapshot();
         let runtime_peer_routes = self.runtime_peer_routes_snapshot();
         self.resolve(destination, &runtime_peer_routes, Some(&leased_routes))
-            .is_some()
+            .has_route()
     }
 
     /// Open a terminated packet's gift wrap with this node's identity key

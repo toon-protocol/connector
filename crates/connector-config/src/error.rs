@@ -657,6 +657,13 @@ pub enum ConfigError {
     )]
     ChannelInBothDirections { value: String },
 
+    /// A runtime write took a peer id or route prefix the config file owns
+    /// (ADR 0034). `peering_admission` owns the rule; a file's own rows are
+    /// all config, so load cannot reach it -- it is named so that the two
+    /// surfaces map every refusal.
+    #[error("'{value}' is defined in this node's config file and cannot be changed at runtime")]
+    PeeringOwnedByConfig { value: String },
+
     #[error(
         "peer '{peer_id}' is the next hop of route '{prefix}' but has no '[[pay_channels]]' \
          entry: a connector covers every PREPARE it sends (ADR 0042), so a peering this node \
@@ -1816,10 +1823,40 @@ pub enum ConfigError {
 
 impl From<connector_domain::peering_admission::PeeringRefusal> for ConfigError {
     /// The one place a domain refusal becomes the named refusal an operator
-    /// reads at boot (ADR 0009); the message is the variant's own.
+    /// reads at boot (ADR 0009). No wildcard arm: a new rule does not compile
+    /// until it is named here (issue #1692).
     fn from(refusal: connector_domain::peering_admission::PeeringRefusal) -> Self {
         use connector_domain::peering_admission::PeeringRefusal;
         match refusal {
+            PeeringRefusal::PeerIdOwnedByConfig(value)
+            | PeeringRefusal::PrefixOwnedByConfig(value) => {
+                ConfigError::PeeringOwnedByConfig { value }
+            }
+            PeeringRefusal::UnknownPeer { prefix, peer_id } => {
+                ConfigError::UnknownPeerId { prefix, peer_id }
+            }
+            PeeringRefusal::PeerChannelOrphaned { peer_id } => {
+                ConfigError::PeerChannelOrphaned { peer_id }
+            }
+            PeeringRefusal::PeeringWithoutChannel(id) => ConfigError::PeerChannelUnbound { id },
+            PeeringRefusal::PayChannelOrphaned { peer_id } => {
+                ConfigError::PayChannelOrphaned { peer_id }
+            }
+            PeeringRefusal::PayChannelOnUnsettledChain { peer_id, chain } => {
+                ConfigError::PayChannelWithoutX402 { peer_id, chain }
+            }
+            PeeringRefusal::ChannelInBothDirections { channel } => {
+                ConfigError::ChannelInBothDirections { value: channel }
+            }
+            PeeringRefusal::PeeringNetworksDiffer {
+                peer_id,
+                inbound,
+                outbound,
+            } => ConfigError::PeeringNetworksDiffer {
+                peer_id,
+                inbound,
+                outbound,
+            },
             PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
                 ConfigError::PayChannelUnbound { prefix, peer_id }
             }
