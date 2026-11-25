@@ -14,6 +14,7 @@ mod packet_history;
 mod peer_route_store;
 mod peer_transport;
 mod peering;
+mod peerings;
 mod rate_poller;
 mod rate_table;
 mod route;
