@@ -1066,6 +1066,20 @@ impl ClientClaimGate {
         self.zk_edge.is_some()
     }
 
+    /// How many paid packets admitted on an allowance are in flight right
+    /// now, across every allowance (ADR 0080 decision 4): each one is an
+    /// [`InFlightForward`] somebody still holds. A read-only query for the
+    /// operator surface (#1719), `0` on a gate that is no zk edge.
+    pub fn forwards_in_flight(&self) -> usize {
+        self.zk_ledger
+            .lock()
+            .expect("zk ledger lock poisoned")
+            .allowances
+            .values()
+            .map(|allowance| allowance.in_flight)
+            .sum()
+    }
+
     /// The parts a close needs, shared with every [`InFlightForward`]:
     /// `None` on a gate that is no zk edge.
     fn zk_parts(&self) -> Option<ZkParts> {
@@ -1527,4 +1541,4 @@ impl ZkParts {
 }
 #[cfg(test)]
 #[path = "allowance_tests.rs"]
-mod tests;
+pub(crate) mod tests;
