@@ -3191,6 +3191,72 @@ mod tests {
             assert_eq!(routes, vec![created]);
         }
 
+        /// #1217 through the operator surface: a runtime peering this node
+        /// holds no channel to pay from takes no route. Accepted, every
+        /// packet on it would be refused `T00`; refused here it is `400`
+        /// and the table stays empty.
+        #[tokio::test]
+        async fn a_route_to_a_runtime_peering_with_no_pay_channel_is_refused_not_accepted() {
+            use connector_runtime::{RuntimePeerChannel, RuntimePeering};
+            let keypair = keypair();
+            let connector = Arc::new(Connector::new(
+                vec![],
+                vec![],
+                Arc::new(FakeAppClient::new()),
+                Arc::new(InProcessPeerTransport::new()),
+                Arc::new(TestClock::new(chrono::Utc::now())),
+            ));
+            connector
+                .upsert_runtime_peer(
+                    "bound-not-paid",
+                    RuntimePeering {
+                        fee: 0,
+                        max_packet_amount: 0,
+                        endpoint: Some("https://peer.example/ilp".to_string()),
+                        edge_identity: None,
+                        client_edge_url: Some("https://peer.example/ilp".to_string()),
+                        channels: vec![RuntimePeerChannel::EvmVoucher {
+                            outbound_channel_id: format!("0x{}", "ab".repeat(32)),
+                            voucher_signer: format!("0x{}", "aa".repeat(20)),
+                            network: NETWORK.to_string(),
+                        }],
+                    },
+                )
+                .expect("a peering with a binding is accepted at write time");
+            let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("operator-test-key"));
+            let app = router(
+                connector,
+                empty_claim_gate(),
+                signer,
+                "correct-token".to_string(),
+                vec![keypair.public.to_bytes()],
+                None,
+            );
+            let body = serde_json::to_vec(&serde_json::json!({
+                "prefix": "g.example.runtime",
+                "peer_id": "bound-not-paid",
+                "price": 0,
+            }))
+            .unwrap();
+
+            let response = app
+                .clone()
+                .oneshot(signed(&keypair, "POST", "/routes/peers", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = hyper::body::to_bytes(response.into_body()).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("no channel to pay from"),
+                "{bytes:?}"
+            );
+
+            let read = get(app, "/routes/peers", Some("correct-token")).await;
+            let bytes = hyper::body::to_bytes(read.into_body()).await.unwrap();
+            let routes: Vec<PeerRouteView> = serde_json::from_slice(&bytes).unwrap();
+            assert!(routes.is_empty(), "{routes:?}");
+        }
+
         /// A route naming a peer id nothing recognizes -- the runtime
         /// analogue of `connector-config`'s load-time `UnknownPeerId` --
         /// is `400`, not silently accepted as an orphaned row.
