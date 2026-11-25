@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use connector_domain::{AssetId, AssetIdError, GuardError, Price, RateError};
 
-use crate::settlement::SettlementChain;
+use crate::settlement::{NetworkTableFamily, SettlementChain};
 
 use thiserror::Error;
 
@@ -881,33 +881,24 @@ pub enum ConfigError {
     )]
     SettlementEvmTableRemoved,
 
-    /// A `[settlement.eip155.<key>]` table whose key is not a decimal
-    /// EIP-155 chain id (ADR 0086 decision 4).
-    #[error(
-        "[settlement.eip155.{key}] is not keyed by a chain id: an EVM settlement table is \
-         [settlement.eip155.<chainId>], with the network's EIP-155 chain id in decimal, no \
-         leading zero (e.g. [settlement.eip155.8453] for Base), checked against eth_chainId at \
-         boot (ADR 0086)"
-    )]
-    SettlementEip155KeyNotAChainId { key: String },
+    /// A network-keyed settlement table (`[settlement.eip155]`,
+    /// `[settlement.xrpl]`) holding no network. One refusal for every
+    /// family; the family supplies the words (ADR 0086 decision 4, ADR 0087
+    /// decision 5).
+    #[error("{}", .family.empty_message())]
+    SettlementNetworkTableEmpty { family: NetworkTableFamily },
 
-    /// `[settlement.eip155]` holding no network (ADR 0086 decision 4).
-    #[error(
-        "[settlement.eip155] names no network: add a [settlement.eip155.<chainId>] table under \
-         it (e.g. [settlement.eip155.8453] for Base), or remove the heading (ADR 0086)"
-    )]
-    SettlementEip155Empty,
+    /// A network-keyed settlement table whose key names no network this
+    /// build knows for that family: not a chain id, not an XRPL network
+    /// (ADR 0086 decision 4, ADR 0087 decision 5).
+    #[error("{}", .family.unknown_network_message(.key))]
+    SettlementNetworkKeyUnknown {
+        family: NetworkTableFamily,
+        key: String,
+    },
 
     #[error("the [settlement.solana] section's token_address is empty")]
     SettlementMissingSolanaTokenAddress,
-
-    /// `[settlement.xrpl]` holding no network (ADR 0087 decision 5).
-    #[error(
-        "[settlement.xrpl] names no network: add a [settlement.xrpl.<id>] table under it, \
-         where <id> is the server_info network_id of the ledger its rpc_url answers (0 \
-         mainnet, 1 testnet, 2 devnet, 1000 stand-alone), or remove the heading (ADR 0087)"
-    )]
-    SettlementXrplEmpty,
 
     /// A bare `[settlement.xrpl]` table, written with its keys directly under
     /// it and no network (ADR 0087 decision 5): a claim binds no network, so
@@ -919,16 +910,6 @@ pub enum ConfigError {
          testnet, 2 devnet, 1000 stand-alone) (ADR 0087)"
     )]
     SettlementXrplBareTable { key: String },
-
-    /// `[settlement.xrpl.<key>]` where this binary's network table has no
-    /// such network (ADR 0087 decision 5).
-    #[error(
-        "[settlement.xrpl.{key}] is not a network this build knows: the XRPL networks are 0 \
-         (mainnet), 1 (testnet), 2 (devnet) and 1000 (the stand-alone harness), keyed by the \
-         ledger's server_info network_id (ADR 0087, ADR 0085). A network with no row is \
-         refused, never guessed"
-    )]
-    SettlementXrplUnknownNetwork { key: String },
 
     /// `[settlement.xrpl.<id>] key = "..."`: a key is a file, never a value
     /// (ADR 0009, ADR 0012).
