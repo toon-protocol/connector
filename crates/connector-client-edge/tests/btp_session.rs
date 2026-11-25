@@ -718,8 +718,16 @@ async fn a_replayed_claim_is_refused_with_the_http_taxonomy() {
     let reject = Reject::decode(&second.ilp_packet).expect("an OER REJECT");
     assert_eq!(reject.code.as_str(), "F01");
     assert_eq!(pd(&second, "toon-accumulated-cost"), Some(b"0".as_slice()));
-    // An `F01` is not one of the `F03` situations: no reason (#1532).
-    assert_eq!(pd(&second, "toon-reject-reason"), None);
+    // A replay is `F01` with its own reason, and the watermark the journal
+    // holds (`2 * PRICE`).
+    assert_eq!(
+        pd(&second, "toon-reject-reason"),
+        Some(b"amount_not_advancing".as_slice())
+    );
+    assert_eq!(
+        pd(&second, "toon-watermark"),
+        Some((2 * PRICE).to_string().as_bytes())
+    );
 }
 
 /// Issue #1532, BTP-shaped: an underpaying voucher is `F03` with the charge
@@ -749,6 +757,8 @@ async fn an_underpaying_voucher_carries_the_underpayment_reason_over_btp() {
         pd(&answer, "toon-reject-reason"),
         Some(b"underpayment".as_slice())
     );
+    // A first voucher on a channel never paid on: the watermark is `0`.
+    assert_eq!(pd(&answer, "toon-watermark"), Some(b"0".as_slice()));
 }
 
 /// Issue #1532, BTP-shaped: a voucher above what the channel can pay is

@@ -382,12 +382,20 @@ pub struct Reject {
     /// rides beside the packet, never in the OER bytes, and never reaches a
     /// peer.
     pub reason: Option<RejectReason>,
+    /// The watermark this connector holds for the voucher's channel, on the
+    /// two refusals that are about it (`amount_not_advancing`,
+    /// `underpayment`): `None` on every other reject. Like `reason` it rides
+    /// beside the packet (`toon-watermark`), never in the OER bytes.
+    pub watermark: Option<u128>,
 }
 
 /// The closed set of reasons a client-edge `F03` carries
 /// (`docs/protocol/client-edge-spec.md` §1.6, ADR 0051's issue #1532 update).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
+    /// The voucher's cumulative amount does not exceed the watermark: a
+    /// replay.
+    AmountNotAdvancing,
     /// The voucher did not advance by the route's charge.
     Underpayment,
     /// The cumulative amount is above what the channel can pay.
@@ -402,6 +410,7 @@ impl RejectReason {
     /// The ASCII token that rides on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
+            RejectReason::AmountNotAdvancing => "amount_not_advancing",
             RejectReason::Underpayment => "underpayment",
             RejectReason::Undercollateralized => "undercollateralized",
             RejectReason::AmountOverCharge => "amount_over_charge",
@@ -459,6 +468,7 @@ impl Reject {
             data,
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         })
     }
 }
@@ -617,6 +627,7 @@ mod tests {
             data: vec![],
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         };
         let encoded = reject.encode();
         assert_eq!(encoded[0], TYPE_REJECT);
@@ -632,6 +643,7 @@ mod tests {
             data: vec![],
             accumulated_cost: 0,
             reason: None,
+            watermark: None,
         };
         let encoded = reject.encode();
         assert_eq!(Reject::decode(&encoded).expect("decode"), reject);
@@ -650,6 +662,7 @@ mod tests {
             data: vec![],
             accumulated_cost: 42,
             reason: None,
+            watermark: None,
         };
         let encoded = reject.encode();
         let decoded = Reject::decode(&encoded).expect("decode");

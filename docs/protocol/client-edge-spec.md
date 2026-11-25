@@ -796,6 +796,13 @@ none. An absent reason means "not raised here", never "unknown". A client that r
 or unrecognized reason acts on the code and the cost alone. Adding a value to the set is a spec
 change. The vectors pin each case (`client_edge.f03_rejects`).
 
+**The watermark.** A voucher refused at the watermark layer also names the watermark the connector
+holds for its channel (`0` for one never paid on), in `Toon-Watermark` — a decimal amount, an HTTP
+response header, and a protocolData entry named `toon-watermark` on a BTP reject response, beside
+`toon-reject-reason`. Two refusals carry it: an `underpayment` `F03` (unchanged otherwise, cost the
+charge) and a replay, which is `F01` with the reason `amount_not_advancing` and cost `0`. No other
+refusal carries it, and no code or message changes (`schema_version` 14).
+
 **The probe ingress: `POST /ilp/probe`.** Same request body and same response framing as `POST
 /ilp` (§1.1); what differs is the gate in front of it, and that nothing is charged. Because probing
 traverses the network for free, a probe is accepted only from a sender identified by a payment

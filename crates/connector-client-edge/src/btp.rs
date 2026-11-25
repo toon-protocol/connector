@@ -46,7 +46,7 @@ use connector_btp::{
     decode_frame, encode_error, encode_response, reply, BtpDecodeError, BtpSessionHandle,
     OutboundRequests, ProtocolData, SessionGone, ACCUMULATED_COST_PROTOCOL, AUTH_PROTOCOL,
     BTP_ERROR, BTP_MESSAGE, BTP_RESPONSE, BTP_TRANSFER, CLAIM_PROTOCOL, CONTENT_TYPE_TEXT,
-    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL,
+    PAYMENT_REQUIRED_PROTOCOL, PAYOUT_CLAIM_PROTOCOL, REJECT_REASON_PROTOCOL, WATERMARK_PROTOCOL,
 };
 use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::BTP_MESSAGE_LIMIT;
@@ -474,6 +474,13 @@ fn reject_response(request_id: u32, reject: Reject, extra: Vec<ProtocolData>) ->
             data: reason.as_str().as_bytes().to_vec(),
         });
     }
+    if let Some(watermark) = reject.watermark {
+        protocol_data.push(ProtocolData {
+            name: WATERMARK_PROTOCOL.to_string(),
+            content_type: CONTENT_TYPE_TEXT,
+            data: watermark.to_string().into_bytes(),
+        });
+    }
     protocol_data.extend(extra);
     encode_response(request_id, &protocol_data, &reject.encode())
 }
@@ -794,6 +801,7 @@ async fn handle_frame(
                 data: Vec::new(),
                 accumulated_cost: 0,
                 reason: None,
+                watermark: None,
             };
             return reply(
                 replies,
@@ -847,6 +855,7 @@ async fn handle_frame(
             // `greeting` declared on an unpriced destination).
             accumulated_cost: charge,
             reason: None,
+            watermark: None,
         };
         return reply(
             replies,

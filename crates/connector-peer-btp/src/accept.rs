@@ -418,6 +418,7 @@ impl PeerSession {
                         data: Vec::new(),
                         accumulated_cost: 0,
                         reason: None,
+                        watermark: None,
                     },
                     ClaimAckOutcome::NotSent,
                 ))

@@ -355,6 +355,7 @@ fn peer_not_dialable(peer_id: &str) -> PacketResponse {
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     })
 }
 
@@ -377,6 +378,7 @@ fn dial_failed(peer_id: &str, endpoint: &Url) -> PacketResponse {
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     })
 }
 
@@ -503,6 +505,7 @@ impl HttpPeerTransport {
                 data: Vec::new(),
                 accumulated_cost: terms.price().unwrap_or_default(),
                 reason: None,
+                watermark: None,
             };
             return PeerForward::quoted(
                 PacketResponse::Reject(reject),

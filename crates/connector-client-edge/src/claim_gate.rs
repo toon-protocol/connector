@@ -134,10 +134,13 @@ pub enum ClaimIngestRejection {
     /// name the way [`ClaimIngestRejection::Mina`] is -- this connector no
     /// longer takes it, which is not the same as it making no sense.
     ToonChannel,
-    AmountNotAdvancing,
+    AmountNotAdvancing {
+        watermark: u128,
+    },
     Underpayment {
         advanced: u128,
         price: u64,
+        watermark: u128,
     },
     /// The voucher names a channel the settlement backend does not admit
     /// (issue #558's rule: an unverifiable claim is never accepted), so there
@@ -279,10 +282,10 @@ impl ClaimIngestRejection {
                 "claim rejected: {}",
                 ClientClaimError::ToonChannel
             ),
-            ClaimIngestRejection::AmountNotAdvancing => "claim rejected: cumulative amount does \
+            ClaimIngestRejection::AmountNotAdvancing { .. } => "claim rejected: cumulative amount does \
                  not strictly exceed this channel's watermark (replay)"
                 .to_string(),
-            ClaimIngestRejection::Underpayment { advanced, price } => format!(
+            ClaimIngestRejection::Underpayment { advanced, price, .. } => format!(
                 "claim rejected: advances value by {advanced}, less than this route's price of {price}"
             ),
             ClaimIngestRejection::UnknownChannel => "claim rejected: names a channel this \
@@ -1733,16 +1736,24 @@ fn check_voucher_freshness_and_value(
         cumulative_amount: record.watermark.cumulative_amount,
         signature: &record.signature,
     });
-    validate_voucher(watermark, amount, signature, price).map_err(claim_refusal)
+    let held = watermark.map_or(0, |watermark| watermark.cumulative_amount);
+    validate_voucher(watermark, amount, signature, price).map_err(|e| claim_refusal(e, held))
 }
 
 /// A watermark-layer refusal in this gate's taxonomy.
-fn claim_refusal(error: ClaimError) -> ClaimIngestRejection {
+///
+/// `held` is the watermark the journal holds for the channel (`0` for one
+/// never paid on); both watermark-layer refusals carry it home.
+fn claim_refusal(error: ClaimError, held: u128) -> ClaimIngestRejection {
     match error {
-        ClaimError::AmountNotAdvancing { .. } => ClaimIngestRejection::AmountNotAdvancing,
-        ClaimError::Underpayment { advanced, price } => {
-            ClaimIngestRejection::Underpayment { advanced, price }
+        ClaimError::AmountNotAdvancing { watermark, .. } => {
+            ClaimIngestRejection::AmountNotAdvancing { watermark }
         }
+        ClaimError::Underpayment { advanced, price } => ClaimIngestRejection::Underpayment {
+            advanced,
+            price,
+            watermark: held,
+        },
         ClaimError::OverBudget { claimed, budget } => {
             ClaimIngestRejection::OverBudget { claimed, budget }
         }
@@ -2163,7 +2174,7 @@ mod tests {
         assert_eq!(gate.watermark(&channel_key()), at(100));
         assert_eq!(
             gate.ingest(&signed_voucher(50), 0).await,
-            Err(ClaimIngestRejection::AmountNotAdvancing)
+            Err(ClaimIngestRejection::AmountNotAdvancing { watermark: 100 })
         );
         assert_eq!(gate.watermark(&channel_key()), at(100));
     }
@@ -2181,7 +2192,7 @@ mod tests {
         assert_ne!(recased, signed_voucher(50));
         assert_eq!(
             gate.ingest(&recased, 0).await,
-            Err(ClaimIngestRejection::AmountNotAdvancing),
+            Err(ClaimIngestRejection::AmountNotAdvancing { watermark: 100 }),
             "a recased channel id must not open a second, empty watermark"
         );
         assert_eq!(
@@ -2282,13 +2293,14 @@ mod tests {
             restarted.ingest(&signed_voucher(100), 5).await,
             Err(ClaimIngestRejection::Underpayment {
                 advanced: 0,
-                price: 5
+                price: 5,
+                watermark: 100
             }),
             "resent after a restart, the spent voucher buys nothing"
         );
         assert_eq!(
             restarted.ingest(&signed_voucher(90), 0).await,
-            Err(ClaimIngestRejection::AmountNotAdvancing)
+            Err(ClaimIngestRejection::AmountNotAdvancing { watermark: 100 })
         );
     }
 

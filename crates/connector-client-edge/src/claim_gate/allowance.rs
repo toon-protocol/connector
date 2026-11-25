@@ -1008,8 +1008,9 @@ impl ClientClaimGate {
                 cumulative_amount: record.watermark.cumulative_amount,
                 signature: &record.signature,
             });
+            let held = watermark.map_or(0, |watermark| watermark.cumulative_amount);
             validate_allowance_claim(watermark, amount, &claim.signature, price, tier)
-                .map_err(claim_refusal)
+                .map_err(|e| claim_refusal(e, held))
         };
         {
             let watermarks = self
