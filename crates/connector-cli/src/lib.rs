@@ -49,7 +49,13 @@ pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
 // Typed `connector send` (issue #1703): the verb's own entry point, so a caller
 // that originates a packet does not shell out. `SendError::was_sent` says
 // whether a failed send may have left a packet behind.
-pub use send::{send, Outcome, SendError, SendOptions, SendOutcome};
+// `SendOptions` takes what an embedding program needs and the verb never sets
+// (issue #1704): envelope headers, a key in memory, a pinned seal key, an
+// every-host proxy and a wait. A refused write's reason is a `Refusal`.
+pub use send::{
+    send, OperatorKey, Outcome, ProxyScope, Refusal, RefusalReason, SendError, SendOptions,
+    SendOutcome,
+};
 
 // What a reject code says about cost, on its own (issue #1475): a dependent
 // crate holding only a reject's code asks here rather than keep its own copy
@@ -473,6 +479,12 @@ fn describe_send(outcome: &send::SendOutcome) -> String {
         send::Outcome::NotSent => {
             format!("DRY RUN -- would have sent {head}. Nothing was sent and nothing was paid.")
         }
+        // `connector send` sets no wait, so it never reads this; a caller
+        // that does is told what it means.
+        send::Outcome::Unanswered => format!(
+            "UNANSWERED -- {head}\nNo answer came within the wait. The packet may have been \
+             delivered and paid for."
+        ),
     }
 }
 
@@ -605,11 +617,11 @@ fn parse_send_args(rest: &[&str], verb: &str) -> Result<Invocation, CliError> {
             "--operator <url>",
             "the node whose operator surface originates the packet",
         )?,
-        operator_key_file: required(
+        operator_key: send::OperatorKey::File(required(
             operator_key_file,
             "--operator-key <file>",
             "the ed25519 key whose public half is on that node's [operator] write_keys",
-        )?,
+        )?),
         destination: required(
             destination,
             "--to <ilp-address>",
@@ -622,12 +634,16 @@ fn parse_send_args(rest: &[&str], verb: &str) -> Result<Invocation, CliError> {
              -- a payload is sealed to the terminating node (ADR 0018), which in a multi-hop \
              topology is not the node given to --operator",
         )?,
+        seal_key: None,
         amount,
         target: target.unwrap_or_else(|| "/".to_string()),
         method: method.unwrap_or_else(|| "POST".to_string()),
         body,
+        headers: Vec::new(),
         expires_in_seconds,
+        wait: None,
         socks_proxy,
+        proxy_scope: send::ProxyScope::OnionOnly,
         dry_run,
         expect_fulfill,
     });

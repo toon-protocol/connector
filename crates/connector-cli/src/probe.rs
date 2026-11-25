@@ -104,6 +104,9 @@ pub enum ProbeError {
     /// `--dry-run` reached a probe. Not offered on the command line; kept so
     /// the match over [`Outcome`] is exhaustive without a panic.
     NotSent,
+    /// No answer came within the wait. `connector probe` sets none, so it
+    /// never meets this; kept so the match over [`Outcome`] is exhaustive.
+    Unanswered,
     /// One of the above, already rendered as `--json` asked
     /// ([`ProbeError::to_json`]), so the process's error line is the object.
     Json(String),
@@ -129,6 +132,11 @@ impl std::fmt::Display for ProbeError {
                  does not match the one this probe's gift wrap derives (ADR 0019)"
             ),
             ProbeError::NotSent => write!(f, "nothing was sent"),
+            ProbeError::Unanswered => write!(
+                f,
+                "no answer came within the wait, so the probe learned nothing; it may have been \
+                 delivered and paid for"
+            ),
             ProbeError::Json(rendered) => write!(f, "{rendered}"),
         }
     }
@@ -174,6 +182,7 @@ pub fn classify(outcome: Outcome) -> Result<Finding, ProbeError> {
         Outcome::Fulfilled { status, body } => Ok(Finding::Delivered { status, body }),
         Outcome::FulfilledWithWrongFulfillment => Err(ProbeError::WrongFulfillment),
         Outcome::NotSent => Err(ProbeError::NotSent),
+        Outcome::Unanswered => Err(ProbeError::Unanswered),
         Outcome::Rejected {
             code,
             message,

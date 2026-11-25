@@ -57,6 +57,17 @@
 //! `socks_proxy` key cannot reach it, and no environment variable is
 //! consulted for it either -- see [`crate::parse_socks_proxy`] for why that
 //! is a decision rather than an omission.
+//!
+//! # What a program embedding this crate may add
+//!
+//! [`send`] is exported (issues #1703, #1704), and a program that embeds the
+//! connector crates may set what the verb never does: extra envelope
+//! headers, a write key held in memory ([`OperatorKey::InMemory`]), a pinned
+//! seal key that skips the identity fetch, [`ProxyScope::EveryHost`] for a
+//! caller behind an overlay (ADR 0070's amendment of issue #1704), and a wait
+//! after which the packet is [`Outcome::Unanswered`]. `connector send` builds
+//! its options exactly as before: a key file, the onion-only rule, no
+//! headers, the identity fetched and no wait.
 
 use std::path::Path;
 
@@ -96,11 +107,11 @@ const SIGNATURE_TTL_SECONDS: u64 = 60;
 pub struct SendOptions {
     /// Base URL of the node whose operator surface originates the packet.
     pub operator_url: String,
-    /// File holding the ed25519 secret key whose public half is on that
-    /// node's `[operator] write_keys`. 32 raw bytes or 64 hex characters,
-    /// matching every other key file this binary reads (ADR 0012 -- a
-    /// location, never an inline value).
-    pub operator_key_file: String,
+    /// The ed25519 write key whose public half is on that node's
+    /// `[operator] write_keys`: a file, which is the only form the
+    /// `--operator-key` flag produces (ADR 0012 -- a location, never an
+    /// inline value), or a key a program embedding this crate already holds.
+    pub operator_key: OperatorKey,
     /// The ILP address the packet is bound for.
     pub destination: String,
     /// The packet's amount. The node it is handed to (`--operator`) takes no
@@ -115,14 +126,29 @@ pub struct SendOptions {
     /// payload is sealed to, e.g. `http://host:3000/ilp`. See the module
     /// header.
     pub seal_to: String,
+    /// The terminating connector's 65-byte identity key, when the caller
+    /// already holds it. Set, the payload is sealed to it and `seal_to` is
+    /// not dialed: no identity is fetched. `None` fetches it from `seal_to`,
+    /// which is what `connector send` always does.
+    pub seal_key: Option<PublicKeyBytes>,
     /// The envelope's request target, as the terminating app will see it.
     pub target: String,
     /// The envelope's request method.
     pub method: String,
     /// The envelope's request body.
     pub body: Vec<u8>,
+    /// Extra envelope headers, after the default
+    /// `content-type: application/json`. A `content-type` here (in any case)
+    /// replaces that default rather than joining it. `connector send` passes
+    /// none.
+    pub headers: Vec<(String, String)>,
     /// How long the PREPARE is valid for.
     pub expires_in_seconds: i64,
+    /// How long to wait for the operator surface's answer once the request
+    /// is on its way. When it runs out, `send` returns
+    /// [`Outcome::Unanswered`]. `None` waits as long as the connection
+    /// lasts, which is what `connector send` does.
+    pub wait: Option<std::time::Duration>,
     /// The SOCKS5 proxy an **onion** URL is dialed through, and `None` on an
     /// invocation that named none (ADR 0070 decision 5).
     ///
@@ -134,6 +160,12 @@ pub struct SendOptions {
     /// Already validated by [`crate::parse_socks_proxy`]: `socks5h`, and
     /// naming a host. Nothing downstream re-checks it.
     pub socks_proxy: Option<Url>,
+    /// Which of the two dials `socks_proxy` applies to. `connector send`
+    /// always sets [`ProxyScope::OnionOnly`], ADR 0070's host-selected rule;
+    /// [`ProxyScope::EveryHost`] is for a program embedding this crate that
+    /// sits behind an overlay and must send every byte through it (ADR 0070,
+    /// amendment of issue #1704).
+    pub proxy_scope: ProxyScope,
     /// Form and sign everything, print it, and send nothing.
     pub dry_run: bool,
     /// Treat anything other than a correctly-fulfilled packet as a failure,
@@ -145,6 +177,48 @@ pub struct SendOptions {
     /// and a run that prints "REJECT F02" and exits 0 is the same
     /// green-tick-over-nothing failure ADR 0007 bans a chain-less test for.
     pub expect_fulfill: bool,
+}
+
+/// Which dials `SendOptions::socks_proxy` applies to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyScope {
+    /// Only a URL whose host is an onion endpoint goes through the proxy;
+    /// every other URL is dialed direct (ADR 0070 decision 5).
+    #[default]
+    OnionOnly,
+    /// Every URL goes through the proxy, onion or not.
+    EveryHost,
+}
+
+/// Where the operator write key comes from.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OperatorKey {
+    /// A file holding the secret: 32 raw bytes or 64 hex characters,
+    /// matching every other key file this binary reads.
+    File(String),
+    /// The 32-byte ed25519 secret, held in memory by the caller, so a key
+    /// that lives nowhere on disk never has to be written there to send.
+    InMemory([u8; 32]),
+}
+
+/// Never prints a secret: a `SendOptions` is `Debug`, and a key in memory
+/// would otherwise land in any log that prints one.
+impl std::fmt::Debug for OperatorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperatorKey::File(path) => f.debug_tuple("File").field(path).finish(),
+            OperatorKey::InMemory(_) => f.write_str("InMemory(..)"),
+        }
+    }
+}
+
+impl OperatorKey {
+    fn keypair(&self) -> Result<ed25519_dalek::Keypair, SendError> {
+        match self {
+            OperatorKey::File(path) => read_key_file(path),
+            OperatorKey::InMemory(bytes) => Ok(key_from_bytes(*bytes)),
+        }
+    }
 }
 
 /// What came back.
@@ -173,6 +247,10 @@ pub enum Outcome {
     },
     /// `--dry-run`: nothing was sent.
     NotSent,
+    /// The packet was handed to the operator surface and no answer came
+    /// within `SendOptions::wait`. It may have been delivered and paid for;
+    /// by the time a caller reads this, its PREPARE has usually expired.
+    Unanswered,
 }
 
 /// The result of a [`send`], in the shape the one summary line is built from.
@@ -188,6 +266,72 @@ pub struct SendOutcome {
     pub outcome: Outcome,
 }
 
+/// The operator surface refusing a write with a non-2xx: a `401` for a
+/// signature it does not accept, a `403` for a write key it knows and will
+/// not let make this write (ADR 0078), a `400` for a write it could not read.
+/// Nothing was taken in for forwarding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// Why a `403` refused, read off the start of its body; `None` for any
+    /// other status, or a body that names no reason.
+    pub reason: Option<RefusalReason>,
+    /// The surface's own words, trimmed.
+    pub body: String,
+}
+
+/// Why the operator surface refused a controller's write key
+/// (ADR 0078 decision 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The write is outside the key's scope.
+    Scope,
+    /// The key has expired.
+    Expiry,
+    /// The packet would break the key's spending limit.
+    SpendingLimit,
+    /// The deposit would break the key's deposit limit.
+    DepositLimit,
+}
+
+impl RefusalReason {
+    /// The label a `403`'s body starts with, before its colon.
+    pub fn label(self) -> &'static str {
+        match self {
+            RefusalReason::Scope => "scope",
+            RefusalReason::Expiry => "expiry",
+            RefusalReason::SpendingLimit => "spending-limit",
+            RefusalReason::DepositLimit => "deposit-limit",
+        }
+    }
+}
+
+impl Refusal {
+    fn read(status: u16, body: &[u8]) -> Refusal {
+        let body = String::from_utf8_lossy(body).trim().to_string();
+        let reason = (status == 403)
+            .then(|| {
+                [
+                    RefusalReason::Scope,
+                    RefusalReason::Expiry,
+                    RefusalReason::SpendingLimit,
+                    RefusalReason::DepositLimit,
+                ]
+                .into_iter()
+                .find(|reason| {
+                    body.strip_prefix(reason.label())
+                        .is_some_and(|rest| rest.starts_with(':'))
+                })
+            })
+            .flatten();
+        Refusal {
+            status,
+            reason,
+            body,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SendError {
     /// The operator key file is missing, unreadable, or not a 32-byte key.
@@ -198,8 +342,13 @@ pub enum SendError {
     Seal(String),
     /// Nothing was sent: the operator surface could not be dialed, or it
     /// refused the write with a non-2xx, so no packet was taken in for
-    /// forwarding.
-    Transport { url: String, reason: String },
+    /// forwarding. `refusal` is that non-2xx, and `None` when the surface
+    /// was never reached.
+    Transport {
+        url: String,
+        reason: String,
+        refusal: Option<Refusal>,
+    },
     /// A packet left and its answer was lost: the request was written and the
     /// connection failed before an answer was read.
     AnswerLost { url: String, reason: String },
@@ -210,6 +359,14 @@ pub enum SendError {
 }
 
 impl SendError {
+    /// The operator surface's refusal of the write, when it refused it.
+    pub fn refusal(&self) -> Option<&Refusal> {
+        match self {
+            SendError::Transport { refusal, .. } => refusal.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Whether a packet may have left this process. `false` means nothing
     /// was sent, so a retry cannot duplicate it; `true` means the packet may
     /// have gone out and the caller must not assume it did not arrive.
@@ -244,7 +401,7 @@ impl std::fmt::Display for SendError {
                  given to --operator."
             ),
             SendError::Seal(reason) => write!(f, "could not seal the payload: {reason}"),
-            SendError::Transport { url, reason } | SendError::AnswerLost { url, reason } => {
+            SendError::Transport { url, reason, .. } | SendError::AnswerLost { url, reason } => {
                 write!(f, "POST {url}: {reason}")
             }
             SendError::Undecodable(reason) => write!(
@@ -276,13 +433,16 @@ fn read_key_file(path: &str) -> Result<ed25519_dalek::Keypair, SendError> {
             raw.len()
         ),
     })?;
-    let secret =
-        ed25519_dalek::SecretKey::from_bytes(&bytes).map_err(|error| SendError::KeyFile {
-            path: path.to_string(),
-            reason: error.to_string(),
-        })?;
+    Ok(key_from_bytes(bytes))
+}
+
+/// The ed25519 key pair whose secret is `bytes`. Any 32 bytes are a valid
+/// ed25519 secret, so this cannot fail.
+fn key_from_bytes(bytes: [u8; 32]) -> ed25519_dalek::Keypair {
+    let secret = ed25519_dalek::SecretKey::from_bytes(&bytes)
+        .expect("any 32 bytes are an ed25519 secret key");
     let public = ed25519_dalek::PublicKey::from(&secret);
-    Ok(ed25519_dalek::Keypair { secret, public })
+    ed25519_dalek::Keypair { secret, public }
 }
 
 /// 32 raw bytes, or 64 hex characters possibly followed by whitespace a
@@ -319,8 +479,17 @@ fn decode_key_bytes(raw: &[u8]) -> Option<[u8; 32]> {
 /// with the error it will give anyway, and inventing a second complaint about
 /// it here would only add a shape the caller has to tell apart from a real
 /// dial failure.
-fn client_for(url: &str, socks_proxy: Option<&Url>) -> Result<reqwest::Client, String> {
-    if !Url::parse(url).is_ok_and(|parsed| is_onion_endpoint(&parsed)) {
+///
+/// [`ProxyScope::EveryHost`] puts every URL on the proxy when one is named;
+/// with none named it changes nothing, and an onion URL is still refused.
+fn client_for(
+    url: &str,
+    socks_proxy: Option<&Url>,
+    scope: ProxyScope,
+) -> Result<reqwest::Client, String> {
+    let onion = Url::parse(url).is_ok_and(|parsed| is_onion_endpoint(&parsed));
+    let every_host = scope == ProxyScope::EveryHost && socks_proxy.is_some();
+    if !onion && !every_host {
         return Ok(reqwest::Client::new());
     }
     let proxy = socks_proxy.ok_or_else(|| NO_SOCKS_PROXY.to_string())?;
@@ -345,13 +514,14 @@ fn client_for(url: &str, socks_proxy: Option<&Url>) -> Result<reqwest::Client, S
 async fn fetch_identity(
     connector_url: &str,
     socks_proxy: Option<&Url>,
+    scope: ProxyScope,
 ) -> Result<PublicKeyBytes, SendError> {
     let url = format!("{}/identity", connector_url.trim_end_matches('/'));
     let fail = |reason: String| SendError::Identity {
         url: url.clone(),
         reason,
     };
-    let body: serde_json::Value = client_for(&url, socks_proxy)
+    let body: serde_json::Value = client_for(&url, socks_proxy, scope)
         .map_err(fail)?
         .get(&url)
         .send()
@@ -419,16 +589,115 @@ fn reject_accumulated_cost(header: Option<&[u8]>) -> Result<u64, SendError> {
         })
 }
 
+/// The envelope's headers: the default content type, unless the caller
+/// names its own, then the caller's headers in the order given.
+fn envelope_headers(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let names_content_type = extra
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+    let default =
+        (!names_content_type).then(|| ("content-type".to_string(), "application/json".to_string()));
+    default.into_iter().chain(extra.iter().cloned()).collect()
+}
+
+/// Read the operator surface's answer to a written `POST /packets`: a
+/// refused write, or the packet's FULFILL or REJECT.
+async fn read_answer(
+    response: reqwest::Response,
+    url: &str,
+    keyid: &str,
+    shared_secret: &[u8; 32],
+) -> Result<Outcome, SendError> {
+    let status = response.status();
+    let cost_header = response
+        .headers()
+        .get(connector_btp::ACCUMULATED_COST_HEADER)
+        .map(|value| value.as_bytes().to_vec());
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        // A non-2xx is a refused write whether or not its body arrives.
+        Err(error) if !status.is_success() => {
+            return Err(SendError::Transport {
+                url: url.to_string(),
+                reason: error.to_string(),
+                refusal: Some(Refusal::read(status.as_u16(), &[])),
+            })
+        }
+        Err(error) if error.is_timeout() => return Ok(Outcome::Unanswered),
+        Err(error) => {
+            return Err(SendError::AnswerLost {
+                url: url.to_string(),
+                reason: error.to_string(),
+            })
+        }
+    };
+
+    // A non-2xx here is the operator surface refusing the WRITE -- an
+    // unallowlisted key, a stale signature, a replayed one -- and never a
+    // packet-level answer. Naming the keyid is the whole point: 401/403 from
+    // this endpoint is almost always "that key is not in write_keys".
+    if !status.is_success() {
+        return Err(SendError::Transport {
+            url: url.to_string(),
+            reason: format!(
+                "{status} -- {}. The write was refused before any packet was formed; check that \
+                 keyid {keyid} is on the target node's [operator] write_keys.",
+                String::from_utf8_lossy(&bytes).trim()
+            ),
+            refusal: Some(Refusal::read(status.as_u16(), &bytes)),
+        });
+    }
+
+    Ok(match Fulfill::decode(&bytes) {
+        Ok(fulfill) => {
+            if fulfill.fulfillment != derive_fulfillment(shared_secret) {
+                Outcome::FulfilledWithWrongFulfillment
+            } else {
+                let opened = open_response(shared_secret, &fulfill.data)
+                    .map_err(|error| SendError::Undecodable(error.to_string()))?;
+                let envelope = EnvelopeResponse::decode(&opened)
+                    .map_err(|error| SendError::Undecodable(error.to_string()))?;
+                Outcome::Fulfilled {
+                    status: envelope.status,
+                    body: envelope.body,
+                }
+            }
+        }
+        Err(fulfill_error) => match Reject::decode(&bytes) {
+            Ok(reject) => Outcome::Rejected {
+                code: reject.code.as_str().to_string(),
+                message: reject.message,
+                accumulated_cost: reject_accumulated_cost(cost_header.as_deref())?,
+            },
+            Err(reject_error) => {
+                return Err(SendError::Undecodable(format!(
+                    "not a FULFILL ({fulfill_error}) and not a REJECT ({reject_error})"
+                )))
+            }
+        },
+    })
+}
+
 /// Form the packet, sign the write, and hand it to the operator surface.
 pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
-    let keypair = read_key_file(&options.operator_key_file)?;
+    let keypair = options.operator_key.keypair()?;
     let keyid = keyid_hex(&keypair);
-    let identity = fetch_identity(&options.seal_to, options.socks_proxy.as_ref()).await?;
+    let identity = match options.seal_key {
+        Some(pinned) => pinned,
+        None => {
+            fetch_identity(
+                &options.seal_to,
+                options.socks_proxy.as_ref(),
+                options.proxy_scope,
+            )
+            .await?
+        }
+    };
 
     let plaintext = EnvelopeRequest {
         method: options.method.clone(),
         target: options.target.clone(),
-        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        headers: envelope_headers(&options.headers),
         body: options.body.clone(),
     }
     .encode();
@@ -468,93 +737,42 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
     // The second of the two dials, judged on its own URL (ADR 0070 decision
     // 5). The identity fetch above is already done and its verdict has no
     // bearing here.
-    let response = client_for(&url, options.socks_proxy.as_ref())
+    let mut request = client_for(&url, options.socks_proxy.as_ref(), options.proxy_scope)
         .map_err(|reason| SendError::Transport {
             url: url.clone(),
             reason,
+            refusal: None,
         })?
         .post(&url)
         .header("content-type", "application/octet-stream")
         .header("content-digest", content_digest)
         .header("signature-input", signature_input)
         .header("signature", signature)
-        .body(body)
-        .send()
-        .await
-        .map_err(|error| {
-            // Only a failed dial (or an unbuildable request) is certain to
-            // have written nothing; any other failure may follow the write.
-            let reason = error.to_string();
-            if error.is_connect() || error.is_builder() {
-                SendError::Transport {
-                    url: url.clone(),
-                    reason,
-                }
-            } else {
-                SendError::AnswerLost {
-                    url: url.clone(),
-                    reason,
-                }
-            }
-        })?;
-
-    let status = response.status();
-    let cost_header = response
-        .headers()
-        .get(connector_btp::ACCUMULATED_COST_HEADER)
-        .map(|value| value.as_bytes().to_vec());
-    let bytes = response.bytes().await.map_err(|error| {
-        // A non-2xx is a refused write whether or not its body arrives.
-        let (url, reason) = (url.clone(), error.to_string());
-        if status.is_success() {
-            SendError::AnswerLost { url, reason }
-        } else {
-            SendError::Transport { url, reason }
-        }
-    })?;
-
-    // A non-2xx here is the operator surface refusing the WRITE -- an
-    // unallowlisted key, a stale signature, a replayed one -- and never a
-    // packet-level answer. Naming the keyid is the whole point: 401/403 from
-    // this endpoint is almost always "that key is not in write_keys".
-    if !status.is_success() {
-        return Err(SendError::Transport {
-            url,
-            reason: format!(
-                "{status} -- {}. The write was refused before any packet was formed; check that \
-                 keyid {keyid} is on the target node's [operator] write_keys.",
-                String::from_utf8_lossy(&bytes).trim()
-            ),
-        });
+        .body(body);
+    if let Some(wait) = options.wait {
+        request = request.timeout(wait);
     }
-
-    let outcome = match Fulfill::decode(&bytes) {
-        Ok(fulfill) => {
-            if fulfill.fulfillment != derive_fulfillment(&shared_secret) {
-                Outcome::FulfilledWithWrongFulfillment
-            } else {
-                let opened = open_response(&shared_secret, &fulfill.data)
-                    .map_err(|error| SendError::Undecodable(error.to_string()))?;
-                let envelope = EnvelopeResponse::decode(&opened)
-                    .map_err(|error| SendError::Undecodable(error.to_string()))?;
-                Outcome::Fulfilled {
-                    status: envelope.status,
-                    body: envelope.body,
-                }
-            }
+    let outcome = match request.send().await {
+        // Only a failed dial (or an unbuildable request) is certain to have
+        // written nothing; any other failure may follow the write.
+        Err(error) if error.is_connect() || error.is_builder() => {
+            return Err(SendError::Transport {
+                url,
+                reason: error.to_string(),
+                refusal: None,
+            })
         }
-        Err(fulfill_error) => match Reject::decode(&bytes) {
-            Ok(reject) => Outcome::Rejected {
-                code: reject.code.as_str().to_string(),
-                message: reject.message,
-                accumulated_cost: reject_accumulated_cost(cost_header.as_deref())?,
-            },
-            Err(reject_error) => {
-                return Err(SendError::Undecodable(format!(
-                    "not a FULFILL ({fulfill_error}) and not a REJECT ({reject_error})"
-                )))
-            }
-        },
+        // The wait ran out. Counted as after the write even when it ran out
+        // while dialing: a caller told "nothing was sent" may send again and
+        // pay twice, so the doubt goes the safe way.
+        Err(error) if error.is_timeout() => Outcome::Unanswered,
+        Err(error) => {
+            return Err(SendError::AnswerLost {
+                url,
+                reason: error.to_string(),
+            })
+        }
+        Ok(response) => read_answer(response, &url, &keyid, &shared_secret).await?,
     };
 
     if options.expect_fulfill && !matches!(outcome, Outcome::Fulfilled { .. }) {
@@ -572,6 +790,9 @@ pub async fn send(options: &SendOptions) -> Result<SendOutcome, SendError> {
                     .to_string()
             }
             Outcome::NotSent => "--dry-run sends nothing, so nothing can be fulfilled".to_string(),
+            Outcome::Unanswered => {
+                "no answer came within the wait, so the packet may have been delivered".to_string()
+            }
             Outcome::Fulfilled { .. } => unreachable!("guarded by the matches! above"),
         }));
     }
@@ -640,7 +861,7 @@ mod tests {
         let public_key_hex = "0x04".to_owned() + &"cd".repeat(64);
         let connector_url = serve_identity(public_key_hex.clone());
 
-        let identity = fetch_identity(&connector_url, None)
+        let identity = fetch_identity(&connector_url, None, ProxyScope::OnionOnly)
             .await
             .expect("the served /ilp/identity must be readable from the /ilp URL");
 
@@ -656,7 +877,7 @@ mod tests {
         let connector_url = serve_identity(public_key_hex.clone());
         let with_slash = format!("{connector_url}/");
 
-        let identity = fetch_identity(&with_slash, None)
+        let identity = fetch_identity(&with_slash, None, ProxyScope::OnionOnly)
             .await
             .expect("a trailing slash on --seal-to must still resolve");
 
@@ -676,7 +897,7 @@ mod tests {
         drop(listener);
         let connector_url = format!("http://{addr}/ilp");
 
-        let error = fetch_identity(&connector_url, None)
+        let error = fetch_identity(&connector_url, None, ProxyScope::OnionOnly)
             .await
             .expect_err("nothing is listening on this port");
 
@@ -895,15 +1116,19 @@ mod tests {
     ) -> SendOptions {
         SendOptions {
             operator_url: operator_url.to_string(),
-            operator_key_file: key_file.path().display().to_string(),
+            operator_key: OperatorKey::File(key_file.path().display().to_string()),
             destination: "g.example.app".to_string(),
             amount: 1,
             seal_to: seal_to.to_string(),
+            seal_key: None,
             target: "/".to_string(),
             method: "POST".to_string(),
             body: Vec::new(),
+            headers: Vec::new(),
             expires_in_seconds: 60,
+            wait: None,
             socks_proxy,
+            proxy_scope: ProxyScope::OnionOnly,
             dry_run: false,
             expect_fulfill: false,
         }
@@ -919,7 +1144,12 @@ mod tests {
     async fn an_onion_seal_to_is_fetched_through_the_proxy() {
         let proxy = Socks5TestServer::spawn_recording_only().await;
 
-        let failed = fetch_identity(&onion_seal_to(), Some(&proxy.proxy_url())).await;
+        let failed = fetch_identity(
+            &onion_seal_to(),
+            Some(&proxy.proxy_url()),
+            ProxyScope::OnionOnly,
+        )
+        .await;
 
         assert!(
             failed.is_err(),
@@ -949,6 +1179,7 @@ mod tests {
         let failed = fetch_identity(
             &format!("http://{ANYONE_HOST}/ilp"),
             Some(&proxy.proxy_url()),
+            ProxyScope::OnionOnly,
         )
         .await;
 
@@ -975,9 +1206,13 @@ mod tests {
         let connector_url = serve_identity(public_key_hex.clone());
         let proxy = Socks5TestServer::spawn_recording_only().await;
 
-        let identity = fetch_identity(&connector_url, Some(&proxy.proxy_url()))
-            .await
-            .expect("a clearnet self-description is reachable without the proxy");
+        let identity = fetch_identity(
+            &connector_url,
+            Some(&proxy.proxy_url()),
+            ProxyScope::OnionOnly,
+        )
+        .await
+        .expect("a clearnet self-description is reachable without the proxy");
 
         let expected = decode_hex(&public_key_hex).expect("the identity is hex");
         assert_eq!(identity.as_slice(), expected.as_slice());
@@ -1000,9 +1235,13 @@ mod tests {
         let upstream = serve_identity_at(public_key_hex.clone());
         let proxy = Socks5TestServer::spawn(HashMap::from([(onion_target(), upstream)])).await;
 
-        let identity = fetch_identity(&onion_seal_to(), Some(&proxy.proxy_url()))
-            .await
-            .expect("the proxy routes this name to a listener that is really there");
+        let identity = fetch_identity(
+            &onion_seal_to(),
+            Some(&proxy.proxy_url()),
+            ProxyScope::OnionOnly,
+        )
+        .await
+        .expect("the proxy routes this name to a listener that is really there");
 
         let expected = decode_hex(&public_key_hex).expect("the identity is hex");
         assert_eq!(identity.as_slice(), expected.as_slice());
@@ -1019,7 +1258,7 @@ mod tests {
     /// is the one thing they have to change.
     #[tokio::test]
     async fn with_no_proxy_an_onion_seal_to_is_refused_before_any_lookup() {
-        let refused = fetch_identity(&onion_seal_to(), None)
+        let refused = fetch_identity(&onion_seal_to(), None, ProxyScope::OnionOnly)
             .await
             .expect_err("no proxy, no way to reach a .onion");
 
@@ -1262,5 +1501,379 @@ mod tests {
         .await
         .expect("a wrong fulfilment is an outcome, not an error");
         assert_eq!(outcome.outcome, Outcome::FulfilledWithWrongFulfillment);
+    }
+
+    // ── What an embedding program hands `send` (issue #1704) ──
+
+    /// The 32-byte ed25519 secret a terminating fake accepts writes from.
+    const WRITE_KEY: [u8; 32] = [5u8; 32];
+
+    /// A fake operator surface that terminates what it is handed, the way a
+    /// node whose route this is would: it accepts a write only if it was
+    /// signed by `write_key`, opens the wrap with `identity`, and answers a
+    /// FULFILL whose sealed body is the opened envelope's headers, as JSON.
+    ///
+    /// The signature is checked by signing the same request again with
+    /// `write_key` at the `created` and `expires` the request names: ed25519
+    /// is deterministic, so only the same key produces the same signature.
+    fn serve_terminating_operator(
+        identity: std::sync::Arc<LocalSigner>,
+        write_key: [u8; 32],
+    ) -> std::net::SocketAddr {
+        use axum::body::Bytes;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        use connector_signer::giftwrap::{open_request, seal_response};
+
+        serve_app(Router::new().route(
+            "/packets",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let identity = identity.clone();
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let input = header("signature-input");
+                    let param = |name: &str| {
+                        input
+                            .split(';')
+                            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                            .and_then(|value| value.parse::<u64>().ok())
+                    };
+                    let keypair = key_from_bytes(write_key);
+                    let (expected_input, expected_signature, _) = sign_request(
+                        &keypair,
+                        "POST",
+                        PACKETS_PATH,
+                        &body,
+                        param("created").unwrap_or_default(),
+                        param("expires"),
+                    );
+                    if header("signature") != expected_signature || input != expected_input {
+                        return (StatusCode::UNAUTHORIZED, "signature does not verify")
+                            .into_response();
+                    }
+                    let prepare = Prepare::decode(&body).expect("a PREPARE");
+                    let (plaintext, secret) =
+                        open_request(&prepare.data, identity.as_ref()).expect("sealed to us");
+                    let envelope = EnvelopeRequest::decode(&plaintext).expect("an envelope");
+                    let answer = EnvelopeResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: serde_json::to_vec(&envelope.headers).expect("headers as JSON"),
+                    }
+                    .encode();
+                    Fulfill {
+                        fulfillment: derive_fulfillment(&secret),
+                        data: seal_response(&secret, &answer),
+                    }
+                    .encode()
+                    .into_response()
+                }
+            }),
+        ))
+    }
+
+    /// The headers the terminating fake's app was handed, read off a
+    /// fulfilled outcome.
+    fn headers_the_app_saw(outcome: &SendOutcome) -> Vec<(String, String)> {
+        let Outcome::Fulfilled { status, body } = &outcome.outcome else {
+            panic!("expected a FULFILL: {outcome:?}");
+        };
+        assert_eq!(*status, 200);
+        serde_json::from_slice(body).expect("the fake answers the headers as JSON")
+    }
+
+    /// A terminating identity, and its public key as `/ilp/identity`
+    /// publishes it.
+    fn terminating_identity() -> (std::sync::Arc<LocalSigner>, PublicKeyBytes) {
+        let signer = LocalSigner::generate("terminating-node");
+        let public = signer
+            .public_key()
+            .expect("a local signer has a public key");
+        (std::sync::Arc::new(signer), public)
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// `send` with the terminating fake's write key in memory and nothing
+    /// else changed.
+    fn options_for(operator: std::net::SocketAddr, seal_to: &str) -> SendOptions {
+        SendOptions {
+            operator_key: OperatorKey::InMemory(WRITE_KEY),
+            ..send_options(
+                &format!("http://{operator}"),
+                seal_to,
+                &operator_key_file(),
+                None,
+            )
+        }
+    }
+
+    /// Extra headers ride in the envelope, after the default content type,
+    /// and a caller's own `content-type` replaces that default.
+    #[tokio::test]
+    async fn extra_headers_arrive_in_the_apps_opened_envelope() {
+        let (identity, public) = terminating_identity();
+        let seal_to = serve_identity(hex_of(&public));
+        let operator = serve_terminating_operator(identity, WRITE_KEY);
+
+        let mut options = options_for(operator, &seal_to);
+        options.headers = vec![("authorization".to_string(), "Nostr abc".to_string())];
+        let outcome = send(&options).await.expect("delivered");
+        assert_eq!(
+            headers_the_app_saw(&outcome),
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("authorization".to_string(), "Nostr abc".to_string()),
+            ]
+        );
+
+        options.headers = vec![
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("x-one".to_string(), "1".to_string()),
+        ];
+        let outcome = send(&options).await.expect("delivered");
+        assert_eq!(
+            headers_the_app_saw(&outcome),
+            vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("x-one".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    /// A key held in memory signs a write the surface accepts -- and the
+    /// surface really checks: the same send signed by another key is refused.
+    #[tokio::test]
+    async fn a_key_in_memory_signs_a_write_the_surface_accepts() {
+        let (identity, public) = terminating_identity();
+        let seal_to = serve_identity(hex_of(&public));
+        let operator = serve_terminating_operator(identity, WRITE_KEY);
+
+        let mut options = options_for(operator, &seal_to);
+        let outcome = send(&options).await.expect("the write is accepted");
+        assert!(matches!(outcome.outcome, Outcome::Fulfilled { .. }));
+        assert_eq!(outcome.keyid, keyid_hex(&key_from_bytes(WRITE_KEY)));
+
+        options.operator_key = OperatorKey::InMemory([6u8; 32]);
+        let refused = send(&options).await.expect_err("another key is refused");
+        assert!(!refused.was_sent(), "{refused:?}");
+    }
+
+    /// A key in memory is never printed.
+    #[test]
+    fn a_key_in_memory_is_not_in_the_debug_output() {
+        let printed = format!("{:?}", OperatorKey::InMemory([0xab; 32]));
+        assert!(
+            !printed.contains("171") && !printed.contains("ab"),
+            "{printed}"
+        );
+    }
+
+    /// A self-description listener that counts the identity requests it is
+    /// asked.
+    fn serve_counted_identity(
+        public_key_hex: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let addr = serve_app(Router::new().route(
+            "/ilp/identity",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let public_key_hex = public_key_hex.clone();
+                async move { Json(serde_json::json!({ "publicKey": public_key_hex })) }
+            }),
+        ));
+        (format!("http://{addr}/ilp"), asked)
+    }
+
+    /// A pinned seal key is sealed to directly: no identity is fetched, and
+    /// the terminating node still opens the wrap and fulfils.
+    #[tokio::test]
+    async fn a_pinned_seal_key_makes_no_identity_request() {
+        use std::sync::atomic::Ordering;
+        let (identity, public) = terminating_identity();
+        let (seal_to, asked) = serve_counted_identity(hex_of(&public));
+        let operator = serve_terminating_operator(identity, WRITE_KEY);
+
+        let mut options = options_for(operator, &seal_to);
+        options.seal_key = Some(public);
+        let outcome = send(&options).await.expect("delivered");
+        assert!(
+            matches!(outcome.outcome, Outcome::Fulfilled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no identity request");
+
+        options.seal_key = None;
+        send(&options).await.expect("delivered");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "unpinned, it is fetched");
+    }
+
+    /// An every-host proxy carries a clearnet dial too: both the identity
+    /// fetch and the operator write leave through the SOCKS5 server, by name,
+    /// and the packet is delivered.
+    #[tokio::test]
+    async fn an_every_host_proxy_dials_a_clearnet_url_through_the_proxy() {
+        let (identity, public) = terminating_identity();
+        let identity_listener = serve_identity_at(hex_of(&public));
+        let operator = serve_terminating_operator(identity, WRITE_KEY);
+        let proxy = Socks5TestServer::spawn(HashMap::from([
+            ("identity.example.com:80".to_string(), identity_listener),
+            ("operator.example.com:80".to_string(), operator),
+        ]))
+        .await;
+
+        let mut options = options_for(operator, "http://identity.example.com/ilp");
+        options.operator_url = "http://operator.example.com".to_string();
+        options.socks_proxy = Some(proxy.proxy_url());
+        options.proxy_scope = ProxyScope::EveryHost;
+        let outcome = send(&options).await.expect("delivered through the proxy");
+
+        assert!(
+            matches!(outcome.outcome, Outcome::Fulfilled { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            proxy.targets(),
+            vec![
+                "identity.example.com:80".to_string(),
+                "operator.example.com:80".to_string()
+            ]
+        );
+    }
+
+    /// The onion-only scope -- the default, and all `connector send` sets --
+    /// still dials a clearnet URL direct with a proxy named.
+    #[test]
+    fn the_default_proxy_scope_is_onion_only() {
+        assert_eq!(ProxyScope::default(), ProxyScope::OnionOnly);
+    }
+
+    /// A wait that runs out after the request was written is *unanswered*:
+    /// an outcome, since the packet may have been delivered and paid for,
+    /// and not a transport error.
+    #[tokio::test]
+    async fn a_wait_that_runs_out_after_the_write_is_unanswered() {
+        use std::io::Read;
+        let seal_to = serve_identity(a_real_identity());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (written, was_written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Read the request up to its end, then hold the connection open
+            // and answer nothing.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read the request");
+                assert!(read > 0, "the request ended before it was written");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            written.send(()).expect("report the write");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            drop(stream);
+        });
+
+        let mut options = options_for(addr, &seal_to);
+        options.wait = Some(std::time::Duration::from_millis(300));
+        let outcome = send(&options).await.expect("unanswered is an outcome");
+
+        was_written
+            .try_recv()
+            .expect("the request was written before the wait ran out");
+        assert_eq!(outcome.outcome, Outcome::Unanswered);
+
+        options.expect_fulfill = true;
+        let error = send(&options).await.expect_err("not fulfilled");
+        assert!(matches!(error, SendError::NotFulfilled(_)), "{error:?}");
+        assert!(error.was_sent());
+    }
+
+    /// A real socket answering `POST /packets` with `status` and `body`.
+    fn serve_operator_refusal(status: u16, body: &'static str) -> std::net::SocketAddr {
+        serve_app(Router::new().route(
+            "/packets",
+            post(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).expect("a status"),
+                    body,
+                )
+            }),
+        ))
+    }
+
+    /// A `403` names its reason first (ADR 0078 decision 9), and `send`
+    /// returns that reason as a value on the refusal, beside the status and
+    /// the surface's own words.
+    #[tokio::test]
+    async fn a_refusals_reason_comes_back_as_a_value() {
+        let seal_to = serve_identity(a_real_identity());
+        // The bodies the operator surface writes, word for word.
+        let cases = [
+            (
+                403,
+                "spending-limit: a packet of 11 is above this key's per-packet figure of 10 \
+                 (ADR 0078)",
+                Some(RefusalReason::SpendingLimit),
+            ),
+            (
+                403,
+                "scope: this key's scope does not include 'packets' (ADR 0078)",
+                Some(RefusalReason::Scope),
+            ),
+            (
+                403,
+                "expiry: this key has expired (ADR 0078)",
+                Some(RefusalReason::Expiry),
+            ),
+            (
+                403,
+                "deposit-limit: a deposit of 5 is above this key's per-write figure of 4 \
+                 (ADR 0078)",
+                Some(RefusalReason::DepositLimit),
+            ),
+            (401, "keyid is not on the operator write allowlist", None),
+            (403, "spending-limit and nothing else", None),
+        ];
+        for (status, body, reason) in cases {
+            let operator = serve_operator_refusal(status, body);
+            let error = send(&options_for(operator, &seal_to))
+                .await
+                .expect_err("a refused write is an error");
+            assert!(!error.was_sent(), "{body}: {error:?}");
+            assert_eq!(
+                error.refusal(),
+                Some(&Refusal {
+                    status,
+                    reason,
+                    body: body.to_string(),
+                }),
+                "{body}"
+            );
+        }
+    }
+
+    /// A dial that never connects was refused by nobody.
+    #[tokio::test]
+    async fn a_failed_dial_carries_no_refusal() {
+        let seal_to = serve_identity(a_real_identity());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        let error = send(&options_for(addr, &seal_to))
+            .await
+            .expect_err("nothing listens there");
+        assert_eq!(error.refusal(), None, "{error:?}");
     }
 }

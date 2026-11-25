@@ -4,6 +4,9 @@
 is a spelling: `.anyone` is a host on the same terms `.onion` is — see the Amendment below).
 **Decision 4's settlement half is amended by [0073](0073-settlement-rpc-may-ride-the-circuit-once-every-wait-on-it-is-bounded.md)**:
 a settlement table may opt its RPC onto the proxy (see the note under decision 4).
+**Decision 5 is amended in place by issue #1704**: a program that calls the exported
+`connector_cli::send` may ask for every dial to go through the proxy, while `connector send
+--socks-proxy` keeps the host-selected rule (see the second Amendment below).
 Extends
 [0027](0027-connectors-peer-over-btp-or-http-and-the-raw-tcp-peer-wire-is-deleted.md) by naming what
 an onion endpoint is _not_: it adds no third carriage and reopens nothing 0027 closed. Narrows
@@ -125,6 +128,9 @@ this record makes no anonymity claim beyond that sentence.
 5. **`connector send` takes a `--socks-proxy <url>` flag.** That verb parses flags and loads no
    config file, so there is nowhere for a config section to reach it. It applies the same
    host-selected rule to both URLs it dials — `--operator` and `--seal-to`.
+
+   _Amended by issue #1704:_ the library function under the verb may proxy every dial when its
+   caller asks (`ProxyScope::EveryHost`). The flag still sets only the host-selected rule.
 
 6. **No new `[node]` key.** A `.onion` URL is a legal value for the existing `http_endpoint` and
    `btp_endpoint`. An onion-only node has no clearnet endpoint to lose, and issue #1220's rule —
@@ -252,3 +258,32 @@ name must never mean again is _one_ spelling: that reading is what this amendmen
 release binary, sha256-verified, onto that image, and both hidden-service topologies use it. The
 committed placeholder hosts are spelled `.anyone` to match what that daemon actually writes, and
 `local_topologies_load.rs` holds the placeholder's TLD and the image's pinned version to one fact.
+
+## Amendment (issue #1704): a library caller may proxy every dial
+
+`connector send` is now one caller of an exported function, `connector_cli::send` (#1703). Its
+other caller is a program that embeds the connector crates — `toon_cli` is the first — and that
+program can sit behind an overlay of its own: a node published only as a hidden service, whose
+operator does not want any byte of its traffic to leave by the clearnet route. Under decision 5 such
+a program could not send to a clearnet connector without its own copy of the send sequence, because
+the function dialed every non-onion host direct. `toon_cli` kept that copy, and the copy is what
+this amendment lets it delete.
+
+**`SendOptions` carries a proxy scope.** `ProxyScope::OnionOnly` is decision 5's host-selected
+rule, unchanged, and the default. `ProxyScope::EveryHost` puts both dials — the operator surface
+and the self-description fetched for the seal key — on the named `socks5h://` proxy, onion or not.
+With no proxy named, `EveryHost` changes nothing, and an onion URL is still refused before any
+lookup.
+
+**The verb keeps the host-selected rule.** `connector send --socks-proxy` sets `OnionOnly` and
+nothing else; no flag selects `EveryHost`. The operator probing a node by hand gets exactly the
+behaviour decision 5 describes, and the mixed case it protects — an onion URL and a clearnet URL in
+one invocation, each taking its own path — is still what the verb does.
+
+**Why this does not reopen "proxy every outbound dial".** That option was rejected for the
+**node**: a configured proxy that silently reroutes every peering and every settlement client, with
+no way back for the mixed case. Nothing here touches the node. The node's peer dials and settlement
+RPC are still selected by host and by decision 4 (as amended by 0073), the root `socks_proxy` key
+has no new mode, and `is_onion_endpoint` is still the one implementation of the host rule. The
+every-host scope is a parameter a calling program passes on one send, chosen by the program that
+knows it is behind an overlay, and it reroutes only that send's two dials.
