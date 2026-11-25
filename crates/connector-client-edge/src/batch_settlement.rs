@@ -1,19 +1,21 @@
-//! What the client edge's claim gate needs from an x402 `batch-settlement`
-//! backend to admit a **voucher** (ADR 0074, issue #1341): the seam between
-//! the gate, which owns freshness, signature verification and the journal,
-//! and the receive-only settlement port (#1340) whose EVM and Solana
-//! implementations (#1342, #1343) own admission and collateral.
+//! How the client edge's claim gate finds a **voucher**'s channel (ADR 0074,
+//! issue #1341; spec #1684, issue #1714): through the node's settlement
+//! networks, one collection keyed by CAIP-2 network
+//! ([`connector_runtime::SettlementNetworks`]). The gate owns freshness,
+//! signature verification and the journal; each network's batch settlement
+//! port owns admission and collateral.
 //!
 //! # The seam
 //!
-//! **Whether a node accepts vouchers at all is whether its gate was given one
-//! of these** ([`crate::ClientClaimGate::with_batch_settlement`]). A gate
-//! without one refuses every voucher by name
+//! **Whether a node accepts vouchers at all is whether its gate was given a
+//! settlement network** ([`crate::ClientClaimGate::with_settlement_networks`]).
+//! A gate settling on none refuses every voucher by name
 //! ([`crate::ClaimIngestRejection::BatchSettlementNotAccepted`]) -- ADR 0074
-//! decision 1's "off unless configured". `connector-cli`'s runtime passes
-//! one exactly when a `[settlement.<chain>]` table is
-//! written, adapting that chain's receive-only settlement port to this
-//! trait.
+//! decision 1's "off unless configured". A voucher's own `network` picks the
+//! one network asked about its channel (ADR 0086), and nothing here matches
+//! on the chain to find it: [`VoucherChannels`] looks the network up, presents
+//! the channel to its receiving half in the port's spelling and reads back
+//! what the gate verifies against.
 //!
 //! # What the journal remembers
 //!
@@ -22,48 +24,54 @@
 //! config could never `claim` a voucher it had already accepted. The gate
 //! therefore journals each channel it accepts a first voucher on as a
 //! [`JournalEntry::BatchChannelAdmitted`], in the same batch as the voucher,
-//! and [`journaled_batch_channels`] reads them back: the gate, to hand a
-//! known channel's config to [`BatchSettlementChannels::evm`] when a later
-//! voucher carries none, and the runtime, to restore every such channel to
-//! its backend at boot.
+//! and [`journaled_batch_channels`] reads them back: the gate, to present a
+//! known channel's config when a later voucher carries none, and the runtime,
+//! to restore every such channel to its network at boot.
 //!
-//! # What an implementation owes
+//! # What a network admits
 //!
-//! Only channels it would **admit** (ADR 0074 decisions 2 and 5): on EVM,
-//! `receiver` and `receiverAuthorizer` both this connector's settlement
+//! Only channels its port would **admit** (ADR 0074 decisions 2 and 5): on
+//! EVM, `receiver` and `receiverAuthorizer` both this connector's settlement
 //! address, a token it settles in, a `withdrawDelay` at or above its
-//! published minimum, and a nonzero `payerAuthorizer`; on Solana, a channel account whose PDA re-derives from its own
-//! seeds, Open, with `payee` and `rent_payer` this connector's sponsor key,
-//! a mint it settles in, a one-recipient `distribution_hash` and a
-//! `grace_period` at or above its minimum. Anything else is `Ok(None)`,
-//! which the gate reports as an unknown channel.
+//! published minimum, and a nonzero `payerAuthorizer`; on Solana, a channel
+//! account whose PDA re-derives from its own seeds, Open, with `payee` and
+//! `rent_payer` this connector's sponsor key, a mint it settles in, a
+//! one-recipient `distribution_hash` and a `grace_period` at or above its
+//! minimum. Anything else is an unknown channel.
 //!
-//! The gate takes the signer from what this returns and nothing else: the
+//! The gate takes the signer from what the port reads and nothing else: the
 //! verified `ChannelConfig` on EVM, `authorized_signer` on Solana (ADR 0074
-//! decision 4). And it takes `max_cumulative` as the collateral bound
+//! decision 4), the `PublicKey` on XRPL. And it takes the collateral bound
 //! without caching it, because on EVM that figure can fall (decision 5):
 //! keeping it current -- dropping a cache on `WithdrawInitiated` -- is the
-//! implementation's job.
+//! port's job.
 
-use async_trait::async_trait;
+use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard};
+
 use connector_domain::client_claim::{
     canonical_channel_key, EVM_NAMESPACE, SOLANA_NAMESPACE, XRPL_CHANNEL_NAMESPACE,
 };
-use connector_domain::{JournalEntry, Network, XrplNetwork};
-use connector_runtime::JournalError;
+use connector_domain::{AssetChain, JournalEntry, Network, XrplNetwork};
+use connector_runtime::{JournalError, SettlementNetwork, SettlementNetworks};
+use connector_settlement::batch::{
+    BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
+    EvmChannelConfig, VoucherSigner,
+};
+use connector_settlement::ChannelId;
 use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
 
-use crate::channels::ChannelResolutionError;
+use crate::channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 
 /// An EVM batch-settlement channel this connector admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmittedEvmVoucherChannel {
     /// The channel's `ChannelConfig`. The gate re-hashes it and refuses a
-    /// config that does not hash to the channel the voucher names, so an
-    /// implementation that got this wrong fails closed.
+    /// config that does not hash to the channel the voucher names, so a
+    /// lookup that got this wrong fails closed.
     pub config: BatchChannelConfig,
     /// The highest cumulative amount a voucher on this channel may name and
-    /// still be claimable -- the backend's current reading of the channel's
+    /// still be claimable -- the port's current reading of the channel's
     /// escrow, net of any pending withdrawal (ADR 0074 decision 5). `u128`
     /// (ADR 0074 decision 3, amended 2026-09-30 #1429), matching an EVM
     /// voucher's own width.
@@ -95,100 +103,246 @@ pub struct AdmittedXrplVoucherChannel {
     pub max_cumulative: u64,
 }
 
-/// A batch-settlement backend, as the claim gate sees it. See this module's
-/// doc for the seam it is and what an implementation owes.
-#[async_trait]
-pub trait BatchSettlementChannels: Send + Sync + std::fmt::Debug {
-    /// The EIP-712 domain of each EVM network this node settles on -- its
-    /// chain id and `x402BatchSettlement`'s address, one per
-    /// `[settlement.eip155.<chainId>]` table (ADR 0086 decision 4) -- in
-    /// table order. Empty if this node has not opted in to EVM vouchers.
-    fn evm_domains(&self) -> Vec<BatchSettlementDomain>;
+/// The claim gate's view of the node's settlement networks: finds a
+/// voucher's channel on the network the voucher names, and on no other.
+///
+/// Remembers every channel it has seen admitted in this process. A network's
+/// port also answers for channels it only **restored** -- ones the journal
+/// holds vouchers on, brought back at boot without judging them (ADR 0074
+/// decision 5) -- so "the port can read it" is not "a new voucher may be
+/// accepted on it". A channel not yet admitted here is admitted, under this
+/// node's current rules, before its first new voucher.
+pub(crate) struct VoucherChannels {
+    networks: SettlementNetworks,
+    admitted: Mutex<HashSet<ChannelId>>,
+}
 
-    /// The domain vouchers on EVM chain `chain_id` are verified under, if
-    /// this node settles on that network.
-    fn evm_domain_on(&self, chain_id: u64) -> Option<BatchSettlementDomain> {
-        self.evm_domains()
-            .into_iter()
-            .find(|domain| domain.chain_id == chain_id)
-    }
-
-    /// Whether this node has opted in to EVM vouchers on any network.
-    fn accepts_evm(&self) -> bool {
-        !self.evm_domains().is_empty()
-    }
-
-    /// The CAIP-2 network this node settles Solana vouchers on
-    /// (`solana:<genesis prefix>`, as its greeting publishes it), or `None`
-    /// if it has not opted in to Solana vouchers. A Solana voucher's
-    /// `network` must equal it (ADR 0086 decision 1).
-    fn solana_network(&self) -> Option<Network>;
-
-    /// Whether this node has opted in to Solana vouchers.
-    fn accepts_solana(&self) -> bool {
-        self.solana_network().is_some()
-    }
-
-    /// Each XRPL network this node settles on, one per
-    /// `[settlement.xrpl.<id>]` table (ADR 0087), in table order. Empty if
-    /// this node has not opted in to XRPL vouchers.
-    fn xrpl_networks(&self) -> Vec<XrplNetwork> {
-        Vec::new()
-    }
-
-    /// Whether this node has opted in to XRPL vouchers on any network.
-    fn accepts_xrpl(&self) -> bool {
-        !self.xrpl_networks().is_empty()
-    }
-
-    /// Whether `network` names a settlement table this node has: on EVM,
-    /// the chain of the domain vouchers are verified under; on Solana, the
-    /// one Solana network. A voucher, claim-state entry or peer-role
-    /// challenge naming any other network is refused by name (ADR 0086
-    /// decision 1).
-    fn settles_on(&self, network: &Network) -> bool {
-        match network {
-            Network::Eip155(chain_id) => self.evm_domain_on(*chain_id).is_some(),
-            Network::Solana(_) => self.solana_network().as_ref() == Some(network),
-            // No settlement table holds MINA: a zk edge's vault is not one.
-            Network::Mina(_) => false,
-            Network::Xrpl(xrpl) => self.xrpl_networks().contains(xrpl),
+impl VoucherChannels {
+    pub(crate) fn new(networks: SettlementNetworks) -> VoucherChannels {
+        VoucherChannels {
+            networks,
+            admitted: Mutex::new(HashSet::new()),
         }
     }
 
-    /// The EVM channel `channel_id` on `network`, if this connector admits
-    /// it: asked of that network's backend and no other (ADR 0086). The gate
-    /// has already checked `channel_id` recomputes under `network`'s domain
-    /// whenever it holds a config. `presented_config` is the client's
-    /// `ChannelConfig` when the voucher
-    /// carried one, already checked by the gate to hash to `channel_id`; a
-    /// channel's first voucher carries one, and an implementation that has
-    /// never seen the channel and is given `None` has nothing to admit.
-    async fn evm(
+    /// Whether this node settles on `network` (ADR 0086 decision 1).
+    pub(crate) fn settles_on(&self, network: &Network) -> bool {
+        self.networks.settles_on(network)
+    }
+
+    /// Whether this node settles on any network of `chain`: what decides
+    /// between refusing a voucher as "not accepted here" and as "on a network
+    /// not settled".
+    pub(crate) fn settles_on_chain(&self, chain: AssetChain) -> bool {
+        self.networks
+            .iter()
+            .any(|held| held.network().chain() == chain)
+    }
+
+    /// The EIP-712 domain vouchers on EVM network `network` are verified
+    /// under -- its chain id and x402's `x402BatchSettlement`, a constant of
+    /// the binary (ADR 0075) -- if this node settles on that network.
+    pub(crate) fn evm_domain_on(&self, network: &Network) -> Option<BatchSettlementDomain> {
+        let chain_id = network.eip155_chain_id()?;
+        self.settles_on(network)
+            .then(|| BatchSettlementDomain::x402(chain_id))
+    }
+
+    /// The EVM channel `channel_id` on `network`, if that network admits it.
+    /// An EVM channel is found only from its config, since the contract
+    /// stores a hash: with none -- a voucher that carried none, on a channel
+    /// the gate has no record of -- nothing is asked.
+    pub(crate) async fn evm(
         &self,
         network: &Network,
         channel_id: &[u8; 32],
         presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError>;
+    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
+        let (Some(held), Some(config)) = (self.networks.get(network), presented_config) else {
+            return Ok(None);
+        };
+        let presentation = ChannelPresentation::Evm {
+            channel: evm_channel(channel_id),
+            config: port_config(config),
+        };
+        let state = self.state_of(held.as_ref(), presentation).await;
+        Ok(resolution(state)?.map(|state| AdmittedEvmVoucherChannel {
+            config: *config,
+            max_cumulative: state.voucher_ceiling(),
+        }))
+    }
 
-    /// The Solana channel account `channel_account`, if this connector
-    /// admits it.
-    async fn solana(
+    /// The Solana channel account `channel_account` on `network`, if that
+    /// network admits it.
+    pub(crate) async fn solana(
         &self,
+        network: &Network,
         channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError>;
+    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+        let Some(held) = self.networks.get(network) else {
+            return Ok(None);
+        };
+        let presentation = ChannelPresentation::Solana {
+            channel: solana_channel(channel_account),
+        };
+        let state = self.state_of(held.as_ref(), presentation).await;
+        Ok(
+            resolution(state)?.and_then(|state| match state.voucher_signer {
+                VoucherSigner::Solana(authorized_signer) => Some(AdmittedSolanaVoucherChannel {
+                    authorized_signer,
+                    max_cumulative: saturating_u64(&state),
+                }),
+                // A Solana network reporting another chain's signer is not a
+                // channel this gate can verify a voucher against.
+                VoucherSigner::Evm(_) | VoucherSigner::Xrpl(_) => None,
+            }),
+        )
+    }
 
-    /// The XRPL channel `channel_id` on `network`, if this connector admits
-    /// it: asked of that network's backend and no other. A channel id binds
-    /// no network (ADR 0087 decision 2), so the voucher's own `network` is
-    /// what picks the ledger to read. A node with no XRPL table admits
-    /// nothing.
-    async fn xrpl(
+    /// The XRPL channel `channel_id` on `network`, if that network admits
+    /// it. A channel id binds no network (ADR 0087 decision 2), so the
+    /// voucher's own `network` is what picks the ledger read.
+    pub(crate) async fn xrpl(
         &self,
-        _network: &XrplNetwork,
-        _channel_id: &[u8; 32],
+        network: &XrplNetwork,
+        channel_id: &[u8; 32],
     ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
-        Ok(None)
+        let Some(held) = self.networks.get(&Network::Xrpl(*network)) else {
+            return Ok(None);
+        };
+        let presentation = ChannelPresentation::Xrpl {
+            channel: xrpl_channel(channel_id),
+        };
+        let state = self.state_of(held.as_ref(), presentation).await;
+        Ok(
+            resolution(state)?.and_then(|state| match state.voucher_signer {
+                VoucherSigner::Xrpl(public_key) => Some(AdmittedXrplVoucherChannel {
+                    public_key,
+                    max_cumulative: saturating_u64(&state),
+                }),
+                // An XRPL network reporting another chain's signer is not a
+                // channel this gate can verify a voucher against.
+                VoucherSigner::Evm(_) | VoucherSigner::Solana(_) => None,
+            }),
+        )
+    }
+
+    /// The channel's state now, for a voucher the gate is about to accept:
+    /// one read for a channel admitted in this process, and admission --
+    /// which reads it too -- for one that was not. A channel the port only
+    /// restored is admitted here like any other, so a rule tightened since
+    /// its vouchers were accepted refuses its new ones.
+    async fn state_of(
+        &self,
+        network: &dyn SettlementNetwork,
+        presentation: ChannelPresentation,
+    ) -> Result<BatchChannelState, BatchSettlementError> {
+        let receiver: std::sync::Arc<dyn BatchSettlementBackend> = network.receiver();
+        let channel = presentation.channel().clone();
+        if self.admitted().contains(&channel) {
+            match receiver.channel_state(&channel).await {
+                Err(BatchSettlementError::ChannelNotAdmitted(_)) => {}
+                read => return read,
+            }
+        }
+        let state = receiver.admit(presentation).await?;
+        self.admitted().insert(channel);
+        Ok(state)
+    }
+
+    fn admitted(&self) -> MutexGuard<'_, HashSet<ChannelId>> {
+        self.admitted
+            .lock()
+            .expect("voucher channels lock poisoned")
+    }
+}
+
+impl std::fmt::Debug for VoucherChannels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("VoucherChannels")
+            .field(&self.networks)
+            .finish()
+    }
+}
+
+/// How a port answer reads to the gate.
+///
+/// * A channel that accepts vouchers is found.
+/// * One that no longer accepts them -- Solana `Closing` or `Sealed` -- is
+///   **terminal**: it exists, and no new voucher may be accepted on it (ADR
+///   0074 decisions 3 and 5).
+/// * One that does not exist, or that this node does not admit, is not
+///   found: the gate refuses it as an unknown channel. The admission refusal
+///   is logged, since an operator whose clients keep opening channels this
+///   node will not take wants to know why.
+/// * A chain that could not be read is a failed lookup, never an absence.
+fn resolution(
+    state: Result<BatchChannelState, BatchSettlementError>,
+) -> Result<Option<BatchChannelState>, ChannelResolutionError> {
+    match state {
+        Ok(state) if state.status.accepts_vouchers() => Ok(Some(state)),
+        Ok(state) => Err(ChannelResolutionError::Terminal(ChannelTerminal(format!(
+            "batch-settlement channel '{}' is {:?} and accepts no new voucher",
+            state.id, state.status
+        )))),
+        Err(BatchSettlementError::NotAdmissible { channel, refusal }) => {
+            tracing::info!(
+                %channel,
+                %refusal,
+                "refusing a voucher: its batch-settlement channel is not one this node admits"
+            );
+            Ok(None)
+        }
+        Err(
+            BatchSettlementError::ChannelNotFound(_)
+            | BatchSettlementError::ChannelIdMismatch { .. }
+            | BatchSettlementError::WrongChain { .. }
+            | BatchSettlementError::ChannelNotAdmitted(_),
+        ) => Ok(None),
+        Err(BatchSettlementError::ChannelSealed(channel)) => Err(ChannelResolutionError::Terminal(
+            ChannelTerminal(format!("batch-settlement channel '{channel}' is sealed")),
+        )),
+        Err(error) => Err(ChannelResolutionError::LookupFailed(ChannelLookupFailed(
+            error.to_string(),
+        ))),
+    }
+}
+
+/// The port's voucher ceiling in a `u64` chain's amounts: Solana's signed
+/// message and SPL amounts (ADR 0074 decision 3, amended 2026-09-30 #1429),
+/// XRPL's drops (ADR 0087 decision 2). A ceiling wider than any `u64` bounds
+/// nothing a voucher there can name, so it saturates: clamping a bound down
+/// loses no value, where a voucher amount narrowed must never be truncated.
+/// EVM's ceiling is `u128` and never narrows.
+fn saturating_u64(state: &BatchChannelState) -> u64 {
+    u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
+}
+
+/// An XRPL channel id as the port spells it: 64 lowercase hex, no prefix.
+fn xrpl_channel(channel_id: &[u8; 32]) -> ChannelId {
+    ChannelId(hex::encode(channel_id))
+}
+
+/// An EVM channel id as the port spells it: `0x` and 64 lowercase hex.
+fn evm_channel(channel_id: &[u8; 32]) -> ChannelId {
+    ChannelId(format!("0x{}", hex::encode(channel_id)))
+}
+
+/// A Solana channel account as the port spells it: base58.
+fn solana_channel(channel_account: &[u8; 32]) -> ChannelId {
+    ChannelId(bs58::encode(channel_account).into_string())
+}
+
+/// The gate's config as the port carries it: the same seven fields.
+fn port_config(config: &BatchChannelConfig) -> EvmChannelConfig {
+    EvmChannelConfig {
+        payer: config.payer,
+        payer_authorizer: config.payer_authorizer,
+        receiver: config.receiver,
+        receiver_authorizer: config.receiver_authorizer,
+        token: config.token,
+        withdraw_delay: config.withdraw_delay,
+        salt: config.salt,
     }
 }
 
@@ -405,6 +559,86 @@ pub fn first_toon_channel_entry(entries: &[JournalEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connector_settlement::batch::{AdmissionRefusal, BatchChannelStatus};
+
+    fn state(status: BatchChannelStatus, landed: u128, collateral: u128) -> BatchChannelState {
+        BatchChannelState {
+            id: ChannelId("c".to_string()),
+            status,
+            voucher_signer: VoucherSigner::Solana([7; 32]),
+            landed,
+            collateral,
+        }
+    }
+
+    #[test]
+    fn a_channel_that_accepts_vouchers_is_found_at_its_ceiling() {
+        for status in [BatchChannelStatus::Open, BatchChannelStatus::Withdrawing] {
+            let found = resolution(Ok(state(status, 300, 700)))
+                .expect("found")
+                .expect("some");
+            assert_eq!(found.voucher_ceiling(), 1_000);
+            assert_eq!(saturating_u64(&found), 1_000);
+        }
+    }
+
+    /// Solana's and XRPL's amounts are `u64`: a wider ceiling saturates
+    /// rather than wraps.
+    #[test]
+    fn a_u64_chains_ceiling_wider_than_u64_saturates_rather_than_wraps() {
+        let wide = state(BatchChannelStatus::Open, u128::from(u64::MAX), 5);
+        assert_eq!(saturating_u64(&wide), u64::MAX);
+    }
+
+    /// ADR 0074 decision 5: no voucher is accepted once a channel is
+    /// closing, and a sealed one takes nothing at all.
+    #[test]
+    fn a_channel_that_accepts_no_voucher_is_terminal_not_unknown() {
+        for status in [BatchChannelStatus::Closing, BatchChannelStatus::Sealed] {
+            assert!(matches!(
+                resolution(Ok(state(status, 300, 0))),
+                Err(ChannelResolutionError::Terminal(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_channel_that_is_not_there_or_not_ours_is_unknown() {
+        let channel = ChannelId("c".to_string());
+        for error in [
+            BatchSettlementError::ChannelNotFound(channel.clone()),
+            BatchSettlementError::NotAdmissible {
+                channel: channel.clone(),
+                refusal: AdmissionRefusal::TokenNotSettled,
+            },
+            BatchSettlementError::ChannelIdMismatch {
+                presented: channel.clone(),
+                derived: channel.clone(),
+            },
+        ] {
+            assert_eq!(resolution(Err(error)), Ok(None));
+        }
+    }
+
+    /// An unreachable chain is never read as "no such channel": the gate
+    /// refuses the voucher as a failed lookup, which a client retries.
+    #[test]
+    fn a_chain_that_could_not_be_read_is_a_failed_lookup() {
+        assert!(matches!(
+            resolution(Err(BatchSettlementError::Backend("timed out".to_string()))),
+            Err(ChannelResolutionError::LookupFailed(_))
+        ));
+    }
+
+    #[test]
+    fn channel_ids_are_spelled_as_the_port_spells_them() {
+        assert_eq!(evm_channel(&[0xab; 32]).0, format!("0x{}", "ab".repeat(32)));
+        assert_eq!(xrpl_channel(&[0xab; 32]).0, "ab".repeat(32));
+        assert_eq!(
+            solana_channel(&[0x01; 32]).0,
+            "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+        );
+    }
 
     /// ADR 0075 decision 8: a journal of vouchers alone holds no
     /// `toon-channel` entry, whatever else it records about them.

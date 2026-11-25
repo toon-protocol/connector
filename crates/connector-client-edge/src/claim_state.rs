@@ -495,14 +495,22 @@ async fn resolve_solana(
         Ok(network) => network,
         Err(refused) => return *refused,
     };
-    resolve_solana_on(state, channel_account_text, expires, signature_text, now)
-        .await
-        .on(&network)
+    resolve_solana_on(
+        state,
+        &network,
+        channel_account_text,
+        expires,
+        signature_text,
+        now,
+    )
+    .await
+    .on(&network)
 }
 
 /// [`resolve_solana`], once its entry's scheme and network are known good.
 async fn resolve_solana_on(
     state: &ClientEdgeState,
+    network: &Network,
     channel_account_text: String,
     expires: u64,
     signature_text: String,
@@ -524,6 +532,7 @@ async fn resolve_solana_on(
     let requester = format!("claim-state-challenge:{signature_text}");
     resolve_solana_voucher(
         state,
+        network,
         channel_account_text,
         channel_account,
         VoucherProof {
@@ -698,13 +707,14 @@ async fn resolve_evm_voucher(
 /// by the channel account's `authorized_signer`, read from the chain.
 async fn resolve_solana_voucher(
     state: &ClientEdgeState,
+    network: &Network,
     channel_account_text: String,
     channel_account: [u8; 32],
     proof: VoucherProof<'_>,
 ) -> ChannelStateResult {
     let lookup = state
         .claim_gate
-        .solana_voucher_channel(&channel_account, proof.requester)
+        .solana_voucher_channel(network, &channel_account, proof.requester)
         .await;
     let channel = match lookup {
         Ok(Some(channel)) => channel,

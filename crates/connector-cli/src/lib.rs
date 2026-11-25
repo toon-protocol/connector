@@ -29,6 +29,7 @@ mod peer_transport;
 mod probe;
 mod runtime;
 mod send;
+mod settlement_networks;
 mod sponsor;
 
 use std::fmt;

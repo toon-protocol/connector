@@ -1031,7 +1031,11 @@ mod tests {
     const ONE_DAY: u64 = 86_400;
 
     fn fixture(exit: PayerExit) -> BatchContractFixture {
-        let backend = Arc::new(InMemoryBatchSettlement::new(exit, ONE_DAY));
+        fixture_on(InMemoryBatchSettlement::new(exit, ONE_DAY))
+    }
+
+    fn fixture_on(backend: InMemoryBatchSettlement) -> BatchContractFixture {
+        let backend = Arc::new(backend);
         let unopened = backend.unopened_presentation();
         BatchContractFixture {
             backend: Arc::clone(&backend) as Arc<dyn BatchSettlementBackend>,
@@ -1077,6 +1081,20 @@ mod tests {
     #[tokio::test]
     async fn the_in_memory_fake_with_a_close_exit_upholds_the_contract() {
         assert_upholds_the_contract(|| async { fixture(PayerExit::Close) }).await;
+    }
+
+    /// The fake on an XRPL-shaped chain: XRPL presentations, a `PayChannel`
+    /// public key as the voucher signer, and the close-shaped exit.
+    #[tokio::test]
+    async fn the_in_memory_fake_on_an_xrpl_shaped_chain_upholds_the_contract() {
+        assert_upholds_the_contract(|| async {
+            fixture_on(InMemoryBatchSettlement::on(
+                InMemoryBatchChain::xrpl(),
+                0xaa,
+                ONE_DAY,
+            ))
+        })
+        .await;
     }
 
     /// The fake's channels name a token, so one in another is refused.
