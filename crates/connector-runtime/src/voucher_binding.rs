@@ -230,6 +230,22 @@ impl VoucherSignerBindings {
             .retain(|_, bound| bound.peer_id != peer_id);
     }
 
+    /// Unbind `signer` if it is bound to `peer_id`; a signer bound to
+    /// another peering is left alone. What a failed admission uses to undo
+    /// only the bindings it made.
+    pub fn unbind_signer(&self, peer_id: &str, signer: &VoucherSigner) {
+        let mut by_signer = self
+            .by_signer
+            .write()
+            .expect("voucher signer bindings lock poisoned");
+        if by_signer
+            .get(signer)
+            .is_some_and(|bound| bound.peer_id == peer_id)
+        {
+            by_signer.remove(signer);
+        }
+    }
+
     /// The peering `signer` is bound to, if any, on whichever channel.
     #[must_use]
     pub fn peer_for(&self, signer: &VoucherSigner) -> Option<String> {
