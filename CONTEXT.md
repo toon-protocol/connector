@@ -297,6 +297,8 @@ Hides where a node is reachable, never who it pays: a claim names an on-chain ch
 operator write is signed under a keyid. Dialed through the one `socks_proxy` a node configures,
 selected by the endpoint's host and by nothing else — no per-peer key, no all-outbound mode
 ([ADR 0070](docs/adr/0070-an-onion-address-is-a-host-not-a-carriage.md), built, amended by #1284).
+The one exception is a program calling the exported `send`, which may ask for both of that send's
+dials to go through a proxy whatever their host (amended by #1704); the node itself never does.
 The word names the **mechanism**, never one TLD: `anon` renamed the suffix it publishes between
 releases, both spellings are accepted, and `is_onion_endpoint` is the one place that is decided.
 _Avoid_: hidden service, onion transport, third transport, Anyone transport, `.anyone` endpoint —
