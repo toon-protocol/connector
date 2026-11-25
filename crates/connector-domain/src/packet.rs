@@ -392,8 +392,9 @@ pub struct Reject {
     pub watermark: Option<Box<u128>>,
 }
 
-/// The closed set of reasons a client-edge `F03` carries
-/// (`docs/protocol/client-edge-spec.md` §1.6, ADR 0051's issue #1532 update).
+/// The closed set of reasons a client-edge reject carries -- four `F03`s and
+/// the `F01` replay (`docs/protocol/client-edge-spec.md` §1.6, ADR 0051's
+/// issue #1532 and #1706 updates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// The voucher's cumulative amount does not exceed the watermark: a
