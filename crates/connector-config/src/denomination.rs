@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::encoding::{is_base58_32_bytes, parse_evm_address, to_hex};
 use crate::error::ConfigError;
-use crate::settlement::SettledNetworks;
+use crate::settlement::SettlementTables;
 
 /// The most pools one token's quote path may name (ADR 0071 decision 3):
 /// one for a numeraire-quoted token, two for a token whose only real venue
@@ -420,7 +420,7 @@ fn resolve_guard_override(row: &str, raw: &mut RawRateRow) -> Result<GuardOverri
 /// two numeraires has no right one at all.
 fn resolve_tokens(
     raw: Vec<RawToken>,
-    networks: &SettledNetworks,
+    networks: &SettlementTables,
 ) -> Result<(Vec<DeclaredToken>, Option<AssetId>), ConfigError> {
     let mut assets = Vec::with_capacity(raw.len());
     let mut seen = HashSet::with_capacity(raw.len());
@@ -689,7 +689,7 @@ pub(crate) fn resolve_denomination(
     raw_tokens: Vec<RawToken>,
     raw_rates: Vec<RawRateRow>,
     raw_guards: Option<RawRateGuards>,
-    networks: &SettledNetworks,
+    networks: &SettlementTables,
     zk_vault_asset: Option<&AssetId>,
 ) -> Result<DenominationConfig, ConfigError> {
     if raw_tokens.is_empty() && raw_rates.is_empty() && raw_guards.is_none() {
@@ -747,8 +747,8 @@ mod tests {
 
     /// A node with both settlement tables, which is what `local/solo`
     /// runs; the per-chain refusals below narrow it.
-    fn both_chains() -> SettledNetworks {
-        SettledNetworks::for_tests(&[8453], true)
+    fn both_chains() -> SettlementTables {
+        SettlementTables::for_tests(true, true)
     }
 
     fn asset(text: &str) -> AssetId {
@@ -1032,7 +1032,7 @@ asset = "{on_arbitrum}"
         let tokens = tokens_from(&format!(
             "[[tokens]]\nasset = \"{USDC}\"\nnumeraire = true\n"
         ));
-        let solana_only = SettledNetworks::for_tests(&[], true);
+        let solana_only = SettlementTables::for_tests(false, true);
         let error = resolve_denomination(tokens, vec![], None, &solana_only, None)
             .expect_err("no EVM table");
         assert!(

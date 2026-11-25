@@ -27,8 +27,8 @@ use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
 use crate::settlement::{
-    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettledNetworks,
-    SettlementConfig, SettlementTables,
+    check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
+    SettlementTables,
 };
 use crate::zk_note::{resolve_zk_note, RawZkNoteTable, ZkNoteConfig};
 
@@ -521,7 +521,7 @@ impl Config {
             raw.tokens,
             raw.rates,
             raw.rate_guards,
-            &SettledNetworks::of(&settlements),
+            &settlement_tables,
             zk_note.as_ref().map(ZkNoteConfig::asset).as_ref(),
         )?;
         // ADR 0087 decision 6 (#1636): every XRPL leg is a dealing boundary,
