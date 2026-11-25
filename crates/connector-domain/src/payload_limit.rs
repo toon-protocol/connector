@@ -149,6 +149,7 @@ pub fn refuse_oversize(
         data: Vec::new(),
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     })
 }
 

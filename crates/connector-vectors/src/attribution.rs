@@ -1,4 +1,4 @@
-//! Schema 14, issue #1708 (ADR 0040, ADR 0080 decision 6, ADR 0086): the
+//! Schema 15, issue #1708 (ADR 0040, ADR 0080 decision 6, ADR 0086): the
 //! `X-TOON-*` headers an app receives, pinned.
 //!
 //! Every case runs the connector's own

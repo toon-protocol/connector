@@ -1,5 +1,5 @@
 {
-  "schema_version": 14,
+  "schema_version": 15,
   "envelope": {
     "valid": [
       {
@@ -1122,13 +1122,44 @@
   "client_edge": {
     "f03_rejects": [
       {
+        "name": "f01_amount_not_advancing",
+        "code": "F01",
+        "accumulated_cost": 0,
+        "reason": "amount_not_advancing",
+        "watermark": "1000",
+        "http_headers": [
+          ["toon-accumulated-cost", "0"],
+          ["toon-reject-reason", "amount_not_advancing"],
+          ["toon-watermark", "1000"]
+        ],
+        "btp_protocol_data": [
+          {
+            "name": "toon-accumulated-cost",
+            "content_type": 1,
+            "data_hex": "30"
+          },
+          {
+            "name": "toon-reject-reason",
+            "content_type": 1,
+            "data_hex": "616d6f756e745f6e6f745f616476616e63696e67"
+          },
+          {
+            "name": "toon-watermark",
+            "content_type": 1,
+            "data_hex": "31303030"
+          }
+        ]
+      },
+      {
         "name": "f03_underpayment",
         "code": "F03",
         "accumulated_cost": 250,
         "reason": "underpayment",
+        "watermark": "1000",
         "http_headers": [
           ["toon-accumulated-cost", "250"],
-          ["toon-reject-reason", "underpayment"]
+          ["toon-reject-reason", "underpayment"],
+          ["toon-watermark", "1000"]
         ],
         "btp_protocol_data": [
           {
@@ -1140,6 +1171,11 @@
             "name": "toon-reject-reason",
             "content_type": 1,
             "data_hex": "756e6465727061796d656e74"
+          },
+          {
+            "name": "toon-watermark",
+            "content_type": 1,
+            "data_hex": "31303030"
           }
         ]
       },
@@ -1148,6 +1184,7 @@
         "code": "F03",
         "accumulated_cost": 0,
         "reason": "undercollateralized",
+        "watermark": null,
         "http_headers": [
           ["toon-accumulated-cost", "0"],
           ["toon-reject-reason", "undercollateralized"]
@@ -1170,6 +1207,7 @@
         "code": "F03",
         "accumulated_cost": 250,
         "reason": "amount_over_charge",
+        "watermark": null,
         "http_headers": [
           ["toon-accumulated-cost", "250"],
           ["toon-reject-reason", "amount_over_charge"]
@@ -1192,6 +1230,7 @@
         "code": "F03",
         "accumulated_cost": 250,
         "reason": "probe_terminates_here",
+        "watermark": null,
         "http_headers": [
           ["toon-accumulated-cost", "250"],
           ["toon-reject-reason", "probe_terminates_here"]

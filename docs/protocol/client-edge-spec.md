@@ -772,8 +772,9 @@ channel through which a price was ever disclosed was that reject's human-readabl
 client learned a price by underpaying first, which is precisely what cost discovery exists to
 prevent.
 
-**The reject reason.** The client edge answers four different situations with `F03`, and the
-sender's next move differs between them. A reject this connector raises itself for one of them
+**The reject reason.** The client edge answers four different situations with `F03`, and a replayed
+voucher with `F01` beside a malformed claim, and the sender's next move differs between them. A
+reject this connector raises itself for one of them
 carries a **reject reason** (`CONTEXT.md` "Reject reason") beside its code and cost, in the same
 place as `TOON-Accumulated-Cost`: the `Toon-Reject-Reason` response header on `POST /ilp`,
 `POST /ilp/probe` and the operator's `POST /packets`, and a protocolData entry named
@@ -783,18 +784,26 @@ connector sends none on a client interaction). The set is closed:
 
 | reason                  | situation                                                             | cost       | sender's next move                                   |
 | ----------------------- | --------------------------------------------------------------------- | ---------- | ---------------------------------------------------- |
+| `amount_not_advancing`  | `F01`: the voucher does not exceed the channel's watermark (a replay) | `0`        | sign a voucher above `Toon-Watermark` (below)        |
 | `underpayment`          | the voucher did not advance by the route's charge (§1.3 step 5)       | the charge | sign a voucher that pays it                          |
 | `undercollateralized`   | the cumulative amount is above what the channel can pay (§1.3 step 5) | `0`        | top the channel up, then resend **the same** voucher |
 | `amount_over_charge`    | a forwarded PREPARE declares an `amount` above the forwarding charge  | the charge | send `amount` = the charge                           |
 | `probe_terminates_here` | a probe to a route this connector terminates (below)                  | the charge | pay that charge; a probe is never delivered          |
 
-All four are `F03`; the code, the cost and the English `message` are unchanged by the reason, and
-the `message` stays non-normative. A reason is attached **only to a reject this connector raised
-itself**: a reject relayed back from a peer reaches the client with its cost and no reason, a
-connector never invents one, and every other code (`F01`, `T00`, `T05`, `F02`, `F06`, …) carries
-none. An absent reason means "not raised here", never "unknown". A client that receives an absent
+`amount_not_advancing` is `F01` and the other four are `F03`; the code, the cost and the English
+`message` are unchanged by the reason, and the `message` stays non-normative. A reason is attached
+**only to a reject this connector raised itself**: a reject relayed back from a peer reaches the
+client with its cost and no reason, a connector never invents one, and every other refusal (any
+other `F01`, `T00`, `T05`, `F02`, `F06`, …) carries none. An absent reason means "not raised here", never "unknown". A client that receives an absent
 or unrecognized reason acts on the code and the cost alone. Adding a value to the set is a spec
-change. The vectors pin each case (`client_edge.f03_rejects`).
+change. The vectors pin each case (`client_edge.f03_rejects`, the `F01` replay included).
+
+**The watermark.** A voucher refused at the watermark layer also names the watermark the connector
+holds for its channel (`0` for one never paid on), in `Toon-Watermark` — a decimal amount, an HTTP
+response header, and a protocolData entry named `toon-watermark` on a BTP reject response, beside
+`toon-reject-reason`. Two refusals carry it: an `underpayment` `F03` (unchanged otherwise, cost the
+charge) and a replay, which is `F01` with the reason `amount_not_advancing` and cost `0`. No other
+refusal carries it, and no code or message changes (`schema_version` 14).
 
 **The probe ingress: `POST /ilp/probe`.** Same request body and same response framing as `POST
 /ilp` (§1.1); what differs is the gate in front of it, and that nothing is charged. Because probing

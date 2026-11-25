@@ -1156,7 +1156,7 @@ fn the_committed_subsidy_vectors_replay_against_the_real_implementation() {
     }
 }
 
-/// Schema 14 (issue #1708): the committed `attribution` cases hold the
+/// Schema 15 (issue #1708): the committed `attribution` cases hold the
 /// contract an app reads -- only the connector's own `X-TOON-*` headers
 /// survive, in its own spelling and stating what it verified; a sender's
 /// spoofed ones change nothing; and nothing is stated for a delivery with
