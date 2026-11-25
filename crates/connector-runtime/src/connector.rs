@@ -78,18 +78,6 @@ pub enum LeaseRouteError {
     InvalidPrefix(String),
 }
 
-impl From<PeeringRefusal> for PeerRouteTableError {
-    /// The one place a domain refusal becomes the runtime error the operator
-    /// surface maps to an HTTP status (issue #1691).
-    fn from(refusal: PeeringRefusal) -> Self {
-        match refusal {
-            PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
-                PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id }
-            }
-        }
-    }
-}
-
 /// What can go wrong mutating issue #884's runtime peer/route table
 /// through [`Connector::upsert_runtime_peer`],
 /// [`Connector::remove_runtime_peer`],
@@ -155,6 +143,18 @@ pub enum PeerRouteTableError {
     /// in-memory table and the durable copy can never diverge.
     #[error("could not persist the runtime peer/route table: {0}")]
     Persistence(#[from] PeerRouteStoreError),
+}
+
+impl From<PeeringRefusal> for PeerRouteTableError {
+    /// The one place a domain refusal becomes the runtime error the operator
+    /// surface maps to an HTTP status (issue #1691).
+    fn from(refusal: PeeringRefusal) -> Self {
+        match refusal {
+            PeeringRefusal::RouteWithoutPayChannel { prefix, peer_id } => {
+                PeerRouteTableError::PeerHasNoPayChannel { prefix, peer_id }
+            }
+        }
+    }
 }
 
 /// Why [`Connector::handle_probe`] declined to route a packet at all,

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bbba12328f703bd9f0764183926d70297a6035d8fa9c68046a3e484bee548b44 # shrinks to set = PeeringSet { peerings: [PeeringFacts { id: "p0", inbound: [], pay: [] }], routes: [PeerRouteFacts { prefix: "g.r0", peer_id: "p0" }], settlement_networks: {"eip155:31337"} }

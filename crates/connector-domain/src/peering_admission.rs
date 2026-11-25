@@ -109,47 +109,66 @@ mod tests {
         }
     }
 
+    /// A generated peering set: per peering its inbound and pay channel
+    /// counts, and routes naming those peerings by index, in any order.
+    fn peering_set() -> impl Strategy<Value = PeeringSet> {
+        proptest::collection::vec((0usize..3, 0usize..3), 1..6).prop_flat_map(|counts| {
+            let n = counts.len();
+            (Just(counts), proptest::collection::vec(0..n, 0..8)).prop_map(|(counts, routed)| {
+                let peerings = counts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (inbound, pay))| peering(&format!("p{i}"), *inbound, *pay))
+                    .collect();
+                let ids: Vec<String> = routed.iter().map(|i| format!("p{i}")).collect();
+                let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                set(peerings, &ids)
+            })
+        })
+    }
+
+    fn pay_count(set: &PeeringSet, peer_id: &str) -> usize {
+        set.peerings
+            .iter()
+            .find(|p| p.id == peer_id)
+            .map_or(0, |p| p.pay.len())
+    }
+
     proptest! {
         #[test]
         fn a_route_to_a_peering_without_a_pay_channel_is_always_refused(
-            inbound in 0usize..3,
-            others in proptest::collection::vec((0usize..3, 0usize..3), 0..4),
+            set in peering_set(),
         ) {
-            let mut peerings: Vec<_> = others
-                .iter()
-                .enumerate()
-                .map(|(i, (inb, pay))| peering(&format!("other{i}"), *inb, (*pay).max(1)))
-                .collect();
-            peerings.push(peering("bare", inbound, 0));
-            let refusal = admit(&set(peerings, &["bare"])).unwrap_err();
-            prop_assert_eq!(
-                refusal,
-                PeeringRefusal::RouteWithoutPayChannel {
-                    prefix: "g.r0".to_string(),
-                    peer_id: "bare".to_string(),
-                }
-            );
+            match set.routes.iter().find(|r| pay_count(&set, &r.peer_id) == 0) {
+                // The first such route, in the order given, is the one named.
+                Some(route) => prop_assert_eq!(
+                    admit(&set),
+                    Err(PeeringRefusal::RouteWithoutPayChannel {
+                        prefix: route.prefix.clone(),
+                        peer_id: route.peer_id.clone(),
+                    })
+                ),
+                None => prop_assert_eq!(admit(&set), Ok(())),
+            }
         }
 
         #[test]
         fn a_route_to_a_peering_with_a_pay_channel_is_never_refused_for_it(
-            inbound in 0usize..3,
-            pay in 1usize..3,
-            bare in 0usize..3,
+            set in peering_set(),
         ) {
-            // An unrouted peering without a pay channel owes nothing.
-            let peerings = vec![peering("paid", inbound, pay), peering("accept-only", bare, 0)];
-            prop_assert_eq!(admit(&set(peerings, &["paid"])), Ok(()));
+            if let Err(PeeringRefusal::RouteWithoutPayChannel { peer_id, .. }) = admit(&set) {
+                prop_assert_eq!(pay_count(&set, &peer_id), 0);
+            }
         }
 
         #[test]
-        fn adding_an_unrelated_valid_peering_never_changes_the_verdict(
-            pay in 0usize..3,
+        fn an_unrouted_peering_without_a_pay_channel_owes_nothing(
+            set in peering_set(),
+            inbound in 0usize..3,
         ) {
-            let base = set(vec![peering("a", 1, pay)], &["a"]);
-            let mut extended = base.clone();
-            extended.peerings.push(peering("b", 1, 1));
-            prop_assert_eq!(admit(&base).is_ok(), admit(&extended).is_ok());
+            let mut extended = set.clone();
+            extended.peerings.push(peering("accept-only", inbound, 0));
+            prop_assert_eq!(admit(&set), admit(&extended));
         }
     }
 }
