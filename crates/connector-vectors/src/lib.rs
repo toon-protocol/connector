@@ -21,6 +21,7 @@ use connector_btp::{
     ACCUMULATED_COST_HEADER, ACCUMULATED_COST_PROTOCOL, AUTH_PROTOCOL, BTP_MESSAGE,
     CLAIM_ACK_HEADER, CLAIM_ACK_PROTOCOL, CLAIM_HEADER, CONTENT_TYPE_TEXT, PAYOUT_CLAIM_PROTOCOL,
     PEER_CHALLENGE_HEADER, PEER_CHALLENGE_PROTOCOL, REJECT_REASON_HEADER, REJECT_REASON_PROTOCOL,
+    WATERMARK_HEADER, WATERMARK_PROTOCOL,
 };
 use connector_domain::client_claim::{
     self, ClientClaim, ClientClaimError, SCHEME_BATCH_SETTLEMENT,
@@ -241,13 +242,22 @@ use serde::Serialize;
 /// a slot. The `zk_note` section's tags, signatures and successors do not
 /// move: none of them states a `requestTime`.
 ///
+/// **14** (issue #1706): **a refused voucher carries the watermark.** A
+/// replayed voucher's REJECT is `F01` with the new reason
+/// `amount_not_advancing`, and it and an `underpayment` `F03` both carry
+/// `toon-watermark` -- the decimal amount the connector's journal holds for
+/// the channel -- as an HTTP response header and a BTP protocolData entry
+/// beside `toon-reject-reason`. `client_edge.f03_rejects` gains
+/// `f01_amount_not_advancing`, and every case gains `watermark` (`null` where
+/// none rides). Codes and messages do not change.
+///
 /// The placeholder proof in `allowance_request` and
 /// `subsidised_allowance_request` was replaced by the real request proofs o1js
 /// made (zk_toon#65, issue #1514) **without a further bump, on purpose**: no
 /// field, name or frame changes, only the content of a string the vectors had
 /// always said was a placeholder. The two entries gain a
 /// `verification_key_hash`, a field an SDK that does not read it ignores.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub mod xrpl;
 pub mod zk_note;
@@ -342,10 +352,13 @@ pub struct F03RejectCase {
     pub code: &'static str,
     pub accumulated_cost: u64,
     pub reason: &'static str,
-    /// The header pair as `[name, value]`, cost then reason, on the `200`
+    /// The decimal watermark `toon-watermark` carries, on the two refusals
+    /// about it; `None` where no such header rides.
+    pub watermark: Option<String>,
+    /// The header pair as `[name, value]`, cost, reason then watermark, on the `200`
     /// that carries the REJECT body.
     pub http_headers: Vec<(String, String)>,
-    /// The protocolData entries on the BTP RESPONSE, cost then reason.
+    /// The protocolData entries on the BTP RESPONSE, cost, reason then watermark.
     pub btp_protocol_data: Vec<F03ProtocolEntry>,
 }
 
@@ -357,50 +370,79 @@ pub struct F03ProtocolEntry {
 }
 
 fn generate_client_edge_vectors() -> ClientEdgeVectors {
-    // (case, reason, cost): the charge is a fixed 250; undercollateralized
-    // reports `0` because the route's price was covered.
+    // (case, code, reason, cost, watermark): the charge is a fixed 250;
+    // undercollateralized reports `0` because the route's price was covered.
+    // The watermark is the figure the journal holds (a replay of 500 against
+    // a watermark of 1000; an underpaying 1100 against the same).
     let cases = [
-        ("f03_underpayment", RejectReason::Underpayment, 250u64),
+        (
+            "f01_amount_not_advancing",
+            "F01",
+            RejectReason::AmountNotAdvancing,
+            0u64,
+            Some(1000u128),
+        ),
+        (
+            "f03_underpayment",
+            "F03",
+            RejectReason::Underpayment,
+            250,
+            Some(1000),
+        ),
         (
             "f03_undercollateralized",
+            "F03",
             RejectReason::Undercollateralized,
             0,
+            None,
         ),
         (
             "f03_amount_over_charge",
+            "F03",
             RejectReason::AmountOverCharge,
             250,
+            None,
         ),
         (
             "f03_probe_terminates_here",
+            "F03",
             RejectReason::ProbeTerminatesHere,
             250,
+            None,
         ),
     ];
     let f03_rejects = cases
         .into_iter()
-        .map(|(name, reason, cost)| {
+        .map(|(name, code, reason, cost, watermark)| {
             let entry = |entry_name: &'static str, value: String| F03ProtocolEntry {
                 name: entry_name,
                 content_type: CONTENT_TYPE_TEXT,
                 data_hex: hex_of(value.as_bytes()),
             };
+            let watermark = watermark.map(|w| w.to_string());
+            let mut http_headers = vec![
+                (ACCUMULATED_COST_HEADER.to_string(), cost.to_string()),
+                (
+                    REJECT_REASON_HEADER.to_string(),
+                    reason.as_str().to_string(),
+                ),
+            ];
+            let mut btp_protocol_data = vec![
+                entry(ACCUMULATED_COST_PROTOCOL, cost.to_string()),
+                entry(REJECT_REASON_PROTOCOL, reason.as_str().to_string()),
+            ];
+            if let Some(watermark) = &watermark {
+                http_headers.push((WATERMARK_HEADER.to_string(), watermark.clone()));
+                btp_protocol_data.push(entry(WATERMARK_PROTOCOL, watermark.clone()));
+            }
             F03RejectCase {
                 name,
-                code: "F03",
+                code,
                 accumulated_cost: cost,
                 reason: reason.as_str(),
-                http_headers: vec![
-                    (ACCUMULATED_COST_HEADER.to_string(), cost.to_string()),
-                    (
-                        REJECT_REASON_HEADER.to_string(),
-                        reason.as_str().to_string(),
-                    ),
-                ],
-                btp_protocol_data: vec![
-                    entry(ACCUMULATED_COST_PROTOCOL, cost.to_string()),
-                    entry(REJECT_REASON_PROTOCOL, reason.as_str().to_string()),
-                ],
+                watermark,
+                http_headers,
+                btp_protocol_data,
             }
         })
         .collect();
@@ -1389,6 +1431,7 @@ fn fixture_reject() -> Reject {
         // `accumulated-cost` entry/header, built separately below.
         accumulated_cost: 0,
         reason: None,
+        watermark: None,
     }
 }
 

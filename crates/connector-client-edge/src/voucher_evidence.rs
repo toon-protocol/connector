@@ -64,7 +64,7 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
         ClaimIngestRejection::SignatureInvalid => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::SignatureInvalid)
         }
-        ClaimIngestRejection::AmountNotAdvancing
+        ClaimIngestRejection::AmountNotAdvancing { .. }
         | ClaimIngestRejection::Underpayment { .. }
         | ClaimIngestRejection::Undercollateralized { .. } => {
             ClaimAckOutcome::Rejected(ClaimRejectReason::AmountNotAdvancing)

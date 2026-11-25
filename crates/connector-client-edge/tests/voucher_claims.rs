@@ -586,7 +586,7 @@ async fn an_equal_amount_is_refused_before_any_lookup_and_a_higher_one_accepted(
     );
     assert_eq!(
         gate.ingest(&other, 0).await.unwrap_err(),
-        ClaimIngestRejection::AmountNotAdvancing
+        ClaimIngestRejection::AmountNotAdvancing { watermark: 100 }
     );
     assert_eq!(
         backend.lookups(),
@@ -608,7 +608,7 @@ async fn a_lower_amount_is_refused() {
         .expect("first");
     assert_eq!(
         gate.ingest(&signed_evm_voucher(99), 0).await.unwrap_err(),
-        ClaimIngestRejection::AmountNotAdvancing
+        ClaimIngestRejection::AmountNotAdvancing { watermark: 100 }
     );
 }
 
@@ -648,7 +648,8 @@ async fn a_byte_identical_resend_pays_for_nothing() {
         gate.ingest(&voucher, 100).await.unwrap_err(),
         ClaimIngestRejection::Underpayment {
             advanced: 0,
-            price: 100
+            price: 100,
+            watermark: 100
         }
     );
 }
@@ -661,7 +662,8 @@ async fn value_binding_applies_to_a_voucher() {
         gate.ingest(&signed_evm_voucher(40), 50).await.unwrap_err(),
         ClaimIngestRejection::Underpayment {
             advanced: 40,
-            price: 50
+            price: 50,
+            watermark: 0
         }
     );
     assert_eq!(backend.lookups(), 0);
@@ -828,7 +830,8 @@ async fn a_journal_written_before_the_widening_replays_to_the_same_state() {
             .unwrap_err(),
         ClaimIngestRejection::Underpayment {
             advanced: 0,
-            price: 100
+            price: 100,
+            watermark: 100
         }
     );
 }
@@ -927,7 +930,8 @@ async fn after_a_restart_a_resend_is_still_a_resend_and_a_replay_still_stale() {
         gate.ingest(&voucher, 100).await.unwrap_err(),
         ClaimIngestRejection::Underpayment {
             advanced: 0,
-            price: 100
+            price: 100,
+            watermark: 100
         },
         "and still buying nothing"
     );

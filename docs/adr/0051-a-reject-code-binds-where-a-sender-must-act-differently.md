@@ -178,3 +178,14 @@ peer reaches the client with no reason, and a connector never invents one; every
 none. An absent reason means "not raised here", never "unknown", and a client that sees an absent or
 unknown reason acts on the code and the cost alone. The reason is not a claim-ack (that is the peer
 carriage's verdict on a claim) and never rides the REJECT's `data`.
+
+## Update (issue #1706)
+
+**A replay gains a reason, and a watermark-layer refusal names the watermark.** `F01` covers both a
+malformed claim and a replayed voucher, and a payer's move differs between them, so a replay this
+connector raises carries the reason `amount_not_advancing` — the token the peer claim-ack already
+uses for the same verdict — with its code unchanged. A replay and an underpayment (`F03`) also carry
+the watermark the connector holds for the channel, as `Toon-Watermark` / the `toon-watermark`
+protocolData entry (`docs/protocol/client-edge-spec.md` §1.6), so a payer signs its next voucher
+above it without parsing the message. No code and no message changes; every other refusal still
+carries no reason.
