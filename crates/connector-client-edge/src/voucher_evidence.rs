@@ -9,12 +9,12 @@
 //! It is the one component that holds both things a voucher's signer is
 //! resolved from: the node's settlement networks (spec #1684, one
 //! collection keyed by CAIP-2 network) and the journaled
-//! `ChannelConfig` an EVM voucher that carries none is resolved from. The
-//! lookups are the very ones `POST /ilp/claim-state` makes for a
-//! `batch-settlement` entry ([`ClientClaimGate::evm_voucher_channel`],
-//! [`ClientClaimGate::solana_voucher_channel`]), so a channel is found for
-//! the role exactly as it is found for a read, and metered the same way
-//! against the unresolvable-lookup budget (issue #613).
+//! `ChannelConfig` an EVM voucher that carries none is resolved from. A
+//! channel is found and its signature verified by the gate's one "find the
+//! channel, then verify" function (spec #1685, issue #1716) -- the very one
+//! `POST /ilp/claim-state` and voucher admission call -- so a channel is
+//! found for the role exactly as it is found for a read, and metered the
+//! same way against the unresolvable-lookup budget (issue #613).
 //!
 //! # What the role check never does
 //!
@@ -40,15 +40,10 @@ use connector_domain::client_claim::ClientClaim;
 use connector_domain::Network;
 use connector_peer_btp::challenge_json::PeerRoleChallenge;
 use connector_peer_btp::role_gate::{PeerVoucherVerdict, VoucherCheck, VoucherEvidence};
-use connector_runtime::{ClaimAckOutcome, ClaimRejectReason, VoucherSigner};
-use connector_signer::{
-    evm_voucher_signer, verify_evm_voucher, verify_evm_voucher_claim_state_challenge,
-    verify_solana_voucher, verify_solana_voucher_claim_state_challenge, verify_xrpl_claim,
-    verify_xrpl_voucher_claim_state_challenge, BatchChannelConfig,
-};
+use connector_runtime::{ClaimAckOutcome, ClaimRejectReason};
+use connector_signer::EvmVoucherScheme;
 
-use crate::channels::{decode_base58_bytes, decode_hex_bytes};
-use crate::claim_gate::decode_evm_channel_config;
+use crate::claim_gate::Proof;
 use crate::{ClaimIngestRejection, ClientClaimGate};
 
 /// A refused peer voucher's verdict, in the `claim-ack`'s one refusal
@@ -92,28 +87,6 @@ fn voucher_ack(rejection: &ClaimIngestRejection) -> ClaimAckOutcome {
     }
 }
 
-/// What an EVM channel's signature is checked over: a voucher's cumulative
-/// amount, or a challenge's expiry. Two messages under two typehashes, so a
-/// signature over one never verifies as the other.
-enum EvmMessage {
-    Voucher { max_claimable_amount: u128 },
-    Challenge { expires: u64 },
-}
-
-/// As [`EvmMessage`], on Solana.
-enum SolanaMessage {
-    Voucher { cumulative: u64 },
-    Challenge { expires: u64 },
-}
-
-/// As [`EvmMessage`], on XRPL: a claim's drops, or a challenge's expiry, each
-/// under its own domain (ADR 0087 decision 3), so a signature over one is
-/// never a signature over the other.
-enum XrplMessage {
-    Voucher { drops: u128 },
-    Challenge { expires: u64 },
-}
-
 /// Whose lookup a peer-role check is metered as, against the
 /// unresolvable-lookup budget (issue #613): the signature as it rode the
 /// wire, under one prefix, as `POST /ilp/claim-state` keys its own
@@ -123,124 +96,13 @@ fn requester(wire_signature: &str) -> String {
 }
 
 impl ClientClaimGate {
-    /// Resolve EVM channel `channel_id` and check `signature` over `message`
-    /// against its chain-recorded voucher signer.
-    async fn check_evm(
-        &self,
-        network: &Network,
-        channel_id: [u8; 32],
-        presented: Option<BatchChannelConfig>,
-        message: EvmMessage,
-        signature: &[u8; 65],
-        requester: &str,
-    ) -> VoucherCheck {
-        let Ok(Some((domain, channel))) = self
-            .evm_voucher_channel(network, &channel_id, presented, requester)
-            .await
-        else {
-            return VoucherCheck::Unresolved;
-        };
-        let signer = evm_voucher_signer(&channel.config);
-        let verified = match message {
-            EvmMessage::Voucher {
-                max_claimable_amount,
-            } => verify_evm_voucher(
-                &domain,
-                &channel_id,
-                max_claimable_amount,
-                signature,
-                &signer,
-            ),
-            EvmMessage::Challenge { expires } => verify_evm_voucher_claim_state_challenge(
-                &domain,
-                &channel_id,
-                expires,
-                signature,
-                &signer,
-            ),
-        };
-        let signer = VoucherSigner::Evm(signer);
-        if verified {
-            VoucherCheck::Verified(signer)
-        } else {
-            VoucherCheck::SignatureInvalid(signer)
-        }
-    }
-
-    /// Resolve Solana channel account `channel_account` and check
-    /// `signature` over `message` against its `authorized_signer`.
-    async fn check_solana(
-        &self,
-        network: &Network,
-        channel_account: [u8; 32],
-        message: SolanaMessage,
-        signature: &[u8; 64],
-        requester: &str,
-    ) -> VoucherCheck {
-        let Ok(Some(channel)) = self
-            .solana_voucher_channel(network, &channel_account, requester)
-            .await
-        else {
-            return VoucherCheck::Unresolved;
-        };
-        let signer = channel.authorized_signer;
-        let verified = match message {
-            // `expiresAt` is zero: the parser refused anything else (ADR
-            // 0074 decision 3), and it is still part of the signed bytes.
-            SolanaMessage::Voucher { cumulative } => {
-                verify_solana_voucher(&channel_account, cumulative, 0, signature, &signer)
-            }
-            SolanaMessage::Challenge { expires } => verify_solana_voucher_claim_state_challenge(
-                &channel_account,
-                expires,
-                signature,
-                &signer,
-            ),
-        };
-        let signer = VoucherSigner::Solana(signer);
-        if verified {
-            VoucherCheck::Verified(signer)
-        } else {
-            VoucherCheck::SignatureInvalid(signer)
-        }
-    }
-}
-
-impl ClientClaimGate {
-    /// Resolve XRPL channel `channel_id` on `network` and check `signature`
-    /// over `message` against its ledger-recorded `PublicKey`.
-    async fn check_xrpl(
-        &self,
-        network: &Network,
-        channel_id: [u8; 32],
-        message: XrplMessage,
-        signature: &[u8],
-        requester: &str,
-    ) -> VoucherCheck {
-        let Ok(Some(channel)) = self
-            .xrpl_voucher_channel(network, &channel_id, requester)
-            .await
-        else {
-            return VoucherCheck::Unresolved;
-        };
-        let key = channel.public_key;
-        let verified = match message {
-            XrplMessage::Voucher { drops } => {
-                verify_xrpl_claim(&key, &channel_id, drops, signature)
-            }
-            XrplMessage::Challenge { expires } => verify_xrpl_voucher_claim_state_challenge(
-                &key,
-                &network.to_string(),
-                &channel_id,
-                expires,
-                signature,
-            ),
-        };
-        let signer = VoucherSigner::Xrpl(key);
-        if verified {
-            VoucherCheck::Verified(signer)
-        } else {
-            VoucherCheck::SignatureInvalid(signer)
+    /// Find the channel `proof` names on `network` and check its signature
+    /// against the chain-recorded voucher signer, as the role gate reads it.
+    async fn check(&self, network: &Network, proof: &Proof, requester: &str) -> VoucherCheck {
+        match self.find_then_verify(network, proof, requester).await {
+            Ok(found) if found.verified => VoucherCheck::Verified(found.signer),
+            Ok(found) => VoucherCheck::SignatureInvalid(found.signer),
+            Err(_) => VoucherCheck::Unresolved,
         }
     }
 }
@@ -253,72 +115,16 @@ impl VoucherEvidence for ClientClaimGate {
         if !self.settles_on(voucher.network()) {
             return VoucherCheck::Unresolved;
         }
-        match voucher {
-            ClientClaim::EvmVoucher(voucher) => {
-                let (Some(channel_id), Some(signature)) = (
-                    decode_hex_bytes::<32>(&voucher.channel_id),
-                    decode_hex_bytes::<65>(&voucher.signature),
-                ) else {
-                    return VoucherCheck::Unresolved;
-                };
-                let presented = match voucher
-                    .channel_config
-                    .as_ref()
-                    .map(decode_evm_channel_config)
-                    .transpose()
-                {
-                    Ok(presented) => presented,
-                    Err(_) => return VoucherCheck::Unresolved,
-                };
-                self.check_evm(
-                    &voucher.network,
-                    channel_id,
-                    presented,
-                    EvmMessage::Voucher {
-                        max_claimable_amount: voucher.max_claimable_amount,
-                    },
-                    &signature,
-                    &requester(&voucher.signature),
-                )
-                .await
-            }
-            ClientClaim::SolanaVoucher(voucher) => {
-                let (Some(channel_account), Some(signature)) = (
-                    decode_base58_bytes::<32>(&voucher.channel_id),
-                    decode_base58_bytes::<64>(&voucher.signature),
-                ) else {
-                    return VoucherCheck::Unresolved;
-                };
-                self.check_solana(
-                    &voucher.network,
-                    channel_account,
-                    SolanaMessage::Voucher {
-                        cumulative: voucher.max_claimable_amount,
-                    },
-                    &signature,
-                    &requester(&voucher.signature),
-                )
-                .await
-            }
-            ClientClaim::XrplVoucher(voucher) => {
-                let (Some(channel_id), Some(signature)) = (
-                    decode_hex_bytes::<32>(&voucher.channel_id),
-                    hex::decode(&voucher.signature).ok(),
-                ) else {
-                    return VoucherCheck::Unresolved;
-                };
-                self.check_xrpl(
-                    &voucher.network,
-                    channel_id,
-                    XrplMessage::Voucher {
-                        drops: voucher.max_claimable_amount,
-                    },
-                    &signature,
-                    &requester(&voucher.signature),
-                )
-                .await
-            }
-        }
+        let Ok(proof) = Proof::of_voucher(voucher) else {
+            return VoucherCheck::Unresolved;
+        };
+        let wire_signature = match voucher {
+            ClientClaim::EvmVoucher(voucher) => &voucher.signature,
+            ClientClaim::SolanaVoucher(voucher) => &voucher.signature,
+            ClientClaim::XrplVoucher(voucher) => &voucher.signature,
+        };
+        self.check(voucher.network(), &proof, &requester(wire_signature))
+            .await
     }
 
     async fn judge_peer_voucher(&self, voucher: &ClientClaim) -> PeerVoucherVerdict {
@@ -349,62 +155,59 @@ impl VoucherEvidence for ClientClaimGate {
         if !self.settles_on(challenge.network()) {
             return VoucherCheck::Unresolved;
         }
-        match challenge {
+        let (proof, wire_signature) = match challenge {
             PeerRoleChallenge::Evm {
-                network,
                 channel_id,
                 expires,
                 signature,
                 channel_config,
+                ..
             } => {
-                let presented = match channel_config
+                let Ok(channel_config) = channel_config
                     .as_ref()
-                    .map(decode_evm_channel_config)
+                    .map(EvmVoucherScheme::decode_config)
                     .transpose()
-                {
-                    Ok(presented) => presented,
-                    Err(_) => return VoucherCheck::Unresolved,
+                else {
+                    return VoucherCheck::Unresolved;
                 };
-                self.check_evm(
-                    network,
-                    *channel_id,
-                    presented,
-                    EvmMessage::Challenge { expires: *expires },
-                    signature,
-                    &requester(&format!("0x{}", hex::encode(signature))),
+                (
+                    Proof::EvmChallenge {
+                        channel_id: *channel_id,
+                        channel_config,
+                        expires: *expires,
+                        signature: signature.to_vec(),
+                    },
+                    format!("0x{}", hex::encode(signature)),
                 )
-                .await
             }
             PeerRoleChallenge::Solana {
-                network,
                 channel_account,
                 expires,
                 signature,
-            } => {
-                self.check_solana(
-                    network,
-                    *channel_account,
-                    SolanaMessage::Challenge { expires: *expires },
-                    signature,
-                    &requester(&BASE64.encode(signature)),
-                )
-                .await
-            }
+                ..
+            } => (
+                Proof::SolanaChallenge {
+                    channel_account: *channel_account,
+                    expires: *expires,
+                    signature: signature.to_vec(),
+                },
+                BASE64.encode(signature),
+            ),
             PeerRoleChallenge::Xrpl {
-                network,
                 channel_id,
                 expires,
                 signature,
-            } => {
-                self.check_xrpl(
-                    network,
-                    *channel_id,
-                    XrplMessage::Challenge { expires: *expires },
-                    signature,
-                    &requester(&hex::encode(signature)),
-                )
-                .await
-            }
-        }
+                ..
+            } => (
+                Proof::XrplChallenge {
+                    channel_id: *channel_id,
+                    expires: *expires,
+                    signature: signature.clone(),
+                },
+                hex::encode(signature),
+            ),
+        };
+        self.check(challenge.network(), &proof, &requester(&wire_signature))
+            .await
     }
 }

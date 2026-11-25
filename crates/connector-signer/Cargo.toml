@@ -42,6 +42,11 @@ serde_json = "1"
 # `ZkStateSigner` here, through the zk-note boundary crate's re-exports so the
 # workspace has one proof-systems pin.
 connector-zk-note = { path = "../connector-zk-note" }
+# Each chain's voucher scheme (spec #1685) parses the domain's wire shape of
+# its voucher. The domain is pure and depends on nothing here, so this keeps
+# both of ADR 0001's constraints: the domain holds no key, and the scheme's
+# key-holding half stays in the one crate that touches key material.
+connector-domain = { path = "../connector-domain" }
 
 [dev-dependencies]
 proptest = "1"

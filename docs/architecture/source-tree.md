@@ -70,7 +70,11 @@ connector-signer                 the only crate that touches key material
   ├─ giftwrap.rs                 seal/open, and the derived fulfilment (ADR 0018, ADR 0019)
   ├─ claim_signature.rs          EIP-712 and Ed25519 balance-proof verification
   │                               (ADR 0024, ADR 0053)
-  ├─ voucher_signature.rs        x402 batch-settlement voucher verification (ADR 0074)
+  ├─ voucher_scheme.rs           one chain's voucher in one module: wire spelling,
+  │                               signature, channel id, verification and the
+  │                               claim-state challenge (spec #1685); EVM's is evm.rs
+  ├─ voucher_signature.rs        x402 batch-settlement voucher digests and signature rules
+  │                               (ADR 0074), reached through the voucher schemes
   ├─ claim_state_challenge.rs    "prove you hold this channel", moving no value
   ├─ nip59.rs                    the wrapped-claim transport-privacy envelope
   ├─ zk_state.rs                 a zk edge's Mina state key: read, held, and used only
@@ -221,7 +225,11 @@ connector-peer-http              the ILP-over-HTTP peer carriage: dial/accept ov
 connector-client-edge            axum Router, mountable rather than a server:
                                   POST /ilp, GET /ilp (the self-description, ADR 0050),
                                   GET /ilp/btp, POST /ilp/probe, GET /ilp/identity,
-                                  GET /ilp/routes/price, POST /ilp/claim-state
+                                  GET /ilp/routes/price, POST /ilp/claim-state.
+                                  claim_gate/verification.rs is the one "find the
+                                  channel, then verify" the claim gate, the peer
+                                  voucher check and POST /ilp/claim-state share
+                                  (spec #1685)
 connector-operator               axum Router: bearer-gated reads, RFC 9421-signed writes
                                   (ADR 0008), each accepted signature retained as its
                                   write's audit record; GET /dashboard, the operator

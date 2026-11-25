@@ -70,7 +70,8 @@ pub use packet_history::{Direction, Outcome, PacketHistoryView, PacketRow};
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver
 // where that channel's watermark stands.
 pub use outbound_voucher::{
-    challenge_entry, voucher_json, HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
+    challenge_entry, evm_voucher_fields, voucher_json, HttpVoucherState, VoucherStateSource,
+    PEER_CHALLENGE_TTL_SECS,
 };
 pub use peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,
