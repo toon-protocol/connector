@@ -88,7 +88,7 @@ use connector_domain::{
 };
 use connector_peer_auth::SessionRole;
 use connector_runtime::{Journal, JournalError, SettlementNetworks};
-use connector_signer::{EvmVoucherScheme, VoucherRefusal, VoucherScheme};
+use connector_signer::{EvmVoucherScheme, VoucherRefusal, VoucherScheme, XrplVoucherScheme};
 
 use crate::batch_settlement::{journaled_batch_channels, JournaledBatchChannel, VoucherChannels};
 use crate::channels::{decode_base58_bytes, ChannelResolutionError};
@@ -1714,9 +1714,9 @@ fn voucher_signature_bytes(claim: &ClientClaim) -> Result<Vec<u8>, ClaimIngestRe
         ClientClaim::SolanaVoucher(voucher) => {
             decode_base58_bytes::<64>(&voucher.signature).map(|bytes| bytes.to_vec())
         }
-        ClientClaim::XrplVoucher(voucher) => hex::decode(&voucher.signature)
-            .ok()
-            .filter(|bytes| (64..=72).contains(&bytes.len())),
+        ClientClaim::XrplVoucher(voucher) => {
+            XrplVoucherScheme::decode_signature(&voucher.signature)
+        }
     };
     decoded.ok_or_else(|| match Proof::of_voucher(claim) {
         Err(VoucherRefusal::Malformed(message)) => ClaimIngestRejection::Malformed(message),

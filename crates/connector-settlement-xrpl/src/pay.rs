@@ -56,7 +56,8 @@ use connector_settlement::batch::{
 };
 use connector_settlement::ChannelId;
 use connector_signer::{
-    decode_xrpl_classic_address, xrpl_channel_id, xrpl_classic_address, XRPL_MAX_DROPS,
+    decode_xrpl_classic_address, xrpl_channel_id, xrpl_classic_address, XrplVoucherScheme,
+    XRPL_MAX_DROPS,
 };
 use serde_json::Value;
 
@@ -105,10 +106,6 @@ impl XrplBatchSettlement {
     /// This node's settlement key: the channel key of every channel it opens.
     pub fn settlement_public_key(&self) -> [u8; 33] {
         self.signer.public_key()
-    }
-
-    fn caip2(&self) -> String {
-        format!("xrpl:{}", self.network_id)
     }
 
     fn outbound_map(
@@ -805,10 +802,9 @@ impl BatchSettlementPayer for XrplBatchSettlement {
                 backed: entry.backed,
             });
         }
-        let signature = self
-            .signer
-            .sign_claim(&id_bytes, cumulative_amount)
-            .map_err(|error| BatchSettlementError::InvalidVoucherSignature(error.to_string()))?;
+        let signature = XrplVoucherScheme::sign(&id_bytes, cumulative_amount, &self.signer)
+            .map_err(|error| BatchSettlementError::InvalidVoucherSignature(error.to_string()))?
+            .signature;
         self.update(&id, |entry| entry.signed = cumulative_amount);
         Ok(Voucher {
             cumulative_amount,
@@ -910,8 +906,11 @@ impl BatchSettlementPayer for XrplBatchSettlement {
         expires: u64,
     ) -> Result<Vec<u8>, BatchSettlementError> {
         let (_, id_bytes, _) = self.outbound_entry(channel)?;
-        self.signer
-            .sign_claim_state_challenge(&self.caip2(), &id_bytes, expires)
-            .map_err(|error| BatchSettlementError::Backend(error.to_string()))
+        Ok(XrplVoucherScheme::sign_challenge(
+            &self.voucher_domain(),
+            &id_bytes,
+            expires,
+            &self.signer,
+        ))
     }
 }

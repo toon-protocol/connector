@@ -71,7 +71,10 @@ pub use kms::{InMemoryKmsBackend, KmsBackend, KmsSigner};
 pub use local::LocalSigner;
 pub use nip59::{unwrap_claim, wrap_claim, Nip59Error, WrappedClaim};
 pub use signer::{verify, PublicKeyBytes, Signature, Signer};
-pub use voucher_scheme::{EvmVoucherScheme, ParsedEvmVoucher, VoucherRefusal, VoucherScheme};
+pub use voucher_scheme::{
+    EvmVoucherScheme, ParsedEvmVoucher, ParsedXrplVoucher, VoucherRefusal, VoucherScheme,
+    XrplChannelParts, XrplVoucherDomain, XrplVoucherScheme,
+};
 pub use voucher_signature::{
     evm_batch_channel_id, evm_voucher_digest, evm_voucher_signer, solana_voucher_message,
     verify_evm_voucher, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,

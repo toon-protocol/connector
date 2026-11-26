@@ -30,7 +30,10 @@ use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, Landed, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
-use connector_signer::{verify_xrpl_claim, XrplAlgorithm, XrplSigner, XRPL_MAX_DROPS};
+use connector_signer::{
+    ParsedXrplVoucher, VoucherScheme, XrplAlgorithm, XrplSigner, XrplVoucherDomain,
+    XrplVoucherScheme, XRPL_MAX_DROPS,
+};
 use serde_json::Value;
 
 use crate::tx::LandClaim;
@@ -212,6 +215,22 @@ impl XrplBatchSettlement {
     /// The network this backend settles on (`server_info.network_id`).
     pub fn network_id(&self) -> u32 {
         self.network_id
+    }
+
+    /// The domain XRPL's voucher scheme verifies under on this network.
+    pub(crate) fn voucher_domain(&self) -> XrplVoucherDomain {
+        XrplVoucherDomain::for_network_id(self.network_id)
+    }
+
+    /// Whether `voucher` is `key`'s claim on `channel_id`, through XRPL's
+    /// voucher scheme: the one check a landing and a closing sweep make.
+    pub(crate) fn genuine(&self, channel_id: &[u8; 32], voucher: &Voucher, key: &[u8; 33]) -> bool {
+        let parsed = ParsedXrplVoucher {
+            channel_id: *channel_id,
+            max_claimable_amount: voucher.cumulative_amount,
+            signature: voucher.signature.clone(),
+        };
+        XrplVoucherScheme::verify(&self.voucher_domain(), &parsed, key).is_ok()
     }
 
     /// The channel `presentation` names, as the port keeps it, and its
@@ -469,7 +488,7 @@ impl BatchSettlementBackend for XrplBatchSettlement {
                 "channel {id} has a PublicKey that is not a 33-byte channel key"
             ))
         })?;
-        if !verify_xrpl_claim(&key, &id_bytes, amount, &voucher.signature) {
+        if !self.genuine(&id_bytes, &voucher, &key) {
             return Err(BatchSettlementError::InvalidVoucherSignature(format!(
                 "not the channel key's signature over a claim for {drops} drops"
             )));

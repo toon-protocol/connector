@@ -11,10 +11,10 @@
 //! writing one implementation of it. Its associated types name what differs
 //! between chains:
 //!
-//! | Type             | EVM ([`EvmVoucherScheme`])                    | Solana (#1717)            | XRPL (#1718)                 |
+//! | Type             | EVM ([`EvmVoucherScheme`])                    | Solana (#1717)            | XRPL ([`XrplVoucherScheme`]) |
 //! | ---------------- | --------------------------------------------- | ------------------------- | ---------------------------- |
 //! | `Wire`           | `connector_domain`'s `EvmVoucher`             | `SolanaVoucher`           | `XrplVoucher`                |
-//! | `Domain`         | [`BatchSettlementDomain`] (chain id, contract) | none                      | the XRPL network             |
+//! | `Domain`         | [`BatchSettlementDomain`] (chain id, contract) | none                      | [`XrplVoucherDomain`] (the network) |
 //! | `ChannelParts`   | the `ChannelConfig`                           | the PDA seeds             | account, destination, sequence |
 //! | `Recorded`       | the `ChannelConfig` the lookup verified       | `authorized_signer`       | the channel's `PublicKey`    |
 //! | `KeyHolder`      | `dyn` [`crate::Signer`] (ADR 0012)            | `dyn` [`crate::Ed25519Signer`] | [`crate::XrplSigner`]   |
@@ -34,8 +34,10 @@
 //! [`BatchSettlementDomain`]: crate::BatchSettlementDomain
 
 mod evm;
+mod xrpl;
 
 pub use evm::{EvmVoucherScheme, ParsedEvmVoucher};
+pub use xrpl::{ParsedXrplVoucher, XrplChannelParts, XrplVoucherDomain, XrplVoucherScheme};
 
 use crate::SignerError;
 
