@@ -73,7 +73,6 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use connector_config::TransportPolicy;
-use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::identity::{anonymous_identity, resolve_identity, ConfiguredIdentity};
 use connector_domain::{
     agreed_required_transport, published_required_transport, refuse_oversize, EdgeIdentity,
@@ -93,7 +92,7 @@ mod claim_state;
 mod evidence_file;
 mod lookup_budget;
 mod outbound_ledger;
-mod paid_packet;
+pub(crate) use claim_gate::paid_packet;
 mod peer;
 mod session_registry;
 mod session_route;
@@ -995,40 +994,15 @@ fn decode_claim_header(
     })
 }
 
-/// The watermark one admitted claim advanced its channel to (issue
-/// #1012): exactly the pair [`crate::claim_gate::ClientClaimGate::roll_back`]
-/// names when a forwarded route's next hop turns out never to have carried
-/// the packet that claim paid for.
-///
-/// A named type rather than a loose `u64` because the BTP carriage threads
-/// it from its admission to its rollback -- [`Self::of`] is the only way to
-/// build one, so it can only ever come from the voucher itself. The HTTP
-/// carriage's paid packet owns its own rollback (#1719); the BTP carriage
-/// moves onto it in #1720.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AdmittedWatermark {
-    cumulative_amount: u128,
-}
-
-impl AdmittedWatermark {
-    /// Read `claim`'s own cumulative amount.
-    pub(crate) fn of(claim: &ClientEdgeClaim) -> AdmittedWatermark {
-        AdmittedWatermark {
-            cumulative_amount: claim.transferred_amount(),
-        }
-    }
-}
-
 /// Extract and fully validate whatever claim header `headers` carries, per
-/// client-edge-spec.md §1.3, against `charge`, for a probe (`POST
+/// client-edge-spec.md §1.3, against a price of 0, for a probe (`POST
 /// /ilp/probe`): the claim identifies rather than pays, and no packet it
-/// pays for is carried, so there is no paid packet to finish -- only the
-/// channel it proved, which is what this returns.
+/// pays for is carried, so its handle is finished as accepted -- what is
+/// left is the channel it proved, which is what this returns.
 ///
 /// `Ok(None)` means no claim header was present at all.
 async fn extract_and_validate_claim(
     headers: &HeaderMap,
-    charge: u64,
     state: &ClientEdgeState,
 ) -> Result<Option<String>, ClaimIngestRejection> {
     let Some((header_value, wrapped)) = presented_claim_header(headers) else {
@@ -1039,13 +1013,14 @@ async fn extract_and_validate_claim(
         wrapped,
         state.wrap_receiver_secret.as_ref(),
     )?;
-    let claim = state.claim_gate.ingest(&claim_json, charge).await?;
-    let channel_key = claim.claim_key();
-    // Best-effort liveness bookkeeping for issue #693's claim-state
-    // endpoint (`ClientClaimGate::note_claim_time`'s own doc): happens only
-    // after `ingest` has already returned durable, never inside it.
-    state.claim_gate.note_claim_time(&channel_key, now_unix());
-    Ok(Some(channel_key))
+    // The probe's claim notes its time for issue #693's claim-state
+    // endpoint once durable, through the paid packet's handle; it pays for
+    // no packet, so its acceptance is its outcome.
+    let claim = paid_packet::admit_probe_claim(&state.claim_gate, &claim_json)
+        .await?
+        .accepted()
+        .await?;
+    Ok(Some(claim.claim_key()))
 }
 
 /// Answer an ILP-level outcome the way client-edge-spec.md §1.1 and §1.6
@@ -1514,56 +1489,16 @@ pub(crate) fn claim_must_not_be_admitted(state: &ClientEdgeState, prepare: &Prep
 }
 
 /// Whether the single route lookup both carriages make (issue #701)
-/// matched a *forwarded* route -- the one shape
-/// [`roll_back_uncarried_forward`] acts on. One definition, called from
-/// both carriages, for the same reason every other rule the two share has
-/// one: what the HTTP path charges and what the BTP path charges must not
-/// drift.
+/// matched a *forwarded* route -- the one shape whose terminal reject means
+/// the packet was not carried ([`paid_packet::Outcome::of`], issue #1012).
+/// One definition, called from both carriages, for the same reason every
+/// other rule the two share has one: what the HTTP path charges and what the
+/// BTP path charges must not drift.
 pub(crate) fn is_forwarded_route(client_route: Option<ClientRouteFacts>) -> bool {
     matches!(
         client_route.map(|route| route.kind),
         Some(ClientRouteKind::Forwarded)
     )
-}
-
-/// Issue #1012: a client-priced forwarded route (ADR 0028) admits the
-/// client's covering claim before learning whether the next hop will
-/// fulfil it -- `Connector::forward_via_peer_route` can only greet, retry
-/// and finally accept or reject once it has actually tried the peer. A
-/// terminal reject reaching here means the packet this claim paid for was
-/// never carried, so the claim is not counted against the client: its
-/// watermark is rolled back to what it was immediately before this
-/// request, via [`crate::claim_gate::ClientClaimGate::roll_back`], which
-/// itself no-ops (rather than corrupts) if a later claim on the same
-/// channel has since moved on. A no-op on every other shape -- an
-/// unforwarded route, a fulfilment, or a request that admitted no claim at
-/// all -- so this changes nothing about what those already do.
-pub(crate) async fn roll_back_uncarried_forward(
-    state: &ClientEdgeState,
-    is_forwarded_route: bool,
-    client_channel_id: Option<&str>,
-    admitted_claim_watermark: Option<AdmittedWatermark>,
-    response: &PacketResponse,
-) {
-    if !is_forwarded_route || !matches!(response, PacketResponse::Reject(_)) {
-        return;
-    }
-    let (Some(channel_key), Some(watermark)) = (client_channel_id, admitted_claim_watermark) else {
-        return;
-    };
-    if let Err(error) = state
-        .claim_gate
-        .roll_back(channel_key, watermark.cumulative_amount)
-        .await
-    {
-        tracing::error!(
-            channel = channel_key,
-            error = %error.message(),
-            "a forwarded route's next hop rejected this packet, but this claim's watermark \
-             could not be durably rolled back -- the client remains charged for a packet \
-             this connector never carried"
-        );
-    }
 }
 
 /// `POST /ilp/probe` -- a probe's ingress (client-edge-spec.md §1.6, ADR
@@ -1595,7 +1530,7 @@ async fn handle_probe(
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
 
-    let channel_key = match extract_and_validate_claim(&headers, 0, &state).await {
+    let channel_key = match extract_and_validate_claim(&headers, &state).await {
         Ok(Some(channel_key)) => channel_key,
         Ok(None) => {
             return (
