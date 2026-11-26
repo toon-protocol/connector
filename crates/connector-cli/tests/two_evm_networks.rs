@@ -31,9 +31,8 @@ use connector_settlement::batch::contract::{
     BoxFuture, ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
-    BatchChannelStatus, BatchSettlementBackend, BatchSettlementPayer, ChannelPresentation,
-    EvmChannelConfig, EvmReceiverTerms, OutboundChannelRecord, ReceiverTerms, Voucher,
-    VoucherSigner,
+    BatchChannelStatus, BatchSettlementBackend, ChannelPresentation, EvmChannelConfig,
+    EvmReceiverTerms, OutboundChannelRecord, ReceiverTerms, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
@@ -322,13 +321,13 @@ async fn the_greeting_offers_one_entry_per_evm_network() {
     // one settlement key as the voucher signer on each (ADR 0086 decision
     // 5).
     let networks: Vec<String> = runtime
-        .voucher_signers
+        .voucher_signers()
         .iter()
         .map(|fact| fact.network.clone())
         .collect();
     assert_eq!(networks, vec![base.network(), other.network()]);
     assert!(runtime
-        .voucher_signers
+        .voucher_signers()
         .iter()
         .all(|fact| fact.signer == node));
 }
@@ -421,12 +420,11 @@ async fn a_voucher_on_each_network_is_credited_and_settled_on_that_network() {
     drop(runtime);
     let runtime = connector_cli::build(&config).await.expect("rebuild");
     for (net, channel, signature) in &channels {
-        let backend = Arc::clone(
-            runtime
-                .batch_settlement_evm
-                .get(&network(&net.network()))
-                .expect("a backend per network"),
-        ) as Arc<dyn BatchSettlementBackend>;
+        let backend = runtime
+            .settlement_networks
+            .get(&network(&net.network()))
+            .expect("a backend per network")
+            .receiver();
         let restored = backend
             .channel_state(channel)
             .await
@@ -570,13 +568,16 @@ async fn each_networks_backend_upholds_the_batch_settlement_contract() {
     let runtime = connector_cli::build(&config).await.expect("build");
 
     for net in [&base, &other] {
-        let backend = Arc::clone(
-            runtime
-                .batch_settlement_evm
-                .get(&network(&net.network()))
-                .expect("a backend per network"),
-        );
-        let fixture = fixture(Arc::clone(net), backend);
+        let held = runtime
+            .settlement_networks
+            .get(&network(&net.network()))
+            .expect("a backend per network");
+        let node: ethers::types::Address = held
+            .voucher_signer()
+            .signer
+            .parse()
+            .expect("the node's settlement address");
+        let fixture = fixture(Arc::clone(net), held.receiver(), node.to_fixed_bytes());
         assert_refuses_a_channel_in_another_token(&fixture).await;
         assert_upholds_the_contract(|| async move { fixture }).await;
     }
@@ -586,9 +587,9 @@ async fn each_networks_backend_upholds_the_batch_settlement_contract() {
 /// payer.
 fn fixture(
     net: Arc<Net>,
-    backend: Arc<connector_settlement_evm::EvmBatchSettlementBackend>,
+    backend: Arc<dyn BatchSettlementBackend>,
+    node: [u8; 20],
 ) -> BatchContractFixture {
-    let node = backend.own_address().to_fixed_bytes();
     let config_for = {
         let net = Arc::clone(&net);
         move |terms: ChannelTerms| {
@@ -619,7 +620,7 @@ fn fixture(
         }
     };
     BatchContractFixture {
-        backend: backend as Arc<dyn BatchSettlementBackend>,
+        backend,
         minimum_delay_secs: ONE_DAY,
         open: {
             let net = Arc::clone(&net);
@@ -1371,12 +1372,11 @@ async fn open_as_before_adr_0086(
         .mint(net.token, Address::from(node_address()), 1_000_000)
         .await;
     let runtime = connector_cli::build(config).await.expect("build");
-    let payer = Arc::clone(
-        runtime
-            .batch_settlement_evm
-            .get(&network(&net.network()))
-            .expect("a backend for the network"),
-    );
+    let payer = runtime
+        .settlement_networks
+        .get(&network(&net.network()))
+        .expect("a backend for the network")
+        .payer();
     let record = payer
         .prepare_open(
             ReceiverTerms::Evm(EvmReceiverTerms {

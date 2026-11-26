@@ -18,8 +18,9 @@
 use std::fmt;
 use std::sync::Arc;
 
+use connector_domain::x402::X402BatchSettlementTerms;
 use connector_domain::{Network, VoucherSignerFact};
-use connector_settlement::batch::{BatchSettlementBackend, BatchSettlementPayer};
+use connector_settlement::batch::{BatchSettlementBackend, BatchSettlementPayer, HeldVouchers};
 use thiserror::Error;
 
 /// The carriage a voucher arrives over: the client edge, or a peer carriage
@@ -83,6 +84,19 @@ pub trait SettlementNetwork: Send + Sync + fmt::Debug {
     fn carriages(&self) -> VoucherCarriages {
         VoucherCarriages::Every
     }
+
+    /// The batch-settlement terms this network's entry in the greeting's
+    /// `accepts[]` publishes (ADR 0074 decision 8): proved at connect, never
+    /// re-declared. A wire shape, so it stays a per-chain enum; only who
+    /// assembles it moved behind the handle (spec #1684).
+    fn terms(&self) -> X402BatchSettlementTerms;
+
+    /// Start this network's watcher in the background, handed `held`: the
+    /// vouchers held on this network's channels and no other's (ADR 0086).
+    /// The watcher keeps its own run loop; only starting it is the handle's.
+    /// Called once, from inside a Tokio runtime, when the node starts
+    /// serving.
+    fn start_watcher(&self, held: Arc<dyn HeldVouchers>);
 }
 
 /// Two handles for one network: a node settles on a network through one
@@ -157,6 +171,37 @@ impl SettlementNetworks {
     pub fn is_empty(&self) -> bool {
         self.networks.is_empty()
     }
+
+    /// Every network this node settles on, in table order.
+    pub fn networks(&self) -> Vec<Network> {
+        self.iter().map(|held| held.network().clone()).collect()
+    }
+
+    /// The greeting's whole `accepts[]`: each network's terms, in table order
+    /// (ADR 0075 decision 10).
+    pub fn terms(&self) -> Vec<X402BatchSettlementTerms> {
+        self.iter().map(|held| held.terms()).collect()
+    }
+
+    /// Each network's outbound voucher signer, in table order: what the
+    /// self-description publishes so a peer can bind this node's channels.
+    pub fn voucher_signers(&self) -> Vec<VoucherSignerFact> {
+        self.iter().map(|held| held.voucher_signer()).collect()
+    }
+
+    /// Each network's receiving half, keyed by its network.
+    pub fn receivers(&self) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
+        self.iter()
+            .map(|held| (held.network().clone(), held.receiver()))
+            .collect()
+    }
+
+    /// Each network's paying half, keyed by its network.
+    pub fn payers(&self) -> Vec<(Network, Arc<dyn BatchSettlementPayer>)> {
+        self.iter()
+            .map(|held| (held.network().clone(), held.payer()))
+            .collect()
+    }
 }
 
 impl fmt::Debug for SettlementNetworks {
@@ -178,6 +223,7 @@ pub struct InMemorySettlementNetwork {
     settlement: Arc<connector_settlement::batch::InMemoryBatchSettlement>,
     voucher_signer: String,
     carriages: VoucherCarriages,
+    terms: X402BatchSettlementTerms,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -189,12 +235,21 @@ impl InMemorySettlementNetwork {
         settlement: Arc<connector_settlement::batch::InMemoryBatchSettlement>,
         voucher_signer: impl Into<String>,
     ) -> InMemorySettlementNetwork {
+        let voucher_signer = voucher_signer.into();
         InMemorySettlementNetwork {
+            terms: placeholder_terms(&network, &voucher_signer),
             network,
             settlement,
-            voucher_signer: voucher_signer.into(),
+            voucher_signer,
             carriages: VoucherCarriages::Every,
         }
+    }
+
+    /// Publish `terms` in the greeting instead of the placeholder ones a new
+    /// in-memory network names.
+    pub fn with_terms(mut self, terms: X402BatchSettlementTerms) -> InMemorySettlementNetwork {
+        self.terms = terms;
+        self
     }
 
     /// A network on a fresh in-memory chain shaped like `network`'s -- an
@@ -292,6 +347,50 @@ impl InMemorySettlementNetwork {
     }
 }
 
+/// Terms naming `network`, paid to `voucher_signer`, in the shape of
+/// `network`'s chain: what an in-memory network publishes until a test gives
+/// it real ones ([`InMemorySettlementNetwork::with_terms`]).
+#[cfg(any(test, feature = "test-support"))]
+fn placeholder_terms(network: &Network, voucher_signer: &str) -> X402BatchSettlementTerms {
+    use connector_domain::x402::{
+        X402BatchSettlementEvmTerms, X402BatchSettlementSolanaTerms, X402BatchSettlementXrplTerms,
+    };
+    use connector_domain::AssetChain;
+    match network.chain() {
+        AssetChain::Solana => X402BatchSettlementTerms::Solana(X402BatchSettlementSolanaTerms {
+            network: network.to_string(),
+            asset: "in-memory-asset".to_string(),
+            pay_to: voucher_signer.to_string(),
+            fee_payer: voucher_signer.to_string(),
+            min_grace_period_secs: 86_400,
+            token_program: "in-memory-token-program".to_string(),
+            min_deposit: "0".to_string(),
+            sponsor_endpoint: "/ilp/sponsor".to_string(),
+        }),
+        AssetChain::Xrpl => X402BatchSettlementTerms::Xrpl(X402BatchSettlementXrplTerms {
+            network: network.to_string(),
+            asset: "XRP".to_string(),
+            pay_to: voucher_signer.to_string(),
+            binding: connector_domain::x402::XRPL_PAYCHAN_BINDING.to_string(),
+            min_settle_delay_secs: 86_400,
+            redemption_safety_secs: 3_600,
+        }),
+        AssetChain::Evm | AssetChain::Mina => {
+            X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+                network: network.to_string(),
+                asset: "in-memory-asset".to_string(),
+                pay_to: voucher_signer.to_string(),
+                receiver_authorizer: voucher_signer.to_string(),
+                min_withdraw_delay_secs: 86_400,
+                name: "In-Memory Token".to_string(),
+                version: "1".to_string(),
+                asset_transfer_method: Default::default(),
+                facilitator: None,
+            })
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -331,6 +430,14 @@ impl SettlementNetwork for InMemorySettlementNetwork {
     fn carriages(&self) -> VoucherCarriages {
         self.carriages
     }
+
+    fn terms(&self) -> X402BatchSettlementTerms {
+        self.terms.clone()
+    }
+
+    /// The in-memory chain moves only when a test moves it: there is nothing
+    /// to watch.
+    fn start_watcher(&self, _held: Arc<dyn HeldVouchers>) {}
 }
 
 #[cfg(test)]
@@ -410,6 +517,88 @@ mod tests {
                 "eip155:84532",
                 "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
             ]
+        );
+    }
+
+    /// The greeting's `accepts[]` is each network's own terms, in table
+    /// order: assembly names no chain.
+    #[test]
+    fn greeting_terms_are_each_networks_own_in_table_order() {
+        use connector_domain::x402::{
+            X402AssetTransferMethod, X402BatchSettlementEvmTerms, X402BatchSettlementTerms,
+            X402BatchSettlementXrplTerms,
+        };
+        let base = X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+            network: "eip155:8453".to_string(),
+            asset: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string(),
+            pay_to: "0x00000000000000000000000000000000000000aa".to_string(),
+            receiver_authorizer: "0x00000000000000000000000000000000000000aa".to_string(),
+            min_withdraw_delay_secs: 86_400,
+            name: "USD Coin".to_string(),
+            version: "2".to_string(),
+            asset_transfer_method: X402AssetTransferMethod::default(),
+            facilitator: None,
+        });
+        let xrpl = X402BatchSettlementTerms::Xrpl(X402BatchSettlementXrplTerms {
+            network: "xrpl:1".to_string(),
+            asset: "XRP".to_string(),
+            pay_to: "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe".to_string(),
+            binding: "paychan".to_string(),
+            min_settle_delay_secs: 86_400,
+            redemption_safety_secs: 3_600,
+        });
+        let networks = SettlementNetworks::new()
+            .with(Arc::new(
+                InMemorySettlementNetwork::fresh(network("xrpl:1")).with_terms(xrpl.clone()),
+            ))
+            .and_then(|networks| {
+                networks.with(Arc::new(
+                    InMemorySettlementNetwork::fresh(network("eip155:8453"))
+                        .with_terms(base.clone()),
+                ))
+            })
+            .expect("two distinct networks");
+        assert_eq!(networks.terms(), vec![xrpl, base]);
+        assert!(SettlementNetworks::new().terms().is_empty());
+    }
+
+    /// The receiving and paying halves, and the voucher signers, are each
+    /// network's own, keyed by the network that published them.
+    #[test]
+    fn each_networks_halves_and_signer_are_keyed_by_its_network() {
+        let networks = two_evm_one_solana();
+        let order = [
+            "eip155:8453",
+            "eip155:84532",
+            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        ];
+        let receivers: Vec<String> = networks
+            .receivers()
+            .into_iter()
+            .map(|(held, _)| held.to_string())
+            .collect();
+        let payers: Vec<String> = networks
+            .payers()
+            .into_iter()
+            .map(|(held, _)| held.to_string())
+            .collect();
+        let signers: Vec<(String, String)> = networks
+            .voucher_signers()
+            .into_iter()
+            .map(|fact| (fact.network, fact.signer))
+            .collect();
+        assert_eq!(receivers, order);
+        assert_eq!(payers, order);
+        assert_eq!(
+            signers,
+            order
+                .iter()
+                .map(|caip2| (caip2.to_string(), format!("signer-on-{caip2}")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            networks.networks(),
+            order.iter().map(|caip2| network(caip2)).collect::<Vec<_>>()
         );
     }
 

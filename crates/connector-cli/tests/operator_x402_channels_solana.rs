@@ -224,7 +224,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     let b_addr = serve(b_app.clone());
 
     // -- Open toward B, through B's own sponsor endpoint --
-    let terms = serde_json::to_value(&b_runtime.batch_settlements[0]).expect("B's terms");
+    let terms = serde_json::to_value(&b_runtime.batch_settlements()[0]).expect("B's terms");
     assert_eq!(
         terms["sponsorEndpoint"],
         connector_cli::SPONSOR_PATH,

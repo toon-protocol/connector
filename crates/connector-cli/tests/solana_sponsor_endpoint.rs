@@ -33,7 +33,7 @@ use axum::Router;
 use base64::Engine as _;
 use connector_domain::x402::{parse_greeting, X402BatchSettlementExtra, X402PaymentRequired};
 use connector_domain::{Fulfill, Reject};
-use connector_settlement::batch::{BatchChannelStatus, BatchSettlementBackend};
+use connector_settlement::batch::BatchChannelStatus;
 use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::sponsor::MEMO_PROGRAM_ID;
 use connector_settlement_solana::batch::wire::{
@@ -491,9 +491,11 @@ price = {PRICE}
     );
 
     let backend = runtime
-        .batch_settlement_solana
-        .clone()
-        .expect("opted in on Solana");
+        .settlement_networks
+        .iter()
+        .next()
+        .expect("opted in on Solana")
+        .receiver();
     let state = backend
         .channel_state(&ChannelId(channel.to_string()))
         .await
