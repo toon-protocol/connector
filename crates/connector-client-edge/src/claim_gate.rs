@@ -81,7 +81,6 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use connector_domain::client_claim::{
     canonical_channel_key, parse_client_edge_claim, ClientClaim, ClientClaimError, ClientEdgeClaim,
-    EvmVoucherChannelConfig, EVM_NAMESPACE,
 };
 use connector_domain::{
     advance_voucher_watermark, validate_voucher, ClaimError, JournalEntry, Network,
@@ -89,21 +88,18 @@ use connector_domain::{
 };
 use connector_peer_auth::SessionRole;
 use connector_runtime::{Journal, JournalError, SettlementNetworks};
-use connector_signer::{
-    evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, verify_solana_voucher,
-    verify_xrpl_claim, BatchChannelConfig, BatchSettlementDomain,
-};
+use connector_signer::{EvmVoucherScheme, VoucherRefusal, VoucherScheme};
 
-use crate::batch_settlement::{
-    journaled_batch_channels, AdmittedEvmVoucherChannel, AdmittedSolanaVoucherChannel,
-    AdmittedXrplVoucherChannel, JournaledBatchChannel, VoucherChannels,
-};
-use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
+use crate::batch_settlement::{journaled_batch_channels, JournaledBatchChannel, VoucherChannels};
+use crate::channels::{decode_base58_bytes, ChannelResolutionError};
 use crate::lookup_budget::{
-    LookupBudgetBound, LookupReservation, UnresolvableLookupBudget, UnresolvableLookupBudgetPolicy,
+    LookupBudgetBound, UnresolvableLookupBudget, UnresolvableLookupBudgetPolicy,
 };
 use crate::outbound_ledger::{ClientPayoutLedger, PayoutVoucher};
 use connector_settlement::batch::VoucherSigner;
+
+mod verification;
+pub(crate) use verification::{NotFound, Proof};
 
 mod allowance;
 pub(crate) mod paid_packet;
@@ -793,107 +789,6 @@ impl ClientClaimGate {
             .collect()
     }
 
-    /// The EVM batch-settlement channel `channel_id`, found for a claim-state
-    /// read (issue #1364) the way [`Self::admit_voucher`] finds it for a
-    /// voucher, with the domain its challenge is verified under: the config
-    /// is `presented` if the request carried one, else this gate's record of
-    /// the channel, and either must hash to `channel_id` before the backend
-    /// is asked. `Ok(None)` for a node that has not opted in to EVM
-    /// vouchers, a channel with neither config, a config that hashes to
-    /// another channel, or one the backend does not admit.
-    pub(crate) async fn evm_voucher_channel(
-        &self,
-        network: &Network,
-        channel_id: &[u8; 32],
-        presented: Option<BatchChannelConfig>,
-        requester: &str,
-    ) -> Result<Option<(BatchSettlementDomain, AdmittedEvmVoucherChannel)>, ChannelResolutionError>
-    {
-        let channels = &self.voucher_channels;
-        // ADR 0086: verified under the named network's own domain, and
-        // asked of that network only.
-        let Some(domain) = channels.evm_domain_on(network) else {
-            return Ok(None);
-        };
-        let key = format!("{EVM_NAMESPACE}:0x{}", hex::encode(channel_id));
-        let recorded = match self.known_batch_channel(&key) {
-            Some(JournaledBatchChannel::Evm { config, .. }) => Some(config),
-            _ => None,
-        };
-        let Some(config) = presented.or(recorded) else {
-            return Ok(None);
-        };
-        if evm_batch_channel_id(&domain, &config) != *channel_id {
-            return Ok(None);
-        }
-        let found = self
-            .metered_voucher_lookup(
-                recorded.is_none(),
-                requester,
-                channels.evm(network, channel_id, Some(&config)),
-            )
-            .await?;
-        // As in `verify_voucher`: the signer is read from the backend's
-        // config, so it has to be this channel's.
-        Ok(found
-            .filter(|channel| evm_batch_channel_id(&domain, &channel.config) == *channel_id)
-            .map(|channel| (domain, channel)))
-    }
-
-    /// As [`Self::evm_voucher_channel`], for the Solana channel account
-    /// `channel_account` on `network`: every field is on chain, so nothing
-    /// is presented.
-    pub(crate) async fn solana_voucher_channel(
-        &self,
-        network: &Network,
-        channel_account: &[u8; 32],
-        requester: &str,
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
-        if !self.voucher_channels.settles_on(network) {
-            return Ok(None);
-        }
-        let key = JournaledBatchChannel::Solana {
-            channel_account: *channel_account,
-        }
-        .channel_key();
-        let unseen = self.known_batch_channel(&key).is_none();
-        self.metered_voucher_lookup(
-            unseen,
-            requester,
-            self.voucher_channels.solana(network, channel_account),
-        )
-        .await
-    }
-
-    /// As [`Self::solana_voucher_channel`], for the XRPL channel `channel_id`
-    /// on `network`: every field is on the ledger, so nothing is presented.
-    /// The network is the voucher's own, since the id binds none.
-    pub(crate) async fn xrpl_voucher_channel(
-        &self,
-        network: &Network,
-        channel_id: &[u8; 32],
-        requester: &str,
-    ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
-        let Network::Xrpl(xrpl) = network else {
-            return Ok(None);
-        };
-        if !self.voucher_channels.settles_on(network) {
-            return Ok(None);
-        }
-        let key = format!(
-            "{}:{}",
-            connector_domain::client_claim::XRPL_CHANNEL_NAMESPACE,
-            hex::encode(channel_id)
-        );
-        let unseen = self.known_batch_channel(&key).is_none();
-        self.metered_voucher_lookup(
-            unseen,
-            requester,
-            self.voucher_channels.xrpl(xrpl, channel_id),
-        )
-        .await
-    }
-
     /// Whether `network` names a settlement table this node has (ADR 0086
     /// decision 1) -- `false` on a node that settles on nothing.
     pub(crate) fn settles_on(&self, network: &Network) -> bool {
@@ -906,31 +801,6 @@ impl ClientClaimGate {
             .expect("batch channels lock poisoned")
             .get(key)
             .copied()
-    }
-
-    /// Run a batch-settlement `lookup` for a read, metered as a voucher's is
-    /// (issue #613): a channel this gate has no record of is a discovery,
-    /// charged before the backend is asked and given back if it found one.
-    async fn metered_voucher_lookup<T>(
-        &self,
-        unseen: bool,
-        requester: &str,
-        lookup: impl std::future::Future<Output = Result<Option<T>, ChannelResolutionError>>,
-    ) -> Result<Option<T>, ChannelResolutionError> {
-        let budget = self.lookup_budget();
-        let reservation = if unseen {
-            Some(
-                budget
-                    .reserve(requester)
-                    .await
-                    .map_err(ChannelResolutionError::Budgeted)?,
-            )
-        } else {
-            None
-        };
-        let found = lookup.await?;
-        refund_if_found(budget, reservation, found.is_some());
-        Ok(found)
     }
 
     /// Every channel this gate has ever accepted a claim on, and that
@@ -1217,8 +1087,7 @@ impl ClientClaimGate {
 
         // Decoded before freshness, not after: a resend is recognised by its
         // signature's *bytes*, and decoding is not cryptography.
-        let signature = decode_voucher_signature(&claim)?;
-        let signature_bytes = signature.to_bytes();
+        let signature_bytes = voucher_signature_bytes(&claim)?;
         let key = claim.channel_key();
         let amount = claim.transferred_amount();
         {
@@ -1238,20 +1107,21 @@ impl ClientClaimGate {
             }
         }
 
+        // client-edge-spec.md §1.3 step 4 (ADR 0074 decision 4): find the
+        // channel on the voucher's own network, then verify against the
+        // signer its chain records -- never one the voucher names. A channel
+        // this gate has accepted a voucher on before supplies the EVM config
+        // a voucher may omit, and its lookup is not a discovery the
+        // unresolvable-lookup budget meters.
+        let proof = Proof::of_voucher(&claim).map_err(voucher_refusal)?;
         let requester = claim.signer_key();
-        // A channel this gate has accepted a voucher on before: its record
-        // supplies the EVM config a voucher may omit, and its lookup is not
-        // a discovery the unresolvable-lookup budget meters.
-        let known = self.known_batch_channel(&key);
-        let verified = verify_voucher(
-            channels,
-            &claim,
-            signature,
-            &requester,
-            known,
-            self.lookup_budget(),
-        )
-        .await?;
+        let verified = self
+            .find_then_verify(claim.network(), &proof, &requester)
+            .await
+            .map_err(|not_found| not_found_refusal(not_found, claim.network(), &requester))?;
+        if !verified.verified {
+            return Err(ClaimIngestRejection::SignatureInvalid);
+        }
         // client-edge-spec.md §1.3 step 5, against the backend's current
         // reading rather than a cached floor: on EVM the figure can fall
         // (ADR 0074 decision 5), so there is no lower bound to cache.
@@ -1830,288 +1700,64 @@ fn claim_refusal(error: ClaimError, held: u128) -> ClaimIngestRejection {
     }
 }
 
-/// A voucher's signature, decoded: fixed width on the two chains that sign a
-/// fixed-width form, a DER or raw signature of 64 to 72 bytes on XRPL.
-enum VoucherSignature {
-    Evm([u8; 65]),
-    Solana([u8; 64]),
-    Xrpl(Vec<u8>),
-}
-
-impl VoucherSignature {
-    fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            VoucherSignature::Evm(signature) => signature.to_vec(),
-            VoucherSignature::Solana(signature) => signature.to_vec(),
-            VoucherSignature::Xrpl(signature) => signature.clone(),
-        }
-    }
-}
-
 /// A voucher's signature as the bytes its scheme defines: `0x` + 130 hex on
 /// EVM (65 bytes, `v` as the wallet wrote it), base58 of 64 bytes on
 /// Solana, hex of 64 to 72 bytes on XRPL (a DER ECDSA or a raw Ed25519
-/// signature). Anything else is a structural failure -- the parser checked
+/// signature). What a resend is recognised by, so it is decoded before
+/// freshness. Anything else is a structural failure -- the parser checked
 /// the alphabet, this checks the length.
-fn decode_voucher_signature(claim: &ClientClaim) -> Result<VoucherSignature, ClaimIngestRejection> {
-    match claim {
-        ClientClaim::EvmVoucher(voucher) => decode_hex_bytes::<65>(&voucher.signature)
-            .map(VoucherSignature::Evm)
-            .ok_or_else(|| {
-                ClaimIngestRejection::Malformed(
-                    "a voucher's 'signature' must be 65 bytes of hex".to_string(),
-                )
-            }),
-        ClientClaim::SolanaVoucher(voucher) => decode_base58_bytes::<64>(&voucher.signature)
-            .map(VoucherSignature::Solana)
-            .ok_or_else(|| {
-                ClaimIngestRejection::Malformed(
-                    "a Solana voucher's 'signature' must be base58 of 64 bytes".to_string(),
-                )
-            }),
+fn voucher_signature_bytes(claim: &ClientClaim) -> Result<Vec<u8>, ClaimIngestRejection> {
+    let decoded = match claim {
+        ClientClaim::EvmVoucher(voucher) => {
+            EvmVoucherScheme::decode_signature(&voucher.signature).map(|bytes| bytes.to_vec())
+        }
+        ClientClaim::SolanaVoucher(voucher) => {
+            decode_base58_bytes::<64>(&voucher.signature).map(|bytes| bytes.to_vec())
+        }
         ClientClaim::XrplVoucher(voucher) => hex::decode(&voucher.signature)
             .ok()
-            .filter(|bytes| (64..=72).contains(&bytes.len()))
-            .map(VoucherSignature::Xrpl)
-            .ok_or_else(|| {
-                ClaimIngestRejection::Malformed(
-                    "an XRPL voucher's 'signature' must be 64 to 72 bytes of hex".to_string(),
-                )
-            }),
-    }
-}
-
-/// An EVM voucher's `channelConfig`, decoded into the struct
-/// `connector_signer` hashes. The parser has already checked every field's
-/// shape, so a decode that fails here is still reported, not unwrapped.
-pub(crate) fn decode_evm_channel_config(
-    config: &EvmVoucherChannelConfig,
-) -> Result<BatchChannelConfig, ClaimIngestRejection> {
-    let address = |value: &str| {
-        decode_hex_bytes::<20>(value).ok_or_else(|| {
-            ClaimIngestRejection::Malformed(format!("'{value}' is not a 20-byte address"))
-        })
+            .filter(|bytes| (64..=72).contains(&bytes.len())),
     };
-    Ok(BatchChannelConfig {
-        payer: address(&config.payer)?,
-        payer_authorizer: address(&config.payer_authorizer)?,
-        receiver: address(&config.receiver)?,
-        receiver_authorizer: address(&config.receiver_authorizer)?,
-        token: address(&config.token)?,
-        withdraw_delay: config.withdraw_delay,
-        salt: decode_hex_bytes::<32>(&config.salt).ok_or_else(|| {
-            ClaimIngestRejection::Malformed("'channelConfig.salt' is not 32 bytes".to_string())
-        })?,
+    decoded.ok_or_else(|| match Proof::of_voucher(claim) {
+        Err(VoucherRefusal::Malformed(message)) => ClaimIngestRejection::Malformed(message),
+        _ => ClaimIngestRejection::Malformed("a voucher's 'signature' is malformed".to_string()),
     })
 }
 
-/// What survives [`verify_voucher`]: the channel's collateral bound for
-/// step 5, and the channel as the journal records it.
-struct VerifiedVoucher {
-    max_cumulative: u128,
-    channel: JournaledBatchChannel,
-    /// The key the voucher verified against, as the chain records it.
-    signer: VoucherSigner,
+/// A voucher its scheme could not read, as the gate refuses it: a field
+/// that is not its scheme's bytes is malformed, and a channel id that is not
+/// names no channel.
+fn voucher_refusal(refusal: VoucherRefusal) -> ClaimIngestRejection {
+    match refusal {
+        VoucherRefusal::Malformed(message) => ClaimIngestRejection::Malformed(message),
+        VoucherRefusal::UnreadableChannel => ClaimIngestRejection::UnknownChannel,
+        VoucherRefusal::ChannelIdMismatch => ClaimIngestRejection::UnknownChannel,
+        VoucherRefusal::SignatureInvalid => ClaimIngestRejection::SignatureInvalid,
+    }
 }
 
-/// client-edge-spec.md §1.3 step 4 for a voucher (ADR 0074 decision 4):
-/// resolve its channel through `backend`, take the signer from what the
-/// backend verified -- never from the voucher -- and check the signature.
-///
-/// `known` is this gate's record of the channel, if it has accepted a
-/// voucher on it before: on EVM its config is presented for a voucher that
-/// carries none. A channel with no record is a discovery, and its lookup is
-/// metered against `budget` (issue #613): charged before the backend is
-/// asked, and given back if the backend found a channel.
-async fn verify_voucher(
-    channels: &VoucherChannels,
-    claim: &ClientClaim,
-    signature: VoucherSignature,
+/// A voucher whose channel was not found to verify against, as the gate
+/// refuses it.
+fn not_found_refusal(
+    not_found: NotFound,
+    network: &connector_domain::Network,
     requester: &str,
-    known: Option<JournaledBatchChannel>,
-    budget: &UnresolvableLookupBudget,
-) -> Result<VerifiedVoucher, ClaimIngestRejection> {
-    let refuse_resolution = |error: ChannelResolutionError| {
-        if let ChannelResolutionError::LookupFailed(failure) = &error {
-            tracing::warn!(
-                requester = %requester,
-                error = %failure,
-                "refusing a voucher: could not resolve its batch-settlement channel"
-            );
-        }
-        resolution_refusal(error)
-    };
-    match (claim, signature) {
-        (ClientClaim::EvmVoucher(voucher), VoucherSignature::Evm(signature)) => {
-            // ADR 0086: the voucher's own network picks the domain it is
-            // verified under, and the backend that resolves its channel.
-            let domain = channels.evm_domain_on(&voucher.network).ok_or_else(|| {
-                ClaimIngestRejection::NetworkNotSettled {
-                    network: voucher.network.clone(),
-                }
-            })?;
-            let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
-                return Err(ClaimIngestRejection::UnknownChannel);
-            };
-            let recorded = match known {
-                Some(JournaledBatchChannel::Evm { config, .. }) => Some(config),
-                _ => None,
-            };
-            let presented = voucher
-                .channel_config
-                .as_ref()
-                .map(decode_evm_channel_config)
-                .transpose()?
-                .or(recorded);
-            // ADR 0074 decision 2: recompute `getChannelId` and refuse a
-            // mismatch -- before asking the backend anything about it.
-            if presented.is_some_and(|config| evm_batch_channel_id(&domain, &config) != channel_id)
-            {
-                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch {
-                    network: voucher.network.clone(),
-                });
+) -> ClaimIngestRejection {
+    match not_found {
+        NotFound::Unknown => ClaimIngestRejection::UnknownChannel,
+        NotFound::ChannelIdMismatch => ClaimIngestRejection::VoucherChannelConfigMismatch {
+            network: network.clone(),
+        },
+        NotFound::Unresolved(error) => {
+            if let ChannelResolutionError::LookupFailed(failure) = &error {
+                tracing::warn!(
+                    requester = %requester,
+                    error = %failure,
+                    "refusing a voucher: could not resolve its batch-settlement channel"
+                );
             }
-            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = channels
-                .evm(&voucher.network, &channel_id, presented.as_ref())
-                .await
-                .map_err(refuse_resolution)?;
-            refund_if_found(budget, reservation, found.is_some());
-            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
-            // The backend's config is re-hashed too: the signer is read from
-            // it, so it has to be this channel's, whoever supplied it.
-            if evm_batch_channel_id(&domain, &channel.config) != channel_id {
-                return Err(ClaimIngestRejection::VoucherChannelConfigMismatch {
-                    network: voucher.network.clone(),
-                });
-            }
-            let signer = evm_voucher_signer(&channel.config);
-            if verify_evm_voucher(
-                &domain,
-                &channel_id,
-                voucher.max_claimable_amount,
-                &signature,
-                &signer,
-            ) {
-                Ok(VerifiedVoucher {
-                    max_cumulative: channel.max_cumulative,
-                    channel: JournaledBatchChannel::Evm {
-                        channel_id,
-                        config: channel.config,
-                    },
-                    signer: VoucherSigner::Evm(signer),
-                })
-            } else {
-                Err(ClaimIngestRejection::SignatureInvalid)
-            }
+            resolution_refusal(error)
         }
-        (ClientClaim::SolanaVoucher(voucher), VoucherSignature::Solana(signature)) => {
-            let Some(channel_account) = decode_base58_bytes::<32>(&voucher.channel_id) else {
-                return Err(ClaimIngestRejection::UnknownChannel);
-            };
-            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = channels
-                .solana(&voucher.network, &channel_account)
-                .await
-                .map_err(refuse_resolution)?;
-            refund_if_found(budget, reservation, found.is_some());
-            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
-            // `expiresAt` is zero: the parser refused anything else (ADR
-            // 0074 decision 3), and it is still part of the signed bytes.
-            if verify_solana_voucher(
-                &channel_account,
-                voucher.max_claimable_amount,
-                0,
-                &signature,
-                &channel.authorized_signer,
-            ) {
-                Ok(VerifiedVoucher {
-                    max_cumulative: u128::from(channel.max_cumulative),
-                    channel: JournaledBatchChannel::Solana { channel_account },
-                    signer: VoucherSigner::Solana(channel.authorized_signer),
-                })
-            } else {
-                Err(ClaimIngestRejection::SignatureInvalid)
-            }
-        }
-        (ClientClaim::XrplVoucher(voucher), VoucherSignature::Xrpl(signature)) => {
-            let Some(channel_id) = decode_hex_bytes::<32>(&voucher.channel_id) else {
-                return Err(ClaimIngestRejection::UnknownChannel);
-            };
-            // The network is the voucher's own and a channel id binds none
-            // (ADR 0087 decision 2): the ledger asked is the one it names.
-            let Network::Xrpl(network) = &voucher.network else {
-                return Err(ClaimIngestRejection::NetworkNotSettled {
-                    network: voucher.network.clone(),
-                });
-            };
-            let reservation = reserve_voucher_lookup(budget, known.is_none(), requester).await?;
-            let found = channels
-                .xrpl(network, &channel_id)
-                .await
-                .map_err(refuse_resolution)?;
-            refund_if_found(budget, reservation, found.is_some());
-            let channel = found.ok_or(ClaimIngestRejection::UnknownChannel)?;
-            if verify_xrpl_claim(
-                &channel.public_key,
-                &channel_id,
-                voucher.max_claimable_amount,
-                &signature,
-            ) {
-                Ok(VerifiedVoucher {
-                    max_cumulative: u128::from(channel.max_cumulative),
-                    channel: JournaledBatchChannel::Xrpl {
-                        channel_id,
-                        network: *network,
-                    },
-                    signer: VoucherSigner::Xrpl(channel.public_key),
-                })
-            } else {
-                Err(ClaimIngestRejection::SignatureInvalid)
-            }
-        }
-        _ => Err(ClaimIngestRejection::BatchSettlementNotAccepted),
-    }
-}
-
-/// Charge a voucher lookup for a channel this gate has no record of against
-/// the unresolvable-lookup budget (issue #613), waiting for its slot if the
-/// drain is in arrears. `Ok(None)` for a lookup on a known channel, which is
-/// not a discovery and is never charged.
-async fn reserve_voucher_lookup(
-    budget: &UnresolvableLookupBudget,
-    unseen: bool,
-    requester: &str,
-) -> Result<Option<LookupReservation>, ClaimIngestRejection> {
-    if !unseen {
-        return Ok(None);
-    }
-    match budget.reserve(requester).await {
-        Ok(reservation) => Ok(Some(reservation)),
-        Err(exhausted) => {
-            tracing::warn!(
-                bound = exhausted.bound.as_str(),
-                allowance = exhausted.allowance,
-                signer = %requester,
-                "declining to look up an unknown batch-settlement channel: this node's \
-                 discovery drain is saturated and its queue is full"
-            );
-            Err(resolution_refusal(ChannelResolutionError::Budgeted(
-                exhausted,
-            )))
-        }
-    }
-}
-
-/// Give a voucher lookup's slot back if it found a channel: only lookups
-/// that found nothing, or failed, leave a mark (issue #613).
-fn refund_if_found(
-    budget: &UnresolvableLookupBudget,
-    reservation: Option<LookupReservation>,
-    found: bool,
-) {
-    if let (Some(reservation), true) = (reservation, found) {
-        budget.refund(reservation);
     }
 }
 
