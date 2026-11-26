@@ -2343,7 +2343,7 @@ impl Connector {
     /// the voucher cannot be produced at all (no hop registered, no x402
     /// backend, a channel the outbound journal does not hold), the packet
     /// fails right there naming the hop and the reason. `Config::load` refuses a peering with a route to it and no
-    /// `[[pay_channels]]` row (`ConfigError::PayChannelUnbound`), so on a
+    /// `[[pay_channels]]` row (`ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelUnbound)`), so on a
     /// configured route the no-hop case is unreachable from a file that
     /// loaded -- it is still refused here rather than assumed away, because
     /// a leased or runtime-installed route (ADR 0028) reaches this method
@@ -2745,7 +2745,7 @@ impl Connector {
             // nothing to pay it from, and since issue #1145 there is no
             // postpay path to fall through to either. `Config::load` refuses
             // a configured route to an uncovered peering by name
-            // (`ConfigError::PayChannelUnbound`), so a file that loaded
+            // (`ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelUnbound)`), so a file that loaded
             // cannot reach this; a leased or runtime-installed route (ADR
             // 0028) can, and is refused here rather than carried free.
             return Err(CoverError::Failed(format!(

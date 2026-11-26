@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{AddrParseError, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -6,12 +6,10 @@ use std::time::Duration;
 use serde::Deserialize;
 use url::Url;
 
-use connector_domain::peering_admission::{
-    admit as admit_peerings, check_bindings, ChannelFact, PeerRouteFacts, PeeringFacts, PeeringSet,
-};
+use thiserror::Error;
 
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
-use crate::denomination::DenominationRefusal;
+use crate::cross_table::{check as check_cross_table, Tables};
 use crate::denomination::{
     resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
 };
@@ -20,7 +18,6 @@ use crate::identity::{resolve_client_identities, ClientIdentityConfig, RawClient
 use crate::node::{resolve_node, NodeConfig, RawNodeConfig};
 use crate::operator::{resolve_operator, OperatorConfig, RawOperatorConfig};
 use crate::pay_channel::{resolve_pay_channels, PayChannelConfig, RawPayChannel};
-use crate::peer::PeerRefusal;
 use crate::peer::{
     is_onion_endpoint, parse_peer_exposure, resolve_peers, PeerConfig, PeerExposure, RawPeer,
 };
@@ -62,7 +59,7 @@ struct RawConfig {
     node: Option<RawNodeConfig>,
     /// Renamed to `[node]` (ADR 0050, issue #1080). Still parsed, and only so
     /// that a config still writing the old heading fails at boot with
-    /// [`ConfigError::AnnounceSectionRenamed`] rather than tripping the
+    /// [`ConfigError::File(ConfigFileRefusal::AnnounceSectionRenamed)`] rather than tripping the
     /// generic `deny_unknown_fields` message -- the same treatment
     /// `peer_wire_addr` and `[peer_sale]` get, for the same reason: the devnet
     /// boxes run bind-mounted configs that lead the repo copies.
@@ -70,7 +67,7 @@ struct RawConfig {
     announce: Option<toml::Value>,
     /// Removed with the raw-TCP transport (ADR 0027, issue #679). Still
     /// parsed, and only so that a stale config naming it fails at boot
-    /// with [`ConfigError::PeerWireAddrRemoved`] rather than tripping the
+    /// with [`ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved)`] rather than tripping the
     /// generic `deny_unknown_fields` message: the devnet boxes run
     /// bind-mounted configs that lead the repo copies, so the one that
     /// matters is the one an operator reads at 3am.
@@ -117,7 +114,7 @@ struct RawConfig {
     /// local resolver resolves a `.onion` name. A node that started with
     /// one would be a node whose onion peerings fail at dial time for a
     /// reason nothing in its log explains, which is why the scheme is
-    /// [`ConfigError::SocksProxyScheme`] at load rather than a runtime
+    /// [`ConfigError::File(ConfigFileRefusal::SocksProxyScheme)`] at load rather than a runtime
     /// surprise.
     ///
     /// One key and one proxy: there is deliberately no per-peer `proxy =`
@@ -154,7 +151,7 @@ struct RawConfig {
     /// `max_routes_per_payer`/`max_prefix_length`/`purchase_rate_limit`/
     /// `purchase_rate_window_seconds` for it to carry. Still parsed, and
     /// only so that a stale config naming the section fails at boot with
-    /// [`ConfigError::PeerSaleRemoved`] rather than tripping the generic
+    /// [`ConfigError::File(ConfigFileRefusal::PeerSaleRemoved)`] rather than tripping the generic
     /// `deny_unknown_fields` message -- the same treatment
     /// `peer_wire_addr` above already gets, for the same reason: the
     /// devnet boxes run bind-mounted configs that lead the repo copies.
@@ -168,7 +165,7 @@ struct RawConfig {
     settlement: Option<RawSettlementSection>,
     /// `[[client_channels]]`, deleted with the `toon-channel` claim (ADR
     /// 0075, issue #1384): parsed only so it can be refused by name
-    /// ([`ConfigError::ClientChannelsRemoved`]).
+    /// ([`ConfigError::File(ConfigFileRefusal::ClientChannelsRemoved)`]).
     #[serde(default)]
     client_channels: Option<toml::Value>,
     /// The client-edge identities this node authenticates over HTTP (issue
@@ -189,7 +186,7 @@ struct RawConfig {
     state_dir: Option<String>,
     /// The client-edge channel registry's liveness knobs (issue #649),
     /// deleted with the registry (ADR 0075, issue #1384): parsed only so
-    /// each can be refused by name ([`ConfigError::ChannelLivenessKeyRemoved`]).
+    /// each can be refused by name ([`ConfigError::File(ConfigFileRefusal::ChannelLivenessKeyRemoved)`]).
     #[serde(default)]
     channel_liveness_ttl_secs: Option<toml::Value>,
     #[serde(default)]
@@ -328,6 +325,198 @@ pub struct Config {
     zk_note: Option<ZkNoteConfig>,
 }
 
+/// The refusals of reading the file itself, raised by the config-loading function: removed
+/// keys, the numeric bounds, the bind address and the socks proxy (issue #1727).
+#[derive(Debug, Error)]
+pub enum ConfigFileRefusal {
+    #[error("invalid client_edge_addr '{value}': {source}")]
+    InvalidBindAddr {
+        value: String,
+        #[source]
+        source: AddrParseError,
+    },
+
+    /// The other half of §11's removed-field row, spelled and worded
+    /// exactly as PR #718 (`feat/delete-peer-role`) spells it.
+    ///
+    /// **Defined here, constructed there.** #718 owns the deletion of the
+    /// raw-TCP transport itself (issue #679), including the top-level
+    /// `peer_wire_addr` field, the listener `connector-cli` binds from it
+    /// and the infra configs that still name it. This branch does not
+    /// touch that listener, so on this branch alone the field still binds
+    /// one; when the two land, #718's `if raw.peer_wire_addr.is_some()`
+    /// meets this variant and the pair is complete.
+    #[error(
+        "'peer_wire_addr' was removed with the raw-TCP transport (ADR 0027, issue #679) -- \
+         peer carriages are exposed on the connector's own listeners, not a separate socket; \
+         see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerWireAddrRemoved,
+
+    /// `[[client_channels]]`: the channels a `toon-channel` client claim could
+    /// be paid on, declared with their counterparty (issue #558). Deleted
+    /// with that claim scheme (ADR 0075 decision 9, issue #1384).
+    #[error(
+        "'[[client_channels]]' was removed with the toon-channel claim (ADR 0075, issue #1384): \
+         every claim is an x402 'batch-settlement' voucher, whose channel is read from the chain \
+         when the voucher presents it, so no channel is declared in config. Delete the table. A \
+         client pays on an x402 channel it opens toward this node; a toon-channel channel still \
+         open is drained on the last release that supports toon-channel claims"
+    )]
+    ClientChannelsRemoved,
+
+    /// A tuning key of the client edge's `toon-channel` channel registry's
+    /// liveness memo (issue #649), deleted with the registry (ADR 0075,
+    /// issue #1384).
+    #[error(
+        "'{field}' was removed with the toon-channel client channel registry it tuned (ADR 0075, \
+         issue #1384): every claim is an x402 voucher, whose channel is read from the settlement \
+         backend with no liveness memo in between. Delete the line"
+    )]
+    ChannelLivenessKeyRemoved { field: &'static str },
+
+    #[error(
+        "unresolvable_lookup_budget_{field} is 0: this node would never resolve a channel it \
+         was not explicitly configured with, so an unaffiliated buyer who opened a channel on \
+         chain could not pay it at all -- which is the registration-free path issue #611 exists \
+         to provide, switched off by a number that reads as a tightening (issue #613). Omit the \
+         field for the default, or set how many lookups for channels that do not resolve are \
+         allowed per window"
+    )]
+    ZeroUnresolvableLookupBudget { field: &'static str },
+
+    #[error(
+        "unresolvable_lookup_budget_window_secs is 0: a zero-length window restarts on every \
+         request, so both allowances are spendable in full by every request and the budget \
+         bounds nothing at all while appearing to be configured (issue #613). Omit the field for \
+         the default, or set the number of seconds the allowances are counted over"
+    )]
+    ZeroUnresolvableLookupWindow,
+
+    #[error(
+        "btp_session_window is 0: a BTP session's first paid frame would wait forever for an \
+         in-flight slot that does not exist, hanging every client on connect (issue #688). Omit \
+         the field for the default, set 1 for the original lockstep session, or set how many of \
+         one session's frames may be past claim admission at once"
+    )]
+    ZeroBtpSessionWindow,
+
+    #[error(
+        "unresolvable_lookup_budget_per_signer is {per_signer} but \
+         unresolvable_lookup_budget_total is {total}: the node-wide allowance would refuse first \
+         every time, so the per-signer number could never be reached and means nothing. Set it \
+         to at most the total (issue #613)"
+    )]
+    UnresolvableLookupPerSignerAboveTotal { per_signer: u32, total: u32 },
+
+    #[error(
+        "unresolvable_lookup_budget_max_wait_ms is 0: this node would refuse a lookup outright \
+         the moment its discovery drain saturated, rather than holding it for a slot. That hands \
+         any sender able to sustain unresolvable_lookup_budget_total requests per window a switch \
+         that turns the registration-free path of issue #611 off for every new buyer -- a worse \
+         failure than the RPC spend the bound exists to prevent (issue #613). Omit the field for \
+         the default, or set the milliseconds a lookup may wait for its turn"
+    )]
+    ZeroUnresolvableLookupMaxWait,
+
+    #[error(
+        "unresolvable_lookup_budget_max_wait_ms is {max_wait_ms} but \
+         unresolvable_lookup_budget_window_secs is {window_secs} (either as written or by \
+         default): the wait ceiling is the size of the waiting room, not just a timeout -- a \
+         room drained at the configured rate and holding a lookup for {max_wait_ms} ms parks \
+         more than a whole window's worth of them, which is more memory than the bound is worth \
+         and a wait no packet's own deadline would survive (issue #613). Set it to at most the \
+         window"
+    )]
+    UnresolvableLookupMaxWaitAboveWindow { max_wait_ms: u64, window_secs: u64 },
+
+    #[error(
+        "unresolvable_lookup_budget_window_secs is {window_secs}, above the {max_secs} s this \
+         node will honour: a rate limit whose window outlives the process running it is not a \
+         rate limit, and the arithmetic over it stops fitting an instant (issue #613)"
+    )]
+    UnresolvableLookupWindowTooLong { window_secs: u64, max_secs: u64 },
+
+    /// The section itself, renamed rather than removed (ADR 0050).
+    ///
+    /// Two of `[announce]`'s fields feed the packet path -- they ride the x402
+    /// greeting so a client with a stale genesis seed can bootstrap -- so this
+    /// is a rename, not a deletion, and the error says so: an operator whose
+    /// file still writes the old heading needs the new one, not a eulogy.
+    #[error(
+        "'[announce]' was renamed to '[node]' (ADR 0050, issue #1080): the section holds the \
+         facts a node cannot introspect about itself, and it is named for what they are rather \
+         than for a verb this connector no longer has (ADR 0046 removed the announce). Rename \
+         the heading and keep `addresses`, `http_endpoint` and `btp_endpoint`; every other key \
+         it used to carry is gone"
+    )]
+    AnnounceSectionRenamed,
+
+    /// The one `socks_proxy` value is not a URL at all (ADR 0070 decision 3).
+    ///
+    /// Carries the text as written, because the usual cause is a bare
+    /// `host:port` with no scheme -- which is exactly the shape every other
+    /// SOCKS-taking tool accepts -- and an operator reading the message has
+    /// to see that the scheme is what is missing.
+    #[error("socks_proxy '{value}' is not a URL: {source}")]
+    SocksProxyInvalidUrl {
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    /// The `socks_proxy` URL names no host (ADR 0070 decision 3) --
+    /// `socks5h://` on its own, or a `socks5h:9050` that looks like a
+    /// `host:port` and is not one. `socks5h` is not a *special* scheme in
+    /// the URL standard, so unlike `https://` it parses happily with an
+    /// empty host; without this check such a value would load, the node
+    /// would come up clean, and every onion dial would then fail on a proxy
+    /// address that is not an address. A loaded `Config` needs no further
+    /// validation anywhere downstream (ADR 0009), and that includes this.
+    #[error(
+        "socks_proxy '{value}' names no host to reach the proxy at -- write it as \
+         'socks5h://<host>:<port>', e.g. 'socks5h://127.0.0.1:9050'. ('socks5h' is not a \
+         special URL scheme, so a missing host parses rather than failing, which is why this \
+         is checked by name)"
+    )]
+    SocksProxyNoHost { value: String },
+
+    /// The `socks_proxy` URL names a scheme other than `socks5h` (ADR 0070
+    /// decision 3) -- in practice `socks5`, which every SOCKS-taking tool
+    /// spells that way and which is wrong here for a reason no operator can
+    /// be expected to already know. Hence the length of the message: the
+    /// `h` is the whole point of the key.
+    #[error(
+        "socks_proxy '{value}' has scheme '{scheme}', but it must be 'socks5h'. The 'h' is not \
+         a preference: a 'socks5://' proxy resolves the hostname LOCALLY and dials the address \
+         it gets back, and no local resolver can resolve a '.onion' or '.anyone' name -- so a \
+         node that started with one would come up clean and then fail every onion peering at \
+         dial time, for a reason nothing in its log explains. Resolution has to happen AT the proxy, which \
+         is what 'socks5h://' asks for (ADR 0070)"
+    )]
+    SocksProxyScheme { value: String, scheme: String },
+
+    /// The removed-section trap for purchasable peering (ADR 0043), the
+    /// same shape [`ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved)`] and
+    /// [`ConfigError::PeerCeilingRemoved`] already take: the section is
+    /// still parsed so a stale config naming it stops the node by name
+    /// rather than being silently dropped by `deny_unknown_fields`.
+    ///
+    /// One variant covers the whole table -- `prefix`, `price`,
+    /// `lease_seconds` and every abuse bound -- because there is no
+    /// surviving `[peer_sale]` for any of them to be written into: the
+    /// fix is always to delete the section, never to correct a field.
+    #[error(
+        "'[peer_sale]' was removed with purchasable peering (ADR 0043) -- a peering cannot be \
+         bought at all, so 'prefix', 'price', 'lease_seconds', 'max_purchased_rows', \
+         'max_routes_per_payer', 'max_prefix_length', 'purchase_rate_limit' and \
+         'purchase_rate_window_seconds' have nothing left to configure. Delete the whole \
+         section; an operator still adds a peer and its route directly, over the operator \
+         surface (POST /peers, POST /routes/peers) or in the config file"
+    )]
+    PeerSaleRemoved,
+}
+
 impl Config {
     /// Read, parse and fully validate the configuration file at `path`.
     ///
@@ -352,9 +541,11 @@ impl Config {
         let client_edge_addr = raw
             .client_edge_addr
             .parse::<SocketAddr>()
-            .map_err(|source| ConfigError::InvalidBindAddr {
-                value: raw.client_edge_addr.clone(),
-                source,
+            .map_err(|source| {
+                ConfigError::File(ConfigFileRefusal::InvalidBindAddr {
+                    value: raw.client_edge_addr.clone(),
+                    source,
+                })
             })?;
 
         let signer_key = SecretLocation::resolve(raw.signer)?;
@@ -382,63 +573,19 @@ impl Config {
         check_settlement_rpc_routes(&settlements, socks_proxy.as_ref())?;
         let settlement_tables = SettlementTables::of(&settlements);
         let peer_channels = resolve_peer_channels(raw.peer_channels, &settlement_tables)?;
-        for peer_route in &peer_routes {
-            // A route naming no peer is `peering_admission`'s refusal, made
-            // below with the other binding rules.
-            let Some(peer) = peers.iter().find(|peer| peer.id() == peer_route.peer_id()) else {
-                continue;
-            };
-            // The intersection rule, in the one direction this connector's
-            // own file can decide (`peer-carriage-spec.md` §2.2, §6.4(1)):
-            // a route whose next hop is a peering this connector can never
-            // originate to is a route that could only ever answer `T01`.
-            // What the *far* side exposes is not knowable from here and
-            // stays a runtime dial failure.
-            if !peer.can_originate() {
-                return Err(ConfigError::Peer(PeerRefusal::PeerRouteUndeliverable {
-                    prefix: peer_route.prefix().to_string(),
-                    peer_id: peer_route.peer_id().to_string(),
-                }));
-            }
-        }
-        // Unknown peer, orphaned `[[peer_channels]]` rows and unbound
-        // peerings (P2, §1.2: a peering with no channel binding can never
-        // take the peer role) need no pay row, so they are refused here,
-        // where they always were, ahead of the whole-set check below.
-        let mut admission = PeeringSet {
-            peerings: peers
-                .iter()
-                .map(|peer| PeeringFacts::new(peer.id()))
-                .collect(),
-            inbound: peer_channels
-                .iter()
-                .map(|channel| ChannelFact {
-                    peer_id: channel.peer_id().to_string(),
-                    channel: channel.inbound_channel().map(ToString::to_string),
-                    chain: Some(channel.chain().name()),
-                    network: channel.network().map(ToString::to_string),
-                })
-                .collect(),
-            routes: peer_routes
-                .iter()
-                .map(|route| PeerRouteFacts::new(route.prefix(), route.peer_id()))
-                .collect(),
-            ..PeeringSet::default()
-        };
-        check_bindings(&admission).map_err(ConfigError::from)?;
         if raw.peer_sale.is_some() {
-            return Err(ConfigError::PeerSaleRemoved);
+            return Err(ConfigError::File(ConfigFileRefusal::PeerSaleRemoved));
         }
         if raw.peer_wire_addr.is_some() {
-            return Err(ConfigError::PeerWireAddrRemoved);
+            return Err(ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved));
         }
         let operator = resolve_operator(raw.operator)?;
         if raw.announce.is_some() {
-            return Err(ConfigError::AnnounceSectionRenamed);
+            return Err(ConfigError::File(ConfigFileRefusal::AnnounceSectionRenamed));
         }
         let node = resolve_node(raw.node, peer_expose)?;
         if raw.client_channels.is_some() {
-            return Err(ConfigError::ClientChannelsRemoved);
+            return Err(ConfigError::File(ConfigFileRefusal::ClientChannelsRemoved));
         }
         for (field, present) in [
             (
@@ -455,7 +602,9 @@ impl Config {
             ),
         ] {
             if present {
-                return Err(ConfigError::ChannelLivenessKeyRemoved { field });
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::ChannelLivenessKeyRemoved { field },
+                ));
             }
         }
         let client_identities = resolve_client_identities(raw.client_identities)?;
@@ -468,44 +617,6 @@ impl Config {
             peer_allow_plaintext_endpoints,
             &settlement_tables,
         )?;
-        // ADR 0042, and the load-time half of issue #1145: **a connector
-        // covers every PREPARE it sends**, so a peering this node has a
-        // route to must name the channel it pays that hop from. This is the
-        // mirror of `PeerChannelUnbound` one table over -- that one refuses
-        // a peering with nothing to judge an ARRIVING claim against, this
-        // one refuses a peering with nothing to sign a DEPARTING claim
-        // from.
-        //
-        // It became a refusal rather than a default the moment the postpay
-        // path was deleted. Before that a peering with no row simply fell
-        // back to ADR 0004 (`cover_forward` answered `NotConfigured` and
-        // `pending_claim` rode the next packet); now `forward_via_peer_route`
-        // has nothing to fall back to and would reject every packet on the
-        // route with `T00`. ADR 0009 exists to turn exactly that kind of
-        // runtime surprise into a startup refusal.
-        //
-        // Keyed on ROUTES, not on peerings: a peering this node only ever
-        // receives from -- `local/mixed-chain`'s B holds one, and every
-        // accept-only peering is one -- owes nothing and needs no row. What
-        // is checked is the same `peer_id` a `[[routes]]` entry names.
-        // Every cross-table rule of a peering -- unknown peer, orphaned and
-        // unbound channel rows, a channel in both directions, differing
-        // networks, a pay channel on an unsettled chain, a route with no
-        // channel to pay from -- is `connector_domain::peering_admission`'s
-        // (issues #1691, #1692), the same code the runtime's writes run.
-        // This only states the facts and maps its refusal to the named one
-        // operators already know.
-        admission.pay = pay_channels
-            .iter()
-            .map(|channel| ChannelFact {
-                peer_id: channel.peer_id().to_string(),
-                channel: Some(channel.outbound_channel().to_string()),
-                chain: Some(channel.chain().name()),
-                network: channel.network().map(ToString::to_string),
-            })
-            .collect();
-        admission.settled_chains = settlement_tables.settled_chains();
-        admit_peerings(&admission).map_err(ConfigError::from)?;
         // ADR 0071 decisions 3 and 5 (issue #1290): the tokens this node
         // deals, its numeraire, the rates and guards it has declared.
         // Resolved against the networks this node settles on (ADR 0086
@@ -527,48 +638,22 @@ impl Config {
             &settlement_tables,
             zk_note.as_ref().map(ZkNoteConfig::asset).as_ref(),
         )?;
-        // ADR 0087 decision 6 (#1636): every XRPL leg is a dealing boundary,
-        // and a node that declares no token resolves no peering, so it would
-        // cross that boundary unconverted. Refused here, before any value
-        // moves. Which tokens it must declare is
-        // `resolve_client_channel_assets`'s rule below, once it declares any.
-        if !denomination.declares_tokens() {
-            if let Some(xrpl) = settlements.iter().find_map(|settlement| match settlement {
-                SettlementConfig::Xrpl(xrpl) => Some(xrpl),
-                _ => None,
-            }) {
-                return Err(ConfigError::Denomination(
-                    DenominationRefusal::XrplSettlementWithoutTokens {
-                        table: format!("[settlement.{}]", xrpl.table_name()),
-                        asset: xrpl.asset().to_string(),
-                    },
-                ));
-            }
-        }
-        // ADR 0080 decision 7, as amended: a zk edge prices in MINA, and a
-        // forward out of it is paid in a settlement asset, so it crosses a
-        // denomination at a rate the operator declared -- no TWAP source
-        // quotes MINA. Every settlement table this node pays a next hop in
-        // therefore needs a `[[rates]]` row from the vault's asset to the
-        // token that table holds, refused here naming the missing pair rather
-        // than at the first forward. A zk edge with no settlement table
-        // forwards nothing.
-        if let Some(zk_note) = &zk_note {
-            let from = zk_note.asset();
-            for settlement in &settlements {
-                let declared = denomination.rates().iter().any(|row| {
-                    row.from() == &from
-                        && settlement.holds(row.to())
-                        && denomination.rate(row.from(), row.to()).is_some()
-                });
-                if !declared {
-                    return Err(ConfigError::ZkNoteRateMissing {
-                        from,
-                        to: settlement.asset_spelling(),
-                    });
-                }
-            }
-        }
+        // Every rule that reads more than one table is `cross_table`'s: the peering rules
+        // (`connector_domain::peering_admission`), the XRPL and zk edge denomination rules, and
+        // `state_dir` against the journals the tables need (issue #1727).
+        let state_dir = raw.state_dir.map(PathBuf::from);
+        check_cross_table(&Tables {
+            peers: &peers,
+            peer_routes: &peer_routes,
+            peer_channels: &peer_channels,
+            pay_channels: &pay_channels,
+            settlements: &settlements,
+            settlement_tables: &settlement_tables,
+            denomination: &denomination,
+            zk_note: zk_note.as_ref(),
+            operator: operator.as_ref(),
+            state_dir: state_dir.as_deref(),
+        })?;
         // ADR 0071 decision 1 (issue #1292): which of those declared tokens
         // each peering's channels are denominated in, so that a forward can
         // ask whether its two legs hold different ones without asking a
@@ -602,7 +687,6 @@ impl Config {
             &denomination,
             zk_note.as_ref().map(ZkNoteConfig::asset),
         )?;
-        let state_dir = raw.state_dir.map(PathBuf::from);
         // The unresolvable-lookup budget (issue #613). Every one of these
         // is refused at zero: each zero either switches the
         // registration-free path off entirely or switches the budget off
@@ -610,29 +694,45 @@ impl Config {
         // could mean by writing a number down.
         let unresolvable_lookups_per_signer = match raw.unresolvable_lookup_budget_per_signer {
             Some(0) => {
-                return Err(ConfigError::ZeroUnresolvableLookupBudget {
-                    field: "per_signer",
-                })
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::ZeroUnresolvableLookupBudget {
+                        field: "per_signer",
+                    },
+                ))
             }
             other => other,
         };
         let unresolvable_lookups_total = match raw.unresolvable_lookup_budget_total {
-            Some(0) => return Err(ConfigError::ZeroUnresolvableLookupBudget { field: "total" }),
+            Some(0) => {
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::ZeroUnresolvableLookupBudget { field: "total" },
+                ))
+            }
             other => other,
         };
         let unresolvable_lookup_window_secs = match raw.unresolvable_lookup_budget_window_secs {
-            Some(0) => return Err(ConfigError::ZeroUnresolvableLookupWindow),
+            Some(0) => {
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::ZeroUnresolvableLookupWindow,
+                ))
+            }
             Some(secs) if secs > MAX_UNRESOLVABLE_LOOKUP_WINDOW_SECS => {
-                return Err(ConfigError::UnresolvableLookupWindowTooLong {
-                    window_secs: secs,
-                    max_secs: MAX_UNRESOLVABLE_LOOKUP_WINDOW_SECS,
-                })
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::UnresolvableLookupWindowTooLong {
+                        window_secs: secs,
+                        max_secs: MAX_UNRESOLVABLE_LOOKUP_WINDOW_SECS,
+                    },
+                ))
             }
             other => other,
         };
         let unresolvable_lookup_window = unresolvable_lookup_window_secs.map(Duration::from_secs);
         let unresolvable_lookup_max_wait_ms = match raw.unresolvable_lookup_budget_max_wait_ms {
-            Some(0) => return Err(ConfigError::ZeroUnresolvableLookupMaxWait),
+            Some(0) => {
+                return Err(ConfigError::File(
+                    ConfigFileRefusal::ZeroUnresolvableLookupMaxWait,
+                ))
+            }
             other => other,
         };
         // The wait ceiling is not just a timeout: it *is* the size of the
@@ -650,10 +750,12 @@ impl Config {
         let effective_max_wait_ms =
             unresolvable_lookup_max_wait_ms.unwrap_or(DEFAULT_UNRESOLVABLE_LOOKUP_MAX_WAIT_MS);
         if effective_max_wait_ms > effective_window_secs.saturating_mul(1_000) {
-            return Err(ConfigError::UnresolvableLookupMaxWaitAboveWindow {
-                max_wait_ms: effective_max_wait_ms,
-                window_secs: effective_window_secs,
-            });
+            return Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupMaxWaitAboveWindow {
+                    max_wait_ms: effective_max_wait_ms,
+                    window_secs: effective_window_secs,
+                },
+            ));
         }
         let unresolvable_lookup_max_wait =
             unresolvable_lookup_max_wait_ms.map(Duration::from_millis);
@@ -665,7 +767,7 @@ impl Config {
         // reads as configured. (`1` is coherent: the original lockstep
         // session.)
         let btp_session_window = match raw.btp_session_window {
-            Some(0) => return Err(ConfigError::ZeroBtpSessionWindow),
+            Some(0) => return Err(ConfigError::File(ConfigFileRefusal::ZeroBtpSessionWindow)),
             other => other.and_then(NonZeroU32::new),
         };
         // A per-signer rate above the node-wide one is not a stricter
@@ -685,95 +787,12 @@ impl Config {
         let effective_total =
             unresolvable_lookups_total.unwrap_or(DEFAULT_UNRESOLVABLE_LOOKUPS_TOTAL);
         if effective_per_signer > effective_total {
-            return Err(ConfigError::UnresolvableLookupPerSignerAboveTotal {
-                per_signer: effective_per_signer,
-                total: effective_total,
-            });
-        }
-
-        // A spending or deposit limit counts in a journal under `state_dir`
-        // (ADR 0078 decision 8); a node with nowhere to keep it would hand
-        // every key a fresh day on each restart.
-        if state_dir.is_none() {
-            for controller in operator.as_ref().map_or(&[][..], |o| o.controller_keys()) {
-                let limit = if controller.spending_limit().is_some() {
-                    "spending limit"
-                } else if controller.deposit_limit().is_some() {
-                    "deposit limit"
-                } else {
-                    continue;
-                };
-                return Err(ConfigError::LimitWithoutStateDir {
-                    entry: controller.name().to_string(),
-                    limit,
-                });
-            }
-        }
-
-        // A node that can accept a claim must be able to remember having
-        // accepted it (issue #605). Refused here, at load, rather than at
-        // the first claim: a node whose watermarks live only in memory
-        // hands out free service after every restart, and it does so
-        // silently -- there is nothing in a log to see, because from the
-        // gate's point of view every replayed nonce genuinely is fresh.
-        //
-        // The trigger is "can this node resolve a channel", not "did it
-        // declare one" (issue #1186). It used to be the latter, on issue
-        // #558's reasoning that a node with a record of no channel refuses
-        // every claim outright and so has no watermark to lose. That was
-        // true when it was written and stopped being true with chain
-        // resolution: since #611 and #631 a claim naming a channel nothing
-        // declared is resolved from chain and accepted -- and since ADR 0075
-        // (#1384) every voucher is, through each configured settlement
-        // table's backend. That is ADR 0052 and CF-27, and it is the whole of
-        // what makes payment permissionless -- so the node MOST exposed to
-        // strangers was the one this check did not reach.
-        //
-        // What survives of #558 is the exemption's shape, and it is worth
-        // keeping: a node with no settlement table refuses every voucher,
-        // so a node configuring no channel book and no settlement genuinely
-        // has nothing to lose. Demanding a path of it
-        // would be ceremony, and ceremony is what gets configured with a
-        // path nobody checked.
-        //
-        // Price does not enter into it. `extract_and_validate_claim` runs
-        // on any request carrying a claim header whose envelope target is
-        // not already refused, priced route or not, so a free route on a
-        // node with settlement still advances a watermark.
-        if let Some(path) = &state_dir {
-            if path.exists() && !path.is_dir() {
-                return Err(ConfigError::StateDirNotADirectory { path: path.clone() });
-            }
-        } else if zk_note.is_some() {
-            // ADR 0080 decision 11: a zk edge journals every spent nullifier
-            // and keeps its evidence file under state_dir. Without one, a
-            // restart would let a note open a second allowance from a state
-            // it already spent. First, because it is the more specific
-            // diagnosis on a zk edge that also settles.
-            return Err(ConfigError::ZkNoteWithoutStateDir);
-        } else if !peer_channels.is_empty() {
-            // The peer half of the same rule: a peer's voucher watermark
-            // is no less a replay defence than a client's, and it is the
-            // same journal (ADR 0075: one watermark per channel).
-            return Err(ConfigError::PeerChannelsWithoutStateDir);
-        } else if !pay_channels.is_empty() {
-            // The outbound half of the same rule. Unreachable through a
-            // loadable file today -- a `[[pay_channels]]` row needs a
-            // peering, a peering needs a `[[peer_channels]]` row, and that
-            // already demands a `state_dir` two arms above -- and written
-            // out anyway, because what it protects is different in kind:
-            // the outbound-channel journal is the only record of the
-            // channel the row names, and of every voucher signed on it.
-            return Err(ConfigError::PayChannelsWithoutStateDir);
-        } else if !settlements.is_empty() {
-            // Last, deliberately. Every channel book already requires a
-            // settlement table for its own chain (CF-36, issue #1138), so
-            // this arm placed first would swallow all three and answer a
-            // declared-channel mistake with a message about chain
-            // resolution. The specific diagnosis wins; this one catches
-            // exactly the case the three books do not -- a node that
-            // declares no channel and is paid by strangers anyway.
-            return Err(ConfigError::SettlementWithoutStateDir);
+            return Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupPerSignerAboveTotal {
+                    per_signer: effective_per_signer,
+                    total: effective_total,
+                },
+            ));
         }
 
         Ok(Config {
@@ -1099,20 +1118,22 @@ fn resolve_socks_proxy(raw: Option<String>) -> Result<Option<Url>, ConfigError> 
 /// so there is one implementation of what a proxy URL is and one set of
 /// reasons an operator is given for a bad one.
 pub fn parse_socks_proxy(value: &str) -> Result<Url, ConfigError> {
-    let url = Url::parse(value).map_err(|source| ConfigError::SocksProxyInvalidUrl {
-        value: value.to_string(),
-        source,
+    let url = Url::parse(value).map_err(|source| {
+        ConfigError::File(ConfigFileRefusal::SocksProxyInvalidUrl {
+            value: value.to_string(),
+            source,
+        })
     })?;
     if url.scheme() != "socks5h" {
-        return Err(ConfigError::SocksProxyScheme {
+        return Err(ConfigError::File(ConfigFileRefusal::SocksProxyScheme {
             value: value.to_string(),
             scheme: url.scheme().to_string(),
-        });
+        }));
     }
     if url.host_str().is_none() {
-        return Err(ConfigError::SocksProxyNoHost {
+        return Err(ConfigError::File(ConfigFileRefusal::SocksProxyNoHost {
             value: value.to_string(),
-        });
+        }));
     }
     Ok(url)
 }
@@ -1132,6 +1153,7 @@ mod tests {
     use crate::route::TransportPolicy;
     use crate::secret::SignerRefusal;
     use crate::settlement::{SettlementChain, SettlementRefusal};
+    use crate::{CrossTableRefusal, DenominationRefusal, PeerRefusal, PeeringAdmissionRefusal};
     use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
     use std::path::PathBuf;
@@ -1760,7 +1782,7 @@ client_edge_url = "https://store.example/ilp"
         assert!(
             matches!(
                 &error,
-                ConfigError::PeeringNetworksDiffer { peer_id, inbound, outbound }
+                ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PeeringNetworksDiffer { peer_id, inbound, outbound })
                     if peer_id == "store" && inbound == "eip155:31337" && outbound == "eip155:31338"
             ),
             "{error:?}"
@@ -2306,7 +2328,7 @@ key_file = "{key}"
 
             let message = expect_error(
                 result,
-                |error| matches!(error, ConfigError::SocksProxyScheme { value, .. } if value == written),
+                |error| matches!(error, ConfigError::File(ConfigFileRefusal::SocksProxyScheme { value, .. }) if value == written),
             );
             assert!(
                 message.contains("socks5h")
@@ -2329,7 +2351,7 @@ key_file = "{key}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::SocksProxyInvalidUrl { value, .. } if value == "127.0.0.1:9050"),
+            |error| matches!(error, ConfigError::File(ConfigFileRefusal::SocksProxyInvalidUrl { value, .. }) if value == "127.0.0.1:9050"),
         );
         let lowered = message.to_lowercase();
         assert!(
@@ -2355,7 +2377,7 @@ key_file = "{key}"
             let result = load_with_extra(&format!("socks_proxy = \"{written}\""));
             let message = expect_error(
                 result,
-                |error| matches!(error, ConfigError::SocksProxyNoHost { value } if value == written),
+                |error| matches!(error, ConfigError::File(ConfigFileRefusal::SocksProxyNoHost { value }) if value == written),
             );
             assert!(
                 message.contains("socks5h://<host>:<port>"),
@@ -2439,7 +2461,7 @@ key_file = "{key}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerChannelUnbound { id } if id == "store"),
+            |error| matches!(error, ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PeerChannelUnbound { id }) if id == "store"),
         );
         assert!(
             message.contains("voucher_signer") && message.contains("ADR 0075"),
@@ -2460,7 +2482,7 @@ key_file = "{key}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerChannelOrphaned { peer_id } if peer_id == "ghost"),
+            |error| matches!(error, ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PeerChannelOrphaned { peer_id }) if peer_id == "ghost"),
         );
         assert!(
             message.contains("no '[[peers]]' entry configures"),
@@ -3196,7 +3218,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::ChannelInBothDirections { value } if value == PEER_CHANNEL),
+            |error| matches!(error, ConfigError::PeeringAdmission(PeeringAdmissionRefusal::ChannelInBothDirections { value }) if value == PEER_CHANNEL),
         );
         assert!(message.contains("one way"), "got: {message}");
     }
@@ -3252,7 +3274,7 @@ key_file = "{key_file}"
         assert!(
             matches!(
                 &error,
-                ConfigError::PayChannelUnbound { prefix, peer_id }
+                ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PayChannelUnbound { prefix, peer_id })
                     if prefix == "g.example.store" && peer_id == "store"
             ),
             "{error:?}"
@@ -3279,7 +3301,7 @@ key_file = "{key_file}"
 
         expect_error(
             result,
-            |error| matches!(error, ConfigError::PayChannelOrphaned { peer_id } if peer_id == "stroe"),
+            |error| matches!(error, ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PayChannelOrphaned { peer_id }) if peer_id == "stroe"),
         );
     }
 
@@ -3357,7 +3379,7 @@ key_file = "{key_file}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PayChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
+                ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PayChannelWithoutX402 { peer_id, chain: "evm" }) if peer_id == "store"
             )
         });
         assert!(
@@ -3560,7 +3582,7 @@ key_file = "{key_file}"
     /// here is the error identity and its message, which #718 constructs.
     #[test]
     fn the_removed_peer_wire_addr_error_names_the_bringup_doc() {
-        let message = ConfigError::PeerWireAddrRemoved.to_string();
+        let message = ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved).to_string();
 
         assert!(
             message.contains("peer_wire_addr")
@@ -3606,7 +3628,7 @@ controller_keys_file = "{}"
 
         expect_error(
             result,
-            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "spending limit"),
+            |error| matches!(error, ConfigError::CrossTable(CrossTableRefusal::LimitWithoutStateDir { entry, limit }) if entry == "agent" && *limit == "spending limit"),
         );
     }
 
@@ -3644,7 +3666,7 @@ controller_keys_file = "{}"
 
         expect_error(
             result,
-            |error| matches!(error, ConfigError::LimitWithoutStateDir { entry, limit } if entry == "agent" && *limit == "deposit limit"),
+            |error| matches!(error, ConfigError::CrossTable(CrossTableRefusal::LimitWithoutStateDir { entry, limit }) if entry == "agent" && *limit == "deposit limit"),
         );
     }
 
@@ -3659,7 +3681,10 @@ controller_keys_file = "{}"
         });
 
         let message = expect_error(result, |error| {
-            matches!(error, ConfigError::PeerChannelsWithoutStateDir)
+            matches!(
+                error,
+                ConfigError::CrossTable(CrossTableRefusal::PeerChannelsWithoutStateDir)
+            )
         });
         assert!(message.contains("spendable again"), "got: {message}");
     }
@@ -3817,7 +3842,12 @@ price = 1000
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::UnknownPeerId { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::PeeringAdmission(
+                PeeringAdmissionRefusal::UnknownPeerId { .. }
+            ))
+        ));
     }
 
     /// ADR 0043: purchasable peering is removed, so a config still naming
@@ -3847,7 +3877,10 @@ lease_seconds = 3600
         let Err(error) = result else {
             panic!("expected a config error");
         };
-        assert!(matches!(error, ConfigError::PeerSaleRemoved));
+        assert!(matches!(
+            error,
+            ConfigError::File(ConfigFileRefusal::PeerSaleRemoved)
+        ));
         let message = error.to_string();
         assert!(
             message.contains("peer_sale"),
@@ -3883,7 +3916,10 @@ counterparty = "0x{}"
             panic!("expected a config error");
         };
         assert!(
-            matches!(error, ConfigError::ClientChannelsRemoved),
+            matches!(
+                error,
+                ConfigError::File(ConfigFileRefusal::ClientChannelsRemoved)
+            ),
             "{error:?}"
         );
         let message = error.to_string();
@@ -3916,7 +3952,7 @@ key_file = "{}"
                 panic!("expected '{field}' to be refused");
             };
             assert!(
-                matches!(error, ConfigError::ChannelLivenessKeyRemoved { field: named } if named == field),
+                matches!(error, ConfigError::File(ConfigFileRefusal::ChannelLivenessKeyRemoved { field: named }) if named == field),
                 "{error:?}"
             );
             assert!(error.to_string().contains(field), "{error}");
@@ -3950,7 +3986,10 @@ purchase_rate_window_seconds = 30
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::PeerSaleRemoved)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::File(ConfigFileRefusal::PeerSaleRemoved))
+        ));
     }
 
     /// ADR 0027 / issue #679: the raw-TCP transport is deleted, so a
@@ -3976,7 +4015,10 @@ key_file = "{}"
         let Err(error) = result else {
             panic!("expected a config error");
         };
-        assert!(matches!(error, ConfigError::PeerWireAddrRemoved));
+        assert!(matches!(
+            error,
+            ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved)
+        ));
         assert!(error
             .to_string()
             .contains("docs/operators/btp-peer-transport-bringup.md"));
@@ -4047,7 +4089,10 @@ key_file = "{}"
                 key_path.display()
             )
         });
-        assert!(matches!(result, Err(ConfigError::InvalidBindAddr { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::File(ConfigFileRefusal::InvalidBindAddr { .. }))
+        ));
     }
 
     #[test]
@@ -4885,7 +4930,12 @@ price = 1000
         });
 
         assert!(
-            matches!(result, Err(ConfigError::SettlementWithoutStateDir)),
+            matches!(
+                result,
+                Err(ConfigError::CrossTable(
+                    CrossTableRefusal::SettlementWithoutStateDir
+                ))
+            ),
             "a node that resolves channels from chain must be made to keep its \
              watermarks somewhere durable"
         );
@@ -5073,7 +5123,10 @@ key_file = "{key_path}"
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::ZeroBtpSessionWindow)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::File(ConfigFileRefusal::ZeroBtpSessionWindow))
+        ));
     }
 
     /// The unresolvable-lookup budget (issue #613): what a node will spend
@@ -5158,7 +5211,9 @@ key_file = "{key_path}"
             assert!(
                 matches!(
                     result,
-                    Err(ConfigError::ZeroUnresolvableLookupBudget { .. })
+                    Err(ConfigError::File(
+                        ConfigFileRefusal::ZeroUnresolvableLookupBudget { .. }
+                    ))
                 ),
                 "unresolvable_lookup_budget_{field} = 0 must not load"
             );
@@ -5186,7 +5241,9 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::ZeroUnresolvableLookupWindow)
+            Err(ConfigError::File(
+                ConfigFileRefusal::ZeroUnresolvableLookupWindow
+            ))
         ));
     }
 
@@ -5212,7 +5269,9 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::ZeroUnresolvableLookupMaxWait)
+            Err(ConfigError::File(
+                ConfigFileRefusal::ZeroUnresolvableLookupMaxWait
+            ))
         ));
     }
 
@@ -5240,10 +5299,12 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::UnresolvableLookupMaxWaitAboveWindow {
-                max_wait_ms: 600_000,
-                window_secs: 60
-            })
+            Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupMaxWaitAboveWindow {
+                    max_wait_ms: 600_000,
+                    window_secs: 60
+                }
+            ))
         ));
     }
 
@@ -5267,7 +5328,9 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::UnresolvableLookupMaxWaitAboveWindow { .. })
+            Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupMaxWaitAboveWindow { .. }
+            ))
         ));
     }
 
@@ -5297,10 +5360,12 @@ key_file = "{key_path}"
         assert!(
             matches!(
                 result,
-                Err(ConfigError::UnresolvableLookupWindowTooLong {
-                    max_secs: 86_400,
-                    ..
-                })
+                Err(ConfigError::File(
+                    ConfigFileRefusal::UnresolvableLookupWindowTooLong {
+                        max_secs: 86_400,
+                        ..
+                    }
+                ))
             ),
             "{result:?}"
         );
@@ -5328,10 +5393,12 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::UnresolvableLookupPerSignerAboveTotal {
-                per_signer: 1000,
-                total: 10
-            })
+            Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupPerSignerAboveTotal {
+                    per_signer: 1000,
+                    total: 10
+                }
+            ))
         ));
     }
 
@@ -5358,7 +5425,9 @@ key_file = "{key_path}"
         assert!(
             matches!(
                 total_only,
-                Err(ConfigError::UnresolvableLookupPerSignerAboveTotal { total: 5, .. })
+                Err(ConfigError::File(
+                    ConfigFileRefusal::UnresolvableLookupPerSignerAboveTotal { total: 5, .. }
+                ))
             ),
             "a total below the default per-signer rate is the same incoherence"
         );
@@ -5378,10 +5447,12 @@ key_file = "{key_path}"
         });
         assert!(matches!(
             per_signer_only,
-            Err(ConfigError::UnresolvableLookupPerSignerAboveTotal {
-                per_signer: 10000,
-                ..
-            })
+            Err(ConfigError::File(
+                ConfigFileRefusal::UnresolvableLookupPerSignerAboveTotal {
+                    per_signer: 10000,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -5406,7 +5477,9 @@ key_file = "{key_path}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::StateDirNotADirectory { .. })
+            Err(ConfigError::CrossTable(
+                CrossTableRefusal::StateDirNotADirectory { .. }
+            ))
         ));
     }
 

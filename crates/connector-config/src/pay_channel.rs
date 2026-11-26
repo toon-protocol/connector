@@ -203,7 +203,7 @@ pub struct PayChannelConfig {
 impl PayChannelConfig {
     /// The next hop this channel pays -- a `[[peers]]` entry's `id`. A row
     /// naming an id no `[[peers]]` entry configures is
-    /// [`ConfigError::PayChannelOrphaned`].
+    /// [`ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PayChannelOrphaned)`].
     pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
@@ -388,6 +388,7 @@ pub(crate) fn resolve_pay_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PeeringAdmissionRefusal;
 
     const CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
     const OTHER_CHANNEL: &str =
@@ -539,7 +540,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PayChannelWithoutX402 { chain: "evm", .. }
+            ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PayChannelWithoutX402 {
+                chain: "evm",
+                ..
+            })
         ));
         assert!(resolve_pay_channels(
             vec![parse(&row("store", ACCOUNT))],

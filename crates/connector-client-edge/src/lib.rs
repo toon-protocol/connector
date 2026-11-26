@@ -1649,7 +1649,7 @@ mod tests {
     /// decision 6): since issue #1145 a forward to a hop with nothing to pay
     /// it on is refused outright, so every test here that forwards to a peer
     /// needs this, and a fixture without it is one no configuration could
-    /// produce (`ConfigError::PayChannelUnbound`).
+    /// produce (`ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelUnbound)`).
     pub(crate) fn covering(connector: Connector, peer_id: &str) -> Connector {
         connector_runtime::covering_fake::covering(connector, peer_id)
     }

@@ -285,7 +285,7 @@ pub struct RuntimePeering {
     pub client_edge_url: Option<String>,
     /// The payment channels this peering's claims are judged against, one
     /// per chain the two nodes share. A peering with none is refused at
-    /// write time (the runtime twin of `ConfigError::PeerChannelUnbound`).
+    /// write time (the runtime twin of `ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeerChannelUnbound)`).
     pub channels: Vec<RuntimePeerChannel>,
 }
 
