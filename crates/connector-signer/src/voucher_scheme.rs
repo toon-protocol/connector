@@ -11,10 +11,10 @@
 //! writing one implementation of it. Its associated types name what differs
 //! between chains:
 //!
-//! | Type             | EVM ([`EvmVoucherScheme`])                    | Solana ([`SolanaVoucherScheme`])             | XRPL (#1718)                 |
+//! | Type             | EVM ([`EvmVoucherScheme`])                    | Solana ([`SolanaVoucherScheme`])             | XRPL ([`XrplVoucherScheme`]) |
 //! | ---------------- | --------------------------------------------- | -------------------------------------------- | ---------------------------- |
 //! | `Wire`           | `connector_domain`'s `EvmVoucher`             | `connector_domain`'s `SolanaVoucher`         | `XrplVoucher`                |
-//! | `Domain`         | [`BatchSettlementDomain`] (chain id, contract) | [`SolanaVoucherDomain`] (the program)        | the XRPL network             |
+//! | `Domain`         | [`BatchSettlementDomain`] (chain id, contract) | [`SolanaVoucherDomain`] (the program)        | [`XrplVoucherDomain`] (the network) |
 //! | `ChannelParts`   | the `ChannelConfig`                           | the PDA seeds ([`SolanaChannelSeeds`])       | account, destination, sequence |
 //! | `Recorded`       | the `ChannelConfig` the lookup verified       | the account and its `authorized_signer`      | the channel's `PublicKey`    |
 //! | `KeyHolder`      | `dyn` [`crate::Signer`] (ADR 0012)            | `dyn` [`crate::Ed25519Signer`]               | [`crate::XrplSigner`]   |
@@ -35,12 +35,14 @@
 
 mod evm;
 mod solana;
+mod xrpl;
 
 pub use evm::{EvmVoucherScheme, ParsedEvmVoucher};
 pub use solana::{
     ParsedSolanaVoucher, RecordedSolanaChannel, SolanaChannelSeeds, SolanaVoucherDomain,
     SolanaVoucherScheme,
 };
+pub use xrpl::{ParsedXrplVoucher, XrplChannelParts, XrplVoucherDomain, XrplVoucherScheme};
 
 use crate::SignerError;
 

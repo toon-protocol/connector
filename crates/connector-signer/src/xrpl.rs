@@ -438,7 +438,6 @@ fn secp256k1_account_key(entropy: &[u8]) -> SecretKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     /// rippled's well-known genesis account: `masterpassphrase`.
     const MASTER_SEED: &str = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb";
@@ -452,10 +451,6 @@ mod tests {
 
     fn secp() -> XrplSigner {
         XrplSigner::from_family_seed(MASTER_SEED).unwrap()
-    }
-
-    fn ed() -> XrplSigner {
-        XrplSigner::Ed25519(ed25519_dalek::Keypair::generate(&mut rand::rngs::OsRng))
     }
 
     #[test]
@@ -603,29 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn a_challenge_is_never_a_claim() {
-        let message = xrpl_voucher_claim_state_challenge_message("xrpl:1", &[9; 32], 5).unwrap();
-        assert_ne!(message[..4], XRPL_CLAIM_PREFIX);
-        assert_ne!(message.len(), 44);
-        for signer in [secp(), ed()] {
-            let signature = signer.sign(&message);
-            assert!(verify_xrpl_voucher_claim_state_challenge(
-                &signer.public_key(),
-                "xrpl:1",
-                &[9; 32],
-                5,
-                &signature
-            ));
-            assert!(!verify_xrpl_claim(
-                &signer.public_key(),
-                &[9; 32],
-                5,
-                &signature
-            ));
-        }
-    }
-
-    #[test]
     fn an_amount_above_the_ceiling_is_refused_not_truncated() {
         assert!(xrpl_claim_message(&[1; 32], XRPL_MAX_DROPS as u128).is_ok());
         for over in [
@@ -637,78 +609,6 @@ mod tests {
                 xrpl_claim_message(&[1; 32], over),
                 Err(XrplError::AmountExceedsChain { .. })
             ));
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn claims_round_trip_in_both_algorithms(
-            channel in any::<[u8; 32]>(),
-            drops in 0..=XRPL_MAX_DROPS,
-            use_ed in any::<bool>(),
-        ) {
-            let signer = if use_ed { ed() } else { secp() };
-            let signature = signer.sign_claim(&channel, drops as u128).unwrap();
-            prop_assert!(verify_xrpl_claim(&signer.public_key(), &channel, drops as u128, &signature));
-        }
-
-        #[test]
-        fn any_tampered_claim_byte_fails(
-            channel in any::<[u8; 32]>(),
-            drops in 0..XRPL_MAX_DROPS,
-            use_ed in any::<bool>(),
-            flip in any::<usize>(),
-            bit in 0u8..8,
-        ) {
-            let signer = if use_ed { ed() } else { secp() };
-            let signature = signer.sign_claim(&channel, drops as u128).unwrap();
-            let key = signer.public_key();
-            // the amount: one bit of its u64, and the next drop
-            prop_assert!(!verify_xrpl_claim(&key, &channel, drops as u128 + 1, &signature));
-            let flipped = drops ^ (1u64 << (flip % 64));
-            prop_assert!(!verify_xrpl_claim(&key, &channel, flipped as u128, &signature));
-            // the channel id
-            let mut other = channel;
-            other[flip % 32] ^= 1 << bit;
-            prop_assert!(!verify_xrpl_claim(&key, &other, drops as u128, &signature));
-            // the signature
-            let mut bad = signature.clone();
-            let at = flip % bad.len();
-            bad[at] ^= 1 << bit;
-            prop_assert!(!verify_xrpl_claim(&key, &channel, drops as u128, &bad));
-        }
-
-        #[test]
-        fn challenges_round_trip_and_bind_network_channel_and_expiry(
-            channel in any::<[u8; 32]>(),
-            network in "xrpl:[0-9]{1,5}",
-            expires in any::<u64>(),
-            use_ed in any::<bool>(),
-            flip in any::<usize>(),
-            bit in 0u8..8,
-        ) {
-            let signer = if use_ed { ed() } else { secp() };
-            let key = signer.public_key();
-            let signature = signer.sign_claim_state_challenge(&network, &channel, expires).unwrap();
-            prop_assert!(verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, expires, &signature));
-            // the network: one bit of one byte, kept ASCII so it stays a `str`
-            let mut other_network = network.clone().into_bytes();
-            let at = flip % other_network.len();
-            other_network[at] ^= 1 << (bit % 7);
-            let other_network = String::from_utf8(other_network).unwrap();
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &other_network, &channel, expires, &signature));
-            // the expiry
-            let other_expires = expires ^ (1u64 << (flip % 64));
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, other_expires, &signature));
-            // the channel id
-            let mut other = channel;
-            other[flip % 32] ^= 1 << bit;
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &other, expires, &signature));
-            // the signature
-            let mut bad = signature.clone();
-            let at = flip % bad.len();
-            bad[at] ^= 1 << bit;
-            prop_assert!(!verify_xrpl_voucher_claim_state_challenge(&key, &network, &channel, expires, &bad));
         }
     }
 

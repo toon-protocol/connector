@@ -34,7 +34,7 @@ use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, HeldVouchers, Voucher,
 };
 use connector_settlement::ChannelId;
-use connector_signer::{verify_xrpl_claim, XRPL_MAX_DROPS};
+use connector_signer::XRPL_MAX_DROPS;
 
 use crate::batch::{closed_delivering, Channel, Seen, XrplBatchSettlement};
 use crate::tx::{LandClaim, SourceClose};
@@ -64,12 +64,7 @@ impl XrplBatchSettlement {
                 .ok()
                 .filter(|drops| *drops <= XRPL_MAX_DROPS)?;
             let worth = drops > read.balance && drops <= read.amount;
-            let genuine = verify_xrpl_claim(
-                &key,
-                &id_bytes,
-                voucher.cumulative_amount,
-                &voucher.signature,
-            );
+            let genuine = self.genuine(&id_bytes, voucher, &key);
             if worth && !genuine {
                 tracing::warn!(
                     channel = %id,

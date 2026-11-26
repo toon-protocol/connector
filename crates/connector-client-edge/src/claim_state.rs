@@ -59,7 +59,7 @@ use connector_domain::client_claim::{
     declared_scheme, parse_evm_channel_config, DeclaredScheme, SCHEME_BATCH_SETTLEMENT,
 };
 use connector_domain::{AssetChain, Network};
-use connector_signer::{EvmVoucherScheme, SolanaVoucherScheme, VoucherScheme};
+use connector_signer::{EvmVoucherScheme, SolanaVoucherScheme, VoucherScheme, XrplVoucherScheme};
 
 use crate::channels::{decode_hex_bytes, ChannelResolutionError};
 use crate::claim_gate::{NotFound, Proof};
@@ -597,7 +597,7 @@ async fn resolve_xrpl_on(
         log_outcome("xrpl", &channel_id_text, "expired");
         return unverified("xrpl", channel_id_text, "expired");
     }
-    let Some(channel_id) = decode_hex_bytes::<32>(&channel_id_text) else {
+    let Some(channel_id) = XrplVoucherScheme::decode_channel_id(&channel_id_text) else {
         log_outcome("xrpl", &channel_id_text, "malformed_channel_id");
         return unverified("xrpl", channel_id_text, "unverified");
     };

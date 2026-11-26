@@ -7,8 +7,8 @@
 //! ([`VoucherChannels`](crate::batch_settlement::VoucherChannels)), and the port answers the channel's recorded signer
 //! and state. Verifying is the chain's voucher scheme's, against exactly
 //! what the port answered and never against anything the voucher carries.
-//! EVM's is [`EvmVoucherScheme`] and Solana's [`SolanaVoucherScheme`];
-//! XRPL's arm below becomes its scheme in #1718.
+//! EVM's is [`EvmVoucherScheme`], Solana's [`SolanaVoucherScheme`] and
+//! XRPL's [`XrplVoucherScheme`].
 //!
 //! A channel this gate has no record of is a discovery, metered against the
 //! unresolvable-lookup budget (issue #613): charged before the port is
@@ -18,15 +18,15 @@ use connector_domain::client_claim::{ClientClaim, EVM_NAMESPACE};
 use connector_domain::Network;
 use connector_settlement::batch::{BatchChannelState, ChannelPresentation, VoucherSigner};
 use connector_signer::{
-    verify_xrpl_claim, verify_xrpl_voucher_claim_state_challenge, BatchChannelConfig,
-    BatchSettlementDomain, EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher,
-    RecordedSolanaChannel, SolanaVoucherDomain, SolanaVoucherScheme, VoucherRefusal, VoucherScheme,
+    BatchChannelConfig, BatchSettlementDomain, EvmVoucherScheme, ParsedEvmVoucher,
+    ParsedSolanaVoucher, ParsedXrplVoucher, RecordedSolanaChannel, SolanaVoucherDomain,
+    SolanaVoucherScheme, VoucherRefusal, VoucherScheme, XrplVoucherDomain, XrplVoucherScheme,
 };
 
 use super::ClientClaimGate;
 use crate::batch_settlement::JournaledBatchChannel;
 use crate::batch_settlement::{evm_channel, port_config, solana_channel, xrpl_channel};
-use crate::channels::{decode_hex_bytes, ChannelResolutionError};
+use crate::channels::ChannelResolutionError;
 
 /// A signature on a voucher channel, and what it claims to sign: a
 /// voucher's amount, or a claim-state challenge's expiry. Each chain's
@@ -53,11 +53,9 @@ pub(crate) enum Proof {
         expires: u64,
         signature: Vec<u8>,
     },
-    XrplVoucher {
-        channel_id: [u8; 32],
-        drops: u128,
-        signature: Vec<u8>,
-    },
+    /// An XRPL voucher, parsed through its scheme.
+    XrplVoucher(ParsedXrplVoucher),
+    /// An XRPL claim-state challenge.
     XrplChallenge {
         channel_id: [u8; 32],
         expires: u64,
@@ -77,22 +75,7 @@ impl Proof {
                 SolanaVoucherScheme::parse(voucher).map(Proof::SolanaVoucher)
             }
             ClientClaim::XrplVoucher(voucher) => {
-                let signature = hex::decode(&voucher.signature)
-                    .ok()
-                    .filter(|bytes| (64..=72).contains(&bytes.len()))
-                    .ok_or_else(|| {
-                        VoucherRefusal::Malformed(
-                            "an XRPL voucher's 'signature' must be 64 to 72 bytes of hex"
-                                .to_string(),
-                        )
-                    })?;
-                let channel_id = decode_hex_bytes::<32>(&voucher.channel_id)
-                    .ok_or(VoucherRefusal::UnreadableChannel)?;
-                Ok(Proof::XrplVoucher {
-                    channel_id,
-                    drops: voucher.max_claimable_amount,
-                    signature,
-                })
+                XrplVoucherScheme::parse(voucher).map(Proof::XrplVoucher)
             }
         }
     }
@@ -195,14 +178,13 @@ impl ClientClaimGate {
                 )
                 .await
             }
-            Proof::XrplVoucher {
-                channel_id,
-                drops,
-                signature,
-            } => {
-                self.find_then_verify_xrpl(network, channel_id, requester, |key| {
-                    verify_xrpl_claim(key, channel_id, *drops, signature)
-                })
+            Proof::XrplVoucher(voucher) => {
+                self.find_then_verify_xrpl(
+                    network,
+                    &voucher.channel_id,
+                    requester,
+                    |domain, key| XrplVoucherScheme::verify(domain, voucher, key),
+                )
                 .await
             }
             Proof::XrplChallenge {
@@ -210,13 +192,9 @@ impl ClientClaimGate {
                 expires,
                 signature,
             } => {
-                self.find_then_verify_xrpl(network, channel_id, requester, |key| {
-                    verify_xrpl_voucher_claim_state_challenge(
-                        key,
-                        &network.to_string(),
-                        channel_id,
-                        *expires,
-                        signature,
+                self.find_then_verify_xrpl(network, channel_id, requester, |domain, key| {
+                    XrplVoucherScheme::verify_challenge(
+                        domain, channel_id, *expires, signature, key,
                     )
                 })
                 .await
@@ -319,21 +297,22 @@ impl ClientClaimGate {
     }
 
     /// Every field of an XRPL channel is on the ledger: the signer is its
-    /// `PublicKey`. A channel id binds no network (ADR 0087 decision 2), so
-    /// the network asked is the one the proof names.
+    /// `PublicKey`, and the scheme verifies against it. A channel id binds
+    /// no network (ADR 0087 decision 2), so the network asked is the one the
+    /// proof names.
     async fn find_then_verify_xrpl(
         &self,
         network: &Network,
         channel_id: &[u8; 32],
         requester: &str,
-        verify: impl FnOnce(&[u8; 33]) -> bool,
+        verify: impl FnOnce(&XrplVoucherDomain, &[u8; 33]) -> Result<(), VoucherRefusal>,
     ) -> Result<Found, NotFound> {
         let Network::Xrpl(xrpl) = network else {
             return Err(NotFound::Unknown);
         };
-        if !self.voucher_channels.settles_on(network) {
-            return Err(NotFound::Unknown);
-        }
+        let domain = XrplVoucherScheme::domain_on(network)
+            .filter(|_| self.voucher_channels.settles_on(network))
+            .ok_or(NotFound::Unknown)?;
         let channel = JournaledBatchChannel::Xrpl {
             channel_id: *channel_id,
             network: *xrpl,
@@ -354,7 +333,7 @@ impl ClientClaimGate {
             channel,
             signer: state.voucher_signer,
             max_cumulative: u128::from(saturating_u64(&state)),
-            verified: verify(&key),
+            verified: verify(&domain, &key).is_ok(),
         })
     }
 

@@ -72,8 +72,9 @@ pub use local::LocalSigner;
 pub use nip59::{unwrap_claim, wrap_claim, Nip59Error, WrappedClaim};
 pub use signer::{verify, PublicKeyBytes, Signature, Signer};
 pub use voucher_scheme::{
-    EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher, RecordedSolanaChannel,
-    SolanaChannelSeeds, SolanaVoucherDomain, SolanaVoucherScheme, VoucherRefusal, VoucherScheme,
+    EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher, ParsedXrplVoucher,
+    RecordedSolanaChannel, SolanaChannelSeeds, SolanaVoucherDomain, SolanaVoucherScheme,
+    VoucherRefusal, VoucherScheme, XrplChannelParts, XrplVoucherDomain, XrplVoucherScheme,
 };
 pub use voucher_signature::{
     evm_batch_channel_id, evm_voucher_digest, evm_voucher_signer, solana_voucher_message,
