@@ -333,7 +333,7 @@ pub async fn run<S: AsRef<str>>(args: &[S]) -> Result<Command, CliError> {
             Ok(Command::Serve(RunningNode {
                 router,
                 client_edge_addr,
-                _state_dir_lock: runtime.state_dir_lock.take(),
+                _state_dir_lock: runtime.take_state_dir_lock(),
             }))
         }
         Invocation::Send { options } => {

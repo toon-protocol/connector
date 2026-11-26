@@ -245,7 +245,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     assert_eq!(x402.channel(&ChannelId(id.clone())).await, (1_500, 0));
 
     // -- A pays B with a voucher; B lands it now --
-    let outbound = a_runtime.outbound_channels.clone().expect("A pays on x402");
+    let outbound = a_runtime.outbound_channels().expect("A pays on x402");
     let voucher = outbound
         .sign_voucher(&id, u128::from(PRICE))
         .await
@@ -253,7 +253,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     let Some(ChannelPresentation::Evm { config, .. }) = outbound.presentation(&id) else {
         panic!("an EVM channel presents its config");
     };
-    let receiver = b_runtime.signer.public_key().expect("B's wrap key");
+    let receiver = b_runtime.signer().public_key().expect("B's wrap key");
     let response = post_ilp(
         &b_app,
         &evm_voucher(
@@ -333,8 +333,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     assert_eq!(restored["landed"], PRICE);
     assert_eq!(
         a_runtime
-            .outbound_channels
-            .clone()
+            .outbound_channels()
             .expect("A pays on x402")
             .sign_voucher(&id, u128::from(PRICE))
             .await

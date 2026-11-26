@@ -408,8 +408,9 @@ impl Peerings {
     /// panic. A failed step undoes what the earlier ones wired.
     ///
     /// `outbound` is the node's x402 channels, which a `[[pay_channels]]`
-    /// row must name one of. Call after the registrar and socks proxy are
-    /// set.
+    /// row must name one of. The only caller,
+    /// [`crate::PeeringWiring::admit_config_peering`], is reachable only once
+    /// the outbound channels, registrar and socks proxy are set.
     ///
     /// # Errors
     ///
@@ -785,9 +786,10 @@ impl Peerings {
     /// peering stays on disk until the table's next write, which persists
     /// the table as it now stands.
     ///
-    /// Call after the config file's peerings are admitted
-    /// ([`Self::admit_config`], which reserves their ids) and the registrar
-    /// and socks proxy are set: admit reads all three.
+    /// Admit reads the config file's peer ids (reserved by
+    /// [`Self::admit_config`]), the registrar and the socks proxy; the only
+    /// caller, [`crate::PeeringWiring`], is reachable only once the settings
+    /// are set and runs it after every config peering is admitted.
     pub(crate) fn replay(
         &mut self,
         store: PeerRouteStore,

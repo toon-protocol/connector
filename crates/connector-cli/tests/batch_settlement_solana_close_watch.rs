@@ -111,7 +111,7 @@ price = {PRICE}
     ));
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     // A channel this node sponsors, co-signed here as the sponsor endpoint
     // (issue #1346) will.

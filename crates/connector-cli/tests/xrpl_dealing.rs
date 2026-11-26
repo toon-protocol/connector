@@ -383,7 +383,7 @@ price = 0
 
     fn identity(&self) -> PublicKeyBytes {
         self.runtime
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }

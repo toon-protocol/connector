@@ -2,7 +2,7 @@
 //! 2, as ADR 0075 decision 6 amends it; issue #1380), both halves, nothing
 //! faked between them: a payer covering its forwards with vouchers on its
 //! **own outbound x402 channel**, registered the way a `[[pay_channels]]`
-//! row registers it (`Connector::admit_config_peering`), and a payee
+//! row registers it (`PeeringWiring::admit_config_peering`), and a payee
 //! answering a real `POST /ilp` and a real `POST /ilp/claim-state` over a
 //! real socket.
 //!
@@ -253,7 +253,7 @@ fn payer(
     network: &str,
     channel: &str,
     payee: std::net::SocketAddr,
-) -> Connector {
+) -> Arc<Connector> {
     let transport =
         HttpPeerTransport::new(Arc::new(ReqwestPeerClient::new(reqwest::Client::new())));
     transport.add_peer(PeerRelation::new(
@@ -269,6 +269,7 @@ fn payer(
         Arc::new(SystemClock),
     )
     .with_outbound_channels(outbound, vec![(SettlementChain::Evm, network.to_string())])
+    .wire_peerings()
     .admit_config_peering(&ConfigPeering {
         // The payee's own settlement key: the one the channel pays.
         peer_channels: vec![ConfigPeerChannel {
@@ -286,6 +287,7 @@ fn payer(
         ..ConfigPeering::new(NEXT_HOP)
     })
     .expect("the pay channel is this node's own journaled outbound channel")
+    .finish()
 }
 
 /// One crossing: a packet forwarded to the payee must fulfil with the app's
