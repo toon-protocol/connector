@@ -1,10 +1,13 @@
-//! Builds the live [`Connector`] and its signer from a validated [`Config`],
-//! and merges the client-edge and operator routers into the one
-//! [`axum::Router`] the binary serves. Per ADR 0001 this is where every
-//! construction decision lives -- `connector-bin` calls exactly
-//! [`build`] and [`router`] and branches on neither.
+//! Starts a node from a validated [`Config`] in two steps (spec #1689):
+//! [`connect`] dials what the config names and returns connected [`Parts`],
+//! and [`assemble`] turns parts into the running node -- the live
+//! [`Connector`], its claim gate, its background tasks and the one
+//! [`axum::Router`] the binary serves. [`build`] is the two in order. Per
+//! ADR 0001 this is where every construction decision lives --
+//! `connector-bin` calls `run`, which calls [`build`], and branches on
+//! neither.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -24,11 +27,12 @@ use connector_config::{
 use connector_domain::Network;
 use connector_rate_source_evm::UniswapV3RateSource;
 use connector_runtime::{
-    BatchChannels, BoundedHttpSelfDescription, ConfigPayChannel, ConfigPeerChannel, ConfigPeering,
-    ConfigPeeringError, Connector, DeclaredRates, FileJournal, HttpAppClient, InMemoryJournal,
-    Journal, JournalError, OutboundChannels, OutboundRestoreError, PeerRegistrar, PeerRoute,
-    PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources,
-    SettlementNetwork, SettlementNetworks, SharedRateTable, SystemClock,
+    AppClient, BatchChannels, BoundedHttpSelfDescription, ConfigPayChannel, ConfigPeerChannel,
+    ConfigPeering, ConfigPeeringError, Connector, DeclaredRates, FileJournal, HttpAppClient,
+    InMemoryJournal, Journal, JournalError, OutboundChannels, OutboundRestoreError, PeerRegistrar,
+    PeerRoute, PeerRouteStore, PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller,
+    RateSources, RuntimePeers, SelfDescriptionSource, SettlementNetwork, SettlementNetworks,
+    SharedRateTable, SystemClock,
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend};
@@ -896,32 +900,31 @@ async fn build_xrpl_batch_settlement(
     Ok(Arc::new(backend))
 }
 
-/// Refuse a `state_dir` whose claim journals hold `toon-channel` entries
-/// (ADR 0075 decision 8, issue #1385), before anything is served.
+/// Refuse a `state_dir` whose claim journal `name` holds `toon-channel`
+/// entries (ADR 0075 decision 8, issue #1385), before anything is served.
 ///
-/// Both files are read: `peer-claims.log`, which only an older build wrote
-/// and nothing opens any more, and `client-edge-claims.log`, which holds
+/// [`connect`] reads `peer-claims.log` with it, which only an older build
+/// wrote and nothing opens any more. `client-edge-claims.log`, which holds
 /// vouchers now and may hold a pre-ADR 0075 client's `toon-channel` claims
-/// beside them. A file that does not exist holds nothing. One that cannot
-/// be read is [`RuntimeError::JournalUnreplayable`], as it always was.
-fn refuse_toon_channel_journals(state_dir: &Path) -> Result<(), RuntimeError> {
-    for name in [PEER_CLAIM_JOURNAL, CLIENT_EDGE_JOURNAL] {
-        let path = state_dir.join(name);
-        if !path.exists() {
-            continue;
-        }
-        let unreplayable = |source| RuntimeError::JournalUnreplayable {
-            path: path.clone(),
-            source,
-        };
-        let entries = FileJournal::open(&path)
-            .and_then(|journal| journal.read_all())
-            .map_err(unreplayable)?;
-        if let Some(channel) = connector_client_edge::first_toon_channel_entry(&entries) {
-            return Err(RuntimeError::ToonChannelJournal { path, channel });
-        }
+/// beside them, is checked by [`assemble`]'s one replay of it. A file that
+/// does not exist holds nothing. One that cannot be read is
+/// [`RuntimeError::JournalUnreplayable`], as it always was.
+fn refuse_toon_channel_journal(state_dir: &Path, name: &str) -> Result<(), RuntimeError> {
+    let path = state_dir.join(name);
+    if !path.exists() {
+        return Ok(());
     }
-    Ok(())
+    let unreplayable = |source| RuntimeError::JournalUnreplayable {
+        path: path.clone(),
+        source,
+    };
+    let entries = FileJournal::open(&path)
+        .and_then(|journal| journal.read_all())
+        .map_err(unreplayable)?;
+    match connector_client_edge::first_toon_channel_entry(&entries) {
+        Some(channel) => Err(RuntimeError::ToonChannelJournal { path, channel }),
+        None => Ok(()),
+    }
 }
 
 /// The peer claim journal an older build kept under `state_dir` (issue
@@ -1033,12 +1036,10 @@ fn warn_about_host_local_endpoints(config: &Config) {
     }
 }
 
-/// Everything [`build`] produced from a validated [`Config`], and
-/// everything [`router`] needs from it. A struct rather than a tuple
-/// because the third member is the kind of thing that only ever grows: as
-/// issue #556 arms more of the node, more of what `build` connects has to
-/// reach the routers without being reconstructed (and, for a chain
-/// connection, without being connected twice).
+/// The running node [`assemble`] returns: its router, and what the binary,
+/// the operator surface and the tests still read off it. Its background
+/// tasks -- each network's watcher, the rate pollers and a zk edge's
+/// allowance sweep -- are already running by the time it is returned.
 pub struct Runtime {
     pub connector: Arc<Connector>,
     pub signer: Arc<dyn Signer>,
@@ -1047,13 +1048,12 @@ pub struct Runtime {
     /// node that predates the record, and is why this is an `Option` rather
     /// than an empty table.
     ///
-    /// Built here, from the immutable declaration in `[[tokens]]`,
-    /// `[[rates]]` and `[rate_guards]`, for this struct's own reason: it is
-    /// composed once at boot and every reader afterwards shares it rather
-    /// than rebuilding one of its own. Two readers are expected --
-    /// the forwarding path, which reads it for every forward that crosses a
-    /// denomination boundary, and the operator surface, which renders what
-    /// it holds -- and both go through
+    /// Built at connect, from the immutable declaration in `[[tokens]]`,
+    /// `[[rates]]` and `[rate_guards]`: it is composed once at boot and
+    /// every reader afterwards shares it rather than rebuilding one of its
+    /// own. Two readers are expected -- the forwarding path, which reads it
+    /// for every forward that crosses a denomination boundary, and the
+    /// operator surface, which renders what it holds -- and both go through
     /// [`connector_runtime::SharedRateTable`]'s synchronous read API, which
     /// is what keeps ADR 0071's "the forwarding path does no I/O" true by
     /// construction rather than by discipline.
@@ -1062,36 +1062,33 @@ pub struct Runtime {
     pub rate_table: Option<SharedRateTable>,
     /// Every network this node settles on, one handle per settlement table
     /// (spec #1684, ADR 0086), keyed by CAIP-2 network and built once at
-    /// boot, in table order. The node reaches every chain through it and
+    /// connect, in table order. The node reaches every chain through it and
     /// through nothing else (issue #1715): every channel the client-edge
-    /// journal holds vouchers on, and every outbound channel, is already
-    /// restored to its network's backend by the time [`build`] returns;
-    /// [`router`] hands it to the client edge's claim gate, starts each
-    /// network's watcher through it, and publishes each network's terms in
-    /// the greeting. Empty on a node that settles on nothing -- a node that
-    /// then takes no claim at all, since every claim is a voucher (ADR 0075).
+    /// journal holds vouchers on, and every outbound channel, was restored
+    /// to its network's backend by [`assemble`], which also handed it to the
+    /// claim gate, started each network's watcher through it and published
+    /// each network's terms in the greeting. Empty on a node that settles on
+    /// nothing -- a node that then takes no claim at all, since every claim
+    /// is a voucher (ADR 0075).
     pub settlement_networks: SettlementNetworks,
-    /// The Solana backend the public sponsor endpoint (ADR 0074 decision 9,
-    /// issue #1346) co-signs an `open` with, `Some` exactly when
-    /// `[settlement.solana]` is written. The endpoint is Solana's own wire,
-    /// not dispatch: nothing else reads a chain's backend off this.
-    sponsor: Option<Arc<SolanaBatchSettlement>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
-    /// over the paying half of the backends above and journaled to
-    /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when either backend is.
-    /// Every channel that journal names is restored by the time [`build`]
-    /// returns, with the highest voucher journaled on it, so the operator
-    /// surface can fund, withdraw from and sign on it from the first
-    /// request.
+    /// over the paying half of each network and journaled to
+    /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when a network is.
+    /// Every channel that journal names was restored by [`assemble`], with
+    /// the highest voucher journaled on it, so the operator surface can
+    /// fund, withdraw from and sign on it from the first request.
     pub outbound_channels: Option<Arc<OutboundChannels>>,
     /// The lock on `state_dir` (issue #1318), `Some` exactly when the node
     /// names one. `run` moves it into the `RunningNode` it hands back, because
     /// the runtime is dropped before the process stops serving.
     pub state_dir_lock: Option<std::fs::File>,
-    /// What a zk edge reads once at boot (ADR 0080 decisions 14--16), `Some`
-    /// exactly when `[zk_note]` is written. [`router`] hands it to the claim
-    /// gate and starts the allowance sweep.
+    /// What a zk edge read once at boot (ADR 0080 decisions 14--16), `Some`
+    /// exactly when `[zk_note]` is written. The claim gate holds it, and the
+    /// allowance sweep is running.
     pub zk_edge: Option<ZkEdgeBoot>,
+    /// The client edge, the sponsor and zk-note endpoints and, when
+    /// `[operator]` is written, the operator surface, merged.
+    router: Router,
 }
 
 impl Runtime {
@@ -1109,6 +1106,11 @@ impl Runtime {
     pub fn voucher_signers(&self) -> Vec<connector_domain::VoucherSignerFact> {
         self.settlement_networks.voucher_signers()
     }
+
+    /// The one router this node serves.
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
 }
 
 /// A zk edge's vault and the facts read from it at boot (ADR 0080 decision
@@ -1118,6 +1120,76 @@ pub struct ZkEdgeBoot {
     pub vault: Arc<dyn ZkNoteVault>,
     pub subsidy: Option<Subsidy>,
     pub slots: SlotClock,
+}
+
+/// Everything [`connect`] reads for a zk edge (ADR 0080 decisions 8 and
+/// 14--16): the vault and its boot reads, the evidence file, the state key,
+/// and the standing terms the greeting publishes.
+pub struct ZkEdgeParts {
+    pub boot: ZkEdgeBoot,
+    pub evidence: connector_client_edge::EvidenceFile,
+    pub state_signer: connector_signer::ZkStateSigner,
+    pub terms: connector_domain::x402::X402ZkNoteTerms,
+}
+
+/// The journals [`connect`] opened under `state_dir`, or in memory on a
+/// node that names none -- whose records then survive nothing, the same
+/// posture its claim books have always taken.
+pub struct Journals {
+    /// The client edge's claim journal: every voucher it accepted and each
+    /// x402 channel it admitted. [`assemble`] replays it once.
+    pub client_edge: Arc<dyn Journal>,
+    /// The x402 channels this node pays on (ADR 0075 decision 8).
+    pub outbound_channels: Arc<dyn Journal>,
+    /// A spending limit's day totals (ADR 0078 decision 8), `Some` when the
+    /// node writes `[operator]` and names a `state_dir`.
+    pub day_totals: Option<connector_operator::DayTotals>,
+    client_edge_path: PathBuf,
+    outbound_channels_path: PathBuf,
+}
+
+/// The node's durable runtime peer/route table (issue #884), as it was read
+/// back from `state_dir`, and the store future writes go to.
+pub struct StoredPeerRoutes {
+    pub store: PeerRouteStore,
+    pub peers: RuntimePeers,
+    pub routes: HashMap<String, PeerRoute>,
+}
+
+/// What the connector dials through: the peer carriages (in both roles), a
+/// counterparty's self-description and the apps behind its routes.
+pub struct Carriages {
+    pub peer_transport: Arc<dyn PeerTransport>,
+    pub peer_registrar: Arc<dyn PeerRegistrar>,
+    pub self_description: Arc<dyn SelfDescriptionSource>,
+    pub app: Arc<dyn AppClient>,
+}
+
+/// What [`connect`] hands [`assemble`] (spec #1689): every part that
+/// dialed a chain or read a key location, and the config-derived policy.
+pub struct Parts {
+    /// The validated config: the policy -- routes, peerings, fees, caps and
+    /// prices -- assemble builds the connector from.
+    pub config: Config,
+    pub signer: Arc<dyn Signer>,
+    /// The `[signer]` secret a privacy-wrapped claim is opened with.
+    pub wrap_receiver_secret: [u8; 32],
+    /// Every network this node settles on, one handle per settlement table.
+    pub settlement_networks: SettlementNetworks,
+    /// The Solana backend the public sponsor endpoint co-signs an `open`
+    /// with (ADR 0074 decision 9), `Some` exactly when `[settlement.solana]`
+    /// is written. The endpoint is Solana's own wire, not dispatch: nothing
+    /// else reads a chain's backend off this.
+    pub sponsor: Option<Arc<SolanaBatchSettlement>>,
+    pub journals: Journals,
+    /// `Some` exactly when the node names a `state_dir`.
+    pub runtime_peer_routes: Option<StoredPeerRoutes>,
+    pub carriages: Carriages,
+    /// See [`Runtime::rate_table`]. Its pollers are already running.
+    pub rate_table: Option<SharedRateTable>,
+    /// `Some` exactly when `[zk_note]` is written.
+    pub zk_edge: Option<ZkEdgeParts>,
+    pub state_dir_lock: Option<std::fs::File>,
 }
 
 /// How often the zk edge closes the allowances that have expired
@@ -1132,38 +1204,39 @@ const ZK_NOTE_BOOT_ATTEMPTS: u32 = 1 + connector_chain_rpc::READ_RETRIES;
 /// The wait between those attempts.
 const ZK_NOTE_BOOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Construct the live [`Connector`] and [`Signer`] a validated [`Config`]
-/// describes. Every `peer_id`-targeted `[[routes]]` entry becomes a
-/// [`PeerRoute`] alongside the terminated
-/// [`connector_config::StaticRoute`]s -- though nothing can currently
-/// traverse one: ADR 0027 / issue #679 deleted the raw-TCP transport that
-/// was the only [`connector_runtime::PeerTransport`] a built node held,
-/// and the carriages replacing it (BTP over `wss://`, ILP-over-HTTP over
-/// `https://`) are issue #676. Until one lands this node holds an empty
-/// [`InProcessPeerTransport`], so a packet routed to a peer is answered
-/// `T01 peer unreachable` rather than dropped. Every configured
-/// `[settlement.<chain>]` table's real chain-backed [`SettlementBackend`]
-/// is connected and attached under its own chain via
-/// [`Connector::with_settlement`] (issues #542, #630 -- a node with both
-/// tables holds both backends, and operator channel ops route per chain) --
-/// those connections are why this function is `async` at all; an
-/// unconfigured node still builds with no settlement backend, same as
-/// before this section existed.
-///
-/// A node that names a `state_dir` also has its peer claim journal armed
-/// here (issue #605), so the watermarks `ClaimBook` keeps outlive the
-/// process exactly as the client edge's do. That ledger sits *above* the
-/// peer transport port and was untouched by #679's deletion.
+/// Start the node a validated [`Config`] describes: [`connect`], then
+/// [`assemble`].
 pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
+    assemble(connect(config).await?).await
+}
+
+/// Turn a validated [`Config`] into connected [`Parts`] (spec #1689): the
+/// one step that dials a chain or reads a key location. Every configured
+/// `[settlement.<chain>]` table's network is connected here, and refused by
+/// name when its chain disagrees with the table; a `[zk_note]` table's vault
+/// is read; the journals and the runtime peer/route table are opened under
+/// `state_dir`; and each declared quote path's poller is started.
+pub async fn connect(config: &Config) -> Result<Parts, RuntimeError> {
     // Issue #1318: the first thing done with `state_dir`, before any journal
     // is read or any chain dialed.
     let state_dir_lock = config.state_dir().map(lock_state_dir).transpose()?;
     let signer = build_signer(config.signer_key())?;
-    // ADR 0075 decision 8, issue #1385: a node whose journals still hold
-    // claims on TOON's own channels is refused by name before any chain is
-    // dialed -- this build could neither land nor drain them.
+    // Issue #556: a privacy-wrapped claim
+    // (`ILP-Payment-Channel-Claim-Wrapped`, client-edge-spec.md §1.3) is
+    // opened with this node's `[signer]` key, not with a second receiver
+    // key of its own. `connector-config/src/announce.rs` states the rule:
+    // `GET /ilp/identity` and every gift wrap this node opens both use
+    // `[signer]` -- and since that endpoint is the only surface publishing
+    // a receiver public key, a sender can wrap to no other one. No new
+    // config section exists or is needed for this.
+    let wrap_receiver_secret = read_signer_secret(config.signer_key())?;
+    // ADR 0075 decision 8, issue #1385: a node whose peer claim journal still
+    // holds claims on TOON's own channels is refused by name before any
+    // chain is dialed -- this build could neither land nor drain them. The
+    // client edge's journal is checked by the one replay of it, in
+    // `assemble`.
     if let Some(state_dir) = config.state_dir() {
-        refuse_toon_channel_journals(state_dir)?;
+        refuse_toon_channel_journal(state_dir, PEER_CLAIM_JOURNAL)?;
     }
     // Issue #678 gap 3, said once and loudly. A plaintext peering could not
     // have loaded unless somebody wrote `peer_allow_plaintext_endpoints`,
@@ -1171,73 +1244,36 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // took it says so where an operator will see it.
     warn_about_plaintext_peerings(config);
     warn_about_host_local_endpoints(config);
+    let journals = open_journals(config)?;
+    let runtime_peer_routes = match config.state_dir() {
+        Some(state_dir) => Some(open_runtime_peer_routes(state_dir)?),
+        None => None,
+    };
     // Issue #678 gap 2: the dial side, built from `[[peers]]`. A node with
     // no dialable peering still holds an empty `InProcessPeerTransport`, so
     // a packet routed to a peer is answered `T01 peer unreachable` rather
-    // than silently dropped.
+    // than silently dropped. ADR 0058: the same transport, in its other
+    // role, is the registrar `POST /peers` registers a carriage with.
     let peer_transport = peer_transport::build_peer_transport(config);
-    let peer_routes = config
-        .peer_routes()
-        .iter()
-        // ADR 0028: a forwarded route carries the client-edge `price` its
-        // config entry names. What this hop retains of it is the peering's
-        // own fee, wired below from `[[peers]]` (ADR 0061). Built with
-        // `new_scheduled` rather than `new` so a route that loses its price
-        // on the way into the runtime is a compile error, not a silently free
-        // gateway -- and it carries the whole schedule (ADR 0065), so a
-        // forwarded route's slope survives the trip into the runtime the way
-        // its base always has.
-        .map(|route| {
-            PeerRoute::new_scheduled(route.prefix(), route.peer_id(), route.price())
-                .with_request(route.request().cloned())
-                .with_max_bytes(route.max_bytes())
-        })
-        .collect();
-    let mut connector = Connector::new(
-        config.routes().to_vec(),
-        peer_routes,
-        Arc::new(HttpAppClient::new()),
-        Arc::clone(&peer_transport) as Arc<dyn PeerTransport>,
-        Arc::new(SystemClock),
-    )
-    .with_identity_signer(signer.clone())
-    // ADR 0058: the same transport, in its other role. `POST /peers`
-    // establishes a peering and registers its carriage here, and
-    // `DELETE /peers/:id` takes it away -- neither waits for a restart,
-    // which is the whole of what made a runtime peer row a name with
-    // nothing behind it.
-    .with_peer_registrar(Arc::clone(&peer_transport) as Arc<dyn PeerRegistrar>)
-    // The one outbound request this connector makes to an
-    // operator-supplied host, and it is bounded (ADR 0058): a whole-
-    // exchange timeout, a body cap enforced as the body streams, and no
-    // redirect followed. Never reached from the packet path.
-    // ADR 0070 decision 3: an onion counterparty's self-description is read
-    // through the same one proxy the carriages dial through, selected by the
-    // same host rule. Without it `POST /peers` could not establish a peering
-    // with a node whose only published URL is a `.onion` one -- the write
-    // reads that URL before any carriage is chosen.
-    .with_self_description_source(Arc::new(BoundedHttpSelfDescription::new(
-        config.peer_allow_plaintext_endpoints(),
-        config.socks_proxy(),
-    )))
-    // ...and a runtime peering's claim-state ask, where the peer's client
-    // edge is an onion host, by the same rule (issue #1379): an onion peer's
-    // watermark is restored over the circuit its packets ride.
-    .with_socks_proxy(config.socks_proxy().cloned())
-    // The same node-wide opt-in a `[[peers]]` endpoint takes (issue #678
-    // gap 3), so a peering established at runtime picks its carriage by
-    // exactly the rule a config-file peering does.
-    .with_peer_allow_plaintext_endpoints(config.peer_allow_plaintext_endpoints())
-    // ADR 0077: the operator's bounded, in-memory packet history, off unless
-    // `[operator] packet_history` names a size.
-    .with_packet_history(
-        config
-            .operator()
-            .map_or(0, |operator| operator.packet_history()),
-    );
+    let carriages = Carriages {
+        peer_transport: Arc::clone(&peer_transport) as Arc<dyn PeerTransport>,
+        peer_registrar: peer_transport as Arc<dyn PeerRegistrar>,
+        // The one outbound request this connector makes to an
+        // operator-supplied host, and it is bounded (ADR 0058): a whole-
+        // exchange timeout, a body cap enforced as the body streams, and no
+        // redirect followed. Never reached from the packet path.
+        // ADR 0070 decision 3: an onion counterparty's self-description is
+        // read through the same one proxy the carriages dial through,
+        // selected by the same host rule.
+        self_description: Arc::new(BoundedHttpSelfDescription::new(
+            config.peer_allow_plaintext_endpoints(),
+            config.socks_proxy(),
+        )),
+        app: Arc::new(HttpAppClient::new()),
+    };
     // Spec #1684: each table's network, built once, in table order. Each
     // handle carries the terms its greeting entry publishes, so nothing
-    // below re-matches on the chain.
+    // after this re-matches on the chain.
     let mut settlement_networks = SettlementNetworks::new();
     // ADR 0074 decision 9: the sponsor endpoint's co-signer, the Solana
     // table's backend.
@@ -1281,49 +1317,6 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
             .insert(handle)
             .map_err(RuntimeError::NetworkSettledTwice)?;
     }
-    // ADR 0075 decisions 4 and 8: the x402 channels this node pays on,
-    // restored from their journal before the runtime peer table below is
-    // replayed, because a durable x402 peering is rehydrated onto them --
-    // one replayed first would have nothing to sign its forwards on.
-    let outbound_channels = restore_outbound_channels(config, &settlement_networks).await?;
-    if let Some(outbound) = &outbound_channels {
-        // Each network's chain, read off the network itself: never recovered
-        // from the terms built above (spec #1684).
-        let networks = settlement_networks
-            .iter()
-            .filter_map(|held| {
-                let network = held.network();
-                let chain = SettlementChain::try_from(network.chain()).ok()?;
-                Some((chain, network.to_string()))
-            })
-            .collect();
-        connector = connector.with_outbound_channels(Arc::clone(outbound), networks);
-    }
-    // ADR 0075 decisions 4, 6 and 9, issue #1380: the config file's own
-    // peerings, on x402 channels. After the outbound channels above, which a
-    // `[[pay_channels]]` row names one of; before the runtime table below,
-    // so a durable runtime row cannot take a signer a config row binds.
-    connector = wire_config_peerings(connector, config)?;
-    if let Some(state_dir) = config.state_dir() {
-        // Issue #884: replay this node's durable runtime peer/route table,
-        // and arm the connector to persist future writes back to the same
-        // file -- the same `state_dir` scoping as the journals, so an
-        // operator restoring a node from `state_dir` alone restores this
-        // table too. `create_dir_all` first, so a node with nowhere
-        // writable fails here with the path in the message.
-        std::fs::create_dir_all(state_dir).map_err(|source| RuntimeError::StateDirUnusable {
-            path: state_dir.to_path_buf(),
-            source,
-        })?;
-        let table_path = state_dir.join(RUNTIME_PEER_ROUTE_TABLE);
-        let (store, runtime_peers, runtime_peer_routes) = PeerRouteStore::open(&table_path)
-            .map_err(|source| RuntimeError::RuntimePeerRouteTableUnusable {
-                path: table_path,
-                source,
-            })?;
-        connector =
-            connector.with_runtime_peer_route_store(store, runtime_peers, runtime_peer_routes);
-    }
     // ADR 0071 decision 6, issue #1294: the table a converting forward
     // reads, built from what the file declares and from nothing else. A node
     // that declares no token gets `None` here, starts no poller and forwards
@@ -1342,6 +1335,325 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
         // actually read it and left polling in the background. A node whose
         // pairs are all static `[[rates]]` rows starts nothing here.
         spawn_quote_path_pollers(table, config, &transports)?;
+    }
+    // ADR 0080 decision 15: a zk edge's vault is read, and its key checked,
+    // before the node serves anything.
+    let zk_edge = match config.zk_note() {
+        Some(zk_note) => Some(connect_zk_edge(config, zk_note).await?),
+        None => None,
+    };
+    Ok(Parts {
+        config: config.clone(),
+        signer,
+        wrap_receiver_secret,
+        settlement_networks,
+        sponsor,
+        journals,
+        runtime_peer_routes,
+        carriages,
+        rate_table,
+        zk_edge,
+        state_dir_lock,
+    })
+}
+
+/// Open the journals under `state_dir`, creating it if it is not there yet,
+/// or keep them in memory on a node that names none.
+///
+/// Opening happens at startup, before anything is served, precisely so a
+/// node with nowhere writable fails here -- with the path in the message --
+/// rather than at the first claim, hours later, on a packet path where the
+/// only honest answer left is to refuse the claim (issue #605).
+fn open_journals(config: &Config) -> Result<Journals, RuntimeError> {
+    let in_memory = || Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>;
+    let Some(state_dir) = config.state_dir() else {
+        return Ok(Journals {
+            client_edge: in_memory(),
+            outbound_channels: in_memory(),
+            day_totals: None,
+            client_edge_path: PathBuf::from(CLIENT_EDGE_JOURNAL),
+            outbound_channels_path: PathBuf::from(OUTBOUND_CHANNEL_JOURNAL),
+        });
+    };
+    // A spending limit counts in a journal under `state_dir` (ADR 0078
+    // decision 8), opened here so a node with nowhere to write it fails at
+    // boot rather than at a controller's first packet.
+    let day_totals = match config.operator() {
+        Some(_) => Some(
+            connector_operator::DayTotals::open(
+                &state_dir.join(connector_operator::DAY_TOTALS_JOURNAL),
+                Arc::new(SystemClock),
+            )
+            .map_err(RuntimeError::DayTotalsUnusable)?,
+        ),
+        None => None,
+    };
+    Ok(Journals {
+        client_edge: open_journal(state_dir, CLIENT_EDGE_JOURNAL)?,
+        outbound_channels: open_journal(state_dir, OUTBOUND_CHANNEL_JOURNAL)?,
+        day_totals,
+        client_edge_path: state_dir.join(CLIENT_EDGE_JOURNAL),
+        outbound_channels_path: state_dir.join(OUTBOUND_CHANNEL_JOURNAL),
+    })
+}
+
+/// Issue #884: this node's durable runtime peer/route table, read back from
+/// `state_dir` -- the same scoping as the journals, so an operator restoring
+/// a node from `state_dir` alone restores this table too. `create_dir_all`
+/// first, so a node with nowhere writable fails here with the path in the
+/// message.
+fn open_runtime_peer_routes(state_dir: &Path) -> Result<StoredPeerRoutes, RuntimeError> {
+    std::fs::create_dir_all(state_dir).map_err(|source| RuntimeError::StateDirUnusable {
+        path: state_dir.to_path_buf(),
+        source,
+    })?;
+    let table_path = state_dir.join(RUNTIME_PEER_ROUTE_TABLE);
+    let (store, peers, routes) = PeerRouteStore::open(&table_path).map_err(|source| {
+        RuntimeError::RuntimePeerRouteTableUnusable {
+            path: table_path,
+            source,
+        }
+    })?;
+    Ok(StoredPeerRoutes {
+        store,
+        peers,
+        routes,
+    })
+}
+
+/// Turn connected [`Parts`] into the running node (spec #1689): its router
+/// and its background tasks. This is where the order of startup is written:
+///
+/// 1. the client edge's journal is replayed, once;
+/// 2. the x402 channels this node pays on are restored from their journal;
+/// 3. every channel the replay holds vouchers on is restored to its
+///    network, and the claim gate resumes from the same replay;
+/// 4. the connector is built complete -- the gate already answers which
+///    network a channel is on -- with the config file's peerings wired
+///    after the outbound channels a `[[pay_channels]]` row names and before
+///    the durable runtime table is replayed;
+/// 5. each network's watcher starts, and a zk edge's allowance sweep;
+/// 6. the routers are merged.
+pub async fn assemble(parts: Parts) -> Result<Runtime, RuntimeError> {
+    let Parts {
+        config,
+        signer,
+        wrap_receiver_secret,
+        settlement_networks,
+        sponsor,
+        journals,
+        runtime_peer_routes,
+        carriages,
+        rate_table,
+        zk_edge,
+        state_dir_lock,
+    } = parts;
+    let Journals {
+        client_edge: client_edge_journal,
+        outbound_channels: outbound_journal,
+        day_totals,
+        client_edge_path,
+        outbound_channels_path,
+    } = journals;
+
+    // The client edge's journal, replayed once: what restores its channels
+    // below and what the gate resumes from are the same read.
+    let unreplayable = |source| RuntimeError::JournalUnreplayable {
+        path: client_edge_path.clone(),
+        source,
+    };
+    let entries = client_edge_journal.read_all().map_err(unreplayable)?;
+    // ADR 0075 decision 8, issue #1385: a pre-ADR 0075 client's
+    // `toon-channel` claims are refused by name before anything is served.
+    if let Some(channel) = connector_client_edge::first_toon_channel_entry(&entries) {
+        return Err(RuntimeError::ToonChannelJournal {
+            path: client_edge_path,
+            channel,
+        });
+    }
+
+    // ADR 0075 decisions 4 and 8: the x402 channels this node pays on,
+    // restored from their journal before the runtime peer table below is
+    // replayed, because a durable x402 peering is rehydrated onto them --
+    // one replayed first would have nothing to sign its forwards on.
+    let outbound_channels = restore_outbound_channels(
+        outbound_journal,
+        outbound_channels_path,
+        &settlement_networks,
+    )
+    .await?;
+
+    // ADR 0074: every batch-settlement channel the client edge's journal
+    // holds vouchers on, restored before anything is served, so the port
+    // can land them after a restart -- restored, not re-admitted, so a rule
+    // tightened since cannot strand a voucher already accepted (decision 5).
+    // The journal is where an EVM channel's config survives a restart; the
+    // chain never gives it back.
+    if !settlement_networks.is_empty() {
+        let channels =
+            connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
+        restore_journaled_channels(&channels, &settlement_networks.receivers()).await;
+    }
+    // What the runtime keeps of a zk edge, and the terms its greeting
+    // publishes; the gate takes the rest.
+    let zk_boot = zk_edge.as_ref().map(|edge| ZkEdgeBoot {
+        vault: Arc::clone(&edge.boot.vault),
+        subsidy: edge.boot.subsidy,
+        slots: edge.boot.slots,
+    });
+    let zk_note_terms = zk_edge.as_ref().map(|edge| edge.terms.clone());
+    let claim_gate = client_claim_gate(
+        &config,
+        client_edge_journal,
+        client_edge_path,
+        &entries,
+        outbound_channels.clone(),
+        zk_edge,
+    )?;
+    // Vouchers are accepted on exactly the networks whose settlement table is
+    // written, and refused by name on the rest.
+    let claim_gate = Arc::new(claim_gate.with_settlement_networks(settlement_networks.clone()));
+
+    let connector = Arc::new(build_connector(
+        &config,
+        carriages,
+        &signer,
+        &settlement_networks,
+        &claim_gate,
+        outbound_channels.as_ref(),
+        runtime_peer_routes,
+        rate_table.as_ref(),
+    )?);
+
+    spawn_batch_settlement_watchers(&settlement_networks, &claim_gate);
+    // ADR 0080 decision 4: a zk edge closes the allowances that expire, for
+    // as long as it runs.
+    if zk_boot.is_some() {
+        tokio::spawn(Arc::clone(&claim_gate).run_allowance_sweep(ALLOWANCE_SWEEP_INTERVAL));
+    }
+
+    let router = routers(
+        &config,
+        &connector,
+        &signer,
+        wrap_receiver_secret,
+        &claim_gate,
+        node_facts(&config, &settlement_networks, zk_note_terms),
+        sponsor,
+        outbound_channels.as_ref().map(|outbound| {
+            batch_channels_for_operator(outbound, &settlement_networks, &claim_gate)
+        }),
+        day_totals,
+        rate_table.as_ref(),
+    );
+    Ok(Runtime {
+        connector,
+        signer,
+        rate_table,
+        settlement_networks,
+        outbound_channels,
+        state_dir_lock,
+        zk_edge: zk_boot,
+        router,
+    })
+}
+
+/// The connector, built complete: every port it reads is given before it is
+/// shared, and nothing patches it afterwards.
+///
+/// Every `peer_id`-targeted `[[routes]]` entry becomes a [`PeerRoute`]
+/// alongside the terminated [`connector_config::StaticRoute`]s.
+#[allow(clippy::too_many_arguments)]
+fn build_connector(
+    config: &Config,
+    carriages: Carriages,
+    signer: &Arc<dyn Signer>,
+    settlement_networks: &SettlementNetworks,
+    claim_gate: &Arc<ClientClaimGate>,
+    outbound_channels: Option<&Arc<OutboundChannels>>,
+    runtime_peer_routes: Option<StoredPeerRoutes>,
+    rate_table: Option<&SharedRateTable>,
+) -> Result<Connector, RuntimeError> {
+    let peer_routes = config
+        .peer_routes()
+        .iter()
+        // ADR 0028: a forwarded route carries the client-edge `price` its
+        // config entry names. What this hop retains of it is the peering's
+        // own fee, wired below from `[[peers]]` (ADR 0061). Built with
+        // `new_scheduled` rather than `new` so a route that loses its price
+        // on the way into the runtime is a compile error, not a silently free
+        // gateway -- and it carries the whole schedule (ADR 0065), so a
+        // forwarded route's slope survives the trip into the runtime the way
+        // its base always has.
+        .map(|route| {
+            PeerRoute::new_scheduled(route.prefix(), route.peer_id(), route.price())
+                .with_request(route.request().cloned())
+                .with_max_bytes(route.max_bytes())
+        })
+        .collect();
+    let mut connector = Connector::new(
+        config.routes().to_vec(),
+        peer_routes,
+        carriages.app,
+        carriages.peer_transport,
+        Arc::new(SystemClock),
+    )
+    .with_identity_signer(Arc::clone(signer))
+    // ADR 0058: the same transport, in its other role. `POST /peers`
+    // establishes a peering and registers its carriage here, and
+    // `DELETE /peers/:id` takes it away -- neither waits for a restart,
+    // which is the whole of what made a runtime peer row a name with
+    // nothing behind it.
+    .with_peer_registrar(carriages.peer_registrar)
+    // Without it `POST /peers` could not establish a peering with a node
+    // whose only published URL is a `.onion` one -- the write reads that URL
+    // before any carriage is chosen.
+    .with_self_description_source(carriages.self_description)
+    // ...and a runtime peering's claim-state ask, where the peer's client
+    // edge is an onion host, by the same rule (issue #1379): an onion peer's
+    // watermark is restored over the circuit its packets ride.
+    .with_socks_proxy(config.socks_proxy().cloned())
+    // The same node-wide opt-in a `[[peers]]` endpoint takes (issue #678
+    // gap 3), so a peering established at runtime picks its carriage by
+    // exactly the rule a config-file peering does.
+    .with_peer_allow_plaintext_endpoints(config.peer_allow_plaintext_endpoints())
+    // ADR 0077: the operator's bounded, in-memory packet history, off unless
+    // `[operator] packet_history` names a size.
+    .with_packet_history(
+        config
+            .operator()
+            .map_or(0, |operator| operator.packet_history()),
+    )
+    // ADR 0086 decision 14: which network a payment's channel is on, for an
+    // app's `X-TOON-Network`, is the gate's to say -- it verified the
+    // channel under that network's domain.
+    .with_channel_networks(Arc::new(GateChannelNetworks {
+        gate: Arc::clone(claim_gate),
+        networks: settlement_networks.networks(),
+    }));
+    if let Some(outbound) = outbound_channels {
+        // Each network's chain, read off the network itself: never recovered
+        // from its terms (spec #1684).
+        let networks = settlement_networks
+            .iter()
+            .filter_map(|held| {
+                let network = held.network();
+                let chain = SettlementChain::try_from(network.chain()).ok()?;
+                Some((chain, network.to_string()))
+            })
+            .collect();
+        connector = connector.with_outbound_channels(Arc::clone(outbound), networks);
+    }
+    // ADR 0075 decisions 4, 6 and 9, issue #1380: the config file's own
+    // peerings, on x402 channels. After the outbound channels above, which a
+    // `[[pay_channels]]` row names one of; before the runtime table below,
+    // so a durable runtime row cannot take a signer a config row binds.
+    connector = wire_config_peerings(connector, config)?;
+    // Issue #884: replay this node's durable runtime peer/route table, and
+    // arm the connector to persist future writes back to the same file.
+    if let Some(stored) = runtime_peer_routes {
+        connector =
+            connector.with_runtime_peer_route_store(stored.store, stored.peers, stored.routes);
     }
     // ADR 0071 decisions 1 and 2, issues #1295 and #1301: the facts the
     // forwarding path's converting arm reads, and the only ones. Which
@@ -1366,7 +1678,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     connector = connector
         .with_peering_assets(config.peering_assets().clone())
         .with_client_channel_assets(config.client_channel_assets().clone());
-    if let Some(table) = &rate_table {
+    if let Some(table) = rate_table {
         connector = connector.with_rate_table(table.clone());
     }
     // ADR 0080 decision 6: an allowance-paid delivery states the vault's
@@ -1374,44 +1686,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     if let Some(zk_note) = config.zk_note() {
         connector = connector.with_zk_note_network(zk_note.network().caip2());
     }
-    // ADR 0074: every batch-settlement channel the client edge's journal
-    // holds vouchers on, restored before anything is served, so the port
-    // can land them after a restart -- restored, not re-admitted, so a rule
-    // tightened since cannot strand a voucher already accepted (decision 5).
-    // The journal is where an EVM channel's config survives a restart; the
-    // chain never gives it back.
-    if !settlement_networks.is_empty() {
-        if let Some(state_dir) = config.state_dir() {
-            let path = state_dir.join(CLIENT_EDGE_JOURNAL);
-            let unreplayable = |source| RuntimeError::JournalUnreplayable {
-                path: path.clone(),
-                source,
-            };
-            let entries = open_journal(state_dir, CLIENT_EDGE_JOURNAL)?
-                .read_all()
-                .map_err(unreplayable)?;
-            let channels =
-                connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
-            restore_journaled_channels(&channels, &settlement_networks.receivers()).await;
-        }
-    }
-    let connector = Arc::new(connector);
-    // ADR 0080 decision 15: a zk edge's vault is read, and its key checked,
-    // before the node serves anything.
-    let zk_edge = match config.zk_note() {
-        Some(zk_note) => Some(build_zk_edge(config, zk_note).await?),
-        None => None,
-    };
-    Ok(Runtime {
-        connector,
-        signer,
-        rate_table,
-        settlement_networks,
-        sponsor,
-        outbound_channels,
-        state_dir_lock,
-        zk_edge,
-    })
+    Ok(connector)
 }
 
 /// A zk edge's vault adapter and the reads boot makes of it (ADR 0080
@@ -1499,6 +1774,41 @@ async fn build_zk_edge(
     })
 }
 
+/// Everything a zk edge needs read before it serves (ADR 0080 decisions 8
+/// and 14--16): the vault and its boot reads ([`build_zk_edge`]), the
+/// evidence file under `state_dir`, and the state key, from which the
+/// greeting's standing terms are read too.
+async fn connect_zk_edge(
+    config: &Config,
+    zk_note: &connector_config::ZkNoteConfig,
+) -> Result<ZkEdgeParts, RuntimeError> {
+    let boot = build_zk_edge(config, zk_note).await?;
+    // `Config::load` requires `state_dir` beside `[zk_note]`, so this is not
+    // reachable. Were it reached, serving without the edge would be a zk
+    // node that silently accepts nothing it can check: fail closed.
+    let Some(state_dir) = config.state_dir() else {
+        return Err(RuntimeError::ZkNoteEvidence {
+            path: PathBuf::new(),
+            reason: "[zk_note] needs a state_dir for its evidence file".to_string(),
+        });
+    };
+    let path = state_dir.join(connector_client_edge::EVIDENCE_FILE);
+    let evidence = connector_client_edge::EvidenceFile::open(&path).map_err(|error| {
+        RuntimeError::ZkNoteEvidence {
+            path: path.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+    let state_signer = read_zk_note_state_key(zk_note.state_key())?;
+    let terms = zk_note_terms(zk_note, &state_signer);
+    Ok(ZkEdgeParts {
+        boot,
+        evidence,
+        state_signer,
+        terms,
+    })
+}
+
 /// Admit the config file's peerings (spec #1686, issue #1695): one
 /// `Connector::admit_config_peering` call per `[[peers]]` row, the path every
 /// peering takes (ADR 0075 decisions 4, 6 and 9, issue #1380).
@@ -1578,15 +1888,15 @@ fn wire_config_peerings(
     Ok(connector)
 }
 
-/// The x402 channels this node pays on, restored from
-/// [`OUTBOUND_CHANNEL_JOURNAL`] to the paying half of each batch-settlement
-/// backend (ADR 0075 decision 8), or `None` when this node has none. A
-/// journal that will not replay stops the node, as the claim books' do: a
-/// channel it cannot read back is one holding this node's deposit that it
-/// would otherwise forget. A node with no `state_dir` keeps the record in
-/// memory, which survives nothing -- the same posture its claim books take.
+/// The x402 channels this node pays on, restored from `journal` (at
+/// `path`, [`OUTBOUND_CHANNEL_JOURNAL`] under `state_dir`) to the paying
+/// half of each network (ADR 0075 decision 8), or `None` when this node
+/// settles on nothing. A journal that will not replay stops the node, as the
+/// claim books' do: a channel it cannot read back is one holding this node's
+/// deposit that it would otherwise forget.
 async fn restore_outbound_channels(
-    config: &Config,
+    journal: Arc<dyn Journal>,
+    path: PathBuf,
     networks: &SettlementNetworks,
 ) -> Result<Option<Arc<OutboundChannels>>, RuntimeError> {
     // ADR 0086, ADR 0087: one payer per network, each table's own.
@@ -1594,16 +1904,6 @@ async fn restore_outbound_channels(
     if payers.is_empty() {
         return Ok(None);
     }
-    let (journal, path): (Arc<dyn Journal>, PathBuf) = match config.state_dir() {
-        Some(state_dir) => (
-            open_journal(state_dir, OUTBOUND_CHANNEL_JOURNAL)?,
-            state_dir.join(OUTBOUND_CHANNEL_JOURNAL),
-        ),
-        None => (
-            Arc::new(connector_runtime::InMemoryJournal::new()),
-            PathBuf::from(OUTBOUND_CHANNEL_JOURNAL),
-        ),
-    };
     let outbound =
         OutboundChannels::restore(journal, payers)
             .await
@@ -1630,20 +1930,19 @@ async fn restore_outbound_channels(
 }
 
 /// Every x402 channel of this node's, both ways, as the operator surface
-/// drives them (ADR 0075 decision 11): the outbound ones [`build`]
-/// restored, the receiving half of each backend, the claim gate's held
-/// vouchers, and this node's own network on each chain, which a
-/// counterparty's terms must match.
+/// drives them (ADR 0075 decision 11): the outbound ones [`assemble`]
+/// restored, the receiving half of each network, and the claim gate's held
+/// vouchers.
 fn batch_channels_for_operator(
-    runtime: &Runtime,
+    outbound: &Arc<OutboundChannels>,
+    networks: &SettlementNetworks,
     claim_gate: &Arc<ClientClaimGate>,
-) -> Option<Arc<BatchChannels>> {
-    let outbound = Arc::clone(runtime.outbound_channels.as_ref()?);
-    Some(Arc::new(BatchChannels::new(
-        outbound,
-        runtime.settlement_networks.receivers(),
+) -> Arc<BatchChannels> {
+    Arc::new(BatchChannels::new(
+        Arc::clone(outbound),
+        networks.receivers(),
         Arc::new(ClaimGateVouchers(Arc::clone(claim_gate))),
-    )))
+    ))
 }
 
 /// Start one background poller per declared quote path, each refreshing its
@@ -1656,7 +1955,7 @@ fn batch_channels_for_operator(
 /// no quote path starts nothing and says nothing; its pairs are the static
 /// `[[rates]]` rows the operator tends by hand.
 ///
-/// Separate from [`build`] because the two halves arrive separately: the
+/// Separate from [`connect`] because the two halves arrive separately: the
 /// table is built from config alone, while a source is a chain reader
 /// (issue #1293) constructed from a settlement table's own RPC endpoint.
 /// This is the one place the two meet, and it takes the port rather than any
@@ -1907,11 +2206,14 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// [`watch_interval`]: connector_settlement::watch_interval::watch_interval
 /// [`BATCH_SWEEP_INTERVAL`]: connector_settlement_evm::BATCH_SWEEP_INTERVAL
 /// [`OPEN_SETTLE_INTERVAL`]: connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL
-fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
+fn spawn_batch_settlement_watchers(
+    settlement_networks: &SettlementNetworks,
+    gate: &Arc<ClientClaimGate>,
+) {
     // ADR 0086: one watcher per network, each handed only the vouchers held
     // on its own network's channels.
-    let networks = runtime.settlement_networks.networks();
-    for held in runtime.settlement_networks.iter() {
+    let networks = settlement_networks.networks();
+    for held in settlement_networks.iter() {
         held.start_watcher(Arc::new(NetworkVouchers {
             held: ClaimGateVouchers(Arc::clone(gate)),
             network: held.network().clone(),
@@ -1920,12 +2222,10 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
     }
 }
 
-/// The client edge's claim gate, resumed from the watermarks its journal
-/// already records (issue #605), with this node's discovery budget (issue
-/// #613): how many lookups for channels that never resolve it will make.
-///
-/// A node with no `state_dir` gets an in-memory journal: its vouchers'
-/// watermarks do not outlive the process.
+/// The client edge's claim gate, resumed from `entries` -- the one replay of
+/// `journal` (at `path`) -- and so from the watermarks its journal already
+/// records (issue #605), with this node's discovery budget (issue #613): how
+/// many lookups for channels that never resolve it will make.
 ///
 /// Bound to a [`ClientPayoutLedger`] over `outbound` -- this node's journaled
 /// outbound x402 channels -- before it is returned (issue #770, ADR 0075
@@ -1936,25 +2236,18 @@ fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate
 /// channels and pays no client.
 fn client_claim_gate(
     config: &Config,
+    journal: Arc<dyn Journal>,
+    path: PathBuf,
+    entries: &[connector_domain::JournalEntry],
     outbound: Option<Arc<OutboundChannels>>,
-    zk_edge: Option<&ZkEdgeBoot>,
+    zk_edge: Option<ZkEdgeParts>,
 ) -> Result<ClientClaimGate, RuntimeError> {
-    let (journal, path) = match config.state_dir() {
-        Some(state_dir) => (
-            open_journal(state_dir, CLIENT_EDGE_JOURNAL)?,
-            state_dir.join(CLIENT_EDGE_JOURNAL),
-        ),
-        None => (
-            Arc::new(InMemoryJournal::new()) as Arc<dyn Journal>,
-            PathBuf::from(CLIENT_EDGE_JOURNAL),
-        ),
-    };
     // The shaper on lookups for channels that never resolve (issue #613): a
     // voucher naming a channel nobody opened is a free chain read for its
     // sender, and what a node can afford to spend discovering channels that
     // turn out not to exist depends on the settlement endpoint it pays for.
     let budget = UnresolvableLookupBudgetPolicy::default();
-    let gate = ClientClaimGate::restore(journal)
+    let gate = ClientClaimGate::resume(journal, entries)
         .map_err(|source| RuntimeError::JournalUnreplayable { path, source })?
         .with_lookup_budget(UnresolvableLookupBudgetPolicy {
             per_signer: config
@@ -1973,45 +2266,28 @@ fn client_claim_gate(
     // ADR 0080: the zk edge. `with_zk_edge` checks the evidence file against
     // the journal and runs the boot sweep, so an allowance that expired while
     // the node was down is closed before anything is served.
-    match (config.zk_note(), config.state_dir(), zk_edge) {
-        (Some(zk_note), Some(state_dir), Some(boot)) => {
-            let path = state_dir.join(connector_client_edge::EVIDENCE_FILE);
-            let evidence = connector_client_edge::EvidenceFile::open(&path).map_err(|error| {
-                RuntimeError::ZkNoteEvidence {
-                    path: path.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
-            gate.with_zk_edge(connector_client_edge::ZkEdge {
-                vault: Arc::clone(&boot.vault),
-                evidence,
-                state_signer: read_zk_note_state_key(zk_note.state_key())?,
-                tiers: zk_note.tiers().clone(),
-                allowance_lifetime: zk_note.allowance_lifetime(),
-                open_budget_cap: zk_note.open_budget_cap(),
-                subsidy: boot.subsidy,
-                slots: boot.slots,
-                clock: Arc::new(SystemClock),
-            })
-            .map_err(|error| RuntimeError::ZkNoteEvidence {
-                path,
-                reason: error.to_string(),
-            })
-        }
-        (None, _, _) => Ok(gate),
-        // `Config::load` requires `state_dir` beside `[zk_note]` and boot builds
-        // the zk edge exactly when `[zk_note]` is written, so neither arm below
-        // is reachable. Were one reached, serving without the edge would be a
-        // zk node that silently accepts nothing it can check: fail closed.
-        (Some(_), None, _) => Err(RuntimeError::ZkNoteEvidence {
-            path: PathBuf::new(),
-            reason: "[zk_note] needs a state_dir for its evidence file".to_string(),
-        }),
-        (Some(_), Some(state_dir), None) => Err(RuntimeError::ZkNoteEvidence {
-            path: state_dir.join(connector_client_edge::EVIDENCE_FILE),
-            reason: "[zk_note] is written but boot built no zk edge".to_string(),
-        }),
-    }
+    let (Some(zk_note), Some(edge)) = (config.zk_note(), zk_edge) else {
+        return Ok(gate);
+    };
+    let evidence_path = config
+        .state_dir()
+        .map(|state_dir| state_dir.join(connector_client_edge::EVIDENCE_FILE))
+        .unwrap_or_default();
+    gate.with_zk_edge(connector_client_edge::ZkEdge {
+        vault: edge.boot.vault,
+        evidence: edge.evidence,
+        state_signer: edge.state_signer,
+        tiers: zk_note.tiers().clone(),
+        allowance_lifetime: zk_note.allowance_lifetime(),
+        open_budget_cap: zk_note.open_budget_cap(),
+        subsidy: edge.boot.subsidy,
+        slots: edge.boot.slots,
+        clock: Arc::new(SystemClock),
+    })
+    .map_err(|error| RuntimeError::ZkNoteEvidence {
+        path: evidence_path,
+        reason: error.to_string(),
+    })
 }
 
 /// This node's own facts (ADR 0050), assembled once at router construction:
@@ -2039,10 +2315,11 @@ fn client_claim_gate(
 ///     boot on a disagreement. Nothing re-declares any of it.
 fn node_facts(
     config: &Config,
-    runtime: &Runtime,
-) -> Result<connector_domain::NodeFacts, RuntimeError> {
+    settlement_networks: &SettlementNetworks,
+    zk_note: Option<connector_domain::x402::X402ZkNoteTerms>,
+) -> connector_domain::NodeFacts {
     let node = config.node();
-    Ok(connector_domain::NodeFacts {
+    connector_domain::NodeFacts {
         ilp_addresses: node
             .map(|node| node.addresses().to_vec())
             .unwrap_or_default(),
@@ -2061,22 +2338,22 @@ fn node_facts(
             .filter(|carriage| config.peer_expose().exposes(*carriage))
             .map(|carriage| carriage.name().to_string())
             .collect(),
-        batch_settlements: runtime.batch_settlements(),
-        voucher_signers: runtime.voucher_signers(),
-        zk_note: config.zk_note().map(zk_note_terms).transpose()?,
-    })
+        batch_settlements: settlement_networks.terms(),
+        voucher_signers: settlement_networks.voucher_signers(),
+        zk_note,
+    }
 }
 
 /// A zk edge's standing terms (ADR 0080 decisions 7 and 8, #1523), read off
-/// the `[zk_note]` table and the state key it names -- the one fact the
+/// the `[zk_note]` table and the state key it names, `state_key` -- the one fact the
 /// greeting's `zk-note` entry and the self-description's `zkNote` project.
 /// `allowanceEndpoint` is the path the endpoints mount, from the one
 /// constant, so the greeting can never name a path nothing serves.
 fn zk_note_terms(
     zk_note: &connector_config::ZkNoteConfig,
-) -> Result<connector_domain::x402::X402ZkNoteTerms, RuntimeError> {
-    let state_key = read_zk_note_state_key(zk_note.state_key())?;
-    Ok(connector_domain::x402::X402ZkNoteTerms {
+    state_key: &connector_signer::ZkStateSigner,
+) -> connector_domain::x402::X402ZkNoteTerms {
+    connector_domain::x402::X402ZkNoteTerms {
         network: zk_note.network().caip2().to_string(),
         asset: ZK_NOTE_ASSET.to_string(),
         pay_to: zk_note.vault().to_string(),
@@ -2092,7 +2369,7 @@ fn zk_note_terms(
         allowance_endpoint: connector_client_edge::ZK_NOTE_ALLOWANCES_PATH.to_string(),
         subsidy: None,
         subsidised_by_period: None,
-    })
+    }
 }
 
 /// Native MINA as the greeting names it (ADR 0080 decision 7, as amended):
@@ -2125,55 +2402,41 @@ fn read_zk_note_state_key(
     })
 }
 
+/// The router `runtime` serves, which [`assemble`] merged: kept so callers
+/// that read it beside the config keep their shape. `config` is the one the
+/// runtime was connected from.
+///
+/// Infallible since spec #1689: everything that could stop the node
+/// starting -- the claim gate's journal replay, the day-totals journal --
+/// happens at [`connect`] or [`assemble`].
+pub fn router(runtime: &Runtime, _config: &Config) -> Result<Router, RuntimeError> {
+    Ok(runtime.router())
+}
+
 /// Merge the client edge and (if `[operator]` is configured) the operator
 /// surface into the one router the binary serves. The operator router is
 /// mounted only when [`Config::operator`] is `Some` -- absence means the
 /// surface is not started at all, exactly as it means for
 /// [`connector_operator::router`] itself.
-///
-/// Fallible since issue #605: the client edge's claim gate is restored from
-/// a durable journal here, and a journal that will not replay must stop the
-/// node starting rather than let it start at no watermarks.
-pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError> {
-    let connector = runtime.connector.clone();
-    let signer = runtime.signer.clone();
-    // Issue #556: a privacy-wrapped claim
-    // (`ILP-Payment-Channel-Claim-Wrapped`, client-edge-spec.md §1.3) is
-    // opened with this node's `[signer]` key, not with a second receiver
-    // key of its own. `connector-config/src/announce.rs` states the rule:
-    // `GET /ilp/identity` and every gift wrap this node opens both use
-    // `[signer]` -- and since that endpoint is the only surface publishing
-    // a receiver public key, a sender can wrap to no other one. No new
-    // config section exists or is needed for this.
-    let wrap_receiver_secret = Some(read_signer_secret(config.signer_key())?);
-    let claim_gate = client_claim_gate(
-        config,
-        runtime.outbound_channels.clone(),
-        runtime.zk_edge.as_ref(),
-    )?;
-    // Vouchers are accepted on exactly the networks whose settlement table is
-    // written, and refused by name on the rest.
-    let claim_gate =
-        Arc::new(claim_gate.with_settlement_networks(runtime.settlement_networks.clone()));
-    // ADR 0086 decision 14: which network a payment's channel is on, for an
-    // app's `X-TOON-Network`, is the gate's to say -- it verified the
-    // channel under that network's domain.
-    connector.set_channel_networks(Arc::new(GateChannelNetworks {
-        gate: Arc::clone(&claim_gate),
-        networks: runtime.settlement_networks.networks(),
-    }));
-    spawn_batch_settlement_watchers(runtime, &claim_gate);
-    // ADR 0080 decision 4: a zk edge closes the allowances that expire, for
-    // as long as it runs.
-    if runtime.zk_edge.is_some() {
-        tokio::spawn(Arc::clone(&claim_gate).run_allowance_sweep(ALLOWANCE_SWEEP_INTERVAL));
-    }
+#[allow(clippy::too_many_arguments)]
+fn routers(
+    config: &Config,
+    connector: &Arc<Connector>,
+    signer: &Arc<dyn Signer>,
+    wrap_receiver_secret: [u8; 32],
+    claim_gate: &Arc<ClientClaimGate>,
+    node_facts: connector_domain::NodeFacts,
+    sponsor: Option<Arc<SolanaBatchSettlement>>,
+    batch_channels: Option<Arc<BatchChannels>>,
+    day_totals: Option<connector_operator::DayTotals>,
+    rate_table: Option<&SharedRateTable>,
+) -> Router {
     let app = connector_client_edge::router_with_node_facts(
-        connector.clone(),
-        signer.clone(),
-        wrap_receiver_secret,
-        claim_gate.clone(),
-        node_facts(config, runtime)?,
+        Arc::clone(connector),
+        Arc::clone(signer),
+        Some(wrap_receiver_secret),
+        Arc::clone(claim_gate),
+        node_facts,
         config
             .btp_session_window()
             .unwrap_or(connector_client_edge::DEFAULT_BTP_SESSION_WINDOW),
@@ -2183,14 +2446,14 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
         // (`peer-carriage-spec.md` §1.3), never by the port. `None` for a
         // node whose `peer_expose` is `"neither"`, which is the default.
         PeerCarriages::from_config(
-            connector.clone(),
+            Arc::clone(connector),
             config.peers(),
             config.peer_expose(),
             // ADR 0075 decision 5 (issue #1377): a voucher, or a peer-role
             // challenge, proves the peer role once its channel's voucher
             // signer is bound to a peering, and the claim gate is what
             // resolves the channel and reads that signer off the chain.
-            Some(claim_gate.clone() as Arc<dyn connector_peer_btp::VoucherEvidence>),
+            Some(Arc::clone(claim_gate) as Arc<dyn connector_peer_btp::VoucherEvidence>),
         ),
         // Issue #502: every `[[client_identities]]` entry, as the
         // `id`/`secret` pair `resolve_identity` authenticates an
@@ -2209,61 +2472,47 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // ADR 0074 decision 9, issue #1346: the public Solana sponsor endpoint,
     // on the client edge's listener. Mounted whether or not this node opted
     // in, so a node that has not refuses by name.
-    let app = app.merge(crate::sponsor::router(runtime.sponsor.clone()));
+    let app = app.merge(crate::sponsor::router(sponsor));
     // ADR 0080 decision 8, #1523: the zk edge's allowance endpoints, beside
     // the sponsor's and on the same terms -- mounted on every node, so one
     // that is no zk edge refuses them by name.
-    let app = app.merge(connector_client_edge::zk_note_router(claim_gate.clone()));
-    Ok(match config.operator() {
-        Some(operator) => {
-            let batch_channels = batch_channels_for_operator(runtime, &claim_gate);
-            // A spending limit counts in a journal under `state_dir` (ADR
-            // 0078 decision 8), opened here so a node with nowhere to write
-            // it fails at boot rather than at a controller's first packet.
-            let day_totals = match config.state_dir() {
-                Some(state_dir) => Some(
-                    connector_operator::DayTotals::open(
-                        &state_dir.join(connector_operator::DAY_TOTALS_JOURNAL),
-                        Arc::new(connector_runtime::SystemClock),
-                    )
-                    .map_err(RuntimeError::DayTotalsUnusable)?,
-                ),
-                None => None,
-            };
-            app.merge(connector_operator::router_with_controller_keys(
-                connector,
-                claim_gate,
-                signer,
-                operator.bearer_token().to_string(),
-                operator.write_keys().to_vec(),
-                // The file itself, not the list it held at boot: the operator
-                // surface reads it again on every signed request (ADR 0079).
-                operator.controller_keys_file().cloned().map_or_else(
-                    || connector_operator::ControllerKeySource::Fixed(Vec::new()),
-                    connector_operator::ControllerKeySource::File,
-                ),
-                day_totals,
-                declared_rates(runtime, config),
-                batch_channels,
-            ))
-        }
+    let app = app.merge(connector_client_edge::zk_note_router(Arc::clone(
+        claim_gate,
+    )));
+    match config.operator() {
+        Some(operator) => app.merge(connector_operator::router_with_controller_keys(
+            Arc::clone(connector),
+            Arc::clone(claim_gate),
+            Arc::clone(signer),
+            operator.bearer_token().to_string(),
+            operator.write_keys().to_vec(),
+            // The file itself, not the list it held at boot: the operator
+            // surface reads it again on every signed request (ADR 0079).
+            operator.controller_keys_file().cloned().map_or_else(
+                || connector_operator::ControllerKeySource::Fixed(Vec::new()),
+                connector_operator::ControllerKeySource::File,
+            ),
+            day_totals,
+            declared_rates(rate_table, config),
+            batch_channels,
+        )),
         None => app,
-    })
+    }
 }
 
 /// What `GET /rates` reads on a dealing node, or `None` on one that deals
 /// nothing (ADR 0071, issue #1297).
 ///
-/// The table itself is the one [`build`] put on the [`Runtime`] -- the same
-/// handle the forwarding path converts against and the poller refreshes, so
-/// the page cannot disagree with what packets see. What the table does not
-/// know is which pairs this node has *committed* to sourcing: a declared
-/// quote path holds no row until its poller's first observation lands, and
-/// a poller that never started would otherwise leave its pair missing from
-/// the one page that exists to say so. Those pairs are read back out of the
-/// config here, where the declaration lives.
-fn declared_rates(runtime: &Runtime, config: &Config) -> Option<DeclaredRates> {
-    let table = runtime.rate_table.as_ref()?;
+/// The table itself is the one [`connect`] built -- the same handle the
+/// forwarding path converts against and the poller refreshes, so the page
+/// cannot disagree with what packets see. What the table does not know is
+/// which pairs this node has *committed* to sourcing: a declared quote path
+/// holds no row until its poller's first observation lands, and a poller
+/// that never started would otherwise leave its pair missing from the one
+/// page that exists to say so. Those pairs are read back out of the config
+/// here, where the declaration lives.
+fn declared_rates(table: Option<&SharedRateTable>, config: &Config) -> Option<DeclaredRates> {
+    let table = table?;
     let numeraire = config.denomination().numeraire()?;
     Some(DeclaredRates::new(
         table.clone(),
@@ -2862,13 +3111,20 @@ key_file = "{}"
             )
         });
 
-        let gate = client_claim_gate(&config, None, None)
-            .expect("a fresh in-memory journal has nothing to replay")
-            .with_settlement_networks(
-                SettlementNetworks::new()
-                    .with(Arc::clone(&network) as Arc<dyn SettlementNetwork>)
-                    .expect("one network"),
-            );
+        let gate = client_claim_gate(
+            &config,
+            Arc::new(InMemoryJournal::new()),
+            PathBuf::from(CLIENT_EDGE_JOURNAL),
+            &[],
+            None,
+            None,
+        )
+        .expect("a fresh in-memory journal has nothing to replay")
+        .with_settlement_networks(
+            SettlementNetworks::new()
+                .with(Arc::clone(&network) as Arc<dyn SettlementNetwork>)
+                .expect("one network"),
+        );
 
         // A fresh channel per voucher, which is the whole shape of the
         // attack: nothing this connector has ever seen, and nothing it ever
@@ -3028,7 +3284,7 @@ key_file = "{key_path}"
             )
         });
 
-        client_claim_gate(&config, None, None).expect("a writable state_dir produces a gate");
+        open_journals(&config).expect("a writable state_dir opens its journals");
         assert!(
             state_dir.path().join(CLIENT_EDGE_JOURNAL).exists(),
             "the journal file is created at startup, not lazily at the first claim"
@@ -3059,8 +3315,8 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None, None) else {
-            panic!("an unusable state_dir must not produce a gate");
+        let Err(error) = open_journals(&config) else {
+            panic!("an unusable state_dir must not open a journal");
         };
         assert!(matches!(error, RuntimeError::StateDirUnusable { .. }));
         let message = error.to_string();
@@ -3163,7 +3419,9 @@ open_budget_cap = 1000000000
             .0
         };
         let config = table(&state_key);
-        let terms = zk_note_terms(config.zk_note().expect("a zk edge")).expect("terms");
+        let zk_note = config.zk_note().expect("a zk edge");
+        let state_signer = read_zk_note_state_key(zk_note.state_key()).expect("a Mina key");
+        let terms = zk_note_terms(zk_note, &state_signer);
         assert_eq!(
             terms,
             connector_domain::x402::X402ZkNoteTerms {
@@ -3184,7 +3442,7 @@ open_budget_cap = 1000000000
         std::fs::write(&garbage, "not a key").expect("write");
         let config = table(&garbage);
         assert!(matches!(
-            zk_note_terms(config.zk_note().unwrap()),
+            read_zk_note_state_key(config.zk_note().unwrap().state_key()),
             Err(RuntimeError::ZkNoteStateKey { .. })
         ));
     }
@@ -3192,8 +3450,8 @@ open_budget_cap = 1000000000
     /// A journal carrying a line this build cannot decode stops the node
     /// starting. The alternative -- skipping the line, or starting empty --
     /// is precisely the "silently start from zero" this ticket forbids.
-    #[test]
-    fn a_corrupt_client_edge_journal_refuses_to_build_a_gate() {
+    #[tokio::test]
+    async fn a_corrupt_client_edge_journal_refuses_to_build_a_gate() {
         let state_dir = tempfile::tempdir().expect("temp state dir");
         std::fs::write(
             state_dir.path().join(CLIENT_EDGE_JOURNAL),
@@ -3214,7 +3472,7 @@ key_file = "{key_path}"
             )
         });
 
-        let Err(error) = client_claim_gate(&config, None, None) else {
+        let Err(error) = build(&config).await else {
             panic!("a corrupt journal must not produce a gate");
         };
         assert!(matches!(error, RuntimeError::JournalUnreplayable { .. }));
@@ -4358,7 +4616,7 @@ max_move = {{ numerator = 5, denominator = 100 }}
         /// numeraire -- and before the fix its one quoted token got the EVM
         /// reader, whose every tick failed; one `ttl` later every forward
         /// across the pair refused, with a boot `warn!` as the only clue.
-        /// `spawn_quote_path_pollers` is called from [`build`], so this
+        /// `spawn_quote_path_pollers` is called from [`connect`], so this
         /// error is a node that does not start.
         #[tokio::test]
         async fn a_quote_path_on_a_chain_no_source_reads_refuses_to_start() {
