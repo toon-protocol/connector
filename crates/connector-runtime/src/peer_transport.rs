@@ -250,6 +250,20 @@ pub trait PeerRegistrar: Send + Sync {
     /// peering has always had (`peer-carriage-spec.md` §2.2).
     fn register(&self, peer_id: &str, peering: &RuntimePeering);
 
+    /// [`Self::register`] for a peering that bounds its answer by
+    /// `answer_timeout` (a config peering's `peer_answer_timeout_ms`).
+    /// An implementation with no per-peering timeout may ignore it, which
+    /// is what this default does.
+    fn register_with_timeout(
+        &self,
+        peer_id: &str,
+        peering: &RuntimePeering,
+        answer_timeout: std::time::Duration,
+    ) {
+        let _ = answer_timeout;
+        self.register(peer_id, peering);
+    }
+
     /// Stop dialing `peer_id`. A no-op for an id that was never
     /// registered.
     fn deregister(&self, peer_id: &str);
