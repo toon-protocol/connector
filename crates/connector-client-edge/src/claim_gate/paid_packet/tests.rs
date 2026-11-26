@@ -20,7 +20,8 @@ use base64::Engine;
 use chrono::{TimeZone, Utc};
 use connector_config::StaticRoute;
 use connector_domain::{
-    EnvelopeRequest, EnvelopeResponse, Fulfill, JournalEntry, Reject, VOUCHER_WATERMARK_NONCE,
+    EnvelopeRequest, EnvelopeResponse, Fulfill, JournalEntry, Reject, BTP_MESSAGE_LIMIT,
+    VOUCHER_WATERMARK_NONCE,
 };
 use connector_runtime::{
     AppClient, AppOutcome, FakeAppClient, InMemoryJournal, InProcessPeerTransport, Journal,
@@ -28,6 +29,7 @@ use connector_runtime::{
 };
 use connector_signer::{LocalSigner, Signer};
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
@@ -352,10 +354,19 @@ impl Carriage {
                 }))
             }
             Carriage::Btp => {
-                let (mut session, _) =
-                    tokio_tungstenite::connect_async(format!("ws://{}/ilp/btp", edge.addr))
-                        .await
-                        .expect("the upgrade succeeds");
+                // Dialed at the figure every BTP socket reads at (ADR 0082),
+                // as the peer dialer dials, not at tungstenite's defaults.
+                let (mut session, _) = tokio_tungstenite::connect_async_with_config(
+                    format!("ws://{}/ilp/btp", edge.addr),
+                    Some(WebSocketConfig {
+                        max_message_size: Some(BTP_MESSAGE_LIMIT),
+                        max_frame_size: Some(BTP_MESSAGE_LIMIT),
+                        ..WebSocketConfig::default()
+                    }),
+                    false,
+                )
+                .await
+                .expect("the upgrade succeeds");
                 let frame = connector_btp::encode_message(
                     1,
                     &[connector_btp::ProtocolData {
