@@ -512,12 +512,28 @@ impl ClientClaimGate {
     /// to an empty set of watermarks.
     pub fn restore(journal: Arc<dyn Journal>) -> Result<ClientClaimGate, JournalError> {
         let entries = journal.read_all()?;
-        let watermarks = Arc::new(RwLock::new(replay_watermarks(&entries)));
-        let batch_channels = journaled_batch_channels(&entries)?
+        ClientClaimGate::resume(journal, &entries)
+    }
+
+    /// [`Self::restore`], from `entries` already read off `journal` -- for a
+    /// node that replays its journal once at startup and hands the one
+    /// replay to channel restore as well as to the gate (spec #1689).
+    /// `entries` must be everything `journal` holds.
+    ///
+    /// # Errors
+    ///
+    /// A line this build cannot decode ([`JournalError::Corrupt`]), as
+    /// [`Self::restore`].
+    pub fn resume(
+        journal: Arc<dyn Journal>,
+        entries: &[JournalEntry],
+    ) -> Result<ClientClaimGate, JournalError> {
+        let watermarks = Arc::new(RwLock::new(replay_watermarks(entries)));
+        let batch_channels = journaled_batch_channels(entries)?
             .into_iter()
             .map(|channel| (channel.channel_key(), channel))
             .collect();
-        let zk_ledger = Arc::new(Mutex::new(ZkLedger::replay(&entries)?));
+        let zk_ledger = Arc::new(Mutex::new(ZkLedger::replay(entries)?));
         let committer = GroupCommitter::spawn(Arc::clone(&journal), Arc::clone(&watermarks));
         Ok(ClientClaimGate {
             journal,
