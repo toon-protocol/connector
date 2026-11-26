@@ -15,10 +15,12 @@
 //! against and none to keep out of a `Debug` rendering. The key is parsed
 //! solely to be refused by name ([`PeerRefusal::PeerCredentialRemoved`]).
 
+mod address;
 mod batch_settlement;
 mod client_channel_asset;
 mod config;
 mod controller_keys;
+mod cross_table;
 mod denomination;
 mod encoding;
 mod error;
@@ -35,17 +37,19 @@ mod settlement;
 mod x402_row;
 mod zk_note;
 
+pub use address::AddressRefusal;
 pub use batch_settlement::{
     BatchSettlementRefusal, EvmBatchSettlementConfig, SolanaBatchSettlementConfig,
     BATCH_SETTLEMENT_DELAY_FLOOR_SECS, DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS,
     EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
 };
 pub use client_channel_asset::{ClientChannelAssetRefusal, ClientChannelAssets};
-pub use config::{parse_socks_proxy, Config};
+pub use config::{parse_socks_proxy, Config, ConfigFileRefusal};
 pub use controller_keys::{
     ControllerKey, ControllerKeysFile, ControllerKeysRefusal, DepositLimit, SpendingLimit,
     WriteScope,
 };
+pub use cross_table::{CrossTableRefusal, PeeringAdmissionRefusal};
 pub use denomination::{
     DeclaredToken, DenominationConfig, DenominationRefusal, QuoteLeg, QuotePath, RateRow,
 };

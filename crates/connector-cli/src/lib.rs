@@ -797,7 +797,9 @@ key_file = "{}"
 
         assert!(matches!(
             error,
-            CliError::Config(ConfigError::PeerWireAddrRemoved)
+            CliError::Config(ConfigError::File(
+                connector_config::ConfigFileRefusal::PeerWireAddrRemoved
+            ))
         ));
         assert!(error
             .to_string()

@@ -4,6 +4,7 @@ use connector_domain::{PayloadLimit, Price};
 use serde::Deserialize;
 use url::Url;
 
+use crate::address::AddressRefusal;
 use crate::error::ConfigError;
 
 use thiserror::Error;
@@ -565,10 +566,10 @@ impl PeerRouteConfig {
 /// ILP address rules.
 fn validate_prefix(prefix: String) -> Result<String, ConfigError> {
     if !is_valid_ilp_address(&prefix) {
-        return Err(ConfigError::InvalidAddress {
+        return Err(ConfigError::Address(AddressRefusal::InvalidAddress {
             field: "prefix",
             value: prefix,
-        });
+        }));
     }
     Ok(prefix)
 }
@@ -824,10 +825,10 @@ pub(crate) fn resolve_routes(
 
     let apex = apex.ok_or(ConfigError::Route(RouteRefusal::MissingApex))?;
     if !is_valid_ilp_address(apex) {
-        return Err(ConfigError::InvalidAddress {
+        return Err(ConfigError::Address(AddressRefusal::InvalidAddress {
             field: "apex",
             value: apex.to_string(),
-        });
+        }));
     }
 
     for child in raw_children {
@@ -909,7 +910,10 @@ mod tests {
         assert_eq!(route.price(), Price::FREE);
 
         let result = StaticRoute::new("g..app", "http://localhost:4000");
-        assert!(matches!(result, Err(ConfigError::InvalidAddress { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Address(AddressRefusal::InvalidAddress { .. }))
+        ));
     }
 
     #[test]
@@ -1517,7 +1521,10 @@ mod tests {
     #[test]
     fn rejects_an_invalid_prefix() {
         let result = resolve_routes(None, vec![route("g..app", "http://localhost:4000")], vec![]);
-        assert!(matches!(result, Err(ConfigError::InvalidAddress { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Address(AddressRefusal::InvalidAddress { .. }))
+        ));
     }
 
     #[test]

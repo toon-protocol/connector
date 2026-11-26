@@ -186,7 +186,7 @@ pub struct PeerChannelConfig {
 impl PeerChannelConfig {
     /// The peering relation this row binds -- a `[[peers]]` entry's `id`. A
     /// row naming an id no `[[peers]]` entry configures is
-    /// [`ConfigError::PeerChannelOrphaned`].
+    /// [`ConfigError::PeeringAdmission(PeeringAdmissionRefusal::PeerChannelOrphaned)`].
     pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
