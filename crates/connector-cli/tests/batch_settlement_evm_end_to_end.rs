@@ -111,10 +111,9 @@ price = {PRICE}
         rpc_url = anvil.rpc_url,
     ));
 
-    let runtime = connector_cli::build(&config).await.expect("build");
+    let (runtime, networks) = support::build_keeping_networks(&config).await;
     assert_eq!(
-        runtime
-            .settlement_networks
+        networks
             .iter()
             .map(|held| held.network().chain())
             .collect::<Vec<_>>(),
@@ -122,7 +121,7 @@ price = {PRICE}
         "opted in on EVM, and not on Solana"
     );
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     // The client opens a channel that pays this node, through the
     // ERC-3009 collector a facilitator relays for it.
@@ -281,13 +280,8 @@ price = {PRICE}
     // journal is how the port can land this channel at all.
     drop(app);
     drop(runtime);
-    let runtime = connector_cli::build(&config).await.expect("rebuild");
-    let backend = runtime
-        .settlement_networks
-        .iter()
-        .next()
-        .expect("still opted in")
-        .receiver();
+    let (runtime, networks) = support::build_keeping_networks(&config).await;
+    let backend = networks.iter().next().expect("still opted in").receiver();
     let before = backend
         .channel_state(&channel)
         .await

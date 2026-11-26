@@ -148,13 +148,11 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
     let b = node_files(COUNTERPARTY_PRIVATE_KEY, 0x0b, &anvil.rpc_url, token);
     let a_runtime = connector_cli::build(&a.config).await.expect("build A");
     let a_addr = serve(connector_cli::router(&a_runtime, &a.config).expect("A's router"));
-    let client = connector_cli::build(&b.config)
-        .await
-        .expect("build the client");
+    let (client, client_networks) = support::build_keeping_networks(&b.config).await;
     let _client_app = connector_cli::router(&client, &b.config).expect("the client's router");
 
     // -- 1. The client's own channel toward A, and its voucher on it --
-    let client_outbound = client.outbound_channels.clone().expect("x402");
+    let client_outbound = client.outbound_channels().expect("x402");
     let a_terms = receiver_terms(&a_runtime.batch_settlements()[0], None).expect("A's terms");
     let (client_channel, _) = client_outbound
         .open(a_terms, 1_000)
@@ -176,8 +174,7 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
     let client_terms =
         receiver_terms(&client.batch_settlements()[0], None).expect("the client's terms");
     let (payout_channel, _) = a_runtime
-        .outbound_channels
-        .clone()
+        .outbound_channels()
         .expect("x402")
         .open(client_terms, 5_000)
         .await
@@ -195,8 +192,7 @@ async fn a_client_is_paid_an_evm_voucher_it_lands_on_chain_itself() {
     assert_eq!(second.cumulative_amount, 500, "vouchers are cumulative");
 
     // -- 4. The client lands its latest payout itself --
-    let lander = client
-        .settlement_networks
+    let lander = client_networks
         .iter()
         .next()
         .expect("x402 on EVM")

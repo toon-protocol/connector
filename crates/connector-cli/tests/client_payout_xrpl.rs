@@ -129,13 +129,11 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
     let b = node_files(0x6b, &client_wallet, &chain.rpc_url);
     let a_runtime = connector_cli::build(&a.config).await.expect("build A");
     let a_addr = serve(connector_cli::router(&a_runtime, &a.config).expect("A's router"));
-    let client = connector_cli::build(&b.config)
-        .await
-        .expect("build the client");
+    let (client, client_networks) = support::build_keeping_networks(&b.config).await;
     let client_addr = serve(connector_cli::router(&client, &b.config).expect("client router"));
 
     // -- 1. The client's own channel toward A --
-    let client_outbound = client.outbound_channels.clone().expect("x402");
+    let client_outbound = client.outbound_channels().expect("x402");
     let a_url = Url::parse(&format!("http://{a_addr}/ilp")).unwrap();
     let a_terms =
         receiver_terms(&a_runtime.batch_settlements()[0], Some(&a_url)).expect("A's terms");
@@ -157,8 +155,7 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
     let client_terms = receiver_terms(&client.batch_settlements()[0], Some(&client_url))
         .expect("the client's terms");
     let (payout_channel, _) = a_runtime
-        .outbound_channels
-        .clone()
+        .outbound_channels()
         .expect("x402")
         .open(client_terms, 5_000)
         .await
@@ -178,8 +175,7 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
     assert_eq!(second.cumulative_amount, 500, "vouchers are cumulative");
 
     // -- 4. The client lands its latest payout itself: a valid voucher --
-    let lander = client
-        .settlement_networks
+    let lander = client_networks
         .get(&NETWORK.parse::<Network>().expect("a network"))
         .expect("x402 on XRPL")
         .receiver();

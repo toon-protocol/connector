@@ -162,7 +162,7 @@ async fn a_zk_edge_boots_reads_its_vault_publishes_its_terms_and_runs_the_sweep(
     let alive_after = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
-    assert!(runtime.zk_edge.is_some());
+    assert!(runtime.node_facts().zk_note.is_some());
     assert!(
         alive_after > alive_before,
         "assemble spawns the sweep ({alive_before} -> {alive_after})"

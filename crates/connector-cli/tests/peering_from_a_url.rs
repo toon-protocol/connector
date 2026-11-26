@@ -504,7 +504,7 @@ key_file = "{settlement_key}"
     async fn restart(&mut self) {
         // A restart ends the old process first, and with it its hold on
         // `state_dir` (issue #1318).
-        self.runtime.state_dir_lock.take();
+        self.runtime.take_state_dir_lock();
         self.runtime = connector_cli::build(&self.config)
             .await
             .expect("rebuild the node");
@@ -523,7 +523,7 @@ key_file = "{settlement_key}"
     /// The key a payload for this node is sealed to (ADR 0018).
     fn identity(&self) -> PublicKeyBytes {
         self.runtime
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }
@@ -878,7 +878,7 @@ async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) 
 /// packet they ride is refused as uncovered; and a voucher below the
 /// channel's watermark is refused `amount_not_advancing`.
 async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node, b_to_a: &str) {
-    let outbound = b.runtime.outbound_channels.clone().expect("B pays on x402");
+    let outbound = b.runtime.outbound_channels().expect("B pays on x402");
     let presentation = outbound.presentation(b_to_a).expect("B's channel");
     assert!(matches!(presentation, ChannelPresentation::Evm { .. }));
     let stale = outbound.signed(b_to_a).expect("B's channel");

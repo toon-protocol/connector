@@ -263,7 +263,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     assert_eq!(funded["collateral"], 1_500);
 
     // -- A pays B; B lands it now, on an open channel --
-    let receiver = b_runtime.signer.public_key().expect("B's wrap key");
+    let receiver = b_runtime.signer().public_key().expect("B's wrap key");
     let network = solana_network(&b_runtime);
     let pay = |outbound: std::sync::Arc<connector_runtime::OutboundChannels>, amount: u64| {
         let (b_app, id, receiver, network) = (b_app.clone(), id.clone(), receiver, network.clone());
@@ -287,7 +287,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
             });
         }
     };
-    pay(a_runtime.outbound_channels.clone().expect("x402"), PRICE).await;
+    pay(a_runtime.outbound_channels().expect("x402"), PRICE).await;
     let listed = read(&b_app, "/channels").await;
     assert_eq!(row(&listed, &id)["direction"], "inbound");
     assert_eq!(row(&listed, &id)["watermark"], PRICE);
@@ -303,7 +303,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     drop(a_runtime);
     let a_runtime = connector_cli::build(&a.config).await.expect("rebuild A");
     let a_app = connector_cli::router(&a_runtime, &a.config).expect("A's router");
-    let outbound = a_runtime.outbound_channels.clone().expect("x402");
+    let outbound = a_runtime.outbound_channels().expect("x402");
     let restored = read(&a_app, "/channels").await;
     assert_eq!(row(&restored, &id)["watermark"], PRICE);
     assert_eq!(row(&restored, &id)["landed"], PRICE);

@@ -351,7 +351,7 @@ async fn a_voucher_on_each_network_is_credited_and_settled_on_that_network() {
 
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     let mut channels = Vec::new();
     for net in [&base, &other] {
@@ -419,10 +419,9 @@ async fn a_voucher_on_each_network_is_credited_and_settled_on_that_network() {
     // restored to its own network's backend, and lands there.
     drop(app);
     drop(runtime);
-    let runtime = connector_cli::build(&config).await.expect("rebuild");
+    let (_runtime, networks) = support::build_keeping_networks(&config).await;
     for (net, channel, signature) in &channels {
-        let backend = runtime
-            .settlement_networks
+        let backend = networks
             .get(&network(&net.network()))
             .expect("a backend per network")
             .receiver();
@@ -572,11 +571,10 @@ async fn each_networks_backend_upholds_the_batch_settlement_contract() {
     let other = Arc::new(Net::spawn(31_338).await);
     let files = Files::new();
     let config = files.config(&[(&base, ""), (&other, "")], "127.0.0.1:9");
-    let runtime = connector_cli::build(&config).await.expect("build");
+    let (_runtime, networks) = support::build_keeping_networks(&config).await;
 
     for net in [&base, &other] {
-        let held = runtime
-            .settlement_networks
+        let held = networks
             .get(&network(&net.network()))
             .expect("a backend per network");
         let node: ethers::types::Address = held
@@ -867,7 +865,7 @@ write_keys = ["{write_key}"]
     /// The key a payload for this node is sealed to (ADR 0018).
     fn identity(&self) -> connector_signer::PublicKeyBytes {
         self.runtime
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }
@@ -1378,9 +1376,8 @@ async fn open_as_before_adr_0086(
     net.x402
         .mint(net.token, Address::from(node_address()), 1_000_000)
         .await;
-    let runtime = connector_cli::build(config).await.expect("build");
-    let payer = runtime
-        .settlement_networks
+    let (runtime, networks) = support::build_keeping_networks(config).await;
+    let payer = networks
         .get(&network(&net.network()))
         .expect("a backend for the network")
         .payer();
@@ -1431,7 +1428,7 @@ async fn a_version_1_outbound_record_is_upgraded_to_the_network_that_reproduces_
     let key = format!("evm:{}", channel.0);
 
     let runtime = connector_cli::build(&config).await.expect("it boots");
-    let outbound = runtime.outbound_channels.clone().expect("x402");
+    let outbound = runtime.outbound_channels().expect("x402");
     assert_eq!(
         outbound.network(&channel.0),
         Some(network(&other.network()))
@@ -1489,8 +1486,7 @@ async fn a_version_1_outbound_record_is_upgraded_to_the_network_that_reproduces_
     let runtime = connector_cli::build(&config).await.expect("it reboots");
     assert_eq!(
         runtime
-            .outbound_channels
-            .as_ref()
+            .outbound_channels()
             .expect("x402")
             .network(&channel.0),
         Some(network(&other.network()))
