@@ -25,7 +25,8 @@
 //! # Judging a peer's voucher, downstream of the role (#1378)
 //!
 //! [`VoucherEvidence::judge_peer_voucher`] is the one place that does admit
-//! one: through this gate's own voucher admission, with no price of its own
+//! one: through the paid packet's handle every carriage admits through
+//! ([`crate::paid_packet::admit_peer_voucher`], #1720), with no price of its own
 //! (the peer carriages measure coverage themselves, `price_gate`), so a
 //! peer's voucher is held to exactly the rules, the watermark and the
 //! journal a client's is. That is `peer-carriage-spec.md` §1.8's
@@ -49,6 +50,7 @@ use connector_signer::{
 
 use crate::channels::{decode_base58_bytes, decode_hex_bytes};
 use crate::claim_gate::decode_evm_channel_config;
+use crate::paid_packet;
 use crate::{ClaimIngestRejection, ClientClaimGate};
 
 /// A refused peer voucher's verdict, in the `claim-ack`'s one refusal
@@ -328,9 +330,9 @@ impl VoucherEvidence for ClientClaimGate {
         // No price: coverage is the peer carriage's to measure, from `prior`
         // (`connector_peer_btp::price_gate`). The watermark, the collateral
         // check and the journal are this gate's, exactly as for a client.
-        let ack = match self.admit_voucher(voucher.clone(), 0).await {
-            Ok((_, ticket)) => match ticket.durable().await {
-                Ok(()) => ClaimAckOutcome::Accepted,
+        let ack = match paid_packet::admit_peer_voucher(self, voucher.clone()).await {
+            Ok(admitted) => match admitted.accepted().await {
+                Ok(_) => ClaimAckOutcome::Accepted,
                 Err(rejection) => voucher_ack(&rejection),
             },
             Err(rejection) => {

@@ -28,21 +28,34 @@
 //!
 //! [`carry`] is the pipeline both carriages share: packet, claim, price and
 //! role in; response out. Each carriage keeps only its framing. It is split
-//! at [`admit`] and [`carry_admitted`] because the BTP carriage must admit a
-//! session's claims inline, in arrival order, and finish them in a windowed
-//! task -- the split it moves onto in #1720. The HTTP carriage calls
-//! [`carry`], which admits on the request's future and carries in a task of
-//! its own.
+//! at [`admit`] and [`carry_admitted`] because the BTP carriage admits a
+//! session's claims inline, in arrival order, and finishes them in a
+//! windowed task of its own (#1720). The HTTP carriage calls [`carry`],
+//! which admits on the request's future and carries in a task of its own.
+//! Either way the post-admission half runs detached from the client, so a
+//! dropped request or a closed socket charges by the outcome.
+//!
+//! A claim that pays for no packet -- one standing alone on a BTP session, a
+//! probe's, a peer's voucher judged below the role -- is admitted to the
+//! same handle and finished with [`AdmittedPacket::accepted`]: its
+//! acceptance is its outcome.
+//!
+//! This module is a child of the claim gate on purpose: the steps it drives
+//! (the gate's admission tuple, the durability wait, noting a claim's time,
+//! rollback) are private to the gate, so no carriage can call them in
+//! another order. The gate's own interface is admission
+//! ([`ClientClaimGate::ingest`] and the handles here) and read-only queries.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
-use connector_domain::client_claim::ClientEdgeClaim;
+use connector_domain::client_claim::{ClientClaim, ClientEdgeClaim};
 use connector_domain::{PacketResponse, Prepare};
 use connector_peer_auth::SessionRole;
 use connector_runtime::Connector;
 
-use crate::claim_gate::{ClaimIngestRejection, DurabilityTicket, InFlightForward};
-use crate::{ClientClaimGate, ClientEdgeState};
+use super::{ClaimIngestRejection, ClientClaimGate, DurabilityTicket, InFlightForward};
+use crate::ClientEdgeState;
 
 /// How a paid packet ended, as the carriage that carried it reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,37 +85,113 @@ impl Outcome {
     }
 }
 
+/// What a durable acceptance is recorded as, beyond the journal: the step
+/// the handle takes once the claim is durable and before anything is
+/// served for it.
+enum Record {
+    /// A claim on a client's interaction that pays for a packet or stands
+    /// alone on a client's session: its channel is recognised, which makes
+    /// the sender eligible to probe (issue #548), and its time noted for the
+    /// claim-state endpoint (issue #693).
+    Recognised(Arc<Connector>),
+    /// A probe's claim, which identifies rather than pays: its time is noted
+    /// (issue #693), but it never makes a channel one this connector
+    /// recognises (ADR 0011's first condition).
+    ClaimTime,
+    /// A peer's voucher, judged below the role (#1378), or a bare
+    /// [`ClientClaimGate::ingest`]: journaled, and nothing else.
+    JournalOnly,
+}
+
+impl Record {
+    fn record(&self, gate: &ClientClaimGate, channel_key: &str) {
+        match self {
+            Record::Recognised(connector) => {
+                connector.recognize_channel(channel_key);
+                gate.note_claim_time(channel_key, crate::now_unix());
+            }
+            Record::ClaimTime => gate.note_claim_time(channel_key, crate::now_unix()),
+            Record::JournalOnly => {}
+        }
+    }
+}
+
 /// A packet whose claim the gate has accepted but whose acceptance is not yet
 /// durable: no service may be rendered for it until [`Self::durable`]
 /// resolves. Dropped before then, its claim is rolled back.
+///
+/// `G` is how the handle holds the gate: shared (`Arc`) for a packet carried
+/// in a task of its own, borrowed for an admission finished where it was
+/// made (a peer's voucher, [`ClientClaimGate::ingest`]).
 #[must_use = "dropping it rolls the claim back"]
-pub(crate) struct AdmittedPacket {
+pub(crate) struct AdmittedPacket<G: Borrow<ClientClaimGate> = Arc<ClientClaimGate>> {
     durability: DurabilityTicket,
-    connector: Arc<Connector>,
-    packet: PaidPacket,
+    record: Record,
+    packet: PaidPacket<G>,
 }
 
-impl AdmittedPacket {
+impl<G: Borrow<ClientClaimGate>> AdmittedPacket<G> {
+    fn new(
+        gate: G,
+        (claim, durability, in_flight): (ClientEdgeClaim, DurabilityTicket, InFlightForward),
+        record: Record,
+    ) -> AdmittedPacket<G> {
+        AdmittedPacket {
+            durability,
+            record,
+            packet: PaidPacket {
+                gate,
+                claim,
+                settled: false,
+                _in_flight: in_flight,
+            },
+        }
+    }
+
     /// Wait for the acceptance's batch fsync, then record the accepted claim
-    /// -- the sender's channel is recognised (issue #548) and its time noted
-    /// for the claim-state endpoint (issue #693). A batch that could not be
-    /// made durable is [`ClaimIngestRejection::NotDurable`]; the committer
-    /// has already unwound it, so there is nothing to roll back and the same
-    /// claim resubmitted is still good.
-    pub(crate) async fn durable(self) -> Result<PaidPacket, ClaimIngestRejection> {
+    /// -- for a client's packet, the sender's channel is recognised (issue
+    /// #548) and its time noted for the claim-state endpoint (issue #693). A
+    /// batch that could not be made durable is
+    /// [`ClaimIngestRejection::NotDurable`]; the committer has already
+    /// unwound it, so there is nothing to roll back and the same claim
+    /// resubmitted is still good.
+    pub(crate) async fn durable(self) -> Result<PaidPacket<G>, ClaimIngestRejection> {
         let AdmittedPacket {
             durability,
-            connector,
+            record,
             mut packet,
         } = self;
         if let Err(rejection) = durability.durable().await {
             packet.settled = true;
             return Err(rejection);
         }
-        let channel_key = packet.channel_key();
-        connector.recognize_channel(&channel_key);
-        packet.gate.note_claim_time(&channel_key, crate::now_unix());
+        record.record(packet.gate.borrow(), &packet.channel_key());
         Ok(packet)
+    }
+
+    /// Finish a claim that pays for no packet -- a standalone claim on a BTP
+    /// session, a probe's, a peer's voucher -- whose acceptance is itself its
+    /// outcome: the claim stays counted, and the answer is the claim once
+    /// durable and recorded.
+    ///
+    /// The outcome is given **before** the returned future first runs, so a
+    /// caller that goes away while it waits for durability undoes nothing:
+    /// the acceptance is already enqueued, and the committer journals it
+    /// either way, as it always has for these claims.
+    pub(crate) fn accepted(
+        self,
+    ) -> impl std::future::Future<Output = Result<ClientEdgeClaim, ClaimIngestRejection>> {
+        let AdmittedPacket {
+            durability,
+            record,
+            mut packet,
+        } = self;
+        packet.settled = true;
+        async move {
+            durability.durable().await?;
+            record.record(packet.gate.borrow(), &packet.channel_key());
+            Ok(packet.claim.clone())
+        }
     }
 }
 
@@ -110,8 +199,8 @@ impl AdmittedPacket {
 /// carriage routes the packet and gives this its [`Outcome`]; it does the
 /// rest. Dropped without one, it counts as [`Outcome::NotCarried`].
 #[must_use = "dropping it counts the packet as not carried"]
-pub(crate) struct PaidPacket {
-    gate: Arc<ClientClaimGate>,
+pub(crate) struct PaidPacket<G: Borrow<ClientClaimGate> = Arc<ClientClaimGate>> {
+    gate: G,
     claim: ClientEdgeClaim,
     /// Whether an outcome has been given -- or there is otherwise nothing
     /// left for `Drop` to undo.
@@ -123,7 +212,7 @@ pub(crate) struct PaidPacket {
     _in_flight: InFlightForward,
 }
 
-impl PaidPacket {
+impl<G: Borrow<ClientClaimGate>> PaidPacket<G> {
     /// The claim that paid for this packet.
     pub(crate) fn claim(&self) -> &ClientEdgeClaim {
         &self.claim
@@ -143,6 +232,7 @@ impl PaidPacket {
             let channel_key = self.channel_key();
             if let Err(error) = self
                 .gate
+                .borrow()
                 .roll_back(&channel_key, self.claim.transferred_amount())
                 .await
             {
@@ -152,7 +242,7 @@ impl PaidPacket {
     }
 }
 
-impl Drop for PaidPacket {
+impl<G: Borrow<ClientClaimGate>> Drop for PaidPacket<G> {
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -163,6 +253,7 @@ impl Drop for PaidPacket {
         let channel_key = self.channel_key();
         if let Err(error) = self
             .gate
+            .borrow()
             .begin_roll_back(&channel_key, self.claim.transferred_amount())
         {
             log_failed_rollback(&channel_key, &error);
@@ -223,32 +314,94 @@ where
         return Ok(None);
     }
     let claim_json = claim()?;
-    let (claim, durability, in_flight) = state.claim_gate.admit(&claim_json, charge, role).await?;
-    Ok(Some(AdmittedPacket {
-        durability,
-        connector: Arc::clone(&state.connector),
-        packet: PaidPacket {
-            gate: Arc::clone(&state.claim_gate),
-            claim,
-            settled: false,
-            _in_flight: in_flight,
-        },
-    }))
+    let admitted = state.claim_gate.admit(&claim_json, charge, role).await?;
+    Ok(Some(AdmittedPacket::new(
+        Arc::clone(&state.claim_gate),
+        admitted,
+        Record::Recognised(Arc::clone(&state.connector)),
+    )))
+}
+
+/// Admit `claim_json` standing alone on a client's BTP session (§1.9 step
+/// 4): against price 0 -- identify-not-pay -- and recorded as a packet's
+/// claim is, since the session it rides is a client's. It pays for no
+/// packet: finish it with [`AdmittedPacket::accepted`].
+pub(crate) async fn admit_session_claim(
+    state: &ClientEdgeState,
+    claim_json: &str,
+) -> Result<AdmittedPacket, ClaimIngestRejection> {
+    let admitted = state
+        .claim_gate
+        .admit(claim_json, 0, &SessionRole::Client)
+        .await?;
+    Ok(AdmittedPacket::new(
+        Arc::clone(&state.claim_gate),
+        admitted,
+        Record::Recognised(Arc::clone(&state.connector)),
+    ))
+}
+
+/// Admit a probe's `claim_json` (`POST /ilp/probe`, ADR 0011): against price
+/// 0, since it identifies rather than pays, and with its time noted but its
+/// channel not recognised. It pays for no packet: finish it with
+/// [`AdmittedPacket::accepted`].
+pub(crate) async fn admit_probe_claim<'g>(
+    gate: &'g ClientClaimGate,
+    claim_json: &str,
+) -> Result<AdmittedPacket<&'g ClientClaimGate>, ClaimIngestRejection> {
+    let admitted = gate.admit(claim_json, 0, &SessionRole::Client).await?;
+    Ok(AdmittedPacket::new(gate, admitted, Record::ClaimTime))
+}
+
+/// Admit a peer's voucher, judged below the role (#1378): with no price of
+/// its own, since coverage is the peer carriage's to measure, against the
+/// channel's one watermark and journal (`peer-carriage-spec.md` §1.8). It
+/// pays for no packet the gate sees: finish it with
+/// [`AdmittedPacket::accepted`].
+pub(crate) async fn admit_peer_voucher(
+    gate: &ClientClaimGate,
+    voucher: ClientClaim,
+) -> Result<AdmittedPacket<&ClientClaimGate>, ClaimIngestRejection> {
+    let admitted = gate
+        .admit_claim(ClientEdgeClaim::Voucher(Box::new(voucher)), 0)
+        .await?;
+    Ok(AdmittedPacket::new(gate, admitted, Record::JournalOnly))
+}
+
+/// Admit `claim_json` against `price` and finish it as accepted: what
+/// [`ClientClaimGate::ingest`] is.
+pub(super) async fn ingest(
+    gate: &ClientClaimGate,
+    claim_json: &str,
+    price: u64,
+) -> Result<ClientEdgeClaim, ClaimIngestRejection> {
+    let admitted = gate.admit(claim_json, price, &SessionRole::Client).await?;
+    AdmittedPacket::new(gate, admitted, Record::JournalOnly)
+        .accepted()
+        .await
 }
 
 /// The pipeline's order-insensitive half: wait for `admitted` to be durable,
 /// route `packet`, and finish the handle with the outcome. A claim whose
 /// acceptance could not be made durable is refused, and its packet is never
 /// routed.
+///
+/// `on_accepted` is the carriage's own step for a durably accepted claim,
+/// run before the packet is routed: the BTP carriage learns who its session
+/// is paid as from it (issue #1396); HTTP has none.
 pub(crate) async fn carry_admitted(
     state: &ClientEdgeState,
     packet: Packet,
     admitted: Option<AdmittedPacket>,
+    on_accepted: impl FnOnce(&ClientEdgeClaim),
 ) -> Result<Carried, ClaimIngestRejection> {
     let paid = match admitted {
         Some(admitted) => Some(admitted.durable().await?),
         None => None,
     };
+    if let Some(paid) = &paid {
+        on_accepted(paid.claim());
+    }
     let channel_key = paid.as_ref().map(PaidPacket::channel_key);
     let voucher_signer = paid
         .as_ref()
@@ -291,7 +444,8 @@ where
 {
     let admitted = admit(state, &packet.prepare, claim, packet.charge, role).await?;
     let state = Arc::clone(state);
-    let carrying = tokio::spawn(async move { carry_admitted(&state, packet, admitted).await });
+    let carrying =
+        tokio::spawn(async move { carry_admitted(&state, packet, admitted, |_| {}).await });
     match carrying.await {
         Ok(carried) => carried,
         // A panic in the pipeline is this request's panic, as it was before
