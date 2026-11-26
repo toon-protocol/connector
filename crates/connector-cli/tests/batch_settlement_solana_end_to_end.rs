@@ -13,11 +13,10 @@ mod support;
 
 use std::io::Write;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use connector_domain::{Fulfill, JournalEntry, Reject};
 use connector_runtime::{FileJournal, Journal};
-use connector_settlement::batch::{BatchChannelStatus, BatchSettlementBackend, Voucher};
+use connector_settlement::batch::{BatchChannelStatus, Voucher};
 use connector_settlement::ChannelId;
 use connector_settlement_solana::batch::wire::PAYMENT_CHANNELS_PROGRAM_ID;
 use connector_settlement_solana::test_support::{
@@ -114,11 +113,15 @@ price = {PRICE}
     ));
 
     let runtime = connector_cli::build(&config).await.expect("build");
-    assert!(
-        runtime.batch_settlement_solana.is_some(),
-        "opted in on Solana"
+    assert_eq!(
+        runtime
+            .settlement_networks
+            .iter()
+            .map(|held| held.network().chain())
+            .collect::<Vec<_>>(),
+        [connector_domain::AssetChain::Solana],
+        "opted in on Solana, and not on EVM"
     );
-    assert!(runtime.batch_settlement_evm.is_empty(), "and not on EVM");
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
 
@@ -247,9 +250,11 @@ price = {PRICE}
     drop(runtime);
     let runtime = connector_cli::build(&config).await.expect("rebuild");
     let backend = runtime
-        .batch_settlement_solana
-        .clone()
-        .expect("still opted in") as Arc<dyn BatchSettlementBackend>;
+        .settlement_networks
+        .iter()
+        .next()
+        .expect("still opted in")
+        .receiver();
     let before = backend
         .channel_state(&channel_id)
         .await

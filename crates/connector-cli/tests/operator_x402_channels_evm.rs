@@ -216,7 +216,7 @@ async fn an_outbound_channel_is_opened_funded_landed_and_withdrawn_over_the_oper
     let b_app = connector_cli::router(&b_runtime, &b.config).expect("B's router");
 
     // -- Open, toward B, on the terms B publishes (ADR 0075 decision 10) --
-    let terms = serde_json::to_value(&b_runtime.batch_settlements[0]).expect("B's terms");
+    let terms = serde_json::to_value(&b_runtime.batch_settlements()[0]).expect("B's terms");
     let (status, opened) = write(
         &a_app,
         &operator,
