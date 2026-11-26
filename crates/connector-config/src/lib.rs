@@ -59,7 +59,7 @@ pub use peering_asset::PeeringAssets;
 pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
 pub use secret::SecretLocation;
 pub use settlement::{
-    EvmSettlementConfig, NetworkTableFamily, SettlementChain, SettlementConfig,
+    EvmSettlementConfig, NetworkTableFamily, SettlementChain, SettlementConfig, SettlementRefusal,
     SolanaSettlementConfig, UnknownSettlementChain, XrplSettlementConfig,
     DEFAULT_XRPL_MAX_FEE_DROPS, DEFAULT_XRPL_MIN_SETTLE_DELAY_SECS,
     DEFAULT_XRPL_REDEMPTION_SAFETY_SECS, XRPL_MIN_SETTLE_DELAY_FLOOR_SECS,
