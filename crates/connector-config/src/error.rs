@@ -1,9 +1,23 @@
 use std::net::AddrParseError;
 use std::path::PathBuf;
 
-use connector_domain::{AssetId, AssetIdError, GuardError, Price, RateError};
+use connector_domain::AssetId;
 
-use crate::settlement::{SettlementChain, SettlementRefusal};
+use crate::batch_settlement::BatchSettlementRefusal;
+use crate::client_channel_asset::ClientChannelAssetRefusal;
+use crate::controller_keys::ControllerKeysRefusal;
+use crate::denomination::DenominationRefusal;
+use crate::identity::ClientIdentityRefusal;
+use crate::node::NodeRefusal;
+use crate::operator::OperatorRefusal;
+use crate::pay_channel::PayChannelRefusal;
+use crate::peer::PeerRefusal;
+use crate::peer_channel::PeerChannelRefusal;
+use crate::peering_asset::PeeringAssetRefusal;
+use crate::route::RouteRefusal;
+use crate::secret::SignerRefusal;
+use crate::settlement::SettlementRefusal;
+use crate::zk_note::ZkNoteRefusal;
 
 use thiserror::Error;
 
@@ -33,6 +47,62 @@ pub enum ConfigError {
     #[error(transparent)]
     Settlement(#[from] SettlementRefusal),
 
+    /// A refusal of the `batch settlement` rules, defined beside them in `batch_settlement.rs`.
+    #[error(transparent)]
+    BatchSettlement(#[from] BatchSettlementRefusal),
+
+    /// A refusal of the `client channel asset` rules, defined beside them in `client_channel_asset.rs`.
+    #[error(transparent)]
+    ClientChannelAsset(#[from] ClientChannelAssetRefusal),
+
+    /// A refusal of the `controller keys` rules, defined beside them in `controller_keys.rs`.
+    #[error(transparent)]
+    ControllerKeys(#[from] ControllerKeysRefusal),
+
+    /// A refusal of the `denomination` rules, defined beside them in `denomination.rs`.
+    #[error(transparent)]
+    Denomination(#[from] DenominationRefusal),
+
+    /// A refusal of the `identity` rules, defined beside them in `identity.rs`.
+    #[error(transparent)]
+    ClientIdentity(#[from] ClientIdentityRefusal),
+
+    /// A refusal of the `node` rules, defined beside them in `node.rs`.
+    #[error(transparent)]
+    Node(#[from] NodeRefusal),
+
+    /// A refusal of the `operator` rules, defined beside them in `operator.rs`.
+    #[error(transparent)]
+    Operator(#[from] OperatorRefusal),
+
+    /// A refusal of the `pay channel` rules, defined beside them in `pay_channel.rs`.
+    #[error(transparent)]
+    PayChannel(#[from] PayChannelRefusal),
+
+    /// A refusal of the `peer channel` rules, defined beside them in `peer_channel.rs`.
+    #[error(transparent)]
+    PeerChannel(#[from] PeerChannelRefusal),
+
+    /// A refusal of the `peering asset` rules, defined beside them in `peering_asset.rs`.
+    #[error(transparent)]
+    PeeringAsset(#[from] PeeringAssetRefusal),
+
+    /// A refusal of the `peer` rules, defined beside them in `peer.rs`.
+    #[error(transparent)]
+    Peer(#[from] PeerRefusal),
+
+    /// A refusal of the `route` rules, defined beside them in `route.rs`.
+    #[error(transparent)]
+    Route(#[from] RouteRefusal),
+
+    /// A refusal of the `[signer]` rules, defined beside them in `secret.rs`.
+    #[error(transparent)]
+    Signer(#[from] SignerRefusal),
+
+    /// A refusal of the `zk note` rules, defined beside them in `zk_note.rs`.
+    #[error(transparent)]
+    ZkNote(#[from] ZkNoteRefusal),
+
     #[error("invalid client_edge_addr '{value}': {source}")]
     InvalidBindAddr {
         value: String,
@@ -44,358 +114,9 @@ pub enum ConfigError {
     InvalidAddress { field: &'static str, value: String },
 
     #[error(
-        "invalid child name '{name}': must be a single ILP address label \
-         (alphanumeric, '-', '_')"
-    )]
-    InvalidChildName { name: String },
-
-    #[error("invalid handler_url '{value}' for route '{prefix}': {source}")]
-    InvalidHandlerUrl {
-        prefix: String,
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error("handler_url '{value}' for route '{prefix}' must be http or https")]
-    UnsupportedUrlScheme { prefix: String, value: String },
-
-    #[error("duplicate route prefix '{prefix}'")]
-    DuplicatePrefix { prefix: String },
-
-    #[error("children are configured but no apex is set: add a top-level 'apex' field")]
-    MissingApex,
-
-    #[error("signer config must set exactly one of 'key_file' or 'kms_key_id', but {reason}")]
-    SignerLocationAmbiguous { reason: &'static str },
-
-    #[error("signer key_file does not exist or is not a file: {0}")]
-    SignerKeyFileNotFound(PathBuf),
-
-    #[error("signer kms_key_id must not be empty")]
-    SignerKmsIdEmpty,
-
-    #[error(
-        "the [operator] section is present but names no bearer token, or an empty one: the \
-         operator surface would have no read authentication. Set exactly one of \
-         'bearer_token_file = \"/app/data/…\"' (what a deployed node should use -- this \
-         repository is public, so a committed config must not carry the literal) or \
-         'bearer_token = \"…\"'"
-    )]
-    OperatorMissingBearerToken,
-
-    #[error(
-        "the [operator] section is present but names no write keys: the operator surface \
-         would accept writes from no one. Set exactly one of 'write_keys_file = \
-         \"/app/data/…\"' (the deployed form -- a file an operator can edit to revoke, which \
-         a committed literal is not) or 'write_keys = [\"…\"]'"
-    )]
-    OperatorNoWriteKeys,
-
-    #[error(
-        "invalid operator write_keys entry '{value}': must be 64 hex characters \
-         (a 32-byte ed25519 public key)"
-    )]
-    OperatorInvalidWriteKey { value: String },
-
-    #[error(
-        "the [operator] section sets both '{literal}' and '{file}': exactly one of them says \
-         where this setting's value comes from, and two answers is not a merge -- it is an \
-         unanswerable question about which one gates the operator surface, with the losing \
-         value left in the file looking authoritative. Keep '{file}' (the deployed form -- \
-         this repository is public, so a committed config must not carry the literal) and \
-         delete '{literal}'; see docs/operators/key-rotation-runbook.md"
-    )]
-    OperatorSettingAmbiguous {
-        literal: &'static str,
-        file: &'static str,
-    },
-
-    #[error(
-        "the [operator] section sets '{setting} = {path}', which does not exist or is not a \
-         file: an operator surface that cannot read its own authentication authenticates \
-         nobody, so this is refused at load rather than becoming a surface that is enabled \
-         and quietly rejects every request. The path is resolved the same way '[signer] \
-         key_file' is -- relative to the process's working directory, so write an absolute \
-         path; see docs/operators/key-rotation-runbook.md"
-    )]
-    OperatorFileNotFound {
-        setting: &'static str,
-        path: PathBuf,
-    },
-
-    #[error(
-        "the [operator] section sets '{setting} = {path}', which could not be read as text: \
-         {source} -- check the file's permissions inside the container (a secret file is \
-         usually mode 600 and must be owned by the uid the connector runs as); see \
-         docs/operators/key-rotation-runbook.md"
-    )]
-    OperatorFileUnreadable {
-        setting: &'static str,
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(
-        "the [operator] section sets '{setting} = {path}', which carries nothing once \
-         whitespace and comments are stripped: an empty file is the same unauthenticated \
-         surface an empty literal would be, and a truncated or half-written file is the usual \
-         cause -- rewrite it; see docs/operators/key-rotation-runbook.md"
-    )]
-    OperatorFileEmpty {
-        setting: &'static str,
-        path: PathBuf,
-    },
-
-    #[error(
-        "invalid operator write_keys_file entry at {path}:{line}: '{value}' must be 64 hex \
-         characters (a 32-byte ed25519 public key). One key per line, '#' starts a comment; \
-         see docs/operators/key-rotation-runbook.md"
-    )]
-    OperatorWriteKeysFileInvalidKey {
-        path: PathBuf,
-        line: usize,
-        value: String,
-    },
-
-    #[error(
-        "the [operator] controller_keys_file {path} is not a valid controller-key file: \
-         {message}. One TOML table per restricted key (ADR 0078); unknown fields are refused"
-    )]
-    ControllerKeysFileInvalid { path: PathBuf, message: String },
-
-    #[error("controller key '{entry}' in {path} is refused: {reason}")]
-    ControllerKeyInvalid {
-        path: PathBuf,
-        entry: String,
-        reason: String,
-    },
-
-    #[error(
-        "controller key '{entry}' in {path} is also on [operator] write_keys / write_keys_file, \
-         where a key may make every write: a key is restricted or it is not, so keep it in \
-         exactly one place (ADR 0078)"
-    )]
-    ControllerKeyAlsoWriteKey { path: PathBuf, entry: String },
-
-    #[error(
-        "controller key '{entry}' in {path} repeats the key of entry '{first}': one key, one \
-         entry (ADR 0078)"
-    )]
-    ControllerKeyDuplicated {
-        path: PathBuf,
-        entry: String,
-        first: String,
-    },
-
-    #[error(
-        "controller key '{entry}' in {path} has '{write}' in its scope but states no {limit}: \
-         a scope that commits value must state its limit (ADR 0078 decision 6). A key that \
-         needs no limit belongs on write_keys"
-    )]
-    ControllerLimitRequired {
-        path: PathBuf,
-        entry: String,
-        write: crate::WriteScope,
-        limit: &'static str,
-    },
-
-    #[error(
-        "controller key '{entry}' in {path} states a {limit} with only one of 'per_write' and \
-         'per_day': a limit has both figures (ADR 0078 decision 2)"
-    )]
-    ControllerLimitIncomplete {
-        path: PathBuf,
-        entry: String,
-        limit: &'static str,
-    },
-
-    #[error(
-        "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but neither is set"
-    )]
-    RouteMissingTarget { prefix: String },
-
-    #[error(
-        "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but both are set"
-    )]
-    RouteTargetAmbiguous { prefix: String },
-
-    #[error(
-        "route '{prefix}' sets 'payment = true' with a 'peer_id': a payment route ends at an \
-         app, so it needs a 'handler_url' (ADR 0083) -- a forward is never the end of a payment"
-    )]
-    PaymentRouteForwards { prefix: String },
-
-    #[error("route '{prefix}' has an empty 'peer_id'")]
-    RoutePeerIdEmpty { prefix: String },
-
-    #[error(
-        "route '{prefix}' terminates locally at '{handler_url}' but sets no 'price': a \
-         terminated route is never silently free -- set 'price = 0' if that is deliberate"
-    )]
-    RouteMissingPrice { prefix: String, handler_url: String },
-
-    /// ADR 0061's removed-field row. A fee attaches to a **peering**, not to
-    /// a route: what this hop retains is the same number whichever prefix
-    /// the packet was addressed to, so it belongs on the `[[peers]]` row
-    /// that names the counterparty. Refused on **any** route, terminated or
-    /// forwarded -- the narrower `TerminatedRouteHasFee` this replaces let a
-    /// forwarded route keep writing one, which is exactly the spelling ADR
-    /// 0061 moves.
-    #[error(
-        "route '{prefix}' sets 'fee', which moved to the '[[peers]]' row it was always about \
-         (ADR 0061): a fee is what this hop retains for carrying one packet to a counterparty, \
-         and that is the same number whichever prefix is addressed. Delete it here and write \
-         'fee' on the '[[peers]]' entry this route's 'peer_id' names -- a terminating route \
-         never had one to move, since an app's work is paid for by 'price'"
-    )]
-    RouteFeeRemoved { prefix: String },
-
-    #[error(
-        "route '{prefix}' forwards to peer '{peer_id}' but sets no 'price': a forwarded route \
-         is never silently free either (ADR 0028) -- 'price' is what this connector's client \
-         edge charges a client for a packet to this prefix, and the peering's own 'fee' is \
-         only what this hop retains of it. Set 'price = 0' if free carriage is deliberate"
-    )]
-    PeerRouteMissingPrice { prefix: String, peer_id: String },
-
-    #[error(
-        "route '{prefix}' forwards to a peer and sets 'transport = \"{value}\"', which this \
-         connector does not yet apply to a forwarded route (issue #701, ADR 0028) -- such a \
-         route accepts both client transports. Remove the 'transport' field"
-    )]
-    PeerRouteHasTransport { prefix: String, value: String },
-
-    /// ADR 0081: a limit of zero refuses every packet with a payload, which
-    /// is a route nobody can use rather than a limit.
-    #[error(
-        "route '{prefix}' sets max_bytes = 0, which refuses every packet with a payload \
-         (ADR 0081). Omit 'max_bytes' for no limit, or set the largest sealed payload, in \
-         bytes, this route accepts"
-    )]
-    RouteMaxBytesZero { prefix: String },
-
-    /// ADR 0082: a route's `max_bytes` raises the node's request limit to
-    /// carry it, and no further than 64 MiB.
-    #[error(
-        "route '{prefix}' sets max_bytes = {value}, above the {limit}-byte limit a route may \
-         declare (ADR 0082: a route raises the node's request limit to carry its largest \
-         packet, up to this bound). Set it to {limit} or less, or omit it"
-    )]
-    RouteMaxBytesAboveLimit {
-        prefix: String,
-        value: u64,
-        limit: u64,
-    },
-
-    #[error(
-        "route '{prefix}' sets transport = '{value}', which this connector does not recognize \
-         -- only 'http', 'btp' or 'both' are valid (issue #701). Omit the field for the \
-         default ('both'), or set one of those three"
-    )]
-    InvalidTransportPolicy { prefix: String, value: String },
-
-    #[error(
-        "handler_url '{handler_url}' is priced inconsistently: route '{first_prefix}' charges \
-         {first_price} but route '{second_prefix}' charges {second_price} -- an app cannot tell \
-         which request arrived under which price, so the cheaper one would always win"
-    )]
-    ConflictingHandlerPrice {
-        handler_url: String,
-        first_prefix: String,
-        first_price: Price,
-        second_prefix: String,
-        second_price: Price,
-    },
-
-    #[error(
         "route '{prefix}' forwards to peer_id '{peer_id}', which no '[[peers]]' entry configures"
     )]
     UnknownPeerId { prefix: String, peer_id: String },
-
-    #[error("peer entry has an empty 'id'")]
-    PeerIdEmpty,
-
-    #[error(
-        "duplicate peer id '{id}': two '[[peers]]' entries name it, so which endpoint, fee \
-         and cap apply to it is unanswerable -- see \
-         docs/operators/btp-peer-transport-bringup.md"
-    )]
-    DuplicatePeerId { id: String },
-
-    // -- The peer carriage config surface (issue #677, peer-carriage-spec
-    // §11). Every message names the bring-up doc, because a peering that
-    // does not come up produces no other evidence an operator can read.
-    #[error(
-        "invalid peer_expose value '{value}': a connector exposes 'btp', 'http', 'both' or \
-         'neither' peer carriage (peer-carriage-spec.md §2.1) -- 'neither' is the NAT'd \
-         operator, who exposes nothing and only dials out. Omit the field for the default \
-         ('neither'); see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    InvalidPeerExposure { value: String },
-
-    /// ADR 0042 (item 3): the forwarded-arrival migration knob, spelled
-    /// wrong. Refused by name rather than falling through to the default,
-    /// because the default here is the permissive one -- a typo meant as
-    /// "enforce" would leave this peering carrying forwards for free.
-    #[error(
-        "invalid forwarded_claim_enforcement value '{value}' for peer '{id}': a peer sets \
-         'observe' (admit an uncovered forwarded arrival and log it -- the default, because the \
-         fleet's send halves are not live yet) or 'enforce' (refuse it with the x402 greeting, \
-         ADR 0042's permanent rule). Omit the field for the default ('observe'); see \
-         docs/operators/claim-policy-rollout.md"
-    )]
-    InvalidForwardedClaimEnforcement { id: String, value: String },
-
-    /// ADR 0042's cap, written as `0`. A cap of zero refuses every packet
-    /// this peering could carry, so it is a peering that silently does
-    /// nothing -- and there is deliberately no spelling that turns the cap
-    /// off, since the whole point of the rule is that a bound always
-    /// exists.
-    #[error(
-        "max_packet_amount = 0 for peer '{id}': the cap is the largest amount this connector \
-         will forward to a peer in ONE packet (ADR 0042), so zero refuses every packet that \
-         peering could ever carry. Write a positive amount in the settlement asset's base \
-         units, or omit the field for the default"
-    )]
-    PeerMaxPacketAmountZero { id: String },
-
-    #[error(
-        "invalid endpoint '{value}' for peer '{id}': {source} -- a peer endpoint is a URL \
-         ('wss://host:port/path' for BTP, 'https://host:port/path' for ILP-over-HTTP), not a \
-         host:port pair; see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    InvalidPeerEndpoint {
-        id: String,
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error(
-        "endpoint '{value}' for peer '{id}' has scheme '{scheme}', which selects no peer \
-         carriage: 'wss://' selects BTP and 'https://' selects ILP-over-HTTP, and there is no \
-         third one (ADR 0027 deleted the raw-TCP transport). Both are TLS-only because a \
-         peering carries signed balance proofs (ADR 0004), so 'ws://' and 'http://' are not \
-         accepted either -- except at a host ending in '.onion' or '.anyone', which \
-         authenticates the circuit with its own key and needs no certificate (ADR 0070), and \
-         this host is not one; see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerEndpointScheme {
-        id: String,
-        value: String,
-        scheme: String,
-    },
-
-    #[error(
-        "peer '{id}' sets 'credential': the '{{peerId, secret}}' shared secret is deleted (ADR \
-         0060). A peering is proven by a verified claim on one of its '[[peer_channels]]' \
-         rows, not by a string both operators wrote into their own config files, and there is \
-         no replacement key -- not renamed, not optional. Delete the 'credential' table from \
-         this peer; see docs/protocol/peer-carriage-spec.md §1.2"
-    )]
-    PeerCredentialRemoved { id: String },
 
     #[error(
         "peer '{id}' has no '[[peer_channels]]' entry: a peer role is proven by a voucher on a \
@@ -419,113 +140,6 @@ pub enum ConfigError {
     )]
     PeerChannelOrphaned { peer_id: String },
 
-    /// A `[[peer_channels]]` row still writes a field of the `toon-channel`
-    /// row shape (ADR 0075 decision 9, issue #1380): `channel_id` (the EVM
-    /// channel ADR 0059 derived), `channel_account` (a Solana channel in its
-    /// TOON meaning, a PDA of TOON's own program), `chain_id` or
-    /// `token_network` (the EIP-712 domain ADR 0024 signed under),
-    /// `counterparty_key` (what a `toon-channel` claim was verified against)
-    /// or `program_id`. Parsed only so it is refused by name (ADR 0009).
-    #[error(
-        "peer '{peer_id}' writes '{field}' on a '[[peer_channels]]' row, a field of the \
-         'toon-channel' row shape ADR 0075 retired (issue #1380): every channel is an x402 \
-         channel now, and a peering's inbound channel is admitted by its voucher signer rather \
-         than configured by a TOON channel id, domain and counterparty key. Replace the row \
-         with:\n\
-         \n\
-             [[peer_channels]]\n\
-             peer_id = \"{peer_id}\"\n\
-             voucher_signer = \"<the peer's settlement address (EVM) or key (Solana)>\"\n\
-             # inbound_channel = \"<optional: the one x402 channel it pays this node on>\"\n\
-         \n\
-         A node still holding live TOON channels drains them on the last TOON-capable release \
-         first (ADR 0075, 'Draining a node with live TOON channels')"
-    )]
-    PeerChannelToonFieldRemoved {
-        peer_id: String,
-        field: &'static str,
-    },
-
-    #[error(
-        "'[[peer_channels]]' for peer '{peer_id}' names no 'voucher_signer': the row's whole \
-         job is to name the key whose vouchers prove this peering -- the peer's EVM settlement \
-         address, or its Solana settlement key (ADR 0075 decisions 3 and 4)"
-    )]
-    PeerChannelVoucherSignerMissing { peer_id: String },
-
-    #[error(
-        "'[[peer_channels]]' for peer '{peer_id}' has voucher_signer '{value}', which is \
-         neither a '0x'-prefixed 20-byte EVM address nor a base58 32-byte Solana key"
-    )]
-    PeerChannelInvalidVoucherSigner { peer_id: String, value: String },
-
-    #[error(
-        "'[[peer_channels]]' for peer '{peer_id}' has inbound_channel '{value}', which is not \
-         an x402 channel on {chain}, the chain its voucher_signer is on: an EVM channel is a \
-         '0x'-prefixed 32-byte id, a Solana one a base58 32-byte channel account"
-    )]
-    PeerChannelInvalidInboundChannel {
-        peer_id: String,
-        value: String,
-        chain: &'static str,
-    },
-
-    #[error(
-        "'[[peer_channels]]' for peer '{peer_id}' names a voucher signer on {chain}, but this \
-         node has no '{heading}' table, so no channel the peer opens toward this \
-         node could ever be admitted (ADR 0075). Add the table, or peer over a chain this node \
-         settles on",
-        heading = crate::settlement::settlement_heading(.chain)
-    )]
-    PeerChannelWithoutX402 {
-        peer_id: String,
-        chain: &'static str,
-    },
-
-    /// A `[[peer_channels]]` or `[[pay_channels]]` row's `network` is not a
-    /// CAIP-2 network on the chain its value is spelled for (ADR 0086
-    /// decision 8).
-    #[error(
-        "'[[{table}]]' for peer '{peer_id}' has network '{value}', which {reason}. A row's \
-         network is the CAIP-2 network of one of this node's settlement tables, such as \
-         'eip155:8453' for [settlement.eip155.8453] (ADR 0086 decision 8)"
-    )]
-    ChannelRowNetworkInvalid {
-        table: &'static str,
-        peer_id: String,
-        value: String,
-        reason: String,
-    },
-
-    /// A channel row's `network` names no `[settlement.eip155.<chainId>]`
-    /// table this node has (ADR 0086 decision 8): a channel on a network this
-    /// node does not settle on could never be admitted or paid on.
-    #[error(
-        "'[[{table}]]' for peer '{peer_id}' has network '{network}', and this node has no \
-         settlement table for that network -- add [settlement.eip155.<chainId>] for it, or name \
-         the network of a table this node has (ADR 0086 decision 8)"
-    )]
-    ChannelRowNetworkUnsettled {
-        table: &'static str,
-        peer_id: String,
-        network: String,
-    },
-
-    /// A `0x` channel row with no `network` on a node holding more than one
-    /// EVM table (ADR 0086 decision 8): which network the channel is on is
-    /// never guessed.
-    #[error(
-        "'[[{table}]]' for peer '{peer_id}' names an EVM channel or signer but no network, and \
-         this node settles on several EVM networks ({networks}): add network = \"<one of \
-         them>\" to the row. A row is never guessed onto one of several networks (ADR 0086 \
-         decision 8)"
-    )]
-    ChannelRowNetworkAmbiguous {
-        table: &'static str,
-        peer_id: String,
-        networks: String,
-    },
-
     /// A config peering's `[[peer_channels]]` row and its `[[pay_channels]]`
     /// row are on two networks of one chain (ADR 0086 decision 11): a
     /// peering is on one network, both of its channels. A node that moves
@@ -540,13 +154,6 @@ pub enum ConfigError {
         inbound: String,
         outbound: String,
     },
-
-    #[error(
-        "'{value}' is named by two '[[peer_channels]]' rows: one voucher signer, or one inbound \
-         channel, proves exactly one peering, and a second row would leave which one to file \
-         order"
-    )]
-    PeerChannelDuplicate { value: String },
 
     #[error(
         "'[[peer_channels]]' is configured but 'state_dir' is not: the vouchers a peer pays this \
@@ -568,43 +175,6 @@ pub enum ConfigError {
     )]
     PayChannelOrphaned { peer_id: String },
 
-    /// A `[[pay_channels]]` row still writes a field of the `toon-channel`
-    /// shapes (ADR 0075 decision 9, issue #1380). See
-    /// [`ConfigError::PeerChannelToonFieldRemoved`] for the fields.
-    #[error(
-        "peer '{peer_id}' writes '{field}' on a '[[pay_channels]]' row, a field of the \
-         'toon-channel' row shapes ADR 0075 retired (issue #1380): a forward is covered by a \
-         voucher on this node's own outbound x402 channel toward the hop, not by a claim on a \
-         TOON channel under a configured domain. Open that channel with 'POST /channels' and \
-         replace the row with:\n\
-         \n\
-             [[pay_channels]]\n\
-             peer_id = \"{peer_id}\"\n\
-             outbound_channel = \"<the x402 channel id (EVM) or account (Solana) it opened>\"\n\
-             client_edge_url = \"<that hop's own POST /ilp endpoint>\"\n\
-         \n\
-         A node still holding live TOON channels drains them on the last TOON-capable release \
-         first (ADR 0075, 'Draining a node with live TOON channels')"
-    )]
-    PayChannelToonFieldRemoved {
-        peer_id: String,
-        field: &'static str,
-    },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' names no 'outbound_channel': the row's whole \
-         job is to name which of this node's own x402 channels pays that hop (ADR 0075 \
-         decisions 4 and 6)"
-    )]
-    PayChannelOutboundChannelMissing { peer_id: String },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' has outbound_channel '{value}', which is \
-         neither a '0x'-prefixed 32-byte x402 channel id (EVM) nor a base58 32-byte channel \
-         account (Solana)"
-    )]
-    PayChannelInvalidOutboundChannel { peer_id: String, value: String },
-
     #[error(
         "'[[pay_channels]]' for peer '{peer_id}' names an outbound channel on {chain}, but this \
          node has no '{heading}' table, so there is no paying half to sign a voucher \
@@ -615,46 +185,6 @@ pub enum ConfigError {
         peer_id: String,
         chain: &'static str,
     },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' has an unusable client_edge_url '{value}': \
-         {source}. It is that hop's own 'POST /ilp' endpoint -- where 'POST /ilp/claim-state' \
-         answers where this node's vouchers on the channel stand"
-    )]
-    PayChannelInvalidClientEdgeUrl {
-        peer_id: String,
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error(
-        "'[[pay_channels]]' for peer '{peer_id}' has client_edge_url '{value}', whose scheme \
-         '{scheme}' is not one this node may ask a channel's claim state over: it must be \
-         'https://' (or 'http://' with peer_allow_plaintext_endpoints, which is a loopback and \
-         test setting). The ask carries a signed challenge -- on either chain a capability to \
-         read a channel's state -- so it is TLS-only by default. A peering's own 'wss://' \
-         endpoint is not this URL and is never turned into it by swapping scheme and appending \
-         a path (ADR 0030)"
-    )]
-    PayChannelClientEdgeUrlScheme {
-        peer_id: String,
-        value: String,
-        scheme: String,
-    },
-
-    #[error(
-        "'[[pay_channels]]' names peer '{peer_id}' twice: every forward to a hop is signed on \
-         the one outbound channel registered for it, so a second row would leave which channel \
-         paid to file order"
-    )]
-    PayChannelDuplicatePeer { peer_id: String },
-
-    #[error(
-        "channel '{value}' is named by two '[[pay_channels]]' rows: an x402 channel pays exactly \
-         one receiver, so one channel paying two hops cannot be"
-    )]
-    PayChannelDuplicate { value: String },
 
     #[error(
         "channel '{value}' is both a '[[peer_channels]]' inbound_channel and a \
@@ -693,88 +223,6 @@ pub enum ConfigError {
     )]
     PayChannelsWithoutStateDir,
 
-    #[error(
-        "route '{prefix}' forwards to peer '{peer_id}', which this connector can never \
-         originate to: the peering configures no 'endpoint' (so this connector never dials it) \
-         and peer_expose does not include 'btp' (so it can never be reached back over a dialed \
-         session either) -- packets flow only in the dialing direction on HTTP \
-         (peer-carriage-spec.md §6.4). Give the peer a 'wss://' or 'https://' endpoint, or set \
-         peer_expose to include 'btp'; see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerRouteUndeliverable { prefix: String, peer_id: String },
-
-    #[error(
-        "peer '{id}' has no 'endpoint' and this connector's peer_expose is 'neither': it dials \
-         nothing and accepts nothing, so this peering can never establish and no amount of \
-         retrying changes that (peer-carriage-spec.md §2.2). Give it an endpoint, or expose a \
-         carriage for it to dial; see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerUndialable { id: String },
-
-    #[error(
-        "peer '{id}' sets 'addr', which was removed with the raw-TCP transport (ADR 0027, \
-         issue #679) -- a peer is reached by 'endpoint' (a wss:// or https:// URL) instead; \
-         see docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerAddrRemoved { id: String },
-
-    /// §11's removed-field row, `ceiling` half (ADR 0033, issue #882):
-    /// nothing tracks trailing exposure any more, so there is nothing for a
-    /// ceiling to bound. Cites the record that removed the machinery, not the
-    /// reasoning behind it (issue #1068) -- ADR 0042's covering-claim rule is
-    /// a target record whose forwarded half is unbuilt, and a boot error must
-    /// not depend on it.
-    #[error(
-        "peer '{id}' sets 'ceiling', which was removed when the exposure machinery was retired \
-         (ADR 0033, issue #882) -- nothing tracks trailing exposure, so there is nothing for a \
-         ceiling to bound. Delete the key rather than replace it; see \
-         docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerCeilingRemoved { id: String },
-
-    /// §11's removed-field row, `flush_interval_ms` half (ADR 0033, issue
-    /// #882): a claim no longer trails the fulfilment it covers, so there is
-    /// nothing left to flush.
-    #[error(
-        "peer '{id}' sets 'flush_interval_ms', which was removed for the same reason 'ceiling' \
-         was (ADR 0033, issue #882): nothing tracks trailing exposure, so there is no pending \
-         claim for a timer to flush. Delete the key rather than replace it; see \
-         docs/operators/btp-peer-transport-bringup.md"
-    )]
-    PeerFlushIntervalRemoved { id: String },
-
-    /// `claim_ack_timeout_ms` (ADR 0075, issue #1380): it bounded how long a
-    /// flushed claim waited for its acknowledgement, and the flush is gone.
-    /// A peering's voucher rides the packet it covers, and its verdict rides
-    /// that packet's answer, bounded by `peer_answer_timeout_ms`.
-    #[error(
-        "peer '{id}' sets 'claim_ack_timeout_ms', which was removed with the flush it bounded \
-         (ADR 0075, issue #1380): a peering's voucher rides the packet it covers and is \
-         acknowledged on that packet's answer, which 'peer_answer_timeout_ms' already bounds. \
-         Delete the key rather than replace it"
-    )]
-    PeerClaimAckTimeoutRemoved { id: String },
-
-    /// §11's removed-field row, `claim_enforcement` (ADR 0042 item 4, issue
-    /// #1077): the issue #883 migration ramp is gone, so `"observe"` names
-    /// no mode and `"enforce"` names the only behaviour there is. Refused by
-    /// name rather than ignored, because a config still writing `"observe"`
-    /// was written by an operator who believes uncovered arrivals to a
-    /// priced termination are admitted here, and none are.
-    ///
-    /// Not to be confused with `forwarded_claim_enforcement`, which is a
-    /// live field and defaults the other way
-    /// ([`ConfigError::InvalidForwardedClaimEnforcement`]).
-    #[error(
-        "peer '{id}' sets 'claim_enforcement', which was removed with the issue #883 migration \
-         ramp (ADR 0042 item 4, issue #1077): an uncovered peer PREPARE to a priced termination \
-         is now always refused, so 'observe' names a mode this build does not have and \
-         'enforce' names the only behaviour there is. Delete the key rather than replace it -- \
-         and note that 'forwarded_claim_enforcement', which governs forwarded arrivals, is a \
-         different and still-live field; see docs/operators/claim-policy-rollout.md"
-    )]
-    PeerClaimEnforcementRemoved { id: String },
-
     /// The other half of §11's removed-field row, spelled and worded
     /// exactly as PR #718 (`feat/delete-peer-role`) spells it.
     ///
@@ -791,91 +239,6 @@ pub enum ConfigError {
          see docs/operators/btp-peer-transport-bringup.md"
     )]
     PeerWireAddrRemoved,
-
-    /// A settlement table published a minimum `withdrawDelay` or
-    /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
-    #[error(
-        "[settlement.{table}] {key} = {value} is below the floor of 900 \
-         seconds. ADR 0074 lets a connector publish its own minimum, but never one below \
-         x402's; omit the key for the default of one day, the window a delayed claim still \
-         has to land in"
-    )]
-    BatchSettlementDelayBelowFloor {
-        table: String,
-        key: &'static str,
-        value: u64,
-    },
-
-    /// `[settlement.eip155.<chainId>] min_withdraw_delay_secs` above the
-    /// contract's own thirty-day `MAX_WITHDRAW_DELAY`: no channel could carry
-    /// a `withdrawDelay` that meets it.
-    #[error(
-        "[settlement.eip155.<chainId>] min_withdraw_delay_secs = {value} exceeds \
-         x402BatchSettlement's MAX_WITHDRAW_DELAY of 2592000 seconds (30 days). No channel \
-         could ever meet it, so the opt-in would admit nothing"
-    )]
-    BatchSettlementWithdrawDelayAboveContractMaximum { value: u64 },
-
-    /// `[settlement.solana] min_sponsored_deposit = 0`: the
-    /// bound on the public sponsor endpoint would bound nothing (ADR 0074
-    /// decision 5).
-    #[error(
-        "[settlement.solana] min_sponsored_deposit is 0. It bounds a public \
-         endpoint that spends this node's lamports on rent for every channel it sponsors, so \
-         it must name a real opening deposit in the mint's base units"
-    )]
-    BatchSettlementZeroMinimumSponsoredDeposit,
-
-    /// `[settlement.eip155.<chainId>] asset_eip712_name` or
-    /// `asset_eip712_version` was written empty. Both are required wherever
-    /// the table exists (ADR 0074 decision 8, issue #1345): the greeting
-    /// publishes them so a payer's deposit can be signed under the asset's
-    /// real EIP-712 domain, and an empty value would be published as one.
-    #[error(
-        "[settlement.eip155.<chainId>] {key} is empty. A client signs its deposit \
-         authorization under this asset's real EIP-712 domain, so the greeting must publish \
-         it -- there is no safe default for an arbitrary settlement token"
-    )]
-    BatchSettlementEmptyAssetEip712Field { key: &'static str },
-
-    /// `[settlement.eip155.<chainId>] asset_transfer_method` names neither of x402's two
-    /// EVM deposit methods (toon-client#695). The greeting publishes it as
-    /// `extra.assetTransferMethod`, and a payer that deposits by a method
-    /// the operator did not mean has its deposit refused on chain.
-    #[error(
-        "[settlement.eip155.<chainId>] asset_transfer_method = \"{value}\" is not an x402 asset transfer \
-         method. Write \"eip3009\" (ERC-3009 receiveWithAuthorization -- the token must \
-         implement ERC-3009, as USDC does) or \"permit2\" (a Permit2 witness transfer, for any \
-         ERC-20), or omit the key for \"eip3009\""
-    )]
-    BatchSettlementUnknownAssetTransferMethod { value: String },
-
-    /// `[settlement.eip155.<chainId>] facilitator_url` is not a URL at all
-    /// (toon-client#695).
-    #[error(
-        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" is not a valid URL ({source}). It is \
-         published to payers as the x402 facilitator their deposit is relayed through; write \
-         an absolute http(s) URL, or omit the key to name none"
-    )]
-    BatchSettlementInvalidFacilitatorUrl {
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    /// `[settlement.eip155.<chainId>] facilitator_url` is a URL, but not `http`/`https`
-    /// (toon-client#695): a payer POSTs its deposit to it.
-    #[error(
-        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" must use http or https. A payer POSTs \
-         its deposit to the x402 facilitator it names"
-    )]
-    BatchSettlementUnsupportedFacilitatorScheme { value: String },
-
-    #[error("[[client_identities]] entry has an empty 'id'")]
-    ClientIdentityIdEmpty,
-
-    #[error("[[client_identities]] names identity '{id}' more than once")]
-    DuplicateClientIdentityId { id: String },
 
     /// `[[client_channels]]`: the channels a `toon-channel` client claim could
     /// be paid on, declared with their counterparty (issue #558). Deleted
@@ -990,86 +353,6 @@ pub enum ConfigError {
     )]
     UnresolvableLookupWindowTooLong { window_secs: u64, max_secs: u64 },
 
-    // -- The `[node]` section (ADR 0050, issue #1080) --
-    //
-    // Every one of these refuses a value this node would otherwise publish
-    // in its own self-description, which is read by strangers and acted on.
-    // That is what makes them load errors rather than warnings.
-    #[error(
-        "[node] names no addresses: a section with no `addresses` describes no node at all. \
-         Set `addresses = [\"g.your.node\"]` (primary first) -- see \
-         docs/protocol/self-description-spec.md (ADR 0050, issue #1080)"
-    )]
-    NodeNoAddresses,
-
-    /// Issue #1220: `btp_endpoint` is required when `peer_expose` opens a BTP
-    /// peer listener; `http_endpoint` whenever it opens any -- a peer covering
-    /// a forward asks this node's client edge for claim-state over HTTP
-    /// whichever carriage the packet rides (issue #1217), so a peerable node
-    /// with no HTTP endpoint is one nobody can pay.
-    #[error(
-        "[node] {field} is not set, but peer_expose = \"{peer_expose}\" makes this node \
-         peerable and a peer needs it (btp_endpoint to dial over BTP; http_endpoint to ask \
-         this node's client edge for claim-state over HTTP, whichever carriage a packet \
-         rides): a node behind TLS termination cannot learn its own public name, so this is \
-         an operator fact and there is deliberately no default. The retired announcer sidecar \
-         DID default it, and its compiled-in fallback named a `/rust/ilp` path that \
-         answers 410 Gone on both devnet boxes -- a default here is how a node ends up \
-         publishing a dead URL to whoever asks (ADR 0050, issue #1220)"
-    )]
-    NodeMissingEndpoint {
-        field: &'static str,
-        peer_expose: &'static str,
-    },
-
-    #[error("[node] {field} '{value}' is not a URL: {source}")]
-    NodeInvalidUrl {
-        field: &'static str,
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error(
-        "[node] {field} '{value}' has scheme '{scheme}', but this field must name one of: \
-         {allowed}. The two URLs a node publishes are where clients PAY it, over two different \
-         carriages: `http_endpoint` is ILP-over-HTTP (`https://`) and `btp_endpoint` is BTP \
-         (`wss://`). Conflating them publishes an address no client can reach (ADR 0050)"
-    )]
-    NodeEndpointScheme {
-        field: &'static str,
-        value: String,
-        scheme: String,
-        allowed: String,
-    },
-
-    /// A `[node]` (or a stale `[announce]`) key that died with the kind:10032
-    /// announce (ADR 0046, issue #1074).
-    ///
-    /// The removed-key trap [`ConfigError::PeerWireAddrRemoved`] and
-    /// [`ConfigError::PeerSaleRemoved`] already take, for the same reason: the
-    /// devnet boxes bind-mount configs that lead the repo copies, so a stale
-    /// file must stop the node **by name** rather than load with the key
-    /// silently dropped (ADR 0009).
-    ///
-    /// One variant covers all fifteen, because the fix is always the same --
-    /// delete the line. Nothing survives for any of them to be rewritten into:
-    /// what a node publishes about itself is now either one of `[node]`'s three
-    /// configured facts or derived from a settlement backend that proved it
-    /// against a chain.
-    #[error(
-        "'[node] {field}' was removed with the kind:10032 announce (ADR 0046, issue #1074): a \
-         connector answers when asked and never announces, so there is no event for this key to \
-         ride on. `[node]` keeps exactly three fields -- `addresses`, `http_endpoint` and \
-         `btp_endpoint` -- the facts a node cannot introspect about itself; everything else it \
-         publishes is derived from the settlement backends and the route table (ADR 0050). \
-         Delete the line. `relay_url` in particular described software BEHIND this connector, \
-         which a self-description never carries, and `solana_chain_id` was a second declaration \
-         of a fact `[settlement.solana]` already holds -- which is how a mainnet node came to \
-         describe itself as devnet (issue #981)"
-    )]
-    AnnounceKeyRemoved { field: &'static str },
-
     /// The section itself, renamed rather than removed (ADR 0050).
     ///
     /// Two of `[announce]`'s fields feed the packet path -- they ride the x402
@@ -1149,433 +432,6 @@ pub enum ConfigError {
     )]
     PeerSaleRemoved,
 
-    /// A `[[tokens]]` row whose `asset` is not an asset at all (ADR 0071
-    /// decision 3). Carries the domain's own words, because
-    /// `AssetIdError` already says the three things that can be wrong with
-    /// the text -- an unknown chain, no chain at all, no token -- and
-    /// restating them here would be a second place for them to drift.
-    #[error("invalid [[tokens]] asset '{value}': {source}")]
-    TokenAssetInvalid {
-        value: String,
-        #[source]
-        source: AssetIdError,
-    },
-
-    /// A `[[tokens]]` row naming native MINA, `mina:<network>/slip44:12586`
-    /// (ADR 0080 decision 7, as amended): native MINA is a zk-note vault's asset and no settlement
-    /// table's, so no channel holds it and no TWAP quotes it. A zk edge
-    /// deals it only as a `[[rates]]` row's `from`.
-    #[error(
-        "[[tokens]] asset '{value}' is refused: native MINA is the [zk_note] vault's asset, not \
-         a token this connector settles or quotes. On a zk edge, name it as a [[rates]] row's \
-         'from' instead (ADR 0080)"
-    )]
-    TokenMinaNative { value: String },
-
-    /// Two `[[tokens]]` rows for one token. Refused rather than merged: a
-    /// rate table is keyed by token, so the second row is either a typo or
-    /// a disagreement, and a disagreement resolved silently is the one a
-    /// packet finds out about.
-    #[error(
-        "[[tokens]] declares '{asset}' more than once -- a token has one row, and two \
-         spellings of one contract address (a checksummed one and a lowercase one) are one \
-         token"
-    )]
-    DuplicateToken { asset: AssetId },
-
-    /// Two `[[tokens]]` rows both set `numeraire = true` (ADR 0071
-    /// decision 3). The boot refusal that keeps peg arithmetic out of the
-    /// node: a cross rate is composed as `X -> Y = (X/numeraire) /
-    /// (Y/numeraire)`, and composing one leg through USDC and the other
-    /// through DAI silently prices the USDC/DAI peg at exactly 1 -- a peg
-    /// nobody declared, which holds right up until it does not.
-    #[error(
-        "[[tokens]] names two numeraires, '{first}' and '{second}': a node declares exactly \
-         one, because every cross rate composes through it. Mixing them would price the peg \
-         between the two at 1 without anyone declaring it -- set 'numeraire = true' on one \
-         row and declare the other pair's rate in [[rates]] if you deal it"
-    )]
-    MixedNumeraire { first: AssetId, second: AssetId },
-
-    /// The numeraire's own row carries a `quote`. The numeraire is what
-    /// every quote path ends at, so a quote on it is a path from a token to
-    /// itself -- there is nothing it could read.
-    #[error(
-        "[[tokens]] gives the numeraire '{asset}' a quote: the numeraire is the token every \
-         other token's quote path ends AT, so it has no price of its own to read. Remove the \
-         'quote' from this row"
-    )]
-    NumeraireQuoted { asset: AssetId },
-
-    /// `quote = []`. An empty path names no pool and is not a declaration
-    /// of anything; a token priced by hand simply has no `quote` key.
-    #[error(
-        "[[tokens]] gives '{asset}' an empty quote: a quote is one or two pools, and a token \
-         with no pool to read is declared without a 'quote' and priced by a [[rates]] row"
-    )]
-    TokenQuoteEmpty { asset: AssetId },
-
-    /// More than two legs (ADR 0071 decision 3). Not a longer path -- a
-    /// path nobody has reasoned about: each leg is an independent
-    /// manipulation surface and the legs' errors compose.
-    #[error(
-        "[[tokens]] gives '{asset}' a quote of {legs} pools: ADR 0071 allows one (a \
-         numeraire-quoted token) or two (a token whose only real venue is quoted in an \
-         intermediate, e.g. ANYONE/WETH then WETH/USDC). Every extra leg is another \
-         manipulation surface and another rounding, so a third is refused rather than \
-         composed"
-    )]
-    TokenQuoteTooLong { asset: AssetId, legs: usize },
-
-    /// A quote leg's `quote_token` is not an asset.
-    #[error("invalid quote_token '{value}' in '{asset}'s quote: {source}")]
-    TokenQuoteTokenInvalid {
-        asset: AssetId,
-        value: String,
-        #[source]
-        source: AssetIdError,
-    },
-
-    /// A quote leg quoting into a token on another network. There is no
-    /// cross-network pool: a path that leaves the token's own settlement
-    /// network names a venue that does not exist (ADR 0086 decision 13).
-    #[error(
-        "'{asset}'s quote names '{quote_token}', which is on another network: ADR 0071 puts a \
-         token's quote on its OWN settlement network -- the one network the peering already \
-         guarantees this node RPC for -- and no pool spans two of them. Price this pair with \
-         a [[rates]] row instead"
-    )]
-    TokenQuoteOffChain {
-        asset: AssetId,
-        quote_token: AssetId,
-    },
-
-    /// A quote leg's pool is not an address on its chain.
-    #[error(
-        "invalid pool '{value}' in '{asset}'s quote: an EVM pool is 40 hex characters \
-         (optionally '0x'-prefixed) and a Solana pool is a base58 32-byte account. A pool \
-         this node cannot address is a rate it can never read"
-    )]
-    TokenQuotePoolInvalid { asset: AssetId, value: String },
-
-    /// A quote leg with `twap_window_secs = 0`. A window of nothing is a
-    /// spot read, and ADR 0071 decision 3 has none: the whole defence
-    /// against a shoved pool is that manipulation has to be sustained for
-    /// the length of the window.
-    #[error(
-        "'{asset}'s quote sets 'twap_window_secs = 0': a window of nothing is a spot read, \
-         and a spot ratio is manipulable inside one block. Set a window long enough that \
-         holding the pool at a false price across it costs an attacker more than the packets \
-         it would misprice"
-    )]
-    TokenQuoteZeroWindow { asset: AssetId },
-
-    /// A declared token on a network this node has no settlement table for
-    /// (ADR 0086 decision 2, issue #1598). Every asset says which network it
-    /// is on, and one on a network this node does not settle on is a token
-    /// no channel of this node can ever hold -- and, for a quoted one, a pool
-    /// it can never read (ADR 0071 decision 3).
-    #[error(
-        "[[tokens]] declares '{asset}', but this node has no {heading} table: a node deals \
-         only tokens on a network it settles on. Add the settlement table, or correct the \
-         asset's network",
-        heading = crate::settlement::network_heading(.asset.network())
-    )]
-    TokenWithoutSettlement { asset: AssetId },
-
-    /// A declared token on a network other than the numeraire's, with no
-    /// `[[rates]]` row giving it a static rate (ADR 0086 decision 13). A
-    /// quote path cannot leave its token's network, so only tokens on the
-    /// numeraire's own network quote themselves; this one has no way to be
-    /// priced at all, and every forward across it would be refused.
-    #[error(
-        "[[tokens]] declares '{asset}', which is on {network} while the numeraire '{numeraire}' \
-         is on {numeraire_network}: a quote path cannot leave its token's network, so only \
-         tokens on the numeraire's network quote themselves by TWAP. Give '{asset}' a static \
-         rate in a [[rates]] row (a row with `rate`, from or to it), or remove it",
-        network = .asset.network(),
-        numeraire_network = .numeraire.network()
-    )]
-    TokenOffNumeraireNetworkWithoutRate { asset: AssetId, numeraire: AssetId },
-
-    /// A quote path with no numeraire to end at.
-    #[error(
-        "'{asset}' has a quote but no [[tokens]] row sets 'numeraire = true': a quote path \
-         ends at the numeraire, and a node with none has nowhere for it to end"
-    )]
-    QuoteWithoutNumeraire { asset: AssetId },
-
-    /// The last leg of a quote path lands somewhere other than the
-    /// numeraire (ADR 0071 decision 3). The refusal that makes composition
-    /// sound: every quote answers "how much numeraire is this token worth",
-    /// and one that answers in WETH instead would be composed with the
-    /// others as if it had answered in the numeraire.
-    #[error(
-        "'{asset}'s quote ends at '{ends_at}', not at the numeraire '{numeraire}': every \
-         quote path ends at the numeraire, because a cross rate is composed as (X/numeraire) \
-         / (Y/numeraire) and a leg that answers in a different unit is silently treated as \
-         though it had answered in that one. Add the final leg that reaches the numeraire \
-         (e.g. WETH/USDC after ANYONE/WETH)"
-    )]
-    TokenQuoteDoesNotEndAtNumeraire {
-        asset: AssetId,
-        ends_at: AssetId,
-        numeraire: AssetId,
-    },
-
-    /// A `[[rates]]` row whose `from` or `to` is not an asset.
-    #[error("invalid [[rates]] {field} '{value}': {source}")]
-    RateRowAssetInvalid {
-        field: &'static str,
-        value: String,
-        #[source]
-        source: AssetIdError,
-    },
-
-    /// A `[[rates]]` row whose two sides are one token. A pair with itself
-    /// is not a denomination boundary, so nothing would ever look it up.
-    #[error(
-        "[[rates]] declares '{asset}' against itself: a rate crosses a denomination \
-         boundary, and a token is not a boundary with itself -- a forward whose two legs \
-         hold the same token is not a conversion and takes the flat fee alone"
-    )]
-    RateRowSelfPair { asset: AssetId },
-
-    /// A `[[rates]]` row naming a token no `[[tokens]]` row declares (ADR
-    /// 0071 decision 3).
-    #[error(
-        "[[rates]] declares '{from}' -> '{to}', but '{unknown}' is not a token this node \
-         deals: every side of a rate is a [[tokens]] row, so that a mistyped contract \
-         address is a boot refusal rather than a rate filed under a key no forward ever \
-         looks up"
-    )]
-    RateRowUnknownToken {
-        from: AssetId,
-        to: AssetId,
-        unknown: AssetId,
-    },
-
-    /// Two `[[rates]]` rows for one ordered pair. The reverse pair is a
-    /// different row and is not this: direction is the trade.
-    #[error(
-        "[[rates]] declares '{from}' -> '{to}' more than once: one ordered pair has one row. \
-         (The reverse pair is a DIFFERENT row and may carry a different rate -- direction is \
-         the trade.)"
-    )]
-    DuplicateRateRow { from: AssetId, to: AssetId },
-
-    /// A `[[rates]]` row whose declared rate is not a rate -- a zero
-    /// denominator, or the zero numerator ADR 0071 decision 7 refuses for
-    /// the same reason. The check itself lives in `connector_domain::Rate`,
-    /// which is where a rate is constructed at all; this variant exists so
-    /// that the operator reading the refusal learns which ROW was wrong,
-    /// which the domain's message on its own cannot say.
-    #[error("invalid rate on [[rates]] '{from}' -> '{to}': {source}")]
-    RateRowInvalid {
-        from: AssetId,
-        to: AssetId,
-        #[source]
-        source: RateError,
-    },
-
-    /// A declared guard that is not one (ADR 0071 decision 5): a spread at
-    /// or above the whole mid, a fraction with no whole, a ttl of no time
-    /// at all. The check is each guard's own constructor in
-    /// `connector_domain` -- which is where a guard is made at all -- and
-    /// this variant exists so the operator reading the refusal learns which
-    /// row carried it, which the domain's message cannot say. `row` is
-    /// `[rate_guards]`, or the ordered pair whose `[[rates]]` row overrode
-    /// it.
-    #[error("invalid guard on {row}: {source}")]
-    RateGuardInvalid {
-        row: String,
-        #[source]
-        source: GuardError,
-    },
-
-    /// A node that can produce a rate but declared no `[rate_guards]` (ADR
-    /// 0071 decision 5). Required exactly when something can produce a
-    /// rate, and only then: declaring tokens alone -- which is what a
-    /// same-asset cross-chain hop does -- produces none and needs none.
-    #[error(
-        "this node declares a rate (a [[rates]] row, or a [[tokens]] quote) but no \
-         [rate_guards] table: the three guards have no safe default. A defaulted spread \
-         would be zero -- dealing at mid and donating the risk -- and a defaulted 'ttl' or \
-         'max_move' would be a number nobody wrote being enforced on an operator's book. \
-         Add '[rate_guards]' with 'spread', 'ttl_secs' and 'max_move'; a [[rates]] row may \
-         override any of the three for its own pair"
-    )]
-    RateGuardsMissing,
-
-    /// A peering whose channels hold a token no `[[tokens]]` row declares
-    /// (ADR 0071 decision 1, issue #1292).
-    ///
-    /// Only ever reached on a node that declares tokens: one that declares
-    /// none resolves no peering at all and is not held to this rule, which
-    /// is what makes ADR 0071 free for every operator who deals nothing.
-    /// On a node that does deal, the alternative to this refusal is a
-    /// forward discovering mid-packet that it cannot say what unit it is
-    /// carrying -- and the packet is already paid for by then.
-    #[error(
-        "peering '{peer_id}' is denominated in '{asset}', which is not a token this node \
-         deals: a node that declares [[tokens]] must be able to say which declared token \
-         every peering holds, because a forward between two peerings is a conversion exactly \
-         when their tokens differ. The token comes from the [settlement] table that peering's \
-         channels settle through -- declare it with a [[tokens]] row, or remove the [[tokens]] \
-         table if this node deals nothing"
-    )]
-    PeeringTokenNotDeclared { peer_id: String, asset: String },
-
-    /// One peering whose channel rows sit on two chains, and therefore in
-    /// two tokens (ADR 0071 decision 1, issue #1292). A packet's amount is
-    /// denominated by the channel it rides, so a peering with two units has
-    /// no unit at all: which one a forward was converting into would depend
-    /// on which of the two tables the reader consulted.
-    #[error(
-        "peering '{peer_id}' holds channels in two tokens, '{first}' and '{second}': a \
-         peering is one denomination -- a packet's amount is denominated by the channel it \
-         rides, and a forward out of this one has no single unit to convert into. Give each \
-         chain its own [[peers]] row, so that every peering's [[peer_channels]] and \
-         [[pay_channels]] rows settle through one [settlement] table"
-    )]
-    PeeringTokenAmbiguous {
-        peer_id: String,
-        first: AssetId,
-        second: AssetId,
-    },
-
-    /// A chain whose client-edge channels hold a token no `[[tokens]]` row
-    /// declares (ADR 0071 decision 1, issue #1301) -- the client edge's
-    /// sibling of [`ConfigError::PeeringTokenNotDeclared`], and refused for
-    /// the stronger reason.
-    ///
-    /// Named by CHAIN rather than by channel, because the channel that
-    /// forces this refusal is one no config names: a settlement table is what
-    /// lets this node admit a voucher from a buyer this operator has never
-    /// heard of (ADR 0052, issue #502), so
-    /// every chain with a settlement table can carry an arrival whose
-    /// denomination a forward must know. Left unresolved on a dealing node,
-    /// such an arrival would forward across a real boundary at an implied
-    /// 1:1 -- decision 2's failure arriving by the one door the absence rule
-    /// does not cover.
-    ///
-    /// Only ever reached on a node that declares tokens; one that declares
-    /// none resolves no client channel at all and is not held to this rule.
-    #[error(
-        "client-edge channels on the '{chain}' chain are denominated in '{asset}', which is \
-         not a token this node deals: a node that declares [[tokens]] must be able to say \
-         which declared token every channel it accepts a claim on holds, because a forward \
-         out of a client arrival is a conversion exactly when that token and the outgoing \
-         peering's differ. This applies to every channel on the chain -- a \
-         {heading} table is what lets this node accept a claim on a channel it has \
-         never been configured for (ADR 0052). The \
-         token comes from that table's own 'token_address' -- declare it with a [[tokens]] \
-         row, remove the {heading} table, or remove the [[tokens]] table if this \
-         node deals nothing",
-        heading = crate::settlement::settlement_heading(.chain)
-    )]
-    ClientChannelTokenNotDeclared {
-        chain: SettlementChain,
-        /// The table's token in CAIP-19, as a `[[tokens]]` row would
-        /// declare it -- with `<genesis prefix>` left for a Solana table,
-        /// whose cluster config cannot know.
-        asset: String,
-    },
-
-    /// An XRPL table on a node that declares no `[[tokens]]` (ADR 0087
-    /// decision 6, #1636). No forward on such a node is a crossing, so it
-    /// would pass one network's XRP to another's at par, and any other asset
-    /// to XRP at one base unit per drop.
-    #[error(
-        "{table} settles XRP, but this node declares no [[tokens]]: every XRPL leg is a dealing \
-         boundary (ADR 0087), and with nothing declared a forward would cross it unconverted. \
-         Declare it with a [[tokens]] row, asset = \"{asset}\", and one for every other \
-         settlement table this node holds"
-    )]
-    XrplSettlementWithoutTokens {
-        /// The table as an operator wrote it, `[settlement.xrpl.<id>]`.
-        table: String,
-        /// The asset to declare, `xrpl:<id>/slip44:144`.
-        asset: String,
-    },
-
-    // -- [zk_note] (ADR 0080, issue #1522) --
-    /// The vault is not a Mina address.
-    #[error(
-        "[zk_note] vault '{value}' is not a Mina address (B62...): no payer could deposit into it"
-    )]
-    ZkNoteVaultInvalid { value: String },
-
-    /// A network other than the two a vault lives on.
-    #[error("[zk_note] network '{value}' is not 'mina:mainnet' or 'mina:devnet'")]
-    ZkNoteNetworkInvalid { value: String },
-
-    /// The GraphQL endpoint is not an http(s) URL.
-    #[error("[zk_note] graphql_url '{value}' is not an http or https URL")]
-    ZkNoteGraphqlUrlInvalid { value: String },
-
-    /// The archive endpoint is not an http(s) URL.
-    #[error("[zk_note] archive_url '{value}' is not an http or https URL")]
-    ZkNoteArchiveUrlInvalid { value: String },
-
-    /// The vault's reads asked to ride a circuit on a node with none (ADR 0073).
-    #[error(
-        "[zk_note] sets rpc_via_socks_proxy = true but no top-level socks_proxy is set: there \
-         is no fallback to a direct connection, so the vault could never be read. Set \
-         socks_proxy or remove rpc_via_socks_proxy"
-    )]
-    ZkNoteViaSocksProxyWithoutProxy,
-
-    /// The vault's reads would ride a circuit to a plain http endpoint (ADR 0073).
-    #[error(
-        "[zk_note] {key} '{value}' is plain http, and rpc_via_socks_proxy = true would \
-         send it through an exit relay that can read and rewrite every answer (a known root, a \
-         spent nullifier). Use the endpoint's https URL; plain http over a circuit is accepted \
-         only for a .onion or .anyone host (ADR 0070, ADR 0073)"
-    )]
-    ZkNoteViaSocksProxyPlaintext { key: &'static str, value: String },
-
-    /// The state key file does not exist.
-    #[error("[zk_note] state_key_file '{}' does not exist or is not a file", .0.display())]
-    ZkNoteStateKeyFileNotFound(PathBuf),
-
-    /// The verification key hash is not a decimal field element.
-    #[error(
-        "[zk_note] verification_key_hash '{value}' is not a Mina field element in decimal, the \
-         form a verification key's hash is printed in"
-    )]
-    ZkNoteVerificationKeyHashInvalid { value: String },
-
-    /// The tiers are empty, repeat, hold a zero, or name a tier zk_toon does not publish.
-    #[error("[zk_note] tiers are refused: {source}")]
-    ZkNoteTiersInvalid {
-        #[source]
-        source: connector_zk_note::tiers::TiersError,
-    },
-
-    /// An allowance lifetime of zero, or not well below zk_toon's challenge window.
-    #[error(
-        "[zk_note] allowance_lifetime_secs = {secs} is refused: it must be above 0 and at most \
-         {max_secs}, a quarter of zk_toon's challenge window, so that an allowance closes, its \
-         charge is journaled and its evidence reaches the challenger well inside the window"
-    )]
-    ZkNoteAllowanceLifetimeInvalid { secs: u64, max_secs: u64 },
-
-    /// A cap no allowance could ever fit under.
-    #[error(
-        "[zk_note] open_budget_cap = {cap} is below the smallest published tier {tier}: no \
-         allowance could ever be opened"
-    )]
-    ZkNoteOpenBudgetCapBelowTier { cap: u64, tier: u64 },
-
-    /// A subsidy budget with no smallest tier to spend it on (ADR 0080 decision 14).
-    #[error(
-        "[zk_note] subsidy_budget = {budget} is set but 'tiers' does not include {tier}, the \
-         smallest of zk_toon's tiers: a subsidised allowance can only be opened at that tier, so \
-         the budget could never be spent. Add {tier} to 'tiers', or set subsidy_budget = 0"
-    )]
-    ZkNoteSubsidyWithoutSmallestTier { budget: u64, tier: u64 },
-
     /// A zk edge with nowhere to journal its spent nullifiers or keep its evidence.
     #[error(
         "[zk_note] is set but 'state_dir' is not: a zk edge journals every spent nullifier and \
@@ -1634,5 +490,63 @@ impl From<connector_domain::peering_admission::PeeringRefusal> for ConfigError {
                 ConfigError::PayChannelUnbound { prefix, peer_id }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every table's refusals compose transparently (issue #1690): wrapping a
+    /// refusal in the public error changes neither its message nor what it
+    /// is, so the table module owns the message and the binary sees one type.
+    macro_rules! transparent {
+        ($($name:ident: $wrapper:ident($refusal:expr);)*) => {$(
+            #[test]
+            fn $name() {
+                let refusal = $refusal;
+                let message = refusal.to_string();
+                let error = ConfigError::from(refusal);
+                assert_eq!(error.to_string(), message);
+                assert!(matches!(error, ConfigError::$wrapper(_)));
+            }
+        )*};
+    }
+
+    transparent! {
+        a_batch_settlement_refusal_is_the_config_error_it_is_wrapped_in:
+            BatchSettlement(BatchSettlementRefusal::BatchSettlementZeroMinimumSponsoredDeposit);
+        a_controller_keys_refusal_is_the_config_error_it_is_wrapped_in:
+            ControllerKeys(ControllerKeysRefusal::ControllerKeysFileInvalid {
+                path: PathBuf::from("keys.toml"),
+                message: "bad".to_owned(),
+            });
+        a_denomination_refusal_is_the_config_error_it_is_wrapped_in:
+            Denomination(DenominationRefusal::RateGuardsMissing);
+        a_client_identity_refusal_is_the_config_error_it_is_wrapped_in:
+            ClientIdentity(ClientIdentityRefusal::ClientIdentityIdEmpty);
+        a_node_refusal_is_the_config_error_it_is_wrapped_in:
+            Node(NodeRefusal::NodeNoAddresses);
+        an_operator_refusal_is_the_config_error_it_is_wrapped_in:
+            Operator(OperatorRefusal::OperatorNoWriteKeys);
+        a_pay_channel_refusal_is_the_config_error_it_is_wrapped_in:
+            PayChannel(PayChannelRefusal::PayChannelDuplicatePeer { peer_id: "p".to_owned() });
+        a_peer_channel_refusal_is_the_config_error_it_is_wrapped_in:
+            PeerChannel(PeerChannelRefusal::PeerChannelVoucherSignerMissing {
+                peer_id: "p".to_owned(),
+            });
+        a_peering_asset_refusal_is_the_config_error_it_is_wrapped_in:
+            PeeringAsset(PeeringAssetRefusal::PeeringTokenNotDeclared {
+                peer_id: "p".to_owned(),
+                asset: "a".to_owned(),
+            });
+        a_peer_refusal_is_the_config_error_it_is_wrapped_in:
+            Peer(PeerRefusal::PeerIdEmpty);
+        a_route_refusal_is_the_config_error_it_is_wrapped_in:
+            Route(RouteRefusal::MissingApex);
+        a_signer_refusal_is_the_config_error_it_is_wrapped_in:
+            Signer(SignerRefusal::SignerKmsIdEmpty);
+        a_zk_note_refusal_is_the_config_error_it_is_wrapped_in:
+            ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyWithoutProxy);
     }
 }

@@ -30,6 +30,67 @@ use serde::Deserialize;
 
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the controller keys rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum ControllerKeysRefusal {
+    #[error(
+        "the [operator] controller_keys_file {path} is not a valid controller-key file: \
+         {message}. One TOML table per restricted key (ADR 0078); unknown fields are refused"
+    )]
+    ControllerKeysFileInvalid { path: PathBuf, message: String },
+
+    #[error("controller key '{entry}' in {path} is refused: {reason}")]
+    ControllerKeyInvalid {
+        path: PathBuf,
+        entry: String,
+        reason: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} is also on [operator] write_keys / write_keys_file, \
+         where a key may make every write: a key is restricted or it is not, so keep it in \
+         exactly one place (ADR 0078)"
+    )]
+    ControllerKeyAlsoWriteKey { path: PathBuf, entry: String },
+
+    #[error(
+        "controller key '{entry}' in {path} repeats the key of entry '{first}': one key, one \
+         entry (ADR 0078)"
+    )]
+    ControllerKeyDuplicated {
+        path: PathBuf,
+        entry: String,
+        first: String,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} has '{write}' in its scope but states no {limit}: \
+         a scope that commits value must state its limit (ADR 0078 decision 6). A key that \
+         needs no limit belongs on write_keys"
+    )]
+    ControllerLimitRequired {
+        path: PathBuf,
+        entry: String,
+        write: crate::WriteScope,
+        limit: &'static str,
+    },
+
+    #[error(
+        "controller key '{entry}' in {path} states a {limit} with only one of 'per_write' and \
+         'per_day': a limit has both figures (ADR 0078 decision 2)"
+    )]
+    ControllerLimitIncomplete {
+        path: PathBuf,
+        entry: String,
+        limit: &'static str,
+    },
+}
+
 /// One named write of the operator surface (ADR 0078 decision 1). A `DELETE`
 /// belongs to the name of its `POST`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -209,11 +270,11 @@ struct RawControllerKey {
 }
 
 fn entry_error(file: &Path, entry: &str, reason: String) -> ConfigError {
-    ConfigError::ControllerKeyInvalid {
+    ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeyInvalid {
         path: file.to_path_buf(),
         entry: entry.to_string(),
         reason,
-    }
+    })
 }
 
 fn check_limit(
@@ -223,11 +284,13 @@ fn check_limit(
     limit: &RawLimit,
 ) -> Result<(), ConfigError> {
     if limit.per_write.is_some() != limit.per_day.is_some() {
-        return Err(ConfigError::ControllerLimitIncomplete {
-            path: path.to_path_buf(),
-            entry: entry.to_string(),
-            limit: which,
-        });
+        return Err(ConfigError::ControllerKeys(
+            ControllerKeysRefusal::ControllerLimitIncomplete {
+                path: path.to_path_buf(),
+                entry: entry.to_string(),
+                limit: which,
+            },
+        ));
     }
     Ok(())
 }
@@ -239,11 +302,12 @@ pub(crate) fn parse_controller_keys(
     path: &Path,
     write_keys: &[[u8; 32]],
 ) -> Result<Vec<ControllerKey>, ConfigError> {
-    let table: BTreeMap<String, RawControllerKey> =
-        toml::from_str(contents).map_err(|error| ConfigError::ControllerKeysFileInvalid {
+    let table: BTreeMap<String, RawControllerKey> = toml::from_str(contents).map_err(|error| {
+        ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeysFileInvalid {
             path: path.to_path_buf(),
             message: error.to_string(),
-        })?;
+        })
+    })?;
 
     let mut out: Vec<ControllerKey> = Vec::new();
     for (name, raw) in table {
@@ -282,17 +346,21 @@ pub(crate) fn parse_controller_keys(
         }
 
         if write_keys.contains(&key) {
-            return Err(ConfigError::ControllerKeyAlsoWriteKey {
-                path: path.to_path_buf(),
-                entry: name,
-            });
+            return Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyAlsoWriteKey {
+                    path: path.to_path_buf(),
+                    entry: name,
+                },
+            ));
         }
         if let Some(first) = out.iter().find(|existing| existing.key == key) {
-            return Err(ConfigError::ControllerKeyDuplicated {
-                path: path.to_path_buf(),
-                entry: name,
-                first: first.name.clone(),
-            });
+            return Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyDuplicated {
+                    path: path.to_path_buf(),
+                    entry: name,
+                    first: first.name.clone(),
+                },
+            ));
         }
 
         if let Some(limit) = &raw.spending_limit {
@@ -303,12 +371,14 @@ pub(crate) fn parse_controller_keys(
         }
 
         if scope.contains(&WriteScope::Packets) && raw.spending_limit.is_none() {
-            return Err(ConfigError::ControllerLimitRequired {
-                path: path.to_path_buf(),
-                entry: name,
-                write: WriteScope::Packets,
-                limit: "spending_limit",
-            });
+            return Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerLimitRequired {
+                    path: path.to_path_buf(),
+                    entry: name,
+                    write: WriteScope::Packets,
+                    limit: "spending_limit",
+                },
+            ));
         }
         if let Some(write) = [
             WriteScope::Peers,
@@ -319,12 +389,14 @@ pub(crate) fn parse_controller_keys(
         .find(|write| scope.contains(write))
         {
             if raw.deposit_limit.is_none() {
-                return Err(ConfigError::ControllerLimitRequired {
-                    path: path.to_path_buf(),
-                    entry: name,
-                    write,
-                    limit: "deposit_limit",
-                });
+                return Err(ConfigError::ControllerKeys(
+                    ControllerKeysRefusal::ControllerLimitRequired {
+                        path: path.to_path_buf(),
+                        entry: name,
+                        write,
+                        limit: "deposit_limit",
+                    },
+                ));
             }
         }
 
@@ -439,7 +511,9 @@ mod tests {
         ));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerKeysFileInvalid { .. })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeysFileInvalid { .. }
+            ))
         ));
     }
 
@@ -447,7 +521,11 @@ mod tests {
     fn an_empty_scope_is_refused_naming_the_entry() {
         let result = parse(&format!("[a]\nkey = \"{KEY}\"\nscope = []\n"));
         match result {
-            Err(ConfigError::ControllerKeyInvalid { entry, reason, .. }) => {
+            Err(ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeyInvalid {
+                entry,
+                reason,
+                ..
+            })) => {
                 assert_eq!(entry, "a");
                 assert!(reason.contains("empty"));
             }
@@ -461,7 +539,11 @@ mod tests {
             "[a]\nkey = \"{KEY}\"\nscope = [\"channels-burn\"]\n"
         ));
         match result {
-            Err(ConfigError::ControllerKeyInvalid { entry, reason, .. }) => {
+            Err(ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeyInvalid {
+                entry,
+                reason,
+                ..
+            })) => {
                 assert_eq!(entry, "a");
                 assert!(reason.contains("channels-burn"));
             }
@@ -474,7 +556,9 @@ mod tests {
         let result = parse("[a]\nkey = \"abcd\"\nscope = [\"channels-land\"]\n");
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerKeyInvalid { .. })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyInvalid { .. }
+            ))
         ));
     }
 
@@ -484,7 +568,7 @@ mod tests {
             "[a]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n[b]\nkey = \"{KEY}\"\nscope = [\"channels-land\"]\n"
         ));
         assert!(
-            matches!(result, Err(ConfigError::ControllerKeyDuplicated { entry, first, .. }) if entry == "b" && first == "a")
+            matches!(result, Err(ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeyDuplicated { entry, first, .. })) if entry == "b" && first == "a")
         );
     }
 
@@ -497,7 +581,7 @@ mod tests {
             &[key],
         );
         assert!(
-            matches!(result, Err(ConfigError::ControllerKeyAlsoWriteKey { entry, .. }) if entry == "a")
+            matches!(result, Err(ConfigError::ControllerKeys(ControllerKeysRefusal::ControllerKeyAlsoWriteKey { entry, .. })) if entry == "a")
         );
     }
 
@@ -506,11 +590,13 @@ mod tests {
         let result = parse(&format!("[a]\nkey = \"{KEY}\"\nscope = [\"packets\"]\n"));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerLimitRequired {
-                write: WriteScope::Packets,
-                limit: "spending_limit",
-                ..
-            })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerLimitRequired {
+                    write: WriteScope::Packets,
+                    limit: "spending_limit",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -521,10 +607,12 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(ConfigError::ControllerLimitRequired {
-                        limit: "deposit_limit",
-                        ..
-                    })
+                    Err(ConfigError::ControllerKeys(
+                        ControllerKeysRefusal::ControllerLimitRequired {
+                            limit: "deposit_limit",
+                            ..
+                        }
+                    ))
                 ),
                 "{write}: {result:?}"
             );
@@ -538,10 +626,12 @@ mod tests {
         ));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerLimitIncomplete {
-                limit: "spending_limit",
-                ..
-            })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerLimitIncomplete {
+                    limit: "spending_limit",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -584,10 +674,12 @@ mod tests {
         let result = parse(&format!("[a]\nkey = \"{KEY}\"\nscope = [\"peers\"]\n"));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerLimitRequired {
-                limit: "deposit_limit",
-                ..
-            })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerLimitRequired {
+                    limit: "deposit_limit",
+                    ..
+                }
+            ))
         ));
     }
 

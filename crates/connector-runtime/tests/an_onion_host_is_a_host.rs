@@ -220,7 +220,7 @@ fn a_plaintext_scheme_at_any_other_host_is_still_refused() {
         assert!(
             matches!(
                 error,
-                connector_config::ConfigError::PeerEndpointScheme { ref value, .. }
+                connector_config::ConfigError::Peer(connector_config::PeerRefusal::PeerEndpointScheme { ref value, .. })
                     if value == endpoint
             ),
             "{endpoint} must still be refused with the existing error, got: {error}"
@@ -366,7 +366,7 @@ fn an_exposed_listener_still_requires_an_endpoint_on_an_onion_node() {
     assert!(
         matches!(
             error,
-            connector_config::ConfigError::NodeMissingEndpoint { field, .. }
+            connector_config::ConfigError::Node(connector_config::NodeRefusal::NodeMissingEndpoint { field, .. })
                 if field == "http_endpoint"
         ),
         "got: {error}"

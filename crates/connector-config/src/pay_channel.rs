@@ -40,7 +40,7 @@
 //! `chain_id`/`token_network` domain its claims were signed under, or a
 //! Solana `channel_account` of TOON's own program. ADR 0075 retires that
 //! shape, and each of those fields is still parsed so a file that writes it
-//! is refused naming it ([`ConfigError::PayChannelToonFieldRemoved`]).
+//! is refused naming it ([`PayChannelRefusal::PayChannelToonFieldRemoved`]).
 
 use std::collections::HashSet;
 
@@ -55,6 +55,92 @@ use connector_domain::peering_admission::check_pay_chain_settled;
 
 use crate::settlement::{SettlementChain, SettlementTables};
 use crate::x402_row::{parse_x402_channel, RemovedToonFields};
+
+use thiserror::Error;
+
+/// Every way the pay channel rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum PayChannelRefusal {
+    /// A `[[pay_channels]]` row still writes a field of the `toon-channel`
+    /// shapes (ADR 0075 decision 9, issue #1380). See
+    /// [`PeerChannelRefusal::PeerChannelToonFieldRemoved`] for the fields.
+    #[error(
+        "peer '{peer_id}' writes '{field}' on a '[[pay_channels]]' row, a field of the \
+         'toon-channel' row shapes ADR 0075 retired (issue #1380): a forward is covered by a \
+         voucher on this node's own outbound x402 channel toward the hop, not by a claim on a \
+         TOON channel under a configured domain. Open that channel with 'POST /channels' and \
+         replace the row with:\n\
+         \n\
+             [[pay_channels]]\n\
+             peer_id = \"{peer_id}\"\n\
+             outbound_channel = \"<the x402 channel id (EVM) or account (Solana) it opened>\"\n\
+             client_edge_url = \"<that hop's own POST /ilp endpoint>\"\n\
+         \n\
+         A node still holding live TOON channels drains them on the last TOON-capable release \
+         first (ADR 0075, 'Draining a node with live TOON channels')"
+    )]
+    PayChannelToonFieldRemoved {
+        peer_id: String,
+        field: &'static str,
+    },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' names no 'outbound_channel': the row's whole \
+         job is to name which of this node's own x402 channels pays that hop (ADR 0075 \
+         decisions 4 and 6)"
+    )]
+    PayChannelOutboundChannelMissing { peer_id: String },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' has outbound_channel '{value}', which is \
+         neither a '0x'-prefixed 32-byte x402 channel id (EVM) nor a base58 32-byte channel \
+         account (Solana)"
+    )]
+    PayChannelInvalidOutboundChannel { peer_id: String, value: String },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' has an unusable client_edge_url '{value}': \
+         {source}. It is that hop's own 'POST /ilp' endpoint -- where 'POST /ilp/claim-state' \
+         answers where this node's vouchers on the channel stand"
+    )]
+    PayChannelInvalidClientEdgeUrl {
+        peer_id: String,
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error(
+        "'[[pay_channels]]' for peer '{peer_id}' has client_edge_url '{value}', whose scheme \
+         '{scheme}' is not one this node may ask a channel's claim state over: it must be \
+         'https://' (or 'http://' with peer_allow_plaintext_endpoints, which is a loopback and \
+         test setting). The ask carries a signed challenge -- on either chain a capability to \
+         read a channel's state -- so it is TLS-only by default. A peering's own 'wss://' \
+         endpoint is not this URL and is never turned into it by swapping scheme and appending \
+         a path (ADR 0030)"
+    )]
+    PayChannelClientEdgeUrlScheme {
+        peer_id: String,
+        value: String,
+        scheme: String,
+    },
+
+    #[error(
+        "'[[pay_channels]]' names peer '{peer_id}' twice: every forward to a hop is signed on \
+         the one outbound channel registered for it, so a second row would leave which channel \
+         paid to file order"
+    )]
+    PayChannelDuplicatePeer { peer_id: String },
+
+    #[error(
+        "channel '{value}' is named by two '[[pay_channels]]' rows: an x402 channel pays exactly \
+         one receiver, so one channel paying two hops cannot be"
+    )]
+    PayChannelDuplicate { value: String },
+}
 
 /// One `[[pay_channels]]` entry as written in the config file.
 ///
@@ -178,23 +264,26 @@ fn resolve_client_edge_url(
     written: String,
     allow_plaintext: bool,
 ) -> Result<Url, ConfigError> {
-    let url =
-        Url::parse(&written).map_err(|source| ConfigError::PayChannelInvalidClientEdgeUrl {
+    let url = Url::parse(&written).map_err(|source| {
+        ConfigError::PayChannel(PayChannelRefusal::PayChannelInvalidClientEdgeUrl {
             peer_id: peer_id.to_string(),
             value: written.clone(),
             source,
-        })?;
+        })
+    })?;
     let scheme_allowed = match url.scheme() {
         "https" => true,
         "http" => plaintext_permitted(&url, allow_plaintext),
         _ => false,
     };
     if !scheme_allowed {
-        return Err(ConfigError::PayChannelClientEdgeUrlScheme {
-            peer_id: peer_id.to_string(),
-            value: written,
-            scheme: url.scheme().to_string(),
-        });
+        return Err(ConfigError::PayChannel(
+            PayChannelRefusal::PayChannelClientEdgeUrlScheme {
+                peer_id: peer_id.to_string(),
+                value: written,
+                scheme: url.scheme().to_string(),
+            },
+        ));
     }
     Ok(url)
 }
@@ -208,21 +297,27 @@ fn resolve_pay_channel(
     // the clearest thing wrong with a file, and must never fall through to a
     // silent ignore (ADR 0009).
     if let Some(field) = raw.removed().first() {
-        return Err(ConfigError::PayChannelToonFieldRemoved {
-            peer_id: raw.peer_id,
-            field,
-        });
+        return Err(ConfigError::PayChannel(
+            PayChannelRefusal::PayChannelToonFieldRemoved {
+                peer_id: raw.peer_id,
+                field,
+            },
+        ));
     }
     let Some(written) = raw.outbound_channel else {
-        return Err(ConfigError::PayChannelOutboundChannelMissing {
-            peer_id: raw.peer_id,
-        });
+        return Err(ConfigError::PayChannel(
+            PayChannelRefusal::PayChannelOutboundChannelMissing {
+                peer_id: raw.peer_id,
+            },
+        ));
     };
     let Some(channel) = parse_x402_channel(&written) else {
-        return Err(ConfigError::PayChannelInvalidOutboundChannel {
-            peer_id: raw.peer_id,
-            value: written,
-        });
+        return Err(ConfigError::PayChannel(
+            PayChannelRefusal::PayChannelInvalidOutboundChannel {
+                peer_id: raw.peer_id,
+                value: written,
+            },
+        ));
     };
     // The rule is `peering_admission`'s, so the row's own resolver and
     // `Config::load`'s whole-set check cannot disagree about it (#1692).
@@ -268,17 +363,21 @@ pub(crate) fn resolve_pay_channels(
         // row would leave which channel paid to file order. True across
         // chains as much as within one.
         if !seen_peers.insert(entry.peer_id.clone()) {
-            return Err(ConfigError::PayChannelDuplicatePeer {
-                peer_id: entry.peer_id,
-            });
+            return Err(ConfigError::PayChannel(
+                PayChannelRefusal::PayChannelDuplicatePeer {
+                    peer_id: entry.peer_id,
+                },
+            ));
         }
         // And the mirror: one channel paying two hops is one receiver paid
         // for two peerings' traffic on one watermark, which neither hop can
         // tell apart. An x402 channel names exactly one receiver.
         if !seen_channels.insert(entry.outbound_channel.clone()) {
-            return Err(ConfigError::PayChannelDuplicate {
-                value: entry.outbound_channel,
-            });
+            return Err(ConfigError::PayChannel(
+                PayChannelRefusal::PayChannelDuplicate {
+                    value: entry.outbound_channel,
+                },
+            ));
         }
         channels.push(entry);
     }
@@ -362,7 +461,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ConfigError::PayChannelToonFieldRemoved { peer_id, field: named }
+                    ConfigError::PayChannel(PayChannelRefusal::PayChannelToonFieldRemoved { peer_id, field: named })
                         if peer_id == "relay" && *named == field
                 ),
                 "{field}: {error:?}"
@@ -385,17 +484,21 @@ mod tests {
         );
         assert!(matches!(
             resolve(&[&evm]),
-            Err(ConfigError::PayChannelToonFieldRemoved {
-                field: "channel_id",
-                ..
-            })
+            Err(ConfigError::PayChannel(
+                PayChannelRefusal::PayChannelToonFieldRemoved {
+                    field: "channel_id",
+                    ..
+                }
+            ))
         ));
         assert!(matches!(
             resolve(&[&solana]),
-            Err(ConfigError::PayChannelToonFieldRemoved {
-                field: "channel_account",
-                ..
-            })
+            Err(ConfigError::PayChannel(
+                PayChannelRefusal::PayChannelToonFieldRemoved {
+                    field: "channel_account",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -406,7 +509,7 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PayChannelOutboundChannelMissing { ref peer_id } if peer_id == "relay"
+            ConfigError::PayChannel(PayChannelRefusal::PayChannelOutboundChannelMissing { ref peer_id }) if peer_id == "relay"
         ));
     }
 
@@ -415,7 +518,12 @@ mod tests {
         for bad in ["0xnope", "not-an-account", NETWORK] {
             let error = resolve(&[&row("relay", bad)]).unwrap_err();
             assert!(
-                matches!(error, ConfigError::PayChannelInvalidOutboundChannel { .. }),
+                matches!(
+                    error,
+                    ConfigError::PayChannel(
+                        PayChannelRefusal::PayChannelInvalidOutboundChannel { .. }
+                    )
+                ),
                 "{bad}: {error:?}"
             );
         }
@@ -446,12 +554,14 @@ mod tests {
         let result = resolve(&[&row("relay", CHANNEL), &row("relay", OTHER_CHANNEL)]);
         assert!(matches!(
             result,
-            Err(ConfigError::PayChannelDuplicatePeer { ref peer_id }) if peer_id == "relay"
+            Err(ConfigError::PayChannel(PayChannelRefusal::PayChannelDuplicatePeer { ref peer_id })) if peer_id == "relay"
         ));
         let result = resolve(&[&row("relay", CHANNEL), &row("relay", ACCOUNT)]);
         assert!(matches!(
             result,
-            Err(ConfigError::PayChannelDuplicatePeer { .. })
+            Err(ConfigError::PayChannel(
+                PayChannelRefusal::PayChannelDuplicatePeer { .. }
+            ))
         ));
     }
 
@@ -460,7 +570,7 @@ mod tests {
         let result = resolve(&[&row("relay", CHANNEL), &row("store", CHANNEL)]);
         assert!(matches!(
             result,
-            Err(ConfigError::PayChannelDuplicate { ref value }) if value == CHANNEL
+            Err(ConfigError::PayChannel(PayChannelRefusal::PayChannelDuplicate { ref value })) if value == CHANNEL
         ));
     }
 
@@ -471,7 +581,7 @@ mod tests {
         let text = row("relay", CHANNEL).replace("https://relay.example", "http://127.0.0.1:3000");
         assert!(matches!(
             resolve(&[&text]),
-            Err(ConfigError::PayChannelClientEdgeUrlScheme { ref scheme, .. }) if scheme == "http"
+            Err(ConfigError::PayChannel(PayChannelRefusal::PayChannelClientEdgeUrlScheme { ref scheme, .. })) if scheme == "http"
         ));
         let channels = resolve_with(&[&text], true).expect("plaintext is opted into");
         assert_eq!(channels[0].client_edge_url().scheme(), "http");
@@ -494,7 +604,9 @@ mod tests {
             let text = row("relay", CHANNEL).replace("https://relay.example/ilp", url);
             assert!(matches!(
                 resolve(&[&text]),
-                Err(ConfigError::PayChannelClientEdgeUrlScheme { .. })
+                Err(ConfigError::PayChannel(
+                    PayChannelRefusal::PayChannelClientEdgeUrlScheme { .. }
+                ))
             ));
         }
     }
@@ -506,8 +618,11 @@ mod tests {
             assert!(
                 matches!(
                     resolve_with(&[&text], true),
-                    Err(ConfigError::PayChannelClientEdgeUrlScheme { .. })
-                        | Err(ConfigError::PayChannelInvalidClientEdgeUrl { .. })
+                    Err(ConfigError::PayChannel(
+                        PayChannelRefusal::PayChannelClientEdgeUrlScheme { .. }
+                    )) | Err(ConfigError::PayChannel(
+                        PayChannelRefusal::PayChannelInvalidClientEdgeUrl { .. }
+                    ))
                 ),
                 "{written} should be refused"
             );
