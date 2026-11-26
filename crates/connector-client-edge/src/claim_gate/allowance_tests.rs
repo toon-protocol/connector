@@ -11,7 +11,7 @@ use connector_zk_note::request::{json_proof_for, point, RequestPublic};
 use connector_zk_note::session::{sign_allowance_claim, signature_to_hex};
 use connector_zk_note::{Keypair, Scalar, SecKey};
 
-fn keypair(seed: u64) -> Keypair {
+pub(crate) fn keypair(seed: u64) -> Keypair {
     Keypair::try_from(SecKey::new(Scalar::from(seed))).expect("a keypair")
 }
 
@@ -40,7 +40,7 @@ fn edge(dir: &std::path::Path, vault: Arc<InMemoryZkNoteVault>, clock: Arc<dyn C
 }
 
 /// A zk edge over a real journal, with one allowance granted to `session`.
-async fn edge_with_allowance(
+pub(crate) async fn edge_with_allowance(
     dir: &std::path::Path,
     session: &Keypair,
 ) -> (ClientClaimGate, AllowanceId) {
@@ -86,7 +86,7 @@ async fn edge_with_allowance(
     (gate, grant.allowance_id)
 }
 
-fn claim(session: &Keypair, id: AllowanceId, amount: u64) -> String {
+pub(crate) fn claim(session: &Keypair, id: AllowanceId, amount: u64) -> String {
     let signature = signature_to_hex(&sign_allowance_claim(session, id.as_bytes(), amount));
     format!(
         r#"{{"version":"1.0","scheme":"zk-note","allowanceId":"{id}","cumulativeAmount":"{amount}","signature":"{signature}"}}"#
