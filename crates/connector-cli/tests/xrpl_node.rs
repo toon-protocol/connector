@@ -884,7 +884,7 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
 
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
     let id = channel_bytes(CHANNEL);
 
     // Paid with 300 drops on the channel: it is admitted on its first voucher.
@@ -990,7 +990,7 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
             300,
             &payer.sign_claim(&id, 300).expect("a claim"),
         ),
-        paid_prepare(ROUTE, &runtime.signer.public_key().expect("key")),
+        paid_prepare(ROUTE, &runtime.signer().public_key().expect("key")),
     )
     .await;
     Reject::decode(&answer).expect("a replay of the restored watermark is rejected");
@@ -1002,7 +1002,7 @@ async fn an_admitted_xrpl_channel_is_listed_and_survives_a_restart_at_its_waterm
             450,
             &payer.sign_claim(&id, 450).expect("a claim"),
         ),
-        paid_prepare(ROUTE, &runtime.signer.public_key().expect("key")),
+        paid_prepare(ROUTE, &runtime.signer().public_key().expect("key")),
     )
     .await;
     Fulfill::decode(&answer).expect("a later voucher advances from the restored watermark");
@@ -1036,7 +1036,7 @@ async fn a_client_pays_over_xrpl_and_recovers_its_watermark_from_the_node() {
     let config = files.config(&table(1000, &rpc.url(), key.path(), ""), &app_addr);
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
     let id = channel_bytes(CHANNEL);
     let claim = |network: Option<&str>, drops: u64| {
         let mut json: Value = serde_json::from_str(&voucher(
@@ -1190,7 +1190,7 @@ async fn a_channel_breaking_an_admission_rule_takes_no_voucher() {
     let config = files.config(&table(1000, &rpc.url(), key.path(), ""), &app_addr);
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     for channel in [&to_someone_else, &cancels] {
         let claim = voucher(
@@ -1429,7 +1429,7 @@ async fn a_node_boots_on_a_spawned_xrpld_and_serves_a_real_channel() {
             })
         })
         .expect("a channel was created");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
     let claim = voucher(
         "xrpl:1000",
         &channel,

@@ -304,7 +304,8 @@ async fn a_runtime_established_peering_can_pay_the_forward_it_accepted() {
         .with_self_description_source(Arc::new(FixedSelfDescription(document.clone())))
         // The payee's endpoint is a loopback `http://` socket.
         .with_peer_allow_plaintext_endpoints(true)
-        .with_runtime_peer_route_store(store, peers, routes)
+        .wire_peerings()
+        .replaying_runtime_peer_routes(store, peers, routes)
     };
     let outbound = outbound_channels(&anvil.rpc_url, token, state_dir.path()).await;
     let payer = boot(Arc::clone(&outbound));

@@ -406,7 +406,7 @@ client_edge_url = "http://{other_addr}/ilp"
 
     fn identity(&self) -> PublicKeyBytes {
         self.runtime()
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }
@@ -613,8 +613,7 @@ async fn a_config_declared_peering_pays_both_ways(carriage: Carriage, offset: u1
         b.restart_with(&b_config).await;
         let restored = b
             .runtime()
-            .outbound_channels
-            .as_ref()
+            .outbound_channels()
             .expect("B pays on x402")
             .signed(&b_to_a)
             .expect("B's channel is journaled");
