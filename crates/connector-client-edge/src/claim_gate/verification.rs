@@ -252,8 +252,10 @@ impl ClientClaimGate {
 
     /// Every field of a Solana channel is on chain: the signer is its
     /// `authorized_signer` (ADR 0074 decision 4), and the channel is the
-    /// account the network answered at. The scheme verifies against exactly
-    /// that.
+    /// account the network answered at -- the account the voucher names.
+    /// The scheme verifies the voucher's signature against that signer; its
+    /// channel-id check compares the voucher's account with itself here, so
+    /// it never refuses.
     async fn find_then_verify_solana(
         &self,
         network: &Network,
@@ -285,6 +287,7 @@ impl ClientClaimGate {
         };
         let verified = match verify(&SolanaVoucherDomain::payment_channels(), &recorded) {
             Ok(()) => true,
+            // Not reached: `recorded` is the account the voucher names.
             Err(VoucherRefusal::ChannelIdMismatch) => return Err(NotFound::ChannelIdMismatch),
             Err(_) => false,
         };

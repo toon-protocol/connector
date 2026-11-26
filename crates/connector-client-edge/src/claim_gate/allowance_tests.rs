@@ -44,13 +44,22 @@ pub(crate) async fn edge_with_allowance(
     dir: &std::path::Path,
     session: &Keypair,
 ) -> (ClientClaimGate, AllowanceId) {
+    let journal = Arc::new(FileJournal::open(dir.join("claims.log")).unwrap());
+    edge_with_allowance_over(dir, journal, session).await
+}
+
+/// [`edge_with_allowance`], journaling to `journal`.
+pub(crate) async fn edge_with_allowance_over(
+    dir: &std::path::Path,
+    journal: Arc<dyn Journal>,
+    session: &Keypair,
+) -> (ClientClaimGate, AllowanceId) {
     let state = keypair(500).public.into_compressed();
     let clock = Arc::new(TestClock::new(
         chrono::Utc.with_ymd_and_hms(2026, 10, 28, 0, 0, 0).unwrap(),
     ));
     let now = u64::try_from(clock.now().timestamp_millis()).unwrap();
     let vault = Arc::new(InMemoryZkNoteVault::new());
-    let journal = Arc::new(FileJournal::open(dir.join("claims.log")).unwrap());
     let gate = ClientClaimGate::restore(journal)
         .unwrap()
         .with_zk_edge(edge(dir, Arc::clone(&vault), clock))
@@ -111,13 +120,17 @@ async fn a_reject_rolls_an_allowance_claim_back_as_it_does_a_voucher() {
     gate.ingest(&claim(&session, id, 100), 100).await.unwrap();
     gate.ingest(&claim(&session, id, 200), 100).await.unwrap();
 
-    gate.roll_back(&key, 200).await.expect("rolled back");
+    gate.roll_back(&key, 200, InFlightForward::untracked())
+        .await
+        .expect("rolled back");
     assert_eq!(gate.watermark(&key), at(100));
     // The same claim is good again, for the packet that is carried.
     gate.ingest(&claim(&session, id, 200), 100)
         .await
         .expect("the rolled-back claim is good again");
-    gate.roll_back(&key, 200).await.unwrap();
+    gate.roll_back(&key, 200, InFlightForward::untracked())
+        .await
+        .unwrap();
     drop(gate);
 
     // The journal agrees, and boots: an allowance's watermark is no retired
@@ -137,7 +150,9 @@ async fn rolling_back_an_allowances_first_claim_empties_it() {
     let session = keypair(10);
     let (gate, id) = edge_with_allowance(dir.path(), &session).await;
     gate.ingest(&claim(&session, id, 100), 100).await.unwrap();
-    gate.roll_back(&id.claim_key(), 100).await.unwrap();
+    gate.roll_back(&id.claim_key(), 100, InFlightForward::untracked())
+        .await
+        .unwrap();
     assert_eq!(gate.watermark(&id.claim_key()), None);
 }
 
@@ -160,7 +175,7 @@ async fn a_lost_evidence_file_refuses_the_zk_edge_at_boot() {
     assert_eq!(error.allowance_id, id.to_string());
 }
 
-fn close(session: &Keypair, id: AllowanceId) -> AllowanceClose {
+pub(crate) fn close(session: &Keypair, id: AllowanceId) -> AllowanceClose {
     AllowanceClose {
         allowance_id: id,
         signature: connector_zk_note::session::signature_to_be_bytes(
@@ -192,8 +207,9 @@ async fn a_forward_rejected_while_the_close_waits_is_not_charged() {
     );
 
     // The next hop rejects the second packet: rolled back, then resolved.
-    gate.roll_back(&id.claim_key(), 250).await.unwrap();
-    drop(rejected);
+    gate.roll_back(&id.claim_key(), 250, rejected)
+        .await
+        .unwrap();
     assert_eq!(gate.successor(id), Ok(SuccessorStatus::Pending));
     drop(carried);
     let SuccessorStatus::Signed(successor) = gate.successor(id).unwrap() else {

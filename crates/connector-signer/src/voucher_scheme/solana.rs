@@ -13,8 +13,11 @@
 //! ```
 //!
 //! A channel is found by its account's address, so the channel the chain
-//! records is the account it answered at: a voucher naming any other is
-//! refused as [`VoucherRefusal::ChannelIdMismatch`]. `expiresAt` is always
+//! records is the account it answered at -- the account the voucher names.
+//! What binds a voucher to that channel is its signature: it signs the
+//! account, and is checked against the `authorized_signer` the chain
+//! records there. `check_channel_id` adds nothing beyond that for a channel
+//! looked up by the voucher's own account. `expiresAt` is always
 //! zero (ADR 0074 decision 3): the domain's parser refuses any other value
 //! by name, and the zero is still part of the signed bytes.
 //!
@@ -216,6 +219,13 @@ impl VoucherScheme for SolanaVoucherScheme {
             .expect("some bump of 255 derives an off-curve address")
     }
 
+    /// Whether `recorded`'s account is `channel_id`, byte for byte. A
+    /// channel account derives no id to check -- the PDA is the id -- and
+    /// the claim gate records the channel at the account the voucher names,
+    /// so there this compares that account with itself and always holds. A
+    /// voucher naming another channel fails [`verify`](VoucherScheme::verify)
+    /// on its signature instead, which signs the account, against the
+    /// signer the chain records at the account it was looked up by.
     fn check_channel_id(
         _domain: &SolanaVoucherDomain,
         channel_id: &[u8; 32],
