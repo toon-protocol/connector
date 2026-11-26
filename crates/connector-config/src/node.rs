@@ -43,6 +43,7 @@
 use serde::Deserialize;
 use url::{Host, Url};
 
+use crate::address::AddressRefusal;
 use crate::error::ConfigError;
 use crate::peer::{is_onion_endpoint, PeerCarriage, PeerExposure};
 use crate::route::is_valid_ilp_address;
@@ -111,8 +112,8 @@ pub enum NodeRefusal {
     /// A `[node]` (or a stale `[announce]`) key that died with the kind:10032
     /// announce (ADR 0046, issue #1074).
     ///
-    /// The removed-key trap [`ConfigError::PeerWireAddrRemoved`] and
-    /// [`ConfigError::PeerSaleRemoved`] already take, for the same reason: the
+    /// The removed-key trap [`ConfigError::File(ConfigFileRefusal::PeerWireAddrRemoved)`] and
+    /// [`ConfigError::File(ConfigFileRefusal::PeerSaleRemoved)`] already take, for the same reason: the
     /// devnet boxes bind-mount configs that lead the repo copies, so a stale
     /// file must stop the node **by name** rather than load with the key
     /// silently dropped (ADR 0009).
@@ -367,10 +368,10 @@ pub(crate) fn resolve_node(
     }
     for address in &raw.addresses {
         if !is_valid_ilp_address(address) {
-            return Err(ConfigError::InvalidAddress {
+            return Err(ConfigError::Address(AddressRefusal::InvalidAddress {
                 field: "node.addresses",
                 value: address.clone(),
-            });
+            }));
         }
     }
 
@@ -594,7 +595,7 @@ mod tests {
         bad.addresses = vec!["g.toon..ario".to_string()];
         assert!(matches!(
             resolve_node(Some(bad), PeerExposure::Both),
-            Err(ConfigError::InvalidAddress { field, .. }) if field == "node.addresses"
+            Err(ConfigError::Address(AddressRefusal::InvalidAddress { field, .. })) if field == "node.addresses"
         ));
     }
 
