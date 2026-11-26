@@ -26,6 +26,7 @@ use crate::peer_channel::{resolve_peer_channels, PeerChannelConfig, RawPeerChann
 use crate::peering_asset::{resolve_peering_assets, PeeringAssets};
 use crate::route::{resolve_routes, PeerRouteConfig, RawChild, RawRoute, StaticRoute};
 use crate::secret::{RawSignerConfig, SecretLocation};
+
 use crate::settlement::{
     check_settlement_rpc_routes, resolve_settlement, RawSettlementSection, SettlementConfig,
     SettlementTables,
@@ -1117,7 +1118,7 @@ mod tests {
     use super::*;
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
     use crate::route::TransportPolicy;
-    use crate::settlement::SettlementChain;
+    use crate::settlement::{SettlementChain, SettlementRefusal};
     use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
     use std::path::PathBuf;
@@ -2202,7 +2203,7 @@ key_file = "{key}"
             assert!(
                 matches!(
                     &error,
-                    ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table: named }
+                    ConfigError::Settlement(SettlementRefusal::SettlementRpcViaSocksProxyWithoutProxy { table: named })
                         if named == table
                 ),
                 "{error}"
@@ -2225,7 +2226,7 @@ key_file = "{key}"
         assert!(
             matches!(
                 error,
-                ConfigError::SettlementRpcViaSocksProxyPlaintext { ref table, .. } if table == "eip155.31337"
+                ConfigError::Settlement(SettlementRefusal::SettlementRpcViaSocksProxyPlaintext { ref table, .. }) if table == "eip155.31337"
             ),
             "{error}"
         );
@@ -4570,7 +4571,9 @@ key_file = "{}"
 
         assert!(matches!(
             result,
-            Err(ConfigError::SettlementLegacyShapeRemoved)
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementLegacyShapeRemoved
+            ))
         ));
     }
 
