@@ -2,7 +2,7 @@
 //! 2, as ADR 0075 decision 6 amends it; issue #1380), both halves, nothing
 //! faked between them: a payer covering its forwards with vouchers on its
 //! **own outbound x402 channel**, registered the way a `[[pay_channels]]`
-//! row registers it (`PeeringWiring::with_config_pay_channel`), and a payee
+//! row registers it (`PeeringWiring::admit_config_peering`), and a payee
 //! answering a real `POST /ilp` and a real `POST /ilp/claim-state` over a
 //! real socket.
 //!
@@ -50,10 +50,10 @@ use connector_config::StaticRoute;
 use connector_domain::{EnvelopeRequest, EnvelopeResponse, PacketResponse, Prepare};
 use connector_peer_http::{HttpPeerTransport, PeerRelation, ReqwestPeerClient};
 use connector_runtime::{
-    AppOutcome, Connector, FakeAppClient, FileJournal, HttpVoucherState, InMemoryJournal,
-    InMemorySettlementNetwork, InProcessPeerTransport, Journal, OutboundChannels, PeerRoute,
-    PeerTransport, SettlementChain, SettlementNetwork, SettlementNetworks, SystemClock,
-    VoucherStateSource,
+    AppOutcome, ConfigPayChannel, ConfigPeerChannel, ConfigPeering, Connector, FakeAppClient,
+    FileJournal, HttpVoucherState, InMemoryJournal, InMemorySettlementNetwork,
+    InProcessPeerTransport, Journal, OutboundChannels, PeerRoute, PeerTransport, SettlementChain,
+    SettlementNetwork, SettlementNetworks, SystemClock, VoucherStateSource,
 };
 use connector_settlement::batch::{
     BatchSettlementPayer, ChannelPresentation, EvmReceiverTerms, ReceiverTerms,
@@ -268,16 +268,24 @@ fn payer(
         Arc::new(transport) as Arc<dyn PeerTransport>,
         Arc::new(SystemClock),
     )
-    .with_config_peer_ids([NEXT_HOP.to_string()])
     .with_outbound_channels(outbound, vec![(SettlementChain::Evm, network.to_string())])
     .wire_peerings()
-    .with_config_pay_channel(
-        NEXT_HOP,
-        channel,
-        &Url::parse(&format!("http://{payee}/ilp")).expect("url"),
-        std::time::Duration::from_secs(10),
-        None,
-    )
+    .admit_config_peering(&ConfigPeering {
+        // The payee's own settlement key: the one the channel pays.
+        peer_channels: vec![ConfigPeerChannel {
+            chain: SettlementChain::Evm,
+            voucher_signer: format!("{:#x}", address_of(COUNTERPARTY_PRIVATE_KEY)),
+            inbound_channel: None,
+            network: None,
+        }],
+        pay_channels: vec![ConfigPayChannel {
+            outbound_channel: channel.to_string(),
+            client_edge_url: Url::parse(&format!("http://{payee}/ilp")).expect("url"),
+            network: None,
+        }],
+        answer_timeout: std::time::Duration::from_secs(10),
+        ..ConfigPeering::new(NEXT_HOP)
+    })
     .expect("the pay channel is this node's own journaled outbound channel")
     .finish()
 }

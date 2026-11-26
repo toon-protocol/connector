@@ -78,7 +78,11 @@ pub(crate) struct ConfiguredPeerTransport {
     allow_plaintext: bool,
 }
 
-/// The transport a validated [`Config`] describes.
+/// The transport a validated [`Config`] describes: both carriages, with the
+/// node's `socks_proxy` and plaintext opt-in, and **no peering registered**.
+/// Every peering, the config file's included, gets its carriage from
+/// `PeeringWiring::admit_config_peering` through [`PeerRegistrar`] (issue #1695),
+/// so one path decides it.
 ///
 /// It renders no claim of its own: what covers a forward -- a voucher, or
 /// the peer-role challenge -- arrives rendered from the forwarding path
@@ -88,13 +92,6 @@ pub(crate) struct ConfiguredPeerTransport {
 /// peer-routed packet falls through to the bare [`InProcessPeerTransport`]
 /// this holds: `T01 peer unreachable`, with the peer named.
 pub(crate) fn build_peer_transport(config: &Config) -> Arc<ConfiguredPeerTransport> {
-    let mut carriage = HashMap::new();
-    for peer in config.peers() {
-        if let Some(dial) = peer.dial() {
-            carriage.insert(peer.id().to_string(), dial);
-        }
-    }
-
     // ADR 0070 decision 3: the one `socks_proxy` this node dials onion
     // endpoints through, read here because here is where the carriages are
     // built and here is the only place it is needed. It is handed to the
@@ -124,13 +121,11 @@ pub(crate) fn build_peer_transport(config: &Config) -> Arc<ConfiguredPeerTranspo
         None => ReqwestPeerClient::default(),
     };
     let http = HttpPeerTransport::new(Arc::new(http_client));
-    btp.add_peers_from_config(config.peers());
-    http.add_peers_from_config(config.peers());
 
     Arc::new(ConfiguredPeerTransport {
         btp,
         http,
-        carriage: ArcSwap::from_pointee(carriage),
+        carriage: ArcSwap::from_pointee(HashMap::new()),
         unreachable: InProcessPeerTransport::new(),
         allow_plaintext: config.peer_allow_plaintext_endpoints(),
     })
@@ -164,6 +159,19 @@ impl ConfiguredPeerTransport {
 /// `connector_config::PeerCarriage` rather than restated here.
 impl PeerRegistrar for ConfiguredPeerTransport {
     fn register(&self, peer_id: &str, peering: &RuntimePeering) {
+        self.register_with_timeout(
+            peer_id,
+            peering,
+            Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS),
+        );
+    }
+
+    fn register_with_timeout(
+        &self,
+        peer_id: &str,
+        peering: &RuntimePeering,
+        answer_timeout: Duration,
+    ) {
         let (Some(endpoint), Some(carriage)) =
             (peering.endpoint_url(), peering.dial(self.allow_plaintext))
         else {
@@ -193,7 +201,6 @@ impl PeerRegistrar for ConfiguredPeerTransport {
         // channels on both chains (#1378, #1379), which reach the carriage
         // already rendered, and a row naming a `toon-channel` is refused at
         // boot.
-        let answer_timeout = Duration::from_millis(DEFAULT_PEER_TIMEOUT_MS);
         match carriage {
             PeerCarriage::Btp => self.btp.add_peer(connector_peer_btp::PeerRelation::new(
                 peer_id,
