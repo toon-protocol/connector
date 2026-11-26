@@ -31,8 +31,9 @@ use connector_settlement::batch::contract::{
     BoxFuture, ChannelTerms, OpenedChannel,
 };
 use connector_settlement::batch::{
-    BatchChannelStatus, BatchSettlementBackend, ChannelPresentation, EvmChannelConfig,
-    EvmReceiverTerms, OutboundChannelRecord, ReceiverTerms, Voucher, VoucherSigner,
+    BatchChannelStatus, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
+    EvmChannelConfig, EvmReceiverTerms, OutboundChannelRecord, ReceiverTerms, Voucher,
+    VoucherSigner,
 };
 use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
@@ -430,7 +431,10 @@ async fn a_voucher_on_each_network_is_credited_and_settled_on_that_network() {
             .await
             .expect("restored at boot to its own network's backend");
         assert_eq!(restored.status, BatchChannelStatus::Open);
-        let landed = backend
+        // The rebuilt node's watcher starts with it (spec #1689) and may land
+        // the restored voucher first: landed either way, and on its own
+        // network, which the chain read below proves.
+        let landed = match backend
             .land(
                 channel,
                 Voucher {
@@ -439,9 +443,12 @@ async fn a_voucher_on_each_network_is_credited_and_settled_on_that_network() {
                 },
             )
             .await
-            .expect("the voucher lands on its own network")
-            .state;
-        assert_eq!(landed.landed, u128::from(PRICE));
+        {
+            Ok(landing) => landing.state.landed,
+            Err(BatchSettlementError::StaleVoucher { landed, .. }) => landed,
+            Err(error) => panic!("the voucher lands on its own network: {error:?}"),
+        };
+        assert_eq!(landed, u128::from(PRICE));
         assert_eq!(
             net.x402.channel(channel).await,
             (DEPOSIT, u128::from(PRICE)),
