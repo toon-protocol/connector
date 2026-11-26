@@ -512,19 +512,13 @@ pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolDa
         "maxClaimableAmount": payout.cumulative_amount().to_string(),
     });
     match &payout.presentation {
-        ChannelPresentation::Evm { config, .. } => {
-            let address = |bytes: &[u8; 20]| format!("0x{}", hex::encode(bytes));
-            json["blockchain"] = "evm".into();
-            json["signature"] = format!("0x{}", hex::encode(&payout.voucher.signature)).into();
-            json["channelConfig"] = serde_json::json!({
-                "payer": address(&config.payer),
-                "payerAuthorizer": address(&config.payer_authorizer),
-                "receiver": address(&config.receiver),
-                "receiverAuthorizer": address(&config.receiver_authorizer),
-                "token": address(&config.token),
-                "withdrawDelay": config.withdraw_delay,
-                "salt": format!("0x{}", hex::encode(config.salt)),
-            });
+        // EVM's voucher scheme spells the voucher's own fields (spec #1685).
+        ChannelPresentation::Evm { channel, config } => {
+            for (field, value) in
+                connector_runtime::evm_voucher_fields(channel, config, &payout.voucher)
+            {
+                json[field] = value;
+            }
         }
         ChannelPresentation::Solana { .. } => {
             json["blockchain"] = "solana".into();

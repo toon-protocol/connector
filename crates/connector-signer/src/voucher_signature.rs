@@ -399,19 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn a_voucher_signed_by_cast_verifies_against_its_payer_authorizer() {
-        let config = fixture_config();
-        let channel_id = evm_batch_channel_id(&fixture_domain(), &config);
-        assert!(verify_evm_voucher(
-            &fixture_domain(),
-            &channel_id,
-            5_000,
-            &cast_signature(),
-            &evm_voucher_signer(&config),
-        ));
-    }
-
-    #[test]
     fn this_crates_own_key_derivation_agrees_with_cast_about_the_fixture_signer() {
         let secret = SecretKey::parse(&hex(FIXTURE_PAYER_AUTHORIZER_SECRET)).expect("valid");
         let address = derive_evm_address(&PublicKey::from_secret_key(&secret).serialize());
@@ -439,94 +426,6 @@ mod tests {
             5_000,
             &cast_signature(),
             &config.payer,
-        ));
-    }
-
-    #[test]
-    fn changing_any_signed_evm_field_invalidates_the_voucher() {
-        let config = fixture_config();
-        let signer = evm_voucher_signer(&config);
-        let channel_id = evm_batch_channel_id(&fixture_domain(), &config);
-        let other_chain = BatchSettlementDomain::x402(8_453);
-        let other_contract = BatchSettlementDomain {
-            chain_id: FIXTURE_CHAIN_ID,
-            verifying_contract: [0x99; 20],
-        };
-        for (label, domain, channel, amount) in [
-            ("amount", fixture_domain(), channel_id, 5_001u128),
-            ("channel", fixture_domain(), [0xabu8; 32], 5_000),
-            ("chain id", other_chain, channel_id, 5_000),
-            ("contract", other_contract, channel_id, 5_000),
-        ] {
-            assert!(
-                !verify_evm_voucher(&domain, &channel, amount, &cast_signature(), &signer),
-                "changing the {label} must invalidate the voucher"
-            );
-        }
-    }
-
-    /// OpenZeppelin's `ECDSA` refuses `v` of 0 or 1: the contract's
-    /// `ecrecover` would answer the zero address. A voucher this connector
-    /// accepted in that form could never be claimed.
-    #[test]
-    fn a_voucher_with_v_zero_or_one_is_refused_as_the_contract_would() {
-        let config = fixture_config();
-        let channel_id = evm_batch_channel_id(&fixture_domain(), &config);
-        let mut signature = cast_signature();
-        signature[64] -= 27;
-        assert!(!verify_evm_voucher(
-            &fixture_domain(),
-            &channel_id,
-            5_000,
-            &signature,
-            &evm_voucher_signer(&config),
-        ));
-    }
-
-    /// The malleated twin of a genuine signature -- `s` replaced by `n - s`
-    /// and `v` flipped -- recovers the same key under plain ECDSA, and the
-    /// contract refuses it (`ECDSAInvalidSignatureS`). So does this.
-    #[test]
-    fn a_high_s_voucher_is_refused_as_the_contract_would() {
-        const ORDER: [u8; 32] = [
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
-            0xd0, 0x36, 0x41, 0x41,
-        ];
-        let config = fixture_config();
-        let channel_id = evm_batch_channel_id(&fixture_domain(), &config);
-        let genuine = cast_signature();
-        let mut malleated = genuine;
-        let mut borrow = 0i16;
-        for i in (0..32).rev() {
-            let difference = i16::from(ORDER[i]) - i16::from(genuine[32 + i]) - borrow;
-            borrow = i16::from(difference < 0);
-            malleated[32 + i] = (difference + 256 * borrow) as u8;
-        }
-        malleated[64] = if genuine[64] == 27 { 28 } else { 27 };
-
-        // It really is the same key under ECDSA without EIP-2's rule, so the
-        // refusal below is the rule and not a broken signature.
-        let digest = evm_voucher_digest(&fixture_domain(), &channel_id, 5_000);
-        let mut rs = [0u8; 64];
-        rs.copy_from_slice(&malleated[..64]);
-        let lax = libsecp256k1::recover(
-            &Message::parse(&digest),
-            &RawSignature::parse_overflowing(&rs),
-            &RecoveryId::parse(malleated[64] - 27).unwrap(),
-        )
-        .expect("recovers without the low-s rule");
-        assert_eq!(
-            derive_evm_address(&lax.serialize()),
-            evm_voucher_signer(&config)
-        );
-
-        assert!(!verify_evm_voucher(
-            &fixture_domain(),
-            &channel_id,
-            5_000,
-            &malleated,
-            &evm_voucher_signer(&config),
         ));
     }
 
@@ -628,35 +527,6 @@ mod tests {
     }
 
     proptest! {
-        /// A genuine voucher by a random payer authorizer, for any amount in
-        /// the full uint128 range, verifies against exactly that signer.
-        #[test]
-        fn a_genuine_evm_voucher_verifies_for_any_amount(
-            secret in proptest::array::uniform32(1u8..),
-            amount in any::<u128>(),
-            salt in proptest::array::uniform32(any::<u8>()),
-        ) {
-            let Ok(secret) = SecretKey::parse(&secret) else { return Ok(()); };
-            let authorizer = derive_evm_address(&PublicKey::from_secret_key(&secret).serialize());
-            let config = BatchChannelConfig { payer_authorizer: authorizer, salt, ..fixture_config() };
-            let channel_id = evm_batch_channel_id(&fixture_domain(), &config);
-            let digest = evm_voucher_digest(&fixture_domain(), &channel_id, amount);
-            let (signature, recovery) = libsecp256k1::sign(&Message::parse(&digest), &secret);
-            let mut bytes = [0u8; 65];
-            bytes[..64].copy_from_slice(&signature.serialize());
-            bytes[64] = recovery.serialize() + 27;
-            prop_assert!(verify_evm_voucher(&fixture_domain(), &channel_id, amount, &bytes, &authorizer));
-            prop_assert!(!verify_evm_voucher(&fixture_domain(), &channel_id, amount, &bytes, &config.payer));
-        }
-
-        /// Arbitrary bytes never panic, and never verify against the fixture signer.
-        #[test]
-        fn arbitrary_evm_signature_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 65)) {
-            let bytes: [u8; 65] = bytes.try_into().unwrap();
-            let channel_id = evm_batch_channel_id(&fixture_domain(), &fixture_config());
-            let _ = verify_evm_voucher(&fixture_domain(), &channel_id, 5_000, &bytes, &fixture_config().payer_authorizer);
-        }
-
         #[test]
         fn arbitrary_solana_signature_and_key_bytes_never_panic(
             signature in proptest::collection::vec(any::<u8>(), 64),

@@ -32,6 +32,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
+use connector_settlement::ChannelId;
+use connector_signer::{BatchChannelConfig, EvmVoucherScheme, ParsedEvmVoucher, VoucherScheme};
 
 use crate::batch_channels::hex;
 use crate::connector::hex_lower;
@@ -44,16 +46,55 @@ use crate::connector::hex_lower;
 /// operators' hosts.
 pub const PEER_CHALLENGE_TTL_SECS: u64 = 60;
 
+/// The port's config as EVM's voucher scheme carries it: the same seven
+/// fields.
+fn scheme_config(config: &EvmChannelConfig) -> BatchChannelConfig {
+    BatchChannelConfig {
+        payer: config.payer,
+        payer_authorizer: config.payer_authorizer,
+        receiver: config.receiver,
+        receiver_authorizer: config.receiver_authorizer,
+        token: config.token,
+        withdraw_delay: config.withdraw_delay,
+        salt: config.salt,
+    }
+}
+
 fn config_json(config: &EvmChannelConfig) -> serde_json::Value {
-    serde_json::json!({
-        "payer": hex(&config.payer),
-        "payerAuthorizer": hex(&config.payer_authorizer),
-        "receiver": hex(&config.receiver),
-        "receiverAuthorizer": hex(&config.receiver_authorizer),
-        "token": hex(&config.token),
-        "withdrawDelay": config.withdraw_delay,
-        "salt": hex(&config.salt),
-    })
+    EvmVoucherScheme::spell_config(&scheme_config(config))
+}
+
+/// An outbound EVM voucher's own fields, spelled by EVM's voucher scheme
+/// (spec #1685): `blockchain`, `channelId`, `maxClaimableAmount`,
+/// `signature` and, always, `channelConfig` -- a receiver that restarted,
+/// or never saw the channel's first voucher, admits the channel from any of
+/// them. The envelope is the caller's.
+///
+/// `channel` and `voucher` are what this node's EVM payer produced: `0x` and
+/// 64 hex, and 65 signature bytes. Anything else is not a voucher the payer
+/// signs; it is spelled as it stands, for the receiver to refuse.
+#[must_use]
+pub fn evm_voucher_fields(
+    channel: &ChannelId,
+    config: &EvmChannelConfig,
+    voucher: &Voucher,
+) -> serde_json::Map<String, serde_json::Value> {
+    let channel_id = EvmVoucherScheme::decode_channel_id(&channel.0);
+    let signature = <[u8; 65]>::try_from(voucher.signature.as_slice()).ok();
+    let parsed = ParsedEvmVoucher {
+        channel_id: channel_id.unwrap_or_default(),
+        max_claimable_amount: voucher.cumulative_amount,
+        signature: signature.unwrap_or([0; 65]),
+        channel_config: Some(scheme_config(config)),
+    };
+    let mut fields = EvmVoucherScheme::spell(&parsed);
+    if channel_id.is_none() {
+        fields.insert("channelId".into(), channel.0.clone().into());
+    }
+    if signature.is_none() {
+        fields.insert("signature".into(), hex(&voucher.signature).into());
+    }
+    fields
 }
 
 /// A voucher on `presentation`'s channel, on `network` -- the CAIP-2 network
@@ -78,19 +119,16 @@ pub fn voucher_json(
     let amount = voucher.cumulative_amount.to_string();
     let message_id = format!("{}:{amount}", presentation.channel().0);
     match presentation {
-        ChannelPresentation::Evm { channel, config } => serde_json::json!({
-            "version": "1.0",
-            "blockchain": "evm",
-            "network": network.to_string(),
-            "scheme": "batch-settlement",
-            "messageId": message_id,
-            "timestamp": timestamp,
-            "senderId": sender_id,
-            "channelId": channel.0,
-            "maxClaimableAmount": amount,
-            "signature": hex(&voucher.signature),
-            "channelConfig": config_json(config),
-        }),
+        ChannelPresentation::Evm { channel, config } => {
+            let mut fields = evm_voucher_fields(channel, config, voucher);
+            fields.insert("version".into(), "1.0".into());
+            fields.insert("network".into(), network.to_string().into());
+            fields.insert("scheme".into(), "batch-settlement".into());
+            fields.insert("messageId".into(), message_id.into());
+            fields.insert("timestamp".into(), timestamp.into());
+            fields.insert("senderId".into(), sender_id.into());
+            serde_json::Value::Object(fields)
+        }
         ChannelPresentation::Solana { channel } => serde_json::json!({
             "version": "1.0",
             "blockchain": "solana",

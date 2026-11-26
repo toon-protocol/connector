@@ -56,52 +56,12 @@ use connector_domain::{AssetChain, JournalEntry, Network, XrplNetwork};
 use connector_runtime::{JournalError, SettlementNetwork, SettlementNetworks};
 use connector_settlement::batch::{
     BatchChannelState, BatchSettlementBackend, BatchSettlementError, ChannelPresentation,
-    EvmChannelConfig, VoucherSigner,
+    EvmChannelConfig,
 };
 use connector_settlement::ChannelId;
-use connector_signer::{BatchChannelConfig, BatchSettlementDomain};
+use connector_signer::BatchChannelConfig;
 
 use crate::channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
-
-/// An EVM batch-settlement channel this connector admits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmittedEvmVoucherChannel {
-    /// The channel's `ChannelConfig`. The gate re-hashes it and refuses a
-    /// config that does not hash to the channel the voucher names, so a
-    /// lookup that got this wrong fails closed.
-    pub config: BatchChannelConfig,
-    /// The highest cumulative amount a voucher on this channel may name and
-    /// still be claimable -- the port's current reading of the channel's
-    /// escrow, net of any pending withdrawal (ADR 0074 decision 5). `u128`
-    /// (ADR 0074 decision 3, amended 2026-09-30 #1429), matching an EVM
-    /// voucher's own width.
-    pub max_cumulative: u128,
-}
-
-/// A Solana batch-settlement channel this connector admits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmittedSolanaVoucherChannel {
-    /// The channel account's `authorized_signer`, fixed at open.
-    pub authorized_signer: [u8; 32],
-    /// As [`AdmittedEvmVoucherChannel::max_cumulative`], but `u64`: Solana's
-    /// signed message and SPL amounts stay `u64` (ADR 0074 decision 3,
-    /// amended 2026-09-30 #1429). The channel's `deposit`, which only
-    /// `top_up` moves while it is Open.
-    pub max_cumulative: u64,
-}
-
-/// An XRPL `PayChannel` this connector admits (ADR 0087 decision 9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmittedXrplVoucherChannel {
-    /// The channel's `PublicKey`, fixed at creation: 33 bytes, secp256k1
-    /// compressed or `0xED`-prefixed Ed25519. Whose signature a voucher on it
-    /// must carry.
-    pub public_key: [u8; 33],
-    /// The channel's `Amount - Balance` in drops, plus what it has already
-    /// delivered: the most a voucher may name and still be landable (ADR
-    /// 0087 decision 10). `u64`, like the ledger's own amounts.
-    pub max_cumulative: u64,
-}
 
 /// The claim gate's view of the node's settlement networks: finds a
 /// voucher's channel on the network the voucher names, and on no other.
@@ -139,92 +99,19 @@ impl VoucherChannels {
             .any(|held| held.network().chain() == chain)
     }
 
-    /// The EIP-712 domain vouchers on EVM network `network` are verified
-    /// under -- its chain id and x402's `x402BatchSettlement`, a constant of
-    /// the binary (ADR 0075) -- if this node settles on that network.
-    pub(crate) fn evm_domain_on(&self, network: &Network) -> Option<BatchSettlementDomain> {
-        let chain_id = network.eip155_chain_id()?;
-        self.settles_on(network)
-            .then(|| BatchSettlementDomain::x402(chain_id))
-    }
-
-    /// The EVM channel `channel_id` on `network`, if that network admits it.
-    /// An EVM channel is found only from its config, since the contract
-    /// stores a hash: with none -- a voucher that carried none, on a channel
-    /// the gate has no record of -- nothing is asked.
-    pub(crate) async fn evm(
+    /// The channel `presentation` names on `network`, read through that
+    /// network's receiving half, if the network admits it. `Ok(None)` for a
+    /// network this node does not settle on, and for a channel it does not
+    /// admit.
+    pub(crate) async fn find(
         &self,
         network: &Network,
-        channel_id: &[u8; 32],
-        presented_config: Option<&BatchChannelConfig>,
-    ) -> Result<Option<AdmittedEvmVoucherChannel>, ChannelResolutionError> {
-        let (Some(held), Some(config)) = (self.networks.get(network), presented_config) else {
-            return Ok(None);
-        };
-        let presentation = ChannelPresentation::Evm {
-            channel: evm_channel(channel_id),
-            config: port_config(config),
-        };
-        let state = self.state_of(held.as_ref(), presentation).await;
-        Ok(resolution(state)?.map(|state| AdmittedEvmVoucherChannel {
-            config: *config,
-            max_cumulative: state.voucher_ceiling(),
-        }))
-    }
-
-    /// The Solana channel account `channel_account` on `network`, if that
-    /// network admits it.
-    pub(crate) async fn solana(
-        &self,
-        network: &Network,
-        channel_account: &[u8; 32],
-    ) -> Result<Option<AdmittedSolanaVoucherChannel>, ChannelResolutionError> {
+        presentation: ChannelPresentation,
+    ) -> Result<Option<BatchChannelState>, ChannelResolutionError> {
         let Some(held) = self.networks.get(network) else {
             return Ok(None);
         };
-        let presentation = ChannelPresentation::Solana {
-            channel: solana_channel(channel_account),
-        };
-        let state = self.state_of(held.as_ref(), presentation).await;
-        Ok(
-            resolution(state)?.and_then(|state| match state.voucher_signer {
-                VoucherSigner::Solana(authorized_signer) => Some(AdmittedSolanaVoucherChannel {
-                    authorized_signer,
-                    max_cumulative: saturating_u64(&state),
-                }),
-                // A Solana network reporting another chain's signer is not a
-                // channel this gate can verify a voucher against.
-                VoucherSigner::Evm(_) | VoucherSigner::Xrpl(_) => None,
-            }),
-        )
-    }
-
-    /// The XRPL channel `channel_id` on `network`, if that network admits
-    /// it. A channel id binds no network (ADR 0087 decision 2), so the
-    /// voucher's own `network` is what picks the ledger read.
-    pub(crate) async fn xrpl(
-        &self,
-        network: &XrplNetwork,
-        channel_id: &[u8; 32],
-    ) -> Result<Option<AdmittedXrplVoucherChannel>, ChannelResolutionError> {
-        let Some(held) = self.networks.get(&Network::Xrpl(*network)) else {
-            return Ok(None);
-        };
-        let presentation = ChannelPresentation::Xrpl {
-            channel: xrpl_channel(channel_id),
-        };
-        let state = self.state_of(held.as_ref(), presentation).await;
-        Ok(
-            resolution(state)?.and_then(|state| match state.voucher_signer {
-                VoucherSigner::Xrpl(public_key) => Some(AdmittedXrplVoucherChannel {
-                    public_key,
-                    max_cumulative: saturating_u64(&state),
-                }),
-                // An XRPL network reporting another chain's signer is not a
-                // channel this gate can verify a voucher against.
-                VoucherSigner::Evm(_) | VoucherSigner::Solana(_) => None,
-            }),
-        )
+        resolution(self.state_of(held.as_ref(), presentation).await)
     }
 
     /// The channel's state now, for a voucher the gate is about to accept:
@@ -308,33 +195,23 @@ fn resolution(
     }
 }
 
-/// The port's voucher ceiling in a `u64` chain's amounts: Solana's signed
-/// message and SPL amounts (ADR 0074 decision 3, amended 2026-09-30 #1429),
-/// XRPL's drops (ADR 0087 decision 2). A ceiling wider than any `u64` bounds
-/// nothing a voucher there can name, so it saturates: clamping a bound down
-/// loses no value, where a voucher amount narrowed must never be truncated.
-/// EVM's ceiling is `u128` and never narrows.
-fn saturating_u64(state: &BatchChannelState) -> u64 {
-    u64::try_from(state.voucher_ceiling()).unwrap_or(u64::MAX)
-}
-
 /// An XRPL channel id as the port spells it: 64 lowercase hex, no prefix.
-fn xrpl_channel(channel_id: &[u8; 32]) -> ChannelId {
+pub(crate) fn xrpl_channel(channel_id: &[u8; 32]) -> ChannelId {
     ChannelId(hex::encode(channel_id))
 }
 
 /// An EVM channel id as the port spells it: `0x` and 64 lowercase hex.
-fn evm_channel(channel_id: &[u8; 32]) -> ChannelId {
+pub(crate) fn evm_channel(channel_id: &[u8; 32]) -> ChannelId {
     ChannelId(format!("0x{}", hex::encode(channel_id)))
 }
 
 /// A Solana channel account as the port spells it: base58.
-fn solana_channel(channel_account: &[u8; 32]) -> ChannelId {
+pub(crate) fn solana_channel(channel_account: &[u8; 32]) -> ChannelId {
     ChannelId(bs58::encode(channel_account).into_string())
 }
 
 /// The gate's config as the port carries it: the same seven fields.
-fn port_config(config: &BatchChannelConfig) -> EvmChannelConfig {
+pub(crate) fn port_config(config: &BatchChannelConfig) -> EvmChannelConfig {
     EvmChannelConfig {
         payer: config.payer,
         payer_authorizer: config.payer_authorizer,
@@ -559,7 +436,7 @@ pub fn first_toon_channel_entry(entries: &[JournalEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use connector_settlement::batch::{AdmissionRefusal, BatchChannelStatus};
+    use connector_settlement::batch::{AdmissionRefusal, BatchChannelStatus, VoucherSigner};
 
     fn state(status: BatchChannelStatus, landed: u128, collateral: u128) -> BatchChannelState {
         BatchChannelState {
@@ -578,16 +455,7 @@ mod tests {
                 .expect("found")
                 .expect("some");
             assert_eq!(found.voucher_ceiling(), 1_000);
-            assert_eq!(saturating_u64(&found), 1_000);
         }
-    }
-
-    /// Solana's and XRPL's amounts are `u64`: a wider ceiling saturates
-    /// rather than wraps.
-    #[test]
-    fn a_u64_chains_ceiling_wider_than_u64_saturates_rather_than_wraps() {
-        let wide = state(BatchChannelStatus::Open, u128::from(u64::MAX), 5);
-        assert_eq!(saturating_u64(&wide), u64::MAX);
     }
 
     /// ADR 0074 decision 5: no voucher is accepted once a channel is

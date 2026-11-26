@@ -59,14 +59,10 @@ use connector_domain::client_claim::{
     declared_scheme, parse_evm_channel_config, DeclaredScheme, SCHEME_BATCH_SETTLEMENT,
 };
 use connector_domain::{AssetChain, Network};
-use connector_signer::{
-    evm_voucher_signer, verify_evm_voucher_claim_state_challenge,
-    verify_solana_voucher_claim_state_challenge, verify_xrpl_voucher_claim_state_challenge,
-    BatchChannelConfig,
-};
+use connector_signer::{EvmVoucherScheme, VoucherScheme};
 
 use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
-use crate::claim_gate::decode_evm_channel_config;
+use crate::claim_gate::{NotFound, Proof};
 use crate::{hex_encode, now_unix, ClientEdgeState};
 
 /// The wire response for a channel entry stays the single generic
@@ -128,7 +124,7 @@ enum ChannelProofRequest {
         #[serde(default)]
         network: Option<String>,
         /// A batch-settlement channel's `ChannelConfig`, for a channel this
-        /// node has no record of yet; see [`resolve_evm_voucher`].
+        /// node has no record of yet; see [`answer`].
         /// Parsed by `connector_domain`'s own `channelConfig` parser, the
         /// one a voucher's goes through.
         #[serde(default)]
@@ -431,7 +427,7 @@ async fn resolve_evm_on(
         log_outcome("evm", &channel_id_text, "malformed_channel_id");
         return unverified("evm", channel_id_text, "unverified");
     };
-    let Some(signature) = decode_hex_bytes::<65>(&signature_text) else {
+    let Some(signature) = EvmVoucherScheme::decode_signature(&signature_text) else {
         log_outcome("evm", &channel_id_text, "malformed_signature");
         return unverified("evm", channel_id_text, "unverified");
     };
@@ -441,7 +437,7 @@ async fn resolve_evm_on(
         .filter(|config| !config.is_null())
         .map(|config| {
             let config = parse_evm_channel_config(&config).ok()?;
-            decode_evm_channel_config(&config).ok()
+            EvmVoucherScheme::decode_config(&config).ok()
         });
     let presented = match presented {
         Some(None) => {
@@ -451,17 +447,21 @@ async fn resolve_evm_on(
         Some(Some(config)) => Some(config),
         None => None,
     };
-    resolve_evm_voucher(
+    let proof = Proof::EvmChallenge {
+        channel_id,
+        channel_config: presented,
+        expires,
+        signature: signature.to_vec(),
+    };
+    let reported = format!("0x{}", hex_encode(&channel_id));
+    answer(
         state,
         network,
+        "evm",
         channel_id_text,
-        channel_id,
-        VoucherProof {
-            expires,
-            signature: &signature,
-            requester: &requester,
-        },
-        presented,
+        reported,
+        &proof,
+        &requester,
     )
     .await
 }
@@ -530,16 +530,20 @@ async fn resolve_solana_on(
     };
 
     let requester = format!("claim-state-challenge:{signature_text}");
-    resolve_solana_voucher(
+    let proof = Proof::SolanaChallenge {
+        channel_account,
+        expires,
+        signature,
+    };
+    let reported = channel_account_text.clone();
+    answer(
         state,
         network,
+        "solana",
         channel_account_text,
-        channel_account,
-        VoucherProof {
-            expires,
-            signature: &signature,
-            requester: &requester,
-        },
+        reported,
+        &proof,
+        &requester,
     )
     .await
 }
@@ -601,150 +605,75 @@ async fn resolve_xrpl_on(
         return unverified("xrpl", channel_id_text, "unverified");
     };
     let requester = format!("claim-state-challenge:{signature_text}");
-    let channel = match state
+    let proof = Proof::XrplChallenge {
+        channel_id,
+        expires,
+        signature,
+    };
+    let reported = hex_encode(&channel_id);
+    answer(
+        state,
+        network,
+        "xrpl",
+        channel_id_text,
+        reported,
+        &proof,
+        &requester,
+    )
+    .await
+}
+
+/// A batch-settlement entry whose challenge has decoded, answered
+/// (issue #1364): the channel is found and the challenge verified by the
+/// gate's one "find the channel, then verify" function, against the
+/// channel's **voucher signer** as its chain records it -- EVM's verified
+/// `ChannelConfig`'s `payerAuthorizer` (else `payer`), Solana's
+/// `authorized_signer`, XRPL's `PublicKey` -- never against anything in the
+/// request.
+///
+/// On EVM the chain stores the channel by id alone, so the config comes
+/// from this node's record of the channel -- every channel it has accepted
+/// a voucher on, journaled -- or, for one it has not, from the entry's own
+/// `channelConfig`. Either way it must hash to `channelId`. A client that
+/// lost its store therefore needs only the channel id and its signing key
+/// for any channel it has paid on.
+async fn answer(
+    state: &ClientEdgeState,
+    network: &Network,
+    blockchain: &'static str,
+    channel_id_text: String,
+    reported: String,
+    proof: &Proof,
+    requester: &str,
+) -> ChannelStateResult {
+    match state
         .claim_gate
-        .xrpl_voucher_channel(network, &channel_id, &requester)
+        .find_then_verify(network, proof, requester)
         .await
     {
-        Ok(Some(channel)) => channel,
-        Ok(None) => {
-            log_outcome("xrpl", &channel_id_text, "channel_unknown");
-            return unverified("xrpl", channel_id_text, "unverified");
+        Ok(found) if found.verified => {
+            log_outcome(blockchain, &channel_id_text, "verified");
+            verified_voucher_state(
+                blockchain,
+                reported,
+                state,
+                &found.channel.channel_key(),
+                found.max_cumulative,
+            )
         }
-        Err(error) => {
-            log_lookup_error("xrpl", &channel_id_text, &error);
-            return unverified("xrpl", channel_id_text, "unverified");
+        Ok(_) => {
+            log_outcome(blockchain, &channel_id_text, "signature_invalid");
+            unverified(blockchain, channel_id_text, "unverified")
         }
-    };
-    if !verify_xrpl_voucher_claim_state_challenge(
-        &channel.public_key,
-        &network.to_string(),
-        &channel_id,
-        expires,
-        &signature,
-    ) {
-        log_outcome("xrpl", &channel_id_text, "signature_invalid");
-        return unverified("xrpl", channel_id_text, "unverified");
+        Err(NotFound::Unresolved(error)) => {
+            log_lookup_error(blockchain, &channel_id_text, &error);
+            unverified(blockchain, channel_id_text, "unverified")
+        }
+        Err(NotFound::Unknown | NotFound::ChannelIdMismatch) => {
+            log_outcome(blockchain, &channel_id_text, "channel_unknown");
+            unverified(blockchain, channel_id_text, "unverified")
+        }
     }
-    log_outcome("xrpl", &channel_id_text, "verified");
-    let channel_id_hex = hex_encode(&channel_id);
-    let channel_key = format!("xrpl:{channel_id_hex}");
-    verified_voucher_state(
-        "xrpl",
-        channel_id_hex,
-        state,
-        &channel_key,
-        u128::from(channel.max_cumulative),
-    )
-}
-
-/// A batch-settlement entry's already-decoded proof.
-struct VoucherProof<'a> {
-    expires: u64,
-    signature: &'a [u8],
-    requester: &'a str,
-}
-
-/// An EVM entry under `scheme: "batch-settlement"` (issue #1364): an x402
-/// channel this node receives vouchers on, proved by its **voucher signer**
-/// -- the verified `ChannelConfig`'s `payerAuthorizer`, else `payer` (ADR
-/// 0074 decision 4) -- over the claim-state challenge under
-/// `x402BatchSettlement`'s domain.
-///
-/// The chain stores the channel by id alone, so the config comes from this
-/// node's record of the channel -- every channel it has accepted a voucher
-/// on, journaled -- or, for one it has not, from the entry's own
-/// `channelConfig`. Either way it must hash to `channelId`, and the signer
-/// is read from what the backend admitted, never from the request. A client
-/// that lost its store therefore needs only the channel id and its signing
-/// key for any channel it has paid on.
-async fn resolve_evm_voucher(
-    state: &ClientEdgeState,
-    network: &Network,
-    channel_id_text: String,
-    channel_id: [u8; 32],
-    proof: VoucherProof<'_>,
-    presented: Option<BatchChannelConfig>,
-) -> ChannelStateResult {
-    let lookup = state
-        .claim_gate
-        .evm_voucher_channel(network, &channel_id, presented, proof.requester)
-        .await;
-    let (domain, channel) = match lookup {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            log_outcome("evm", &channel_id_text, "channel_unknown");
-            return unverified("evm", channel_id_text, "unverified");
-        }
-        Err(error) => {
-            log_lookup_error("evm", &channel_id_text, &error);
-            return unverified("evm", channel_id_text, "unverified");
-        }
-    };
-    if !verify_evm_voucher_claim_state_challenge(
-        &domain,
-        &channel_id,
-        proof.expires,
-        proof.signature,
-        &evm_voucher_signer(&channel.config),
-    ) {
-        log_outcome("evm", &channel_id_text, "signature_invalid");
-        return unverified("evm", channel_id_text, "unverified");
-    }
-    log_outcome("evm", &channel_id_text, "verified");
-    let channel_id_hex = format!("0x{}", hex_encode(&channel_id));
-    let channel_key = format!("evm:{channel_id_hex}");
-    verified_voucher_state(
-        "evm",
-        channel_id_hex,
-        state,
-        &channel_key,
-        channel.max_cumulative,
-    )
-}
-
-/// A Solana entry under `scheme: "batch-settlement"` (issue #1364), proved
-/// by the channel account's `authorized_signer`, read from the chain.
-async fn resolve_solana_voucher(
-    state: &ClientEdgeState,
-    network: &Network,
-    channel_account_text: String,
-    channel_account: [u8; 32],
-    proof: VoucherProof<'_>,
-) -> ChannelStateResult {
-    let lookup = state
-        .claim_gate
-        .solana_voucher_channel(network, &channel_account, proof.requester)
-        .await;
-    let channel = match lookup {
-        Ok(Some(channel)) => channel,
-        Ok(None) => {
-            log_outcome("solana", &channel_account_text, "channel_unknown");
-            return unverified("solana", channel_account_text, "unverified");
-        }
-        Err(error) => {
-            log_lookup_error("solana", &channel_account_text, &error);
-            return unverified("solana", channel_account_text, "unverified");
-        }
-    };
-    if !verify_solana_voucher_claim_state_challenge(
-        &channel_account,
-        proof.expires,
-        proof.signature,
-        &channel.authorized_signer,
-    ) {
-        log_outcome("solana", &channel_account_text, "signature_invalid");
-        return unverified("solana", channel_account_text, "unverified");
-    }
-    log_outcome("solana", &channel_account_text, "verified");
-    let channel_key = format!("solana:{channel_account_text}");
-    verified_voucher_state(
-        "solana",
-        channel_account_text,
-        state,
-        &channel_key,
-        u128::from(channel.max_cumulative),
-    )
 }
 
 /// A verified voucher channel's figures (issue #1364).
