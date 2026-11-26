@@ -813,11 +813,7 @@ async fn the_ack_carries_each_vouchers_verdict(a: &Node, b: &Node, b_to_a: &str)
     let as_json = |voucher: &Voucher| {
         connector_runtime::voucher_json(
             &presentation,
-            &b.runtime
-                .batch_settlement_solana
-                .as_ref()
-                .expect("B settles on Solana")
-                .caip2_network()
+            &support::solana_network(&b.runtime)
                 .parse()
                 .expect("a CAIP-2 network"),
             voucher,
