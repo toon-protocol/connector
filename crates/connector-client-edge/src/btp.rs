@@ -1,9 +1,11 @@
 //! The client BTP websocket carriage (client-edge-spec.md §1.9, ADR 0026):
 //! one persistent, ordered websocket session carrying BTP-framed ILP packets
-//! and claims through exactly the pipeline `handle_ilp` runs per request --
-//! the same `ClientClaimGate` instance, the same watermarks and journal, the
-//! same refusal taxonomy (`claim_rejection_reject`), the same
-//! `Connector::handle_prepare`.
+//! and claims through the one admission pipeline `handle_ilp` also calls
+//! ([`crate::paid_packet`], #1720) -- the same `ClientClaimGate` instance,
+//! the same watermarks and journal, the same refusal taxonomy
+//! (`claim_rejection_reject`), the same `Connector::handle_prepare`. The
+//! order of its calls is fixed by the paid packet's types, not by this
+//! module; what is this module's is only BTP framing.
 //!
 //! This module is the client edge's *policy* on a BTP session. The frame
 //! grammar itself is not here: it lives in [`connector_btp`], transport- and
@@ -56,8 +58,8 @@ use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
 use connector_settlement::batch::ChannelPresentation;
 
-use crate::claim_gate::{DurabilityTicket, InFlightForward};
 use crate::outbound_ledger::PayoutVoucher;
+use crate::paid_packet::{self, AdmittedPacket};
 use crate::peer::BtpClaimVerdict;
 use crate::{claim_rejection_reject, x402_terms_body, ClaimIngestRejection, ClientEdgeState};
 
@@ -255,10 +257,9 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
         .expect("the session window semaphore is never closed")
 }
 
-/// A claim's batch just cleared durability: mark its channel recognized,
-/// making the sender eligible to probe (issue #548), and note the
-/// claim-state endpoint's liveness timestamp (issue #693), same as
-/// `handle_ilp`'s HTTP carriage. Shared by both places a BTP claim can
+/// A claim's batch just cleared durability, and the paid packet's handle
+/// has recorded it (its channel recognised, its time noted): what is left
+/// is this carriage's own step. Shared by both places a BTP claim can
 /// finish durable -- a standalone claim message and a claim riding a
 /// packet -- so the two stay in lockstep.
 ///
@@ -277,17 +278,12 @@ async fn window_slot(window: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 /// client that dropped before its delivery landed -- becomes deliverable to
 /// this one, so it is resent here, exactly as a `channelChallenge` at auth
 /// resends it ([`spawn_stranded_claim_resend`]).
-fn record_accepted_claim(
+fn record_session_payee(
     state: &Arc<ClientEdgeState>,
     claim: &ClientEdgeClaim,
     session: Option<&(String, u64)>,
 ) {
     let channel_key = claim.claim_key();
-    state.connector.recognize_channel(&channel_key);
-    state
-        .claim_gate
-        .note_claim_time(&channel_key, crate::now_unix());
-
     if let (Some((address, generation)), Some(payee)) =
         (session, state.claim_gate.voucher_signer(&channel_key))
     {
@@ -390,7 +386,7 @@ fn auth_channel_challenge(auth_data: &[u8]) -> Option<PeerRoleChallenge> {
 /// chain** (EVM `payerAuthorizer`, Solana `authorized_signer`), and the
 /// signature must recover to it -- so the payee taught is that signer, the
 /// same key an accepted voucher on the channel teaches
-/// (`record_accepted_claim`), and never anything the challenge itself
+/// (`record_session_payee`), and never anything the challenge itself
 /// declares. Its `expires` must still be ahead and no further than
 /// [`connector_peer_btp::role_gate::MAX_PEER_CHALLENGE_LIFETIME_SECS`]:
 /// within it a challenge is a bearer proof, so it is kept short.
@@ -695,20 +691,20 @@ async fn handle_frame(
     // here is logged, not framed: there is no response to carry it. The
     // admission is inline (in claim order, like every claim); only the
     // durability wait rides a windowed task, and a claim whose batch fails
-    // is likewise only logged.
+    // is likewise only logged. It pays for no packet, so its handle is
+    // finished as accepted at once: nothing after admission undoes it.
     if frame.ilp_packet.is_empty() {
         if let Some(json) = claim_json {
-            match state.claim_gate.admit(&json, 0, &SessionRole::Client).await {
-                // A standalone claim carries no packet, so nothing is in
-                // flight on it.
-                Ok((claim, durability, _resolved)) => {
+            match paid_packet::admit_session_claim(state, &json).await {
+                Ok(admitted) => {
+                    let accepted = admitted.accepted();
                     let permit = window_slot(window).await;
                     let state = Arc::clone(state);
                     let session = binding.clone();
                     tokio::spawn(async move {
                         let _slot = permit;
-                        match durability.durable().await {
-                            Ok(()) => record_accepted_claim(&state, &claim, session.as_ref()),
+                        match accepted.await {
+                            Ok(claim) => record_session_payee(&state, &claim, session.as_ref()),
                             Err(rejection) => tracing::debug!(
                                 rejection = %rejection.message(),
                                 "standalone BTP claim accepted but not durably recorded"
@@ -883,57 +879,49 @@ async fn handle_frame(
         }
     }
 
-    // §1.3, verbatim: the same gate, watermarks and refusal taxonomy as
-    // `handle_ilp`. Admission -- the only order-sensitive step -- happens
-    // here, inline; a refusal answers immediately, and an acceptance
-    // carries its durability ticket into the windowed task below.
-    //
-    // Issue #869: mirrors `handle_ilp`'s own check, so the two carriages
-    // cannot drift on this invariant (§9) -- a packet whose envelope will
-    // be refused for its own target shape (`AppOutcome::Refused`, F00) is
-    // never going to reach the app, however good the claim covering it
-    // is, so that claim is left entirely unadmitted rather than spent on
-    // a packet already known to be going nowhere. `finish_frame` below
-    // still routes `prepare` unchanged and raises the identical F00
-    // itself.
-    let admitted = match claim_json {
-        Some(json) if !crate::claim_must_not_be_admitted(state, &prepare) => {
-            match state
-                .claim_gate
-                .admit(&json, charge, &SessionRole::Client)
-                .await
-            {
-                Ok(accepted) => Some(accepted),
-                Err(rejection) => {
-                    return reply(
-                        replies,
-                        reject_response(
-                            frame.request_id,
-                            claim_rejection_reject(rejection, charge),
-                            Vec::new(),
-                        ),
-                    )
-                    .await;
-                }
-            }
+    // §1.3, verbatim: the shared pipeline's admission (#1720), with the
+    // same gate, watermarks and refusal taxonomy as `handle_ilp`.
+    // Admission -- the only order-sensitive step -- happens here, inline; a
+    // refusal answers immediately, and an acceptance's handle goes into the
+    // windowed task below. A claim on a packet already known to be going
+    // nowhere (issue #869, #1446) is left unadmitted by the pipeline itself.
+    let admitted = match paid_packet::admit(
+        state,
+        &prepare,
+        claim_json.map(|json| move || Ok(json)),
+        charge,
+        &SessionRole::Client,
+    )
+    .await
+    {
+        Ok(admitted) => admitted,
+        Err(rejection) => {
+            return reply(
+                replies,
+                reject_response(
+                    frame.request_id,
+                    claim_rejection_reject(rejection, charge),
+                    Vec::new(),
+                ),
+            )
+            .await;
         }
-        _ => None,
     };
 
     // Issue #1012: decided here, off the one route lookup above, because
-    // `finish_frame` runs detached from it -- the same fact `handle_ilp`
+    // the packet is carried detached from it -- the same fact `handle_ilp`
     // reads inline on the HTTP carriage, through the same helper.
-    let is_forwarded_route = crate::is_forwarded_route(client_route);
+    let packet = paid_packet::Packet {
+        prepare,
+        charge,
+        forwarded: crate::is_forwarded_route(client_route),
+    };
     let session = binding.clone();
     let permit = window_slot(window).await;
     let task = finish_frame(
         Arc::clone(state),
         admitted,
-        MatchedRoute {
-            prepare,
-            charge,
-            is_forwarded_route,
-        },
+        packet,
         frame.request_id,
         replies.clone(),
         session,
@@ -945,97 +933,39 @@ async fn handle_frame(
     Ok(())
 }
 
-/// [`finish_frame`]'s own `prepare` plus the two facts about its matched
-/// route (issue #701, ADR 0028) that finishing it needs -- bundled so
-/// `finish_frame` stays under clippy's argument-count lint rather than
-/// growing a ninth loose parameter for issue #1012.
-struct MatchedRoute {
-    prepare: Prepare,
-    /// What this connector charges for **this** packet: the route's schedule
-    /// evaluated at its own payload length (ADR 0065), which for a flat route
-    /// is the flat price it always was.
-    charge: u64,
-    /// Whether `prepare`'s destination matched a *forwarded* route --
-    /// see [`roll_back_uncarried_forward`](crate::roll_back_uncarried_forward)'s
-    /// own doc for why `finish_frame` needs to know.
-    is_forwarded_route: bool,
-}
-
 /// A judged frame's remaining, order-insensitive work (issue #688), run
-/// under one in-flight-window slot: wait for the claim's batch fsync
-/// (durable-before-service, exactly `ingest`'s own contract -- the
-/// downstream is never asked to do work whose payment a restart could
-/// forget), then route the packet and queue the RESPONSE. A claim whose
-/// batch could not be made durable answers the same `NotDurable` REJECT
-/// the HTTP carriage sends, and its packet is never routed.
+/// under one in-flight-window slot and detached from the session, so a
+/// closed socket cancels nothing: the shared pipeline's second half
+/// ([`paid_packet::carry_admitted`]) waits for the claim's batch fsync
+/// (ADR 0005, durable before service), records the claim, learns who this
+/// session is paid as, routes the packet and charges it by its outcome.
+/// Then the RESPONSE is queued, with nowhere to go if the client has left.
+/// A claim whose batch could not be made durable answers the same
+/// `NotDurable` REJECT the HTTP carriage sends, and its packet is never
+/// routed.
 async fn finish_frame(
     state: Arc<ClientEdgeState>,
-    admitted: Option<(ClientEdgeClaim, DurabilityTicket, InFlightForward)>,
-    matched: MatchedRoute,
+    admitted: Option<AdmittedPacket>,
+    packet: paid_packet::Packet,
     request_id: u32,
     replies: mpsc::Sender<Vec<u8>>,
     session: Option<(String, u64)>,
 ) {
-    let MatchedRoute {
-        prepare,
-        charge,
-        is_forwarded_route,
-    } = matched;
-    // Issue #535/ADR 0036: the channel a covering claim admitted this
-    // packet on, read before `admitted` is consumed below, so it can ride
-    // into the `"packet"` span the same way the HTTP carriage's `handle_ilp`
-    // threads its own `admitted.channel_key` through.
-    let client_channel_id = admitted.as_ref().map(|(claim, _, _)| claim.claim_key());
-    // Issue #1012: the watermark this claim advanced its channel to, kept
-    // for the same reason `handle_ilp`'s HTTP carriage keeps it -- so a
-    // forwarded route whose next hop terminally rejects can roll back
-    // exactly this claim.
-    let admitted_claim_watermark = admitted
-        .as_ref()
-        .map(|(claim, _, _)| crate::AdmittedWatermark::of(claim));
-    // ADR 0080 decision 4: held until the packet has resolved and any
-    // uncarried forward been rolled back, as `handle_ilp` holds it.
-    let mut in_flight = None;
-
-    if let Some((claim, durability, forward)) = admitted {
-        in_flight = Some(forward);
-        match durability.durable().await {
-            // A claim that cleared the gate makes the sender eligible to
-            // probe and notes the claim-state endpoint's liveness
-            // timestamp -- see `record_accepted_claim`.
-            Ok(()) => record_accepted_claim(&state, &claim, session.as_ref()),
-            Err(rejection) => {
-                let _ = reply(
-                    &replies,
-                    reject_response(
-                        request_id,
-                        claim_rejection_reject(rejection, charge),
-                        Vec::new(),
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-    }
-
-    // Issue #736: the same fourth routing arm `handle_ilp`'s HTTP carriage
-    // uses -- a configured route first, then whatever client session
-    // `state.session_registry` has bound to this destination.
-    let packet_response =
-        crate::session_route::route_prepare(&state, prepare, client_channel_id.as_deref()).await;
-    crate::roll_back_uncarried_forward(
-        &state,
-        is_forwarded_route,
-        client_channel_id.as_deref(),
-        admitted_claim_watermark,
-        &packet_response,
-    )
+    let charge = packet.charge;
+    let carried = paid_packet::carry_admitted(&state, packet, admitted, |claim| {
+        record_session_payee(&state, claim, session.as_ref());
+    })
     .await;
-    drop(in_flight);
-    let response = match packet_response {
-        PacketResponse::Fulfill(fulfill) => encode_response(request_id, &[], &fulfill.encode()),
-        PacketResponse::Reject(reject) => reject_response(request_id, reject, Vec::new()),
+    let response = match carried {
+        Ok(carried) => match carried.response {
+            PacketResponse::Fulfill(fulfill) => encode_response(request_id, &[], &fulfill.encode()),
+            PacketResponse::Reject(reject) => reject_response(request_id, reject, Vec::new()),
+        },
+        Err(rejection) => reject_response(
+            request_id,
+            claim_rejection_reject(rejection, charge),
+            Vec::new(),
+        ),
     };
     let _ = reply(&replies, response).await;
 }

@@ -102,6 +102,7 @@ mod verification;
 pub(crate) use verification::{NotFound, Proof};
 
 mod allowance;
+pub(crate) mod paid_packet;
 /// A zk edge with one allowance granted, for tests outside the gate that
 /// drive an allowance claim through a carriage (#1719).
 #[cfg(test)]
@@ -838,14 +839,13 @@ impl ClientClaimGate {
     }
 
     /// Record that a claim on `channel_key` was just accepted, at
-    /// `now_unix`. Deliberately a separate call a caller makes *after*
-    /// [`Self::ingest`] has already returned success, never something
-    /// `ingest`/`admit` do themselves -- see [`Self::last_claim_seen`]'s
-    /// doc. Every carrier that calls `ingest` (`POST /ilp`, `POST
-    /// /ilp/probe`, the BTP session) calls this right after, so the
-    /// claim-state endpoint's liveness signal covers every carrier a claim
-    /// can arrive on.
-    pub fn note_claim_time(&self, channel_key: &str, now_unix: u64) {
+    /// `now_unix`. Deliberately a separate step taken *after* the claim's
+    /// acceptance is durable, never something `admit` does itself -- see
+    /// [`Self::last_claim_seen`]'s doc. The paid packet's handle takes it
+    /// ([`paid_packet`]) for every client carrier a claim can arrive on
+    /// (`POST /ilp`, `POST /ilp/probe`, the BTP session), so the claim-state
+    /// endpoint's liveness signal covers them all.
+    fn note_claim_time(&self, channel_key: &str, now_unix: u64) {
         self.last_claim_seen
             .write()
             .expect("last claim time lock poisoned")
@@ -890,20 +890,24 @@ impl ClientClaimGate {
     /// (see [`GroupCommitter`]), so this connector still never renders
     /// service against a watermark a restart would forget, and a refused
     /// claim is still resubmittable unchanged.
+    ///
+    /// It is admission to the paid packet's handle, finished at once as
+    /// accepted ([`paid_packet::AdmittedPacket::accepted`]): the claim pays
+    /// for no packet here, so nothing is ever rolled back.
     pub async fn ingest(
         &self,
         claim_json: &str,
         price: u64,
     ) -> Result<ClientEdgeClaim, ClaimIngestRejection> {
-        let (claim, _resolved) = self.ingest_forward(claim_json, price).await?;
-        Ok(claim)
+        paid_packet::ingest(self, claim_json, price).await
     }
 
     /// [`Self::ingest`], for a caller about to route the packet the claim
-    /// pays for: the claim, and the [`InFlightForward`] the caller holds
-    /// until that packet has resolved -- past any rollback of an uncarried
-    /// forward (ADR 0080 decision 4, #1523). An allowance cannot be charged
-    /// while one of its forwards is in flight; a voucher's is inert.
+    /// pays for outside the client edge's carriages: the claim, and the
+    /// [`InFlightForward`] the caller holds until that packet has resolved
+    /// (ADR 0080 decision 4, #1523). An allowance cannot be charged while
+    /// one of its forwards is in flight; a voucher's is inert. The carriages
+    /// hold theirs inside the paid packet's handle ([`paid_packet`]).
     pub async fn ingest_forward(
         &self,
         claim_json: &str,
@@ -936,10 +940,9 @@ impl ClientClaimGate {
     /// it, and nowhere else. The one such refusal today is a `mina` claim's
     /// (ADR 0089 decision 4).
     ///
-    /// A carriage does not call this directly: [`crate::paid_packet::admit`]
-    /// wraps the tuple in the paid packet's handle. The BTP carriage still
-    /// does, until it moves onto the shared pipeline (#1720).
-    pub(crate) async fn admit(
+    /// Private to the gate: [`paid_packet`] wraps the tuple in the paid
+    /// packet's handle, which every carriage admits through (#1720).
+    async fn admit(
         &self,
         claim_json: &str,
         price: u64,
@@ -953,6 +956,16 @@ impl ClientClaimGate {
                 other => ClaimIngestRejection::Malformed(other.to_string()),
             },
         )?;
+        self.admit_claim(claim, price).await
+    }
+
+    /// [`Self::admit`], for a claim already parsed: a peer's voucher arrives
+    /// decoded by its carriage (#1378).
+    async fn admit_claim(
+        &self,
+        claim: ClientEdgeClaim,
+        price: u64,
+    ) -> Result<(ClientEdgeClaim, DurabilityTicket, InFlightForward), ClaimIngestRejection> {
         match claim {
             ClientEdgeClaim::Voucher(claim) => {
                 let (claim, ticket) = self.admit_voucher(*claim, price).await?;
@@ -1050,7 +1063,7 @@ impl ClientClaimGate {
     /// * **The signer** comes from the backend's verified channel, never from
     ///   the voucher; on EVM the gate re-hashes that channel's config and
     ///   refuses one that is not the channel the voucher signs.
-    pub(crate) async fn admit_voucher(
+    async fn admit_voucher(
         &self,
         claim: ClientClaim,
         price: u64,
@@ -1226,7 +1239,7 @@ impl ClientClaimGate {
     /// the committer reports it fsync'd -- a rollback a restart could
     /// forget would leave the client durably charged for a packet this
     /// connector itself decided not to count.
-    pub(crate) async fn roll_back(
+    async fn roll_back(
         &self,
         channel_key: &str,
         cumulative_amount: u128,
@@ -1244,7 +1257,7 @@ impl ClientClaimGate {
     /// roll back from its `Drop` (#1719): the watermark is restored before
     /// the drop returns, and a batch that later fails is the committer's to
     /// unwind and log, as for every other entry.
-    pub(crate) fn begin_roll_back(
+    fn begin_roll_back(
         &self,
         channel_key: &str,
         cumulative_amount: u128,
@@ -1372,7 +1385,7 @@ impl DurabilityTicket {
     /// [`ClaimIngestRejection::NotDurable`]: the watermark advance has
     /// already been rolled back by whoever discovered the failure, so the
     /// same claim resubmitted is still good.
-    pub async fn durable(self) -> Result<(), ClaimIngestRejection> {
+    async fn durable(self) -> Result<(), ClaimIngestRejection> {
         match self.durable.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(())) | Err(_) => Err(ClaimIngestRejection::NotDurable),
