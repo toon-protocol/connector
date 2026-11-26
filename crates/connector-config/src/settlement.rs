@@ -12,6 +12,231 @@ use crate::batch_settlement::{
 use crate::encoding::{parse_evm_address, to_hex};
 use crate::error::ConfigError;
 use crate::secret::SecretLocation;
+use thiserror::Error;
+
+/// Every way a `[settlement]` table can be refused: the settlement tables'
+/// half of [`ConfigError`] (issue #1725). Each variant sits beside the rule that
+/// raises it; [`ConfigError::Settlement`] carries one unchanged, so the
+/// messages are the ones the operator has always seen.
+/// The variants keep their `Settlement` prefix: the configuration spec names
+/// each refusal by it.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum SettlementRefusal {
+    /// The flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`,
+    /// ...), which named a `TokenNetworkRegistry` (ADR 0075 decision 9).
+    #[error(
+        "the flat [settlement] shape (chain = \"evm\", contract_address, ...) was removed with \
+         TOON's own channels (ADR 0075, issue #1385): every channel is an x402 channel on a \
+         contract the binary fixes. Write a [settlement.eip155.<chainId>] table instead (ADR 0086) -- rpc_url, \
+         token_address, decimals, asset_eip712_name, asset_eip712_version and \
+         [settlement.eip155.<chainId>.key] -- and no contract_address"
+    )]
+    SettlementLegacyShapeRemoved,
+
+    /// A settlement key that named TOON's own channel deployment:
+    /// `[settlement.eip155.<chainId>] contract_address` (the `TokenNetworkRegistry`) or
+    /// `[settlement.solana] program_id` (TOON's payment-channel program)
+    /// (ADR 0075 decisions 1 and 9).
+    #[error(
+        "'[settlement.{table}] {field}' was removed with TOON's own channels (ADR 0075, issue \
+         #1385): every channel is an x402 channel, on x402BatchSettlement at \
+         0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003 (EVM) or payment-channels at \
+         CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX (Solana), both constants of the binary. \
+         Delete the line. A node with TOON channels still open drains them on the last release \
+         that supports them first (ADR 0075, \"Draining a node with live TOON channels\")"
+    )]
+    SettlementToonKeyRemoved { table: String, field: &'static str },
+
+    /// The `[settlement.<chain>.batch_settlement]` sub-table, whose keys moved
+    /// up into `[settlement.<chain>]` (ADR 0075 decision 9).
+    #[error(
+        "'[settlement.{table}.batch_settlement]' was removed (ADR 0075, issue #1385): x402 \
+         channels are the only channels, so their terms are no longer an opt-in sub-table. Move \
+         its keys up into [settlement.{table}] unchanged and delete the sub-table's header"
+    )]
+    SettlementBatchSubTableRemoved { table: String },
+
+    /// A key ADR 0075 decision 9 makes required wherever its settlement table
+    /// exists: `asset_eip712_name` and `asset_eip712_version` on EVM,
+    /// `min_sponsored_deposit` on Solana.
+    #[error(
+        "[settlement.{table}] has no {key}. Every channel is an x402 channel (ADR 0075), so \
+         accepting them is no longer an opt-in and this key has no safe default: add it to \
+         [settlement.{table}]"
+    )]
+    SettlementMissingRequiredKey { table: String, key: &'static str },
+
+    #[error("the [settlement] section's rpc_url is empty")]
+    SettlementMissingRpcUrl,
+
+    #[error("invalid settlement rpc_url '{value}': {source}")]
+    SettlementInvalidRpcUrl {
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("settlement rpc_url '{value}' must be http or https")]
+    SettlementUnsupportedRpcScheme { value: String },
+
+    #[error(
+        "invalid settlement token_address '{value}': must be 40 hex characters \
+         (a 20-byte EVM address), optionally '0x'-prefixed"
+    )]
+    SettlementInvalidTokenAddress { value: String },
+
+    #[error("the [settlement] section's decimals must not be zero")]
+    SettlementZeroDecimals,
+
+    #[error(
+        "the [settlement] section's key must set exactly one of 'key_file' or 'kms_key_id', \
+         but {reason}"
+    )]
+    SettlementKeyLocationAmbiguous { reason: &'static str },
+
+    #[error("settlement key_file does not exist or is not a file: {0}")]
+    SettlementKeyFileNotFound(PathBuf),
+
+    #[error("settlement kms_key_id must not be empty")]
+    SettlementKmsIdEmpty,
+
+    #[error(
+        "the [settlement] section is present but names no chain at all -- add an \
+         [settlement.eip155.<chainId>] and/or [settlement.solana] table, or remove the section"
+    )]
+    SettlementSectionEmpty,
+
+    /// `[settlement.evm]`, which named no network (ADR 0086 decision 4).
+    /// Refused by name, never read as some chain's table.
+    #[error(
+        "[settlement.evm] was removed: EVM settlement is one table per network (ADR 0086). Rename \
+         [settlement.evm] to [settlement.eip155.<chainId>] and [settlement.evm.key] to \
+         [settlement.eip155.<chainId>.key], where <chainId> is the decimal chain id its rpc_url \
+         answers eth_chainId with -- e.g. [settlement.eip155.8453] for Base, \
+         [settlement.eip155.84532] for Base Sepolia. Every key in the table is unchanged"
+    )]
+    SettlementEvmTableRemoved,
+
+    /// A network-keyed settlement table (`[settlement.eip155]`,
+    /// `[settlement.xrpl]`) holding no network. One refusal for every
+    /// family; the family supplies the words (ADR 0086 decision 4, ADR 0087
+    /// decision 5).
+    #[error("{}", .family.empty_message())]
+    SettlementNetworkTableEmpty { family: NetworkTableFamily },
+
+    /// A network-keyed settlement table whose key names no network this
+    /// build knows for that family: not a chain id, not an XRPL network
+    /// (ADR 0086 decision 4, ADR 0087 decision 5).
+    #[error("{}", .family.unknown_network_message(.key))]
+    SettlementNetworkKeyUnknown {
+        family: NetworkTableFamily,
+        key: String,
+    },
+
+    #[error("the [settlement.solana] section's token_address is empty")]
+    SettlementMissingSolanaTokenAddress,
+
+    /// A bare `[settlement.xrpl]` table, written with its keys directly under
+    /// it and no network (ADR 0087 decision 5): a claim binds no network, so
+    /// every table says which one it is.
+    #[error(
+        "[settlement.xrpl] has '{key}' directly under it, but XRPL settlement is one table \
+         per network: write [settlement.xrpl.<id>] and [settlement.xrpl.<id>.key], where <id> \
+         is the server_info network_id of the ledger its rpc_url answers (0 mainnet, 1 \
+         testnet, 2 devnet, 1000 stand-alone) (ADR 0087)"
+    )]
+    SettlementXrplBareTable { key: String },
+
+    /// `[settlement.xrpl.<id>] key = "..."`: a key is a file, never a value
+    /// (ADR 0009, ADR 0012).
+    #[error(
+        "[settlement.{table}] writes its key inline. A key is referenced by location, never by \
+         value (ADR 0009): write [settlement.{table}.key] with key_file = \"<path>\""
+    )]
+    SettlementXrplInlineKey { table: String },
+
+    /// An `[settlement.xrpl.<id>]` table that does not parse: an unknown key
+    /// (every table is `deny_unknown_fields`), a missing one, or a value of
+    /// the wrong type. The source names which.
+    #[error("[settlement.{table}] is refused: {source}")]
+    SettlementXrplTableInvalid {
+        table: String,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
+
+    /// `min_settle_delay_secs` at or below the settlement port's floor (ADR
+    /// 0087 decision 9).
+    #[error(
+        "[settlement.{table}] min_settle_delay_secs = {value} must exceed {floor} seconds, the \
+         settlement port's floor: a channel one second short of the minimum has to be one the \
+         ledger lets exist. Omit the key for the default of one day, the window a delayed \
+         landing still has"
+    )]
+    SettlementXrplSettleDelayBelowFloor {
+        table: String,
+        value: u64,
+        floor: u64,
+    },
+
+    /// `redemption_safety_secs` that is zero or no shorter than the delay it
+    /// is a margin inside.
+    #[error(
+        "[settlement.{table}] redemption_safety_secs = {value} must be above 0 and below \
+         min_settle_delay_secs ({min_settle_delay_secs}): it is how long before a channel's \
+         Expiration a held voucher is treated as due"
+    )]
+    SettlementXrplRedemptionSafetyOutOfRange {
+        table: String,
+        value: u64,
+        min_settle_delay_secs: u64,
+    },
+
+    /// `max_fee_drops = 0`: a ceiling that no transaction could ever pay
+    /// under.
+    #[error(
+        "[settlement.{table}] max_fee_drops is 0, a ceiling no transaction's fee could be under. \
+         Omit the key for the default, or name the most one transaction may cost in drops"
+    )]
+    SettlementXrplZeroMaxFee { table: String },
+
+    /// A `[settlement.eip155.<chainId>]` key that tuned the local `TokenNetwork` channel
+    /// index (issue #661), deleted with the `toon-channel` client claims it
+    /// resolved (ADR 0075 decisions 9 and 12, issue #1384).
+    #[error(
+        "'[settlement.eip155.<chainId>] {field}' was removed with the TokenNetwork channel index it tuned \
+         (ADR 0075, issue #1384): every claim is an x402 voucher, whose channel the settlement \
+         backend reads from the chain when it is presented, so nothing indexes TokenNetwork \
+         logs any more. Delete the line"
+    )]
+    SettlementChannelIndexKeyRemoved { field: &'static str },
+
+    /// A settlement table asked for its RPC to ride the node's `socks_proxy`
+    /// and the node has none (ADR 0073 decision 1). The key selects the one
+    /// proxy ADR 0070 gives a node; it never names a second, and a dial that
+    /// was meant for a circuit is never made direct instead.
+    #[error(
+        "[settlement.{table}] sets rpc_via_socks_proxy = true, but this node configures no \
+         socks_proxy. The key selects the node's one proxy and never names a second, and a \
+         settlement RPC meant for a circuit is never dialed direct instead (ADR 0073). Set \
+         socks_proxy = \"socks5h://<host>:<port>\" at the top level, or remove \
+         rpc_via_socks_proxy"
+    )]
+    SettlementRpcViaSocksProxyWithoutProxy { table: String },
+
+    /// A settlement table asked for its RPC to ride a circuit to a plain
+    /// `http://` endpoint that is not an onion address (ADR 0073). The exit
+    /// relay would be able to read and rewrite every answer.
+    #[error(
+        "[settlement.{table}] rpc_url '{value}' is plain http, and rpc_via_socks_proxy = true \
+         would send it through an exit relay that can read and rewrite every answer (a \
+         channel's deposit, a transaction's receipt). Use the endpoint's https URL. Plain http \
+         over a circuit is accepted only for a .onion or .anyone host, whose address \
+         authenticates the service itself (ADR 0070, ADR 0073)"
+    )]
+    SettlementRpcViaSocksProxyPlaintext { table: String, value: String },
+}
 
 /// The `[settlement]` section as written in the config file: one table per
 /// chain, `[settlement.eip155.<chainId>]` and/or `[settlement.solana]` (issue #628).
@@ -35,7 +260,7 @@ pub(crate) enum RawSettlementSection {
 /// The retired flat `[settlement]` shape, recognised by its `chain` key and
 /// otherwise unread: every value it could hold named a `TokenNetwork`
 /// deployment, so it is refused by name
-/// ([`ConfigError::SettlementLegacyShapeRemoved`]).
+/// ([`SettlementRefusal::SettlementLegacyShapeRemoved`]).
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct RawLegacySettlementConfig {
@@ -714,19 +939,21 @@ impl SettlementConfig {
 pub(crate) fn check_settlement_rpc_routes(
     settlements: &[SettlementConfig],
     socks_proxy: Option<&Url>,
-) -> Result<(), ConfigError> {
+) -> Result<(), SettlementRefusal> {
     for settlement in settlements.iter().filter(|s| s.rpc_via_socks_proxy()) {
         let table = settlement.table_name();
         let url = Url::parse(settlement.rpc_url())
             .expect("resolve_rpc_url already parsed every settlement rpc_url");
         check_circuit_route(&url, socks_proxy).map_err(|refusal| match refusal {
             CircuitRouteRefusal::WithoutProxy => {
-                ConfigError::SettlementRpcViaSocksProxyWithoutProxy { table }
+                SettlementRefusal::SettlementRpcViaSocksProxyWithoutProxy { table }
             }
-            CircuitRouteRefusal::Plaintext => ConfigError::SettlementRpcViaSocksProxyPlaintext {
-                table,
-                value: settlement.rpc_url().to_string(),
-            },
+            CircuitRouteRefusal::Plaintext => {
+                SettlementRefusal::SettlementRpcViaSocksProxyPlaintext {
+                    table,
+                    value: settlement.rpc_url().to_string(),
+                }
+            }
         })?;
     }
     Ok(())
@@ -950,7 +1177,7 @@ impl SettlementTables {
 
 /// A key a `TokenNetwork`-era settlement table wrote, refused by name (ADR
 /// 0075 decision 9, ADR 0009): never parsed and ignored.
-fn refuse_removed(written: Vec<(bool, ConfigError)>) -> Result<(), ConfigError> {
+fn refuse_removed(written: Vec<(bool, SettlementRefusal)>) -> Result<(), SettlementRefusal> {
     match written.into_iter().find(|(present, _)| *present) {
         Some((_, refusal)) => Err(refusal),
         None => Ok(()),
@@ -958,8 +1185,8 @@ fn refuse_removed(written: Vec<(bool, ConfigError)>) -> Result<(), ConfigError> 
 }
 
 /// A key ADR 0075 decision 9 makes required, written or refused by name.
-fn required<T>(table: &str, key: &'static str, value: Option<T>) -> Result<T, ConfigError> {
-    value.ok_or_else(|| ConfigError::SettlementMissingRequiredKey {
+fn required<T>(table: &str, key: &'static str, value: Option<T>) -> Result<T, SettlementRefusal> {
+    value.ok_or_else(|| SettlementRefusal::SettlementMissingRequiredKey {
         table: table.to_string(),
         key,
     })
@@ -978,26 +1205,26 @@ fn resolve_evm_fields(
     refuse_removed(vec![
         (
             table.contract_address.is_some(),
-            ConfigError::SettlementToonKeyRemoved {
+            SettlementRefusal::SettlementToonKeyRemoved {
                 table: name.clone(),
                 field: "contract_address",
             },
         ),
         (
             table.batch_settlement.is_some(),
-            ConfigError::SettlementBatchSubTableRemoved {
+            SettlementRefusal::SettlementBatchSubTableRemoved {
                 table: name.clone(),
             },
         ),
         (
             table.channel_index_from_block.is_some(),
-            ConfigError::SettlementChannelIndexKeyRemoved {
+            SettlementRefusal::SettlementChannelIndexKeyRemoved {
                 field: "channel_index_from_block",
             },
         ),
         (
             table.channel_index_confirmations.is_some(),
-            ConfigError::SettlementChannelIndexKeyRemoved {
+            SettlementRefusal::SettlementChannelIndexKeyRemoved {
                 field: "channel_index_confirmations",
             },
         ),
@@ -1005,12 +1232,12 @@ fn resolve_evm_fields(
 
     let rpc_url = resolve_rpc_url(table.rpc_url)?;
     let token_address = parse_evm_address(&table.token_address).ok_or_else(|| {
-        ConfigError::SettlementInvalidTokenAddress {
+        SettlementRefusal::SettlementInvalidTokenAddress {
             value: table.token_address.clone(),
         }
     })?;
     if table.decimals == 0 {
-        return Err(ConfigError::SettlementZeroDecimals);
+        return Err(SettlementRefusal::SettlementZeroDecimals.into());
     }
     let key = resolve_settlement_key(table.key)?;
     let batch_settlement = resolve_evm_batch_settlement(
@@ -1046,14 +1273,14 @@ fn resolve_solana_fields(
     refuse_removed(vec![
         (
             table.program_id.is_some(),
-            ConfigError::SettlementToonKeyRemoved {
+            SettlementRefusal::SettlementToonKeyRemoved {
                 table: "solana".to_string(),
                 field: "program_id",
             },
         ),
         (
             table.batch_settlement.is_some(),
-            ConfigError::SettlementBatchSubTableRemoved {
+            SettlementRefusal::SettlementBatchSubTableRemoved {
                 table: "solana".to_string(),
             },
         ),
@@ -1061,10 +1288,10 @@ fn resolve_solana_fields(
 
     let rpc_url = resolve_rpc_url(table.rpc_url)?;
     if table.token_address.trim().is_empty() {
-        return Err(ConfigError::SettlementMissingSolanaTokenAddress);
+        return Err(SettlementRefusal::SettlementMissingSolanaTokenAddress.into());
     }
     if table.decimals == 0 {
-        return Err(ConfigError::SettlementZeroDecimals);
+        return Err(SettlementRefusal::SettlementZeroDecimals.into());
     }
     let key = resolve_settlement_key(table.key)?;
     let batch_settlement = resolve_solana_batch_settlement(RawSolanaBatchSettlementTable {
@@ -1090,7 +1317,7 @@ fn resolve_solana_fields(
 fn resolve_xrpl_fields(
     network: XrplNetwork,
     table: RawXrplSettlementTable,
-) -> Result<XrplSettlementConfig, ConfigError> {
+) -> Result<XrplSettlementConfig, SettlementRefusal> {
     let name = xrpl_table_name(network);
     let rpc_url = resolve_rpc_url(table.rpc_url)?;
     let key = resolve_settlement_key(table.key)?;
@@ -1098,7 +1325,7 @@ fn resolve_xrpl_fields(
         .min_settle_delay_secs
         .unwrap_or(DEFAULT_XRPL_MIN_SETTLE_DELAY_SECS);
     if min_settle_delay_secs <= XRPL_MIN_SETTLE_DELAY_FLOOR_SECS {
-        return Err(ConfigError::SettlementXrplSettleDelayBelowFloor {
+        return Err(SettlementRefusal::SettlementXrplSettleDelayBelowFloor {
             table: name,
             value: min_settle_delay_secs,
             floor: XRPL_MIN_SETTLE_DELAY_FLOOR_SECS,
@@ -1108,15 +1335,17 @@ fn resolve_xrpl_fields(
         .redemption_safety_secs
         .unwrap_or(DEFAULT_XRPL_REDEMPTION_SAFETY_SECS);
     if redemption_safety_secs == 0 || redemption_safety_secs >= min_settle_delay_secs {
-        return Err(ConfigError::SettlementXrplRedemptionSafetyOutOfRange {
-            table: name,
-            value: redemption_safety_secs,
-            min_settle_delay_secs,
-        });
+        return Err(
+            SettlementRefusal::SettlementXrplRedemptionSafetyOutOfRange {
+                table: name,
+                value: redemption_safety_secs,
+                min_settle_delay_secs,
+            },
+        );
     }
     let max_fee_drops = table.max_fee_drops.unwrap_or(DEFAULT_XRPL_MAX_FEE_DROPS);
     if max_fee_drops == 0 {
-        return Err(ConfigError::SettlementXrplZeroMaxFee { table: name });
+        return Err(SettlementRefusal::SettlementXrplZeroMaxFee { table: name });
     }
     Ok(XrplSettlementConfig {
         network,
@@ -1198,7 +1427,7 @@ pub(crate) trait NetworkTables {
 
     /// The refusal for an entry that is a bare table (its own keys written
     /// where networks belong), for a family that reads entries untyped.
-    fn refuse_bare(_key: &str, _entry: &Self::Entry) -> Option<ConfigError> {
+    fn refuse_bare(_key: &str, _entry: &Self::Entry) -> Option<SettlementRefusal> {
         None
     }
 
@@ -1215,20 +1444,23 @@ pub(crate) fn resolve_network_tables<F: NetworkTables>(
     entries: Vec<(String, F::Entry)>,
 ) -> Result<Vec<F::Config>, ConfigError> {
     if entries.is_empty() {
-        return Err(ConfigError::SettlementNetworkTableEmpty { family: F::FAMILY });
+        return Err(SettlementRefusal::SettlementNetworkTableEmpty { family: F::FAMILY }.into());
     }
     if let Some(refusal) = entries
         .iter()
         .find_map(|(key, entry)| F::refuse_bare(key, entry))
     {
-        return Err(refusal);
+        return Err(refusal.into());
     }
     let mut networks = Vec::with_capacity(entries.len());
     for (key, entry) in entries {
-        let network = F::parse_key(&key).ok_or(ConfigError::SettlementNetworkKeyUnknown {
-            family: F::FAMILY,
-            key,
-        })?;
+        let Some(network) = F::parse_key(&key) else {
+            return Err(SettlementRefusal::SettlementNetworkKeyUnknown {
+                family: F::FAMILY,
+                key,
+            }
+            .into());
+        };
         networks.push((network, entry));
     }
     networks.sort_by_key(|(network, _)| F::order(*network));
@@ -1283,7 +1515,7 @@ impl NetworkTables for XrplTables {
     /// `[settlement.xrpl] rpc_url = ...` and `[settlement.xrpl.key]`: an
     /// entry that is no table, or one of a network table's own keys, where
     /// its networks would be.
-    fn refuse_bare(key: &str, entry: &toml::Value) -> Option<ConfigError> {
+    fn refuse_bare(key: &str, entry: &toml::Value) -> Option<SettlementRefusal> {
         const TABLE_KEYS: [&str; 6] = [
             "rpc_url",
             "key",
@@ -1293,7 +1525,7 @@ impl NetworkTables for XrplTables {
             "max_fee_drops",
         ];
         (!entry.is_table() || TABLE_KEYS.contains(&key)).then(|| {
-            ConfigError::SettlementXrplBareTable {
+            SettlementRefusal::SettlementXrplBareTable {
                 key: key.to_string(),
             }
         })
@@ -1311,16 +1543,15 @@ impl NetworkTables for XrplTables {
             .get("key")
             .is_some_and(|key| !matches!(key, toml::Value::Table(_)))
         {
-            return Err(ConfigError::SettlementXrplInlineKey { table: name });
+            return Err(SettlementRefusal::SettlementXrplInlineKey { table: name }.into());
         }
-        let parsed: RawXrplSettlementTable =
-            table
-                .try_into()
-                .map_err(|source| ConfigError::SettlementXrplTableInvalid {
-                    table: name.clone(),
-                    source: Box::new(source),
-                })?;
-        resolve_xrpl_fields(network, parsed)
+        let parsed: RawXrplSettlementTable = table.try_into().map_err(|source| {
+            ConfigError::from(SettlementRefusal::SettlementXrplTableInvalid {
+                table: name.clone(),
+                source: Box::new(source),
+            })
+        })?;
+        resolve_xrpl_fields(network, parsed).map_err(ConfigError::from)
     }
 
     fn order(network: XrplNetwork) -> u64 {
@@ -1345,14 +1576,16 @@ pub(crate) fn resolve_settlement(
     };
 
     match raw {
-        RawSettlementSection::Legacy(_) => Err(ConfigError::SettlementLegacyShapeRemoved),
+        RawSettlementSection::Legacy(_) => {
+            Err(SettlementRefusal::SettlementLegacyShapeRemoved.into())
+        }
         RawSettlementSection::Keyed(raw) => {
             let raw = *raw;
             if raw.evm.is_some() {
-                return Err(ConfigError::SettlementEvmTableRemoved);
+                return Err(SettlementRefusal::SettlementEvmTableRemoved.into());
             }
             if raw.eip155.is_none() && raw.solana.is_none() && raw.xrpl.is_none() {
-                return Err(ConfigError::SettlementSectionEmpty);
+                return Err(SettlementRefusal::SettlementSectionEmpty.into());
             }
             let mut out = Vec::new();
             if let Some(eip155) = raw.eip155 {
@@ -1373,24 +1606,26 @@ pub(crate) fn resolve_settlement(
     }
 }
 
-fn resolve_settlement_key(raw: RawSettlementKeyConfig) -> Result<SecretLocation, ConfigError> {
+fn resolve_settlement_key(
+    raw: RawSettlementKeyConfig,
+) -> Result<SecretLocation, SettlementRefusal> {
     match (raw.key_file, raw.kms_key_id) {
         (Some(path), None) => {
             if !path.is_file() {
-                return Err(ConfigError::SettlementKeyFileNotFound(path));
+                return Err(SettlementRefusal::SettlementKeyFileNotFound(path));
             }
             Ok(SecretLocation::File(path))
         }
         (None, Some(key_id)) => {
             if key_id.trim().is_empty() {
-                return Err(ConfigError::SettlementKmsIdEmpty);
+                return Err(SettlementRefusal::SettlementKmsIdEmpty);
             }
             Ok(SecretLocation::Kms { key_id })
         }
-        (None, None) => Err(ConfigError::SettlementKeyLocationAmbiguous {
+        (None, None) => Err(SettlementRefusal::SettlementKeyLocationAmbiguous {
             reason: "neither 'key_file' nor 'kms_key_id' is set",
         }),
-        (Some(_), Some(_)) => Err(ConfigError::SettlementKeyLocationAmbiguous {
+        (Some(_), Some(_)) => Err(SettlementRefusal::SettlementKeyLocationAmbiguous {
             reason: "both 'key_file' and 'kms_key_id' are set",
         }),
     }
@@ -1398,16 +1633,17 @@ fn resolve_settlement_key(raw: RawSettlementKeyConfig) -> Result<SecretLocation,
 
 /// Shared rpc_url validation between the EVM and Solana tables : non-empty, a well-formed URL, and http(s) -- none of this
 /// is chain-specific.
-fn resolve_rpc_url(rpc_url: String) -> Result<String, ConfigError> {
+fn resolve_rpc_url(rpc_url: String) -> Result<String, SettlementRefusal> {
     if rpc_url.trim().is_empty() {
-        return Err(ConfigError::SettlementMissingRpcUrl);
+        return Err(SettlementRefusal::SettlementMissingRpcUrl);
     }
-    let url = Url::parse(&rpc_url).map_err(|source| ConfigError::SettlementInvalidRpcUrl {
-        value: rpc_url.clone(),
-        source,
-    })?;
+    let url =
+        Url::parse(&rpc_url).map_err(|source| SettlementRefusal::SettlementInvalidRpcUrl {
+            value: rpc_url.clone(),
+            source,
+        })?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ConfigError::SettlementUnsupportedRpcScheme { value: rpc_url });
+        return Err(SettlementRefusal::SettlementUnsupportedRpcScheme { value: rpc_url });
     }
     Ok(rpc_url)
 }
@@ -1417,6 +1653,20 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// The composition is transparent: wrapping a refusal in the public
+    /// error changes neither its message nor what it is.
+    #[test]
+    fn a_settlement_refusal_is_the_config_error_it_is_wrapped_in() {
+        let refusal = SettlementRefusal::SettlementEvmTableRemoved;
+        let message = refusal.to_string();
+        let error = ConfigError::from(refusal);
+        assert_eq!(error.to_string(), message);
+        assert!(matches!(
+            error,
+            ConfigError::Settlement(SettlementRefusal::SettlementEvmTableRemoved)
+        ));
+    }
 
     const TOKEN: &str = "0x49beE1Bca5d15Fb0963117923403F9498119a9Ce";
     const MINT: &str = "SoLMint11111111111111111111111111111111111";
@@ -1620,7 +1870,10 @@ key_file = "{key}"
         ))
         .expect_err("the flat shape is retired");
 
-        assert!(matches!(error, ConfigError::SettlementLegacyShapeRemoved));
+        assert!(matches!(
+            error,
+            ConfigError::Settlement(SettlementRefusal::SettlementLegacyShapeRemoved)
+        ));
         let message = error.to_string();
         assert!(
             message.contains("[settlement.eip155.<chainId>]") && message.contains("ADR 0075"),
@@ -1641,10 +1894,10 @@ key_file = "{key}"
 
         assert!(matches!(
             error,
-            ConfigError::SettlementToonKeyRemoved {
+            ConfigError::Settlement(SettlementRefusal::SettlementToonKeyRemoved {
                 ref table,
                 field: "contract_address",
-            } if table == "eip155.31337"
+            }) if table == "eip155.31337"
         ));
         assert!(error.to_string().contains("contract_address"));
     }
@@ -1662,10 +1915,10 @@ key_file = "{key}"
 
         assert!(matches!(
             error,
-            ConfigError::SettlementToonKeyRemoved {
+            ConfigError::Settlement(SettlementRefusal::SettlementToonKeyRemoved {
                 ref table,
                 field: "program_id",
-            } if table == "solana"
+            }) if table == "solana"
         ));
         assert!(error.to_string().contains("program_id"));
     }
@@ -1683,7 +1936,7 @@ key_file = "{key}"
         .expect_err("the EVM sub-table is retired");
         assert!(matches!(
             evm,
-            ConfigError::SettlementBatchSubTableRemoved { ref table } if table == "eip155.31337"
+            ConfigError::Settlement(SettlementRefusal::SettlementBatchSubTableRemoved { ref table }) if table == "eip155.31337"
         ));
         assert!(evm
             .to_string()
@@ -1696,7 +1949,7 @@ key_file = "{key}"
         .expect_err("the Solana sub-table is retired");
         assert!(matches!(
             solana,
-            ConfigError::SettlementBatchSubTableRemoved { ref table } if table == "solana"
+            ConfigError::Settlement(SettlementRefusal::SettlementBatchSubTableRemoved { ref table }) if table == "solana"
         ));
     }
 
@@ -1710,7 +1963,7 @@ key_file = "{key}"
             assert!(
                 matches!(
                     error,
-                    ConfigError::SettlementChannelIndexKeyRemoved { field: named } if named == field
+                    ConfigError::Settlement(SettlementRefusal::SettlementChannelIndexKeyRemoved { field: named }) if named == field
                 ),
                 "{field}: {error}"
             );
@@ -1741,7 +1994,7 @@ key_file = "{key}"
             assert!(
                 matches!(
                     &error,
-                    ConfigError::SettlementMissingRequiredKey { table: t, key: k } if t == table && *k == key
+                    ConfigError::Settlement(SettlementRefusal::SettlementMissingRequiredKey { table: t, key: k }) if t == table && *k == key
                 ),
                 "{table}.{key}: {error}"
             );
@@ -1774,7 +2027,9 @@ key_file = "{key}"
         let body = evm_table("", key_file.path()).replace("http://127.0.0.1:8545", "");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementMissingRpcUrl)
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementMissingRpcUrl
+            ))
         ));
     }
 
@@ -1784,7 +2039,9 @@ key_file = "{key}"
         let body = evm_table("", key_file.path()).replace("http://", "ws://");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementUnsupportedRpcScheme { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementUnsupportedRpcScheme { .. }
+            ))
         ));
     }
 
@@ -1794,7 +2051,9 @@ key_file = "{key}"
         let body = evm_table("", key_file.path()).replace("http://127.0.0.1:8545", "not a url");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementInvalidRpcUrl { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementInvalidRpcUrl { .. }
+            ))
         ));
     }
 
@@ -1804,7 +2063,9 @@ key_file = "{key}"
         let body = evm_table("", key_file.path()).replace(TOKEN, "not-an-address");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementInvalidTokenAddress { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementInvalidTokenAddress { .. }
+            ))
         ));
     }
 
@@ -1814,7 +2075,9 @@ key_file = "{key}"
         let body = solana_table("", key_file.path()).replace(MINT, " ");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementMissingSolanaTokenAddress)
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementMissingSolanaTokenAddress
+            ))
         ));
     }
 
@@ -1824,7 +2087,9 @@ key_file = "{key}"
         let body = evm_table("", key_file.path()).replace("decimals = 6", "decimals = 0");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementZeroDecimals)
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementZeroDecimals
+            ))
         ));
     }
 
@@ -1835,7 +2100,9 @@ key_file = "{key}"
             .replace(&format!("key_file = \"{}\"", key_file.path().display()), "");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementKeyLocationAmbiguous { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementKeyLocationAmbiguous { .. }
+            ))
         ));
     }
 
@@ -1844,7 +2111,9 @@ key_file = "{key}"
         let body = evm_table("", Path::new("/nonexistent/settlement.key"));
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementKeyFileNotFound(_))
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementKeyFileNotFound(_)
+            ))
         ));
     }
 
@@ -1960,7 +2229,7 @@ key_file = "{}"
         .expect_err("a table with no network");
         assert!(matches!(
             error,
-            ConfigError::SettlementXrplBareTable { ref key } if key == "key"
+            ConfigError::Settlement(SettlementRefusal::SettlementXrplBareTable { ref key }) if key == "key"
         ));
         assert!(
             error.to_string().contains("[settlement.xrpl.<id>]"),
@@ -1977,7 +2246,7 @@ key_file = "{}"
             assert!(
                 matches!(
                     error,
-                    ConfigError::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Xrpl, key: ref named } if named == key
+                    ConfigError::Settlement(SettlementRefusal::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Xrpl, key: ref named }) if named == key
                 ),
                 "{key}: {error:?}"
             );
@@ -1994,7 +2263,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
         let error = resolve(body).expect_err("a key is never a value");
         assert!(matches!(
             error,
-            ConfigError::SettlementXrplInlineKey { ref table } if table == "xrpl.1000"
+            ConfigError::Settlement(SettlementRefusal::SettlementXrplInlineKey { ref table }) if table == "xrpl.1000"
         ));
     }
 
@@ -2005,7 +2274,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             .expect_err("deny_unknown_fields");
         assert!(matches!(
             error,
-            ConfigError::SettlementXrplTableInvalid { ref table, .. } if table == "xrpl.1000"
+            ConfigError::Settlement(SettlementRefusal::SettlementXrplTableInvalid { ref table, .. }) if table == "xrpl.1000"
         ));
         assert!(error.to_string().contains("network_id"), "{error}");
     }
@@ -2017,13 +2286,17 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
         let without_rpc = body.replace("rpc_url = \"http://127.0.0.1:5005\"", "");
         assert!(matches!(
             resolve(&without_rpc),
-            Err(ConfigError::SettlementXrplTableInvalid { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementXrplTableInvalid { .. }
+            ))
         ));
         let without_key =
             body.replace(&format!("key_file = \"{}\"", key_file.path().display()), "");
         assert!(matches!(
             resolve(&without_key),
-            Err(ConfigError::SettlementKeyLocationAmbiguous { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementKeyLocationAmbiguous { .. }
+            ))
         ));
     }
 
@@ -2031,9 +2304,11 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
     fn an_empty_xrpl_heading_is_refused() {
         assert!(matches!(
             resolve("[xrpl]\n"),
-            Err(ConfigError::SettlementNetworkTableEmpty {
-                family: NetworkTableFamily::Xrpl
-            })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementNetworkTableEmpty {
+                    family: NetworkTableFamily::Xrpl
+                }
+            ))
         ));
     }
 
@@ -2051,7 +2326,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             assert!(
                 matches!(
                     error,
-                    ConfigError::SettlementXrplSettleDelayBelowFloor { value: v, floor: 901, .. } if v == value
+                    ConfigError::Settlement(SettlementRefusal::SettlementXrplSettleDelayBelowFloor { value: v, floor: 901, .. }) if v == value
                 ),
                 "{value}: {error:?}"
             );
@@ -2078,7 +2353,9 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             assert!(
                 matches!(
                     resolve(&xrpl_table_on("1000", extra, key_file.path())),
-                    Err(ConfigError::SettlementXrplRedemptionSafetyOutOfRange { .. })
+                    Err(ConfigError::Settlement(
+                        SettlementRefusal::SettlementXrplRedemptionSafetyOutOfRange { .. }
+                    ))
                 ),
                 "{extra}"
             );
@@ -2090,7 +2367,9 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
         let key_file = temp_key_file();
         assert!(matches!(
             resolve(&xrpl_table_on("1000", "max_fee_drops = 0", key_file.path())),
-            Err(ConfigError::SettlementXrplZeroMaxFee { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementXrplZeroMaxFee { .. }
+            ))
         ));
     }
 
@@ -2101,7 +2380,9 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             .replace("http://127.0.0.1:5005", "ws://127.0.0.1:6006");
         assert!(matches!(
             resolve(&body),
-            Err(ConfigError::SettlementUnsupportedRpcScheme { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementUnsupportedRpcScheme { .. }
+            ))
         ));
     }
 
@@ -2125,7 +2406,12 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
                 evm: None,
             },
         ))));
-        assert!(matches!(result, Err(ConfigError::SettlementSectionEmpty)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Settlement(
+                SettlementRefusal::SettlementSectionEmpty
+            ))
+        ));
     }
 
     #[test]
@@ -2186,7 +2472,10 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
             .replace("[eip155.31337.key]", "[evm.key]");
         let error = resolve(&body).expect_err("[settlement.evm] is retired");
 
-        assert!(matches!(error, ConfigError::SettlementEvmTableRemoved));
+        assert!(matches!(
+            error,
+            ConfigError::Settlement(SettlementRefusal::SettlementEvmTableRemoved)
+        ));
         let message = error.to_string();
         assert!(
             message.contains("[settlement.evm]")
@@ -2207,7 +2496,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
                 .replace("[eip155.31337.key]", &format!("[eip155.\"{key}\".key]"));
             let error = resolve(&body).expect_err("not a chain id");
             assert!(
-                matches!(&error, ConfigError::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Eip155, key: named } if named == key),
+                matches!(&error, ConfigError::Settlement(SettlementRefusal::SettlementNetworkKeyUnknown { family: NetworkTableFamily::Eip155, key: named }) if named == key),
                 "{key}: {error}"
             );
             let message = error.to_string();
@@ -2225,9 +2514,9 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
         let error = resolve("[eip155]\n").expect_err("no network");
         assert!(matches!(
             error,
-            ConfigError::SettlementNetworkTableEmpty {
+            ConfigError::Settlement(SettlementRefusal::SettlementNetworkTableEmpty {
                 family: NetworkTableFamily::Eip155,
-            }
+            })
         ));
         assert!(error.to_string().contains("[settlement.eip155]"));
     }
@@ -2388,7 +2677,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
                 assert!(
                     matches!(
                         &error,
-                        ConfigError::SettlementNetworkTableEmpty { family: named } if *named == family.empty
+                        ConfigError::Settlement(SettlementRefusal::SettlementNetworkTableEmpty { family: named }) if *named == family.empty
                     ),
                     "{}: {error:?}",
                     family.heading
@@ -2405,7 +2694,7 @@ key = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
                 assert!(
                     matches!(
                         &error,
-                        ConfigError::SettlementNetworkKeyUnknown { family: named, key: written }
+                        ConfigError::Settlement(SettlementRefusal::SettlementNetworkKeyUnknown { family: named, key: written })
                             if *named == family.empty && written == family.unknown_key
                     ),
                     "{}: {error:?}",
