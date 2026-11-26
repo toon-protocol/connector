@@ -39,8 +39,10 @@
 //! so a close is final: a restart brings the allowance back closing, and
 //! the boot sweep finishes it. Every packet admitted on an
 //! allowance is counted in flight from before its watermark moves until the
-//! carriage drops its [`InFlightForward`] -- after any rollback -- so the
-//! charge Δ is read only once nothing can move the watermark again. Then,
+//! carriage drops its [`InFlightForward`] -- after any rollback, which
+//! carries the hold to the journal committer and has it released only once
+//! the rollback is durable -- so the charge Δ is read only once nothing can
+//! move the watermark again, and never journaled ahead of a rollback. Then,
 //! each durable before the next: Δ is journaled
 //! ([`JournalEntry::AllowanceClosed`], once), the close record goes to the
 //! evidence file, and the successor -- zk_toon's `charge` and
@@ -1295,9 +1297,10 @@ impl SignedSuccessor {
 
 /// One packet admitted on an allowance and not yet resolved (ADR 0080
 /// decision 4). Held by the carriage from admission until the packet has
-/// been fulfilled or rejected -- past the rollback of an uncarried forward
-/// -- and dropped then: an allowance is charged only once none of its
-/// forwards is in flight. Inert for a voucher.
+/// been fulfilled or rejected -- past the rollback of an uncarried forward,
+/// which hands it to the journal committer to drop once the rollback is
+/// durable -- and dropped then: an allowance is charged only once none of
+/// its forwards is in flight. Inert for a voucher.
 #[must_use = "dropping it ends the forward it holds open"]
 pub struct InFlightForward(Option<(ZkParts, AllowanceId)>);
 

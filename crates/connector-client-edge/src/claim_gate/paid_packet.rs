@@ -17,10 +17,16 @@
 //! - [`PaidPacket::finish`] takes the packet's [`Outcome`]. *Not carried*
 //!   rolls the claim's watermark back (ADR 0028, #1012); every outcome then
 //!   releases the zk edge's in-flight hold (ADR 0080 decision 4).
-//! - **A handle dropped without an outcome counts as not carried.** Its
-//!   rollback is made synchronously in `Drop`, so a pipeline that panics or
-//!   is cancelled from inside never leaves value counted or a hold held, and
-//!   the same voucher is good again.
+//! - **A handle dropped before its packet is routed counts as not
+//!   carried.** Its rollback is made synchronously in `Drop`, so a pipeline
+//!   that panics or is cancelled from inside before routing never leaves
+//!   value counted or a hold held, and the same voucher is good again.
+//! - **A handle dropped once routing has begun keeps the claim counted.**
+//!   [`PaidPacket::routing`] marks the point: past it the forward may have
+//!   been covered and sent, and the next hop may have done the work, so
+//!   rolling back would let the client resend the same voucher and have
+//!   this connector pay the next hop twice. The payer stays charged rather
+//!   than this connector unpaid.
 //! - **A client going away is not such a cancellation.** Once admitted, a
 //!   packet is carried in its own task, so it always reaches an outcome and
 //!   is charged by that outcome: a client cannot be refunded for work the
@@ -62,24 +68,31 @@ use crate::ClientEdgeState;
 pub(crate) enum Outcome {
     /// The packet was fulfilled: the claim stays counted.
     Fulfilled,
-    /// The packet was carried and rejected where it ended -- an app's own
-    /// answer, which consumed real work (ADR 0020): the claim stays counted.
+    /// The packet reached the termination and was rejected there at a cost
+    /// -- the priced work was set in motion (issue #545): the claim stays
+    /// counted.
     Rejected,
     /// The packet was never carried: the claim is rolled back. What a
-    /// forwarded route's terminal reject means (ADR 0028, #1012), and what a
-    /// handle dropped without an outcome counts as.
+    /// forwarded route's terminal reject means (ADR 0028, #1012), what a
+    /// termination's reject at no cost means -- the app was never reached
+    /// -- and what a handle dropped before its packet was routed counts as.
     NotCarried,
 }
 
 impl Outcome {
     /// The outcome of `response` on a route that is `forwarded` or not. A
     /// forwarded route charges on the forward's FULFILL and never on its
-    /// REJECT (ADR 0028), so any reject there is *not carried*; a reject at a
-    /// route this connector terminates is the app's answer.
+    /// REJECT (ADR 0028), so any reject there is *not carried*. A reject at
+    /// a route this connector terminates is charged by what it tells the
+    /// payer it cost: the route's price where the packet reached the app or
+    /// its termination (issue #545), and 0 where the app was never reached
+    /// -- unreachable, a refused target, no time left to deliver -- which is
+    /// *not carried*, so the payer is not charged for the attempt.
     pub(crate) fn of(response: &PacketResponse, forwarded: bool) -> Outcome {
         match response {
             PacketResponse::Fulfill(_) => Outcome::Fulfilled,
             PacketResponse::Reject(_) if forwarded => Outcome::NotCarried,
+            PacketResponse::Reject(reject) if reject.accumulated_cost == 0 => Outcome::NotCarried,
             PacketResponse::Reject(_) => Outcome::Rejected,
         }
     }
@@ -142,8 +155,8 @@ impl<G: Borrow<ClientClaimGate>> AdmittedPacket<G> {
             packet: PaidPacket {
                 gate,
                 claim,
-                settled: false,
-                _in_flight: in_flight,
+                phase: Phase::Admitted,
+                in_flight,
             },
         }
     }
@@ -162,7 +175,7 @@ impl<G: Borrow<ClientClaimGate>> AdmittedPacket<G> {
             mut packet,
         } = self;
         if let Err(rejection) = durability.durable().await {
-            packet.settled = true;
+            packet.phase = Phase::Settled;
             return Err(rejection);
         }
         record.record(packet.gate.borrow(), &packet.channel_key());
@@ -186,7 +199,7 @@ impl<G: Borrow<ClientClaimGate>> AdmittedPacket<G> {
             record,
             mut packet,
         } = self;
-        packet.settled = true;
+        packet.phase = Phase::Settled;
         async move {
             durability.durable().await?;
             record.record(packet.gate.borrow(), &packet.channel_key());
@@ -195,21 +208,37 @@ impl<G: Borrow<ClientClaimGate>> AdmittedPacket<G> {
     }
 }
 
+/// Where a [`PaidPacket`] is, as far as its `Drop` needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Accepted, and nothing routed yet: dropped here, the packet was not
+    /// carried and the claim is rolled back.
+    Admitted,
+    /// Routing has begun: the forward may have been covered and sent, so a
+    /// drop keeps the claim counted.
+    Routing,
+    /// An outcome has been given, or there is otherwise nothing left for
+    /// `Drop` to undo.
+    Settled,
+}
+
 /// The handle for one paid packet whose claim is durably accepted. The
-/// carriage routes the packet and gives this its [`Outcome`]; it does the
-/// rest. Dropped without one, it counts as [`Outcome::NotCarried`].
-#[must_use = "dropping it counts the packet as not carried"]
+/// carriage marks it [`Self::routing`], routes the packet and gives this its
+/// [`Outcome`]; it does the rest. Dropped without one before routing, it
+/// counts as [`Outcome::NotCarried`]; dropped once routing has begun, the
+/// claim stays counted.
+#[must_use = "dropping it before routing counts the packet as not carried"]
 pub(crate) struct PaidPacket<G: Borrow<ClientClaimGate> = Arc<ClientClaimGate>> {
     gate: G,
     claim: ClientEdgeClaim,
-    /// Whether an outcome has been given -- or there is otherwise nothing
-    /// left for `Drop` to undo.
-    settled: bool,
+    phase: Phase,
     /// Held until the packet has resolved, past any rollback: an allowance
     /// is charged only once none of its forwards is in flight (ADR 0080
-    /// decision 4). Inert for a voucher. A field, so it is released after
-    /// `Drop::drop`'s rollback has run.
-    _in_flight: InFlightForward,
+    /// decision 4). Inert for a voucher. A rollback takes it, and the
+    /// journal committer releases it once the rollback is durable, so the
+    /// charge it may trigger is never journaled ahead of the rollback;
+    /// otherwise it is released with the handle.
+    in_flight: InFlightForward,
 }
 
 impl<G: Borrow<ClientClaimGate>> PaidPacket<G> {
@@ -223,39 +252,65 @@ impl<G: Borrow<ClientClaimGate>> PaidPacket<G> {
         self.claim.claim_key()
     }
 
+    /// Mark the packet as being routed, just before the carriage hands it to
+    /// the route: from here a drop without an outcome keeps the claim
+    /// counted, since the forward may already have been paid for and sent.
+    pub(crate) fn routing(&mut self) {
+        if self.phase == Phase::Admitted {
+            self.phase = Phase::Routing;
+        }
+    }
+
     /// Finish the packet with `outcome`. Not carried rolls the claim back,
-    /// durably, before this resolves (#1012); then the in-flight hold is
-    /// released.
+    /// durably, before this resolves (#1012); the in-flight hold is
+    /// released once the rollback is durable, or with the handle.
     pub(crate) async fn finish(mut self, outcome: Outcome) {
-        self.settled = true;
+        self.phase = Phase::Settled;
         if outcome == Outcome::NotCarried {
             let channel_key = self.channel_key();
+            let release = self.take_in_flight();
             if let Err(error) = self
                 .gate
                 .borrow()
-                .roll_back(&channel_key, self.claim.transferred_amount())
+                .roll_back(&channel_key, self.claim.transferred_amount(), release)
                 .await
             {
                 log_failed_rollback(&channel_key, &error);
             }
         }
     }
+
+    /// The in-flight hold, for a rollback to release once it is durable.
+    fn take_in_flight(&mut self) -> InFlightForward {
+        std::mem::replace(&mut self.in_flight, InFlightForward::untracked())
+    }
 }
 
 impl<G: Borrow<ClientClaimGate>> Drop for PaidPacket<G> {
     fn drop(&mut self) {
-        if self.settled {
-            return;
+        match self.phase {
+            Phase::Settled => return,
+            Phase::Routing => {
+                tracing::warn!(
+                    channel = %self.channel_key(),
+                    "a paid packet ended without an outcome after it was routed; its claim \
+                     stays counted, since the next hop may already have been paid to carry it"
+                );
+                return;
+            }
+            Phase::Admitted => {}
         }
         // Not carried. The restore and the journal enqueue happen here, under
         // the gate's lock; the fsync is the committer's, which unwinds and
-        // logs a batch that fails.
+        // logs a batch that fails. The in-flight hold rides with the entry
+        // and is released once it is durable: nothing here waits on it.
         let channel_key = self.channel_key();
-        if let Err(error) = self
-            .gate
-            .borrow()
-            .begin_roll_back(&channel_key, self.claim.transferred_amount())
-        {
+        let release = self.take_in_flight();
+        if let Err(error) = self.gate.borrow().begin_roll_back(
+            &channel_key,
+            self.claim.transferred_amount(),
+            release,
+        ) {
             log_failed_rollback(&channel_key, &error);
         }
     }
@@ -395,7 +450,7 @@ pub(crate) async fn carry_admitted(
     admitted: Option<AdmittedPacket>,
     on_accepted: impl FnOnce(&ClientEdgeClaim),
 ) -> Result<Carried, ClaimIngestRejection> {
-    let paid = match admitted {
+    let mut paid = match admitted {
         Some(admitted) => Some(admitted.durable().await?),
         None => None,
     };
@@ -407,6 +462,11 @@ pub(crate) async fn carry_admitted(
         .as_ref()
         .and_then(|paid| paid.claim().voucher())
         .map(|voucher| voucher.signer().to_string());
+    // From here a drop keeps the claim counted: the forward may be covered
+    // and sent at any point inside the route.
+    if let Some(paid) = &mut paid {
+        paid.routing();
+    }
     // Issue #736: the configured routes first, then whatever client session
     // is bound to this destination.
     let response =
@@ -432,7 +492,8 @@ pub(crate) async fn carry_admitted(
 /// caller's future: its last suspension point comes before anything is
 /// advanced, so a caller dropped during admission leaves nothing counted,
 /// and nothing is held. A handle dropped without an outcome inside the task
-/// -- the task panicked, or the runtime shut it down -- still rolls back.
+/// -- the task panicked, or the runtime shut it down -- rolls back if its
+/// packet was not yet routed, and otherwise stays counted.
 pub(crate) async fn carry<F>(
     state: &Arc<ClientEdgeState>,
     packet: Packet,
@@ -450,11 +511,12 @@ where
         Ok(carried) => carried,
         // A panic in the pipeline is this request's panic, as it was before
         // the pipeline had a task of its own; the handle it dropped has
-        // already rolled back.
+        // already rolled back, or kept the claim counted if it was routed.
         Err(error) => match error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             // Cancelled only by the runtime shutting down: the handle rolled
-            // back, so the packet was not carried and nothing is charged.
+            // back if its packet was not yet routed, and otherwise kept the
+            // claim counted.
             Err(_) => Err(ClaimIngestRejection::NotDurable),
         },
     }

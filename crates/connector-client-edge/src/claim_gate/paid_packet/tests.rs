@@ -24,8 +24,8 @@ use connector_domain::{
     VOUCHER_WATERMARK_NONCE,
 };
 use connector_runtime::{
-    AppClient, AppOutcome, FakeAppClient, InMemoryJournal, InProcessPeerTransport, Journal,
-    PeerRoute, TestClock,
+    AppClient, AppOutcome, Covering, FakeAppClient, InMemoryJournal, InProcessPeerTransport,
+    Journal, PeerForward, PeerRoute, PeerTransport, TestClock,
 };
 use connector_signer::{LocalSigner, Signer};
 use futures_util::{SinkExt, StreamExt};
@@ -97,6 +97,16 @@ fn payer_over_a_priced_peering(
     signer: &Arc<dyn Signer>,
     remote_app: Option<Arc<dyn AppClient>>,
 ) -> Arc<Connector> {
+    payer_over_a_priced_peering_through(signer, remote_app, |transport| Arc::new(transport))
+}
+
+/// [`payer_over_a_priced_peering`], with the in-process transport to the
+/// peer handed to `through` to wrap.
+fn payer_over_a_priced_peering_through(
+    signer: &Arc<dyn Signer>,
+    remote_app: Option<Arc<dyn AppClient>>,
+    through: impl FnOnce(InProcessPeerTransport) -> Arc<dyn PeerTransport>,
+) -> Arc<Connector> {
     let (routes, app): (Vec<StaticRoute>, Arc<dyn AppClient>) = match remote_app {
         Some(app) => (
             vec![StaticRoute::new(REMOTE_APP, "http://localhost:4000").unwrap()],
@@ -121,13 +131,37 @@ fn payer_over_a_priced_peering(
             vec![],
             vec![PeerRoute::new_priced(FORWARD_PREFIX, PEER_ID, PRICE)],
             Arc::new(FakeAppClient::new()),
-            Arc::new(transport),
+            through(transport),
             clock(),
         )
         .with_peer_fees([(PEER_ID.to_string(), FEE)])
         .with_identity_signer(Arc::clone(signer)),
         PEER_ID,
     ))
+}
+
+/// A transport that carries its first forward to the peer, and panics once
+/// the peer has answered it: a pipeline that fails after the next hop has
+/// done the work. Every later forward is carried as usual.
+struct PanicsAfterTheFirstForward {
+    inner: InProcessPeerTransport,
+    forwarded: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl PeerTransport for PanicsAfterTheFirstForward {
+    async fn forward(
+        &self,
+        peer_id: &str,
+        prepare: Prepare,
+        covering: Option<Covering>,
+    ) -> PeerForward {
+        let answer = self.inner.forward(peer_id, prepare, covering).await;
+        if !self.forwarded.swap(true, Ordering::SeqCst) {
+            panic!("the carriage fails after the forward was carried");
+        }
+        answer
+    }
 }
 
 fn remote_app_answering(outcome: AppOutcome) -> Arc<dyn AppClient> {
@@ -198,8 +232,14 @@ fn paid_prepare(destination: &str, signer: &Arc<dyn Signer>) -> Prepare {
         body: b"hello app".to_vec(),
     }
     .encode();
+    paid_prepare_sealing(destination, signer, &envelope)
+}
+
+/// A PREPARE to `destination` at [`PRICE`] whose sealed payload is
+/// `envelope`, whatever its bytes.
+fn paid_prepare_sealing(destination: &str, signer: &Arc<dyn Signer>, envelope: &[u8]) -> Prepare {
     let (data, _shared_secret) =
-        connector_signer::giftwrap::seal_request(&envelope, &signer.public_key().unwrap())
+        connector_signer::giftwrap::seal_request(envelope, &signer.public_key().unwrap())
             .expect("seal");
     Prepare {
         amount: PRICE,
@@ -213,11 +253,17 @@ fn paid_prepare(destination: &str, signer: &Arc<dyn Signer>) -> Prepare {
 /// A paid `POST /ilp` to `destination`, sealed to `signer`, carrying
 /// `claim_json` in the plaintext claim header.
 fn paid_request(destination: &str, signer: &Arc<dyn Signer>, claim_json: &str) -> Request<Body> {
+    request_carrying(&paid_prepare(destination, signer), claim_json)
+}
+
+/// A `POST /ilp` of `prepare`, carrying `claim_json` in the plaintext claim
+/// header.
+fn request_carrying(prepare: &Prepare, claim_json: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/ilp")
         .header(crate::CLAIM_HEADER, BASE64.encode(claim_json.as_bytes()))
-        .body(Body::from(paid_prepare(destination, signer).encode()))
+        .body(Body::from(prepare.encode()))
         .unwrap()
 }
 
@@ -345,9 +391,16 @@ impl Carriage {
         signer: &Arc<dyn Signer>,
         claim_json: &str,
     ) -> InFlight {
+        self.send_prepare(edge, paid_prepare(destination, signer), claim_json)
+            .await
+    }
+
+    /// Send `prepare`, paid for by `claim_json`, without waiting for its
+    /// answer.
+    async fn send_prepare(self, edge: &Edge, prepare: Prepare, claim_json: &str) -> InFlight {
         match self {
             Carriage::Http => {
-                let request = paid_request(destination, signer, claim_json);
+                let request = request_carrying(&prepare, claim_json);
                 let router = edge.router.clone();
                 InFlight::Http(Box::pin(async move {
                     answer(router.oneshot(request).await.unwrap()).await
@@ -374,7 +427,7 @@ impl Carriage {
                         content_type: connector_btp::CONTENT_TYPE_TEXT,
                         data: claim_json.as_bytes().to_vec(),
                     }],
-                    &paid_prepare(destination, signer).encode(),
+                    &prepare.encode(),
                 );
                 session
                     .send(WsMessage::Binary(frame))
@@ -397,6 +450,26 @@ impl Carriage {
             .await
             .answer()
             .await
+    }
+
+    /// Pay for one packet whose sealed payload is `envelope`, whatever its
+    /// bytes, and read its answer.
+    async fn pay_with_envelope(
+        self,
+        edge: &Edge,
+        destination: &str,
+        signer: &Arc<dyn Signer>,
+        claim_json: &str,
+        envelope: &[u8],
+    ) -> Answer {
+        self.send_prepare(
+            edge,
+            paid_prepare_sealing(destination, signer, envelope),
+            claim_json,
+        )
+        .await
+        .answer()
+        .await
     }
 
     /// Pay for one packet and go away -- drop the request, or close the
@@ -564,10 +637,11 @@ async fn an_uncarried_forward_rolls_the_claim_back() {
     }
 }
 
-/// A reject from an app this connector terminates is that app's answer,
-/// which consumed real work (ADR 0020): it stays counted.
+/// An app this connector terminates that cannot be reached did no priced
+/// work: the connector answers with an accumulated cost of 0, and the claim
+/// is rolled back to match, so the same voucher is good again.
 #[tokio::test]
-async fn a_terminated_apps_rejection_stays_counted() {
+async fn an_unreachable_terminated_app_rolls_the_claim_back() {
     for carriage in CARRIAGES {
         let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
         let (gate, journal) = voucher_gate();
@@ -579,11 +653,58 @@ async fn a_terminated_apps_rejection_stays_counted() {
         );
         let edge = edge(connector, Arc::clone(&signer), Arc::clone(&gate)).await;
 
-        let answer = carriage
+        let first = carriage
             .pay(&edge, LOCAL_APP, &signer, &voucher(PRICE))
             .await;
 
-        assert!(matches!(answer, Answer::Reject { .. }), "{carriage:?}");
+        assert_eq!(first, reject("T01", 0), "{carriage:?}");
+        assert_eq!(
+            claim_entries(&journal),
+            vec![accepted(100), reset()],
+            "{carriage:?}"
+        );
+        assert_eq!(
+            gate.watermark(&test_support::channel_key()),
+            None,
+            "{carriage:?}"
+        );
+
+        // Not a resend: the rolled-back voucher is judged afresh, and
+        // accepted again.
+        let second = carriage
+            .pay(&edge, LOCAL_APP, &signer, &voucher(PRICE))
+            .await;
+        assert_eq!(second, first, "{carriage:?}");
+        assert_eq!(
+            claim_entries(&journal),
+            vec![accepted(100), reset(), accepted(100), reset()],
+            "{carriage:?}"
+        );
+    }
+}
+
+/// A reject the termination charges for -- an envelope that reached it and
+/// did not decode is answered with the route's price (issue #545) -- stays
+/// counted.
+#[tokio::test]
+async fn a_charged_termination_reject_stays_counted() {
+    for carriage in CARRIAGES {
+        let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+        let (gate, journal) = voucher_gate();
+        let connector = terminating(&signer, answered(b"never asked"));
+        let edge = edge(connector, Arc::clone(&signer), Arc::clone(&gate)).await;
+
+        let answer = carriage
+            .pay_with_envelope(
+                &edge,
+                LOCAL_APP,
+                &signer,
+                &voucher(PRICE),
+                b"not an envelope",
+            )
+            .await;
+
+        assert_eq!(answer, reject("F01", PRICE), "{carriage:?}");
         assert_eq!(claim_entries(&journal), vec![accepted(100)], "{carriage:?}");
         assert_eq!(
             gate.watermark(&test_support::channel_key())
@@ -788,7 +909,180 @@ async fn a_packet_dropped_before_its_forward_leaves_nothing_counted() {
     );
 }
 
-/// The same on a zk edge: no hold is left held.
+/// A pipeline that panics once its packet has been forwarded -- the next
+/// hop was covered and did the work -- leaves the claim counted: rolling it
+/// back would let the client resend the same voucher and have this
+/// connector pay the next hop twice.
+#[tokio::test]
+async fn a_packet_that_panics_after_its_forward_stays_counted() {
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let (gate, journal) = voucher_gate();
+    let connector = payer_over_a_priced_peering_through(
+        &signer,
+        Some(remote_app_answering(answered(b"carried"))),
+        |inner| {
+            Arc::new(PanicsAfterTheFirstForward {
+                inner,
+                forwarded: AtomicBool::new(false),
+            })
+        },
+    );
+    let state = Arc::new(state_over(Arc::clone(&connector), Arc::clone(&gate)));
+
+    let claim_json = voucher(PRICE);
+    let carrying = {
+        let state = Arc::clone(&state);
+        let packet = Packet {
+            prepare: paid_prepare(REMOTE_APP, &signer),
+            charge: PRICE,
+            forwarded: true,
+        };
+        tokio::spawn(async move {
+            carry(
+                &state,
+                packet,
+                Some(move || Ok(claim_json)),
+                &SessionRole::Client,
+            )
+            .await
+            .map(|_| ())
+        })
+    };
+    let panicked = carrying.await.expect_err("the pipeline panics");
+    assert!(panicked.is_panic());
+
+    assert_eq!(
+        gate.watermark(&test_support::channel_key())
+            .map(|watermark| watermark.cumulative_amount),
+        Some(100)
+    );
+    let app = edge_router(connector, Arc::clone(&signer), Arc::clone(&gate));
+    let resent = app
+        .oneshot(paid_request(REMOTE_APP, &signer, &voucher(PRICE)))
+        .await
+        .unwrap();
+    assert_eq!(answer(resent).await, reject("F03", PRICE));
+    assert_eq!(claim_entries(&journal), vec![accepted(100)]);
+}
+
+/// A journal whose batches -- the committer's writes -- wait while it is
+/// held, and whose single appends do not: what lets a test see whether an
+/// entry appended directly can overtake one still queued for a batch.
+#[derive(Default)]
+struct HeldBatches {
+    inner: InMemoryJournal,
+    held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+}
+
+impl HeldBatches {
+    fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
+    }
+}
+
+impl Journal for HeldBatches {
+    fn append(&self, entry: &JournalEntry) -> Result<(), connector_runtime::JournalError> {
+        self.inner.append(entry)
+    }
+
+    fn append_batch(
+        &self,
+        entries: &[JournalEntry],
+    ) -> Result<(), connector_runtime::JournalError> {
+        let held = self.held.lock().unwrap();
+        drop(self.released.wait_while(held, |held| *held).unwrap());
+        self.inner.append_batch(entries)
+    }
+
+    fn read_all(&self) -> Result<Vec<JournalEntry>, connector_runtime::JournalError> {
+        self.inner.read_all()
+    }
+}
+
+/// A packet dropped before its forward while its allowance is closing
+/// rolls the claim back, and the close then charges what is left. The
+/// charge must not reach the journal before the rollback does (ADR 0005):
+/// a restart between the two would find the allowance charged for less
+/// than the claim its journal still holds.
+#[tokio::test]
+async fn a_zk_edge_packet_dropped_while_its_allowance_closes_charges_after_the_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = allowance_fixtures::keypair(23);
+    let journal = Arc::new(HeldBatches::default());
+    let (gate, id) = allowance_fixtures::edge_with_allowance_over(
+        dir.path(),
+        Arc::clone(&journal) as Arc<dyn Journal>,
+        &session,
+    )
+    .await;
+    let gate = Arc::new(gate);
+    let signer: Arc<dyn Signer> = Arc::new(LocalSigner::generate("paid-packet"));
+    let connector =
+        payer_over_a_priced_peering(&signer, Some(remote_app_answering(answered(b"carried"))));
+    let state = state_over(connector, Arc::clone(&gate));
+
+    journal.hold();
+    let prepare = paid_prepare(REMOTE_APP, &signer);
+    let claim_json = allowance_fixtures::claim(&session, id, PRICE);
+    let admitted = admit(
+        &state,
+        &prepare,
+        Some(|| Ok(claim_json)),
+        PRICE,
+        &SessionRole::Client,
+    )
+    .await
+    .expect("the claim admits")
+    .expect("a claim was presented");
+    assert_eq!(
+        gate.close_allowance(allowance_fixtures::close(&session, id)),
+        Ok(crate::claim_gate::SuccessorStatus::Pending)
+    );
+    drop(admitted);
+    journal.release();
+
+    let entries = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let entries = journal.read_all().unwrap();
+            if entries
+                .iter()
+                .any(|entry| matches!(entry, JournalEntry::AllowanceClosed { .. }))
+            {
+                break entries;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the close charges once nothing is in flight");
+    let reset_at = entries.iter().position(|entry| {
+        matches!(entry, JournalEntry::InboundClaimWatermarkReset { channel_id }
+            if *channel_id == id.claim_key())
+    });
+    let closed_at = entries
+        .iter()
+        .position(|entry| matches!(entry, JournalEntry::AllowanceClosed { .. }));
+    assert!(
+        reset_at.is_some() && reset_at < closed_at,
+        "the rollback is journaled before the charge: {entries:?}"
+    );
+    assert_eq!(
+        entries[closed_at.unwrap()],
+        JournalEntry::AllowanceClosed {
+            allowance_id: id.to_string(),
+            charge: 0
+        }
+    );
+}
+
+/// The same on a zk edge: no hold is left held once the rollback is
+/// durable.
 #[tokio::test]
 async fn a_zk_edge_packet_dropped_before_its_forward_holds_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -807,8 +1101,16 @@ async fn a_zk_edge_packet_dropped_before_its_forward_holds_nothing() {
     )
     .await;
 
-    assert_eq!(gate.forwards_in_flight(), 0);
+    // The watermark is restored at once; the hold is released once the
+    // rollback is durable, so a close never charges ahead of it.
     assert_eq!(gate.watermark(&id.claim_key()), None);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while gate.forwards_in_flight() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the hold is released once the rollback is durable");
     let app = edge_router(connector, Arc::clone(&signer), Arc::clone(&gate));
     let carried = app
         .oneshot(paid_request(

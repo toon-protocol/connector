@@ -5328,14 +5328,20 @@ mod tests {
         /// and the watermark the journal holds.
         #[tokio::test]
         async fn a_replayed_voucher_carries_its_reason_and_the_watermark() {
-            let (app, _app_client, _signer) = priced_route_router();
+            let (app, _app_client, signer) = priced_route_router();
 
-            let paid = request_with_claim_header(
-                &sample_prepare("g.example.app"),
-                CLAIM_HEADER,
-                &evm_claim_json(2 * PRICE),
+            // Sealed, so it reaches the app and stays counted: an unsealed
+            // packet is refused at no cost, and its claim rolled back.
+            let (sealed, _secret) =
+                sealed_sample_prepare("g.example.app", &signer.public_key().unwrap());
+            let paid = request_with_claim_header(&sealed, CLAIM_HEADER, &evm_claim_json(2 * PRICE));
+            let paid = app.clone().oneshot(paid).await.unwrap();
+            assert_eq!(paid.status(), StatusCode::OK);
+            let bytes = hyper::body::to_bytes(paid.into_body()).await.unwrap();
+            assert!(
+                Fulfill::decode(&bytes).is_ok(),
+                "the paid packet is fulfilled"
             );
-            app.clone().oneshot(paid).await.unwrap();
             let replay = request_with_claim_header(
                 &sample_prepare("g.example.app"),
                 CLAIM_HEADER,

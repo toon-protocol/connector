@@ -1019,6 +1019,7 @@ impl ClientClaimGate {
             },
             channel_key: key.to_string(),
             previous: previous.clone(),
+            _release: None,
         }) {
             Ok(ticket) => {
                 // Recorded only now the advance is actually queued for the
@@ -1241,12 +1242,16 @@ impl ClientClaimGate {
     /// the committer reports it fsync'd -- a rollback a restart could
     /// forget would leave the client durably charged for a packet this
     /// connector itself decided not to count.
+    ///
+    /// `release` is the packet's in-flight hold, released once the rollback
+    /// is durable -- see [`Self::begin_roll_back`].
     async fn roll_back(
         &self,
         channel_key: &str,
         cumulative_amount: u128,
+        release: InFlightForward,
     ) -> Result<(), ClaimIngestRejection> {
-        match self.begin_roll_back(channel_key, cumulative_amount)? {
+        match self.begin_roll_back(channel_key, cumulative_amount, release)? {
             Some(ticket) => ticket.durable().await,
             None => Ok(()),
         }
@@ -1259,10 +1264,21 @@ impl ClientClaimGate {
     /// roll back from its `Drop` (#1719): the watermark is restored before
     /// the drop returns, and a batch that later fails is the committer's to
     /// unwind and log, as for every other entry.
+    ///
+    /// `release` -- the packet's [`InFlightForward`] -- rides with the
+    /// rollback's entry and is released by the committer only once that
+    /// entry's batch is written, or has failed and been unwound. Releasing
+    /// the last forward of a closing allowance journals its charge, read
+    /// from the watermark, so it must not reach the journal ahead of the
+    /// rollback that watermark reflects (ADR 0005): a restart between the
+    /// two would find the allowance charged for less than the claim its
+    /// journal still holds. With nothing to roll back, `release` is
+    /// released before this returns.
     fn begin_roll_back(
         &self,
         channel_key: &str,
         cumulative_amount: u128,
+        release: InFlightForward,
     ) -> Result<Option<DurabilityTicket>, ClaimIngestRejection> {
         let key = canonical_channel_key(channel_key);
         let ticket = {
@@ -1304,6 +1320,7 @@ impl ClientClaimGate {
                 entry,
                 channel_key: key.clone(),
                 previous: current.clone(),
+                _release: Some(release),
             }) {
                 Ok(ticket) => ticket,
                 Err(CommitterGone) => {
@@ -1354,6 +1371,12 @@ struct PendingAcceptance {
     entry: JournalEntry,
     channel_key: String,
     previous: Option<LiveClaim>,
+    /// A paid packet's in-flight hold, released only once this entry's
+    /// batch is written or has failed and been unwound: what keeps a
+    /// closing allowance's charge behind the rollback it reads (see
+    /// `ClientClaimGate::begin_roll_back`). Dropped with the entry, after
+    /// its ticket is answered and with no lock held.
+    _release: Option<InFlightForward>,
 }
 
 /// The committer thread has exited, so nothing will ever journal this
@@ -1486,15 +1509,13 @@ fn group_commit_loop(
                     .cloned()
             })
             .collect();
-        match journal.append_batch(&entries) {
-            Ok(()) => {
-                for (_, ticket) in batch {
-                    // A receiver gone before its fsync means the ingest
-                    // future was dropped; the acceptance is durable
-                    // regardless, so there is nothing to do about it.
-                    let _ = ticket.send(Ok(()));
-                }
-            }
+        // Every ticket is answered before any entry is dropped: dropping one
+        // may release an in-flight hold whose allowance then charges, which
+        // journals and fsyncs on this thread, and no waiter should wait on
+        // that. By then this batch is written or unwound, which is the
+        // point of the hold riding with its entry.
+        let pendings = match journal.append_batch(&entries) {
+            Ok(()) => answer(batch, Ok(())),
             Err(err) => {
                 tracing::error!(
                     %err,
@@ -1527,12 +1548,30 @@ fn group_commit_loop(
                         }
                     }
                 }
-                for (_, ticket) in batch {
-                    let _ = ticket.send(Err(()));
-                }
+                answer(batch, Err(()))
             }
-        }
+        };
+        // Dropped only now, with every ticket answered and no lock held: an
+        // entry's in-flight hold may be the last of a closing allowance,
+        // whose charge is journaled on this thread as it is released --
+        // after this batch, written or unwound, never ahead of it.
+        drop(pendings);
     }
+}
+
+/// Answer every ticket in `batch` with `result`, and hand back the entries,
+/// for the caller to drop once no ticket is left waiting.
+fn answer(batch: Vec<QueuedAcceptance>, result: Result<(), ()>) -> Vec<PendingAcceptance> {
+    batch
+        .into_iter()
+        .map(|(pending, ticket)| {
+            // A receiver gone before its fsync means the ingest future was
+            // dropped; the acceptance is durable (or unwound) regardless,
+            // so there is nothing to do about it.
+            let _ = ticket.send(result);
+            pending
+        })
+        .collect()
 }
 
 /// Put `channel_key` back to `previous` -- the inverse of one watermark
@@ -2266,7 +2305,7 @@ mod tests {
             let gate = file_gate(&path);
             gate.ingest(&signed_voucher(100), 0).await.expect("first");
             gate.ingest(&signed_voucher(200), 0).await.expect("second");
-            gate.roll_back(&channel_key(), 200)
+            gate.roll_back(&channel_key(), 200, InFlightForward::untracked())
                 .await
                 .expect("rolled back");
             assert_eq!(gate.watermark(&channel_key()), at(100));
@@ -2284,7 +2323,9 @@ mod tests {
         let gate = gate();
         gate.ingest(&signed_voucher(100), 0).await.expect("first");
         gate.ingest(&signed_voucher(200), 0).await.expect("second");
-        gate.roll_back(&channel_key(), 100).await.expect("a no-op");
+        gate.roll_back(&channel_key(), 100, InFlightForward::untracked())
+            .await
+            .expect("a no-op");
         assert_eq!(gate.watermark(&channel_key()), at(200));
     }
 
@@ -2292,7 +2333,7 @@ mod tests {
     async fn rolling_back_a_channels_first_voucher_empties_it() {
         let gate = gate();
         gate.ingest(&signed_voucher(100), 0).await.expect("first");
-        gate.roll_back(&channel_key(), 100)
+        gate.roll_back(&channel_key(), 100, InFlightForward::untracked())
             .await
             .expect("rolled back");
         assert_eq!(gate.watermark(&channel_key()), None);
