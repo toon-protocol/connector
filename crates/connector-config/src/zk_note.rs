@@ -368,6 +368,7 @@ mod tests {
     use super::*;
     use crate::denomination::DenominationRefusal;
     use crate::Config;
+    use crate::CrossTableRefusal;
     use connector_zk_note::note::policy::TIERS;
     use connector_zk_note::{Keypair, Scalar, SecKey};
     use std::io::Write;
@@ -485,7 +486,10 @@ key_file = "{signer}"
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteWithoutStateDir),
+            matches!(
+                error,
+                ConfigError::CrossTable(CrossTableRefusal::ZkNoteWithoutStateDir)
+            ),
             "{error}"
         );
     }
@@ -724,7 +728,8 @@ max_move = {{ numerator = 1, denominator = 10 }}
     #[test]
     fn a_forward_out_of_mina_needs_a_declared_rate_naming_the_pair() {
         let error = load(|text| with_evm(text, "")).unwrap_err();
-        let ConfigError::ZkNoteRateMissing { from, to } = &error else {
+        let ConfigError::CrossTable(CrossTableRefusal::ZkNoteRateMissing { from, to }) = &error
+        else {
             panic!("{error}");
         };
         assert_eq!(from.to_string(), MINA);

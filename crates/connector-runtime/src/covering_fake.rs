@@ -7,7 +7,7 @@
 //! point of issue #1145: a peering with nothing to pay it on is refused
 //! outright by `Connector::forward_via_peer_route`, and `Config::load`
 //! refuses the file that would have produced it
-//! (`ConfigError::PayChannelUnbound`). A fixture that forwards without this
+//! (`ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelUnbound)`). A fixture that forwards without this
 //! is not a simpler fixture -- it is one no configuration can produce.
 //!
 //! Behind `test-support` rather than `#[cfg(test)]` because the carriage
