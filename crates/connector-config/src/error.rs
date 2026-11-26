@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use connector_domain::{AssetId, AssetIdError, GuardError, Price, RateError};
 
-use crate::settlement::{NetworkTableFamily, SettlementChain};
+use crate::settlement::{SettlementChain, SettlementRefusal};
 
 use thiserror::Error;
 
@@ -26,6 +26,12 @@ pub enum ConfigError {
         #[source]
         source: Box<toml::de::Error>,
     },
+
+    /// A refusal of the `[settlement]` tables, defined beside them in
+    /// `settlement.rs`. Each table's refusals compose into this one type the
+    /// same way (issue #1690), so the binary still handles one error.
+    #[error(transparent)]
+    Settlement(#[from] SettlementRefusal),
 
     #[error("invalid client_edge_addr '{value}': {source}")]
     InvalidBindAddr {
@@ -786,195 +792,6 @@ pub enum ConfigError {
     )]
     PeerWireAddrRemoved,
 
-    /// The flat `[settlement]` shape (`chain`, `rpc_url`, `contract_address`,
-    /// ...), which named a `TokenNetworkRegistry` (ADR 0075 decision 9).
-    #[error(
-        "the flat [settlement] shape (chain = \"evm\", contract_address, ...) was removed with \
-         TOON's own channels (ADR 0075, issue #1385): every channel is an x402 channel on a \
-         contract the binary fixes. Write a [settlement.eip155.<chainId>] table instead (ADR 0086) -- rpc_url, \
-         token_address, decimals, asset_eip712_name, asset_eip712_version and \
-         [settlement.eip155.<chainId>.key] -- and no contract_address"
-    )]
-    SettlementLegacyShapeRemoved,
-
-    /// A settlement key that named TOON's own channel deployment:
-    /// `[settlement.eip155.<chainId>] contract_address` (the `TokenNetworkRegistry`) or
-    /// `[settlement.solana] program_id` (TOON's payment-channel program)
-    /// (ADR 0075 decisions 1 and 9).
-    #[error(
-        "'[settlement.{table}] {field}' was removed with TOON's own channels (ADR 0075, issue \
-         #1385): every channel is an x402 channel, on x402BatchSettlement at \
-         0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003 (EVM) or payment-channels at \
-         CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX (Solana), both constants of the binary. \
-         Delete the line. A node with TOON channels still open drains them on the last release \
-         that supports them first (ADR 0075, \"Draining a node with live TOON channels\")"
-    )]
-    SettlementToonKeyRemoved { table: String, field: &'static str },
-
-    /// The `[settlement.<chain>.batch_settlement]` sub-table, whose keys moved
-    /// up into `[settlement.<chain>]` (ADR 0075 decision 9).
-    #[error(
-        "'[settlement.{table}.batch_settlement]' was removed (ADR 0075, issue #1385): x402 \
-         channels are the only channels, so their terms are no longer an opt-in sub-table. Move \
-         its keys up into [settlement.{table}] unchanged and delete the sub-table's header"
-    )]
-    SettlementBatchSubTableRemoved { table: String },
-
-    /// A key ADR 0075 decision 9 makes required wherever its settlement table
-    /// exists: `asset_eip712_name` and `asset_eip712_version` on EVM,
-    /// `min_sponsored_deposit` on Solana.
-    #[error(
-        "[settlement.{table}] has no {key}. Every channel is an x402 channel (ADR 0075), so \
-         accepting them is no longer an opt-in and this key has no safe default: add it to \
-         [settlement.{table}]"
-    )]
-    SettlementMissingRequiredKey { table: String, key: &'static str },
-
-    #[error("the [settlement] section's rpc_url is empty")]
-    SettlementMissingRpcUrl,
-
-    #[error("invalid settlement rpc_url '{value}': {source}")]
-    SettlementInvalidRpcUrl {
-        value: String,
-        #[source]
-        source: url::ParseError,
-    },
-
-    #[error("settlement rpc_url '{value}' must be http or https")]
-    SettlementUnsupportedRpcScheme { value: String },
-
-    #[error(
-        "invalid settlement token_address '{value}': must be 40 hex characters \
-         (a 20-byte EVM address), optionally '0x'-prefixed"
-    )]
-    SettlementInvalidTokenAddress { value: String },
-
-    #[error("the [settlement] section's decimals must not be zero")]
-    SettlementZeroDecimals,
-
-    #[error(
-        "the [settlement] section's key must set exactly one of 'key_file' or 'kms_key_id', \
-         but {reason}"
-    )]
-    SettlementKeyLocationAmbiguous { reason: &'static str },
-
-    #[error("settlement key_file does not exist or is not a file: {0}")]
-    SettlementKeyFileNotFound(PathBuf),
-
-    #[error("settlement kms_key_id must not be empty")]
-    SettlementKmsIdEmpty,
-
-    #[error(
-        "the [settlement] section is present but names no chain at all -- add an \
-         [settlement.eip155.<chainId>] and/or [settlement.solana] table, or remove the section"
-    )]
-    SettlementSectionEmpty,
-
-    /// `[settlement.evm]`, which named no network (ADR 0086 decision 4).
-    /// Refused by name, never read as some chain's table.
-    #[error(
-        "[settlement.evm] was removed: EVM settlement is one table per network (ADR 0086). Rename \
-         [settlement.evm] to [settlement.eip155.<chainId>] and [settlement.evm.key] to \
-         [settlement.eip155.<chainId>.key], where <chainId> is the decimal chain id its rpc_url \
-         answers eth_chainId with -- e.g. [settlement.eip155.8453] for Base, \
-         [settlement.eip155.84532] for Base Sepolia. Every key in the table is unchanged"
-    )]
-    SettlementEvmTableRemoved,
-
-    /// A network-keyed settlement table (`[settlement.eip155]`,
-    /// `[settlement.xrpl]`) holding no network. One refusal for every
-    /// family; the family supplies the words (ADR 0086 decision 4, ADR 0087
-    /// decision 5).
-    #[error("{}", .family.empty_message())]
-    SettlementNetworkTableEmpty { family: NetworkTableFamily },
-
-    /// A network-keyed settlement table whose key names no network this
-    /// build knows for that family: not a chain id, not an XRPL network
-    /// (ADR 0086 decision 4, ADR 0087 decision 5).
-    #[error("{}", .family.unknown_network_message(.key))]
-    SettlementNetworkKeyUnknown {
-        family: NetworkTableFamily,
-        key: String,
-    },
-
-    #[error("the [settlement.solana] section's token_address is empty")]
-    SettlementMissingSolanaTokenAddress,
-
-    /// A bare `[settlement.xrpl]` table, written with its keys directly under
-    /// it and no network (ADR 0087 decision 5): a claim binds no network, so
-    /// every table says which one it is.
-    #[error(
-        "[settlement.xrpl] has '{key}' directly under it, but XRPL settlement is one table \
-         per network: write [settlement.xrpl.<id>] and [settlement.xrpl.<id>.key], where <id> \
-         is the server_info network_id of the ledger its rpc_url answers (0 mainnet, 1 \
-         testnet, 2 devnet, 1000 stand-alone) (ADR 0087)"
-    )]
-    SettlementXrplBareTable { key: String },
-
-    /// `[settlement.xrpl.<id>] key = "..."`: a key is a file, never a value
-    /// (ADR 0009, ADR 0012).
-    #[error(
-        "[settlement.{table}] writes its key inline. A key is referenced by location, never by \
-         value (ADR 0009): write [settlement.{table}.key] with key_file = \"<path>\""
-    )]
-    SettlementXrplInlineKey { table: String },
-
-    /// An `[settlement.xrpl.<id>]` table that does not parse: an unknown key
-    /// (every table is `deny_unknown_fields`), a missing one, or a value of
-    /// the wrong type. The source names which.
-    #[error("[settlement.{table}] is refused: {source}")]
-    SettlementXrplTableInvalid {
-        table: String,
-        #[source]
-        source: Box<toml::de::Error>,
-    },
-
-    /// `min_settle_delay_secs` at or below the settlement port's floor (ADR
-    /// 0087 decision 9).
-    #[error(
-        "[settlement.{table}] min_settle_delay_secs = {value} must exceed {floor} seconds, the \
-         settlement port's floor: a channel one second short of the minimum has to be one the \
-         ledger lets exist. Omit the key for the default of one day, the window a delayed \
-         landing still has"
-    )]
-    SettlementXrplSettleDelayBelowFloor {
-        table: String,
-        value: u64,
-        floor: u64,
-    },
-
-    /// `redemption_safety_secs` that is zero or no shorter than the delay it
-    /// is a margin inside.
-    #[error(
-        "[settlement.{table}] redemption_safety_secs = {value} must be above 0 and below \
-         min_settle_delay_secs ({min_settle_delay_secs}): it is how long before a channel's \
-         Expiration a held voucher is treated as due"
-    )]
-    SettlementXrplRedemptionSafetyOutOfRange {
-        table: String,
-        value: u64,
-        min_settle_delay_secs: u64,
-    },
-
-    /// `max_fee_drops = 0`: a ceiling that no transaction could ever pay
-    /// under.
-    #[error(
-        "[settlement.{table}] max_fee_drops is 0, a ceiling no transaction's fee could be under. \
-         Omit the key for the default, or name the most one transaction may cost in drops"
-    )]
-    SettlementXrplZeroMaxFee { table: String },
-
-    /// A `[settlement.eip155.<chainId>]` key that tuned the local `TokenNetwork` channel
-    /// index (issue #661), deleted with the `toon-channel` client claims it
-    /// resolved (ADR 0075 decisions 9 and 12, issue #1384).
-    #[error(
-        "'[settlement.eip155.<chainId>] {field}' was removed with the TokenNetwork channel index it tuned \
-         (ADR 0075, issue #1384): every claim is an x402 voucher, whose channel the settlement \
-         backend reads from the chain when it is presented, so nothing indexes TokenNetwork \
-         logs any more. Delete the line"
-    )]
-    SettlementChannelIndexKeyRemoved { field: &'static str },
-
     /// A settlement table published a minimum `withdrawDelay` or
     /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
     #[error(
@@ -1053,31 +870,6 @@ pub enum ConfigError {
          its deposit to the x402 facilitator it names"
     )]
     BatchSettlementUnsupportedFacilitatorScheme { value: String },
-
-    /// A settlement table asked for its RPC to ride the node's `socks_proxy`
-    /// and the node has none (ADR 0073 decision 1). The key selects the one
-    /// proxy ADR 0070 gives a node; it never names a second, and a dial that
-    /// was meant for a circuit is never made direct instead.
-    #[error(
-        "[settlement.{table}] sets rpc_via_socks_proxy = true, but this node configures no \
-         socks_proxy. The key selects the node's one proxy and never names a second, and a \
-         settlement RPC meant for a circuit is never dialed direct instead (ADR 0073). Set \
-         socks_proxy = \"socks5h://<host>:<port>\" at the top level, or remove \
-         rpc_via_socks_proxy"
-    )]
-    SettlementRpcViaSocksProxyWithoutProxy { table: String },
-
-    /// A settlement table asked for its RPC to ride a circuit to a plain
-    /// `http://` endpoint that is not an onion address (ADR 0073). The exit
-    /// relay would be able to read and rewrite every answer.
-    #[error(
-        "[settlement.{table}] rpc_url '{value}' is plain http, and rpc_via_socks_proxy = true \
-         would send it through an exit relay that can read and rewrite every answer (a \
-         channel's deposit, a transaction's receipt). Use the endpoint's https URL. Plain http \
-         over a circuit is accepted only for a .onion or .anyone host, whose address \
-         authenticates the service itself (ADR 0070, ADR 0073)"
-    )]
-    SettlementRpcViaSocksProxyPlaintext { table: String, value: String },
 
     #[error("[[client_identities]] entry has an empty 'id'")]
     ClientIdentityIdEmpty,
