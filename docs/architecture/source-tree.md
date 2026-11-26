@@ -226,9 +226,11 @@ connector-operator               axum Router: bearer-gated reads, RFC 9421-signe
                                   (ADR 0008), each accepted signature retained as its
                                   write's audit record; GET /dashboard, the operator
                                   dashboard embedded from dashboard.html (ADR 0066)
-connector-cli                    config → runtime → merged routers → bound listeners,
-                                  plus the `send` verb; the binary itself branches on
-                                  nothing. Mounts POST /ilp/batch-settlement/solana/open,
+connector-cli                    config → connect (dials chains, reads keys, opens
+                                  journals) → assemble (one journal replay, the
+                                  connector built complete, watchers, merged routers)
+                                  → bound listeners, plus the `send` verb (spec #1689);
+                                  the binary itself branches on nothing. Mounts POST /ilp/batch-settlement/solana/open,
                                   the public Solana sponsor endpoint (ADR 0074). Its
                                   settlement_networks.rs binds each chain's backend as a
                                   settlement network, one per table (spec #1684)

@@ -45,7 +45,10 @@ use url::Url;
 // node's `RateSources` meet, and the reader that supplies the EVM one
 // (issue #1293) is a crate of its own. A map rather than a source, because
 // decision 3 puts a token's pools on that token's own chain (issue #1302).
-pub use runtime::{build, router, spawn_rate_pollers, Runtime, RuntimeError};
+pub use runtime::{
+    assemble, build, connect, router, spawn_rate_pollers, Carriages, Journals, Parts, Runtime,
+    RuntimeError, StoredPeerRoutes, ZkEdgeBoot, ZkEdgeParts,
+};
 
 // Typed `connector send` (issue #1703): the verb's own entry point, so a caller
 // that originates a packet does not shell out. `SendError::was_sent` says

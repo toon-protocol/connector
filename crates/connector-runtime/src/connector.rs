@@ -456,9 +456,9 @@ pub struct Connector {
     x402_networks: Vec<(SettlementChain, String)>,
     /// Which network an admitted channel is on, for a chain on which this
     /// node holds several (ADR 0086 decision 14): the claim gate, which
-    /// verified the channel under its network's domain. Set once the gate
-    /// exists, after this connector is shared.
-    channel_networks: RwLock<Option<Arc<dyn ChannelNetworks>>>,
+    /// verified the channel under its network's domain. Given before this
+    /// connector is shared, by [`Connector::with_channel_networks`].
+    channel_networks: Option<Arc<dyn ChannelNetworks>>,
     /// Reads another node's self-description so a peering can be
     /// established from a URL (ADR 0058). Defaults to
     /// [`UnreachableSelfDescription`]: a node whose builder never gave it
@@ -711,7 +711,7 @@ impl Connector {
             recognized_channels: RwLock::new(HashSet::new()),
             outbound_channels: None,
             x402_networks: Vec::new(),
-            channel_networks: RwLock::new(None),
+            channel_networks: None,
             self_description: Arc::new(UnreachableSelfDescription),
             peer_allow_plaintext: false,
             peering_assets: PeeringAssets::default(),
@@ -1115,12 +1115,10 @@ impl Connector {
 
     /// Tell this connector which network each admitted channel is on (ADR
     /// 0086 decision 14): consulted for a chain on which it holds several
-    /// networks. Replaces any source set before.
-    pub fn set_channel_networks(&self, source: Arc<dyn ChannelNetworks>) {
-        *self
-            .channel_networks
-            .write()
-            .expect("channel networks lock poisoned") = Some(source);
+    /// networks.
+    pub fn with_channel_networks(mut self, source: Arc<dyn ChannelNetworks>) -> Connector {
+        self.channel_networks = Some(source);
+        self
     }
 
     /// The CAIP-2 network a payment on `channel_key` was verified on (ADR
@@ -1136,8 +1134,6 @@ impl Connector {
             [only] => Some((*only).to_string()),
             _ => self
                 .channel_networks
-                .read()
-                .expect("channel networks lock poisoned")
                 .as_ref()?
                 .network_of(channel_key)
                 .map(|network| network.to_string()),
