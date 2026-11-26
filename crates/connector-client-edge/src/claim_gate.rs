@@ -86,6 +86,7 @@ use connector_domain::{
     advance_voucher_watermark, validate_voucher, ClaimError, JournalEntry, Network,
     VoucherAdmission, VoucherWatermark, Watermark, VOUCHER_WATERMARK_NONCE,
 };
+use connector_peer_auth::SessionRole;
 use connector_runtime::{Journal, JournalError, SettlementNetworks};
 use connector_signer::{EvmVoucherScheme, VoucherRefusal, VoucherScheme};
 
@@ -101,6 +102,10 @@ mod verification;
 pub(crate) use verification::{NotFound, Proof};
 
 mod allowance;
+/// A zk edge with one allowance granted, for tests outside the gate that
+/// drive an allowance claim through a carriage (#1719).
+#[cfg(test)]
+pub(crate) use allowance::tests as allowance_fixtures;
 use allowance::ZkLedger;
 pub use allowance::{
     AllowanceClose, AllowanceCloseRefusal, AllowanceGrant, AllowanceRefusal, AllowanceRequest,
@@ -904,7 +909,8 @@ impl ClientClaimGate {
         claim_json: &str,
         price: u64,
     ) -> Result<(ClientEdgeClaim, InFlightForward), ClaimIngestRejection> {
-        let (claim, durability, in_flight) = self.admit(claim_json, price).await?;
+        let (claim, durability, in_flight) =
+            self.admit(claim_json, price, &SessionRole::Client).await?;
         durability.durable().await?;
         Ok((claim, in_flight))
     }
@@ -924,14 +930,24 @@ impl ClientClaimGate {
     /// advanced and the entry is queued in acceptance order, but no
     /// service may be rendered for the claim until the ticket resolves --
     /// that is the boundary ADR 0005 protects.
+    ///
+    /// `role` is the authority of the interaction the claim arrived on
+    /// (#1719): a refusal that depends on the carriage is decided here, off
+    /// it, and nowhere else. The one such refusal today is a `mina` claim's
+    /// (ADR 0089 decision 4).
+    ///
+    /// A carriage does not call this directly: [`crate::paid_packet::admit`]
+    /// wraps the tuple in the paid packet's handle. The BTP carriage still
+    /// does, until it moves onto the shared pipeline (#1720).
     pub(crate) async fn admit(
         &self,
         claim_json: &str,
         price: u64,
+        role: &SessionRole,
     ) -> Result<(ClientEdgeClaim, DurabilityTicket, InFlightForward), ClaimIngestRejection> {
         let claim = parse_client_edge_claim(claim_json, self.zk_edge.is_some()).map_err(
             |error| match error {
-                ClientClaimError::Mina => ClaimIngestRejection::Mina,
+                ClientClaimError::Mina => mina_refusal(role),
                 ClientClaimError::ToonChannel => ClaimIngestRejection::ToonChannel,
                 ClientClaimError::NetworkMissing => ClaimIngestRejection::NetworkMissing,
                 other => ClaimIngestRejection::Malformed(other.to_string()),
@@ -1215,6 +1231,24 @@ impl ClientClaimGate {
         channel_key: &str,
         cumulative_amount: u128,
     ) -> Result<(), ClaimIngestRejection> {
+        match self.begin_roll_back(channel_key, cumulative_amount)? {
+            Some(ticket) => ticket.durable().await,
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::roll_back`]'s synchronous half: the in-memory restore and the
+    /// journal enqueue, under the write lock, with the wait for the batch
+    /// fsync left to the returned ticket (`None`: there was nothing to roll
+    /// back). Synchronous so a paid packet dropped without an outcome can
+    /// roll back from its `Drop` (#1719): the watermark is restored before
+    /// the drop returns, and a batch that later fails is the committer's to
+    /// unwind and log, as for every other entry.
+    pub(crate) fn begin_roll_back(
+        &self,
+        channel_key: &str,
+        cumulative_amount: u128,
+    ) -> Result<Option<DurabilityTicket>, ClaimIngestRejection> {
         let key = canonical_channel_key(channel_key);
         let ticket = {
             let mut watermarks = self
@@ -1225,7 +1259,7 @@ impl ClientClaimGate {
             if current.as_ref().map(|record| record.watermark)
                 != Some(Watermark { cumulative_amount })
             {
-                return Ok(());
+                return Ok(None);
             }
             let mut previous_watermarks = self
                 .previous_watermarks
@@ -1237,7 +1271,7 @@ impl ClientClaimGate {
                     "asked to roll back a claim this gate has no prior watermark recorded \
                      for; leaving it charged rather than guessing"
                 );
-                return Ok(());
+                return Ok(None);
             };
             let entry = match &previous {
                 Some(record) => JournalEntry::InboundClaimRolledBack {
@@ -1269,7 +1303,19 @@ impl ClientClaimGate {
                 }
             }
         };
-        ticket.durable().await
+        Ok(Some(ticket))
+    }
+}
+
+/// What a `mina` claim is answered with on a carriage of `role` (ADR 0089
+/// decision 4). The client edge refuses one by name, always: that refusal is
+/// wire behaviour owed to `toon-client`. ADR 0089 lets a peer carriage
+/// accept a Mina voucher on a bound channel, but no Mina backend exists yet
+/// (the record is not yet built), so a peer's is refused by the same name
+/// until one does -- and that change is made here, once.
+fn mina_refusal(role: &SessionRole) -> ClaimIngestRejection {
+    match role {
+        SessionRole::Client | SessionRole::Peer { .. } => ClaimIngestRejection::Mina,
     }
 }
 
