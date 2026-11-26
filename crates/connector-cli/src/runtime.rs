@@ -30,13 +30,10 @@ use connector_runtime::{
     PeerTransport, QuotePathUnusable, RatePoller, RateSources, SettlementNetwork,
     SettlementNetworks, SharedRateTable, SystemClock,
 };
-use connector_settlement::batch::{
-    BatchSettlementBackend, BatchSettlementError, BatchSettlementPayer, HeldVouchers,
-};
-use connector_settlement::watch_interval::watch_interval;
-use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend, EvmBatchWatcher};
-use connector_settlement_solana::batch::{SolanaBatchSettlement, SolanaBatchWatcher};
-use connector_settlement_xrpl::{XrplBatchSettlement, XrplBatchWatcher};
+use connector_settlement::batch::BatchSettlementError;
+use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend};
+use connector_settlement_solana::batch::SolanaBatchSettlement;
+use connector_settlement_xrpl::XrplBatchSettlement;
 use connector_signer::{LocalSigner, Signer, SignerError, XrplSigner};
 
 use crate::batch_settlement::{
@@ -1045,22 +1042,6 @@ fn warn_about_host_local_endpoints(config: &Config) {
 pub struct Runtime {
     pub connector: Arc<Connector>,
     pub signer: Arc<dyn Signer>,
-    /// One entry per chain this node has opted into accepting an x402
-    /// `batch-settlement` channel on (ADR 0074 decision 8, issue #1345),
-    /// composed from the connected backend. Empty on a node whose
-    /// settlement tables write no `batch_settlement` sub-table -- a node that
-    /// then takes no claim at all, since every claim is a voucher (ADR 0075,
-    /// issue #1384). The self-description's `settlements` -- the
-    /// `toon-channel` terms composed beside this list -- is gone with that
-    /// scheme.
-    pub batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms>,
-    /// The key this node signs its vouchers with on each chain it pays x402
-    /// on (ADR 0075 decisions 3 and 10), published so a peer can bind this
-    /// node's channel toward it: the EVM settlement address, which every
-    /// outbound EVM channel names as `payer` and `payerAuthorizer`, and the
-    /// Solana settlement key. Read off the backends this node connected,
-    /// alongside `batch_settlements`, never declared.
-    pub voucher_signers: Vec<connector_domain::VoucherSignerFact>,
     /// The rates this node deals at, or `None` for a node that declares no
     /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
     /// node that predates the record, and is why this is an `Option` rather
@@ -1079,30 +1060,22 @@ pub struct Runtime {
     ///
     /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's.
     pub rate_table: Option<SharedRateTable>,
-    /// This node's x402 `batch-settlement` backend on each EVM network (ADR
-    /// 0074, ADR 0086), one per `[settlement.eip155.<chainId>]` table, keyed
-    /// by its CAIP-2 network. [`router`] hands them to the client edge's
-    /// claim gate, which admits each voucher through its own network's;
-    /// every channel the client-edge journal holds vouchers on is already
-    /// restored to its network's by the time [`build`] returns, so
-    /// `channel_state` and `land` work from the first packet. [`router`]
-    /// also starts a watcher and sweep over each (issue #1344,
-    /// `spawn_batch_settlement_watchers`).
-    pub batch_settlement_evm: BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
-    /// The Solana twin of [`Self::batch_settlement_evm`], `Some` exactly
-    /// when `[settlement.solana]` is written -- and what
-    /// the public sponsor endpoint (issue #1346) co-signs an `open` with.
-    pub batch_settlement_solana: Option<Arc<SolanaBatchSettlement>>,
-    /// The XRPL twin of [`Self::batch_settlement_evm`] (ADR 0087): the
-    /// receiving half over each `[settlement.xrpl.<id>]` table, keyed by its
-    /// CAIP-2 network, which is also that network's payer among the outbound
-    /// channels'.
-    pub batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>>,
     /// Every network this node settles on, one handle per settlement table
     /// (spec #1684, ADR 0086), keyed by CAIP-2 network and built once at
-    /// boot over the backends above: what the client edge's claim gate finds
-    /// a voucher's channel through.
+    /// boot, in table order. The node reaches every chain through it and
+    /// through nothing else (issue #1715): every channel the client-edge
+    /// journal holds vouchers on, and every outbound channel, is already
+    /// restored to its network's backend by the time [`build`] returns;
+    /// [`router`] hands it to the client edge's claim gate, starts each
+    /// network's watcher through it, and publishes each network's terms in
+    /// the greeting. Empty on a node that settles on nothing -- a node that
+    /// then takes no claim at all, since every claim is a voucher (ADR 0075).
     pub settlement_networks: SettlementNetworks,
+    /// The Solana backend the public sponsor endpoint (ADR 0074 decision 9,
+    /// issue #1346) co-signs an `open` with, `Some` exactly when
+    /// `[settlement.solana]` is written. The endpoint is Solana's own wire,
+    /// not dispatch: nothing else reads a chain's backend off this.
+    sponsor: Option<Arc<SolanaBatchSettlement>>,
     /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
     /// over the paying half of the backends above and journaled to
     /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when either backend is.
@@ -1119,6 +1092,23 @@ pub struct Runtime {
     /// exactly when `[zk_note]` is written. [`router`] hands it to the claim
     /// gate and starts the allowance sweep.
     pub zk_edge: Option<ZkEdgeBoot>,
+}
+
+impl Runtime {
+    /// This node's x402 batch-settlement terms, one entry per network it
+    /// settles on, in table order (ADR 0074 decision 8): the greeting's whole
+    /// `accepts[]` (ADR 0075 decision 10), assembled from each network's
+    /// handle. Proved at connect, never declared.
+    pub fn batch_settlements(&self) -> Vec<connector_client_edge::X402BatchSettlementTerms> {
+        self.settlement_networks.terms()
+    }
+
+    /// The key this node signs its vouchers with on each network it settles
+    /// on (ADR 0075 decisions 3 and 10), published so a peer can bind this
+    /// node's channel toward it. Read off each network's handle.
+    pub fn voucher_signers(&self) -> Vec<connector_domain::VoucherSignerFact> {
+        self.settlement_networks.voucher_signers()
+    }
 }
 
 /// A zk edge's vault and the facts read from it at boot (ADR 0080 decision
@@ -1277,18 +1267,13 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
             .iter()
             .map(|peer| (peer.id().to_string(), peer.fee())),
     );
-    // ADR 0074 decision 8, issue #1345: this node's x402 batch-settlement
-    // facts, one entry per chain whose settlement table opted in, off the
-    // connected backend -- the greeting's whole `accepts[]` (ADR 0075
-    // decision 10).
-    let mut batch_settlements: Vec<connector_client_edge::X402BatchSettlementTerms> = Vec::new();
-    let mut voucher_signers: Vec<connector_domain::VoucherSignerFact> = Vec::new();
-    let mut batch_settlement_evm: BTreeMap<Network, Arc<EvmBatchSettlementBackend>> =
-        BTreeMap::new();
-    let mut batch_settlement_solana: Option<Arc<SolanaBatchSettlement>> = None;
-    let mut batch_settlement_xrpl: BTreeMap<Network, Arc<XrplBatchSettlement>> = BTreeMap::new();
-    // Spec #1684: each table's network, built once, in table order.
+    // Spec #1684: each table's network, built once, in table order. Each
+    // handle carries the terms its greeting entry publishes, so nothing
+    // below re-matches on the chain.
     let mut settlement_networks = SettlementNetworks::new();
+    // ADR 0074 decision 9: the sponsor endpoint's co-signer, the Solana
+    // table's backend.
+    let mut sponsor: Option<Arc<SolanaBatchSettlement>> = None;
     // ADR 0087 decision 4, before any ledger is dialed: one account is one
     // network, and two tables on one are refused by name.
     check_xrpl_accounts_are_distinct(config)?;
@@ -1299,123 +1284,40 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // bound, so two tables on one chain are refused as that.
     let reported = evm_reported_chain_ids(config, &transports).await?;
     for settlement in config.settlements() {
-        match settlement {
-            SettlementConfig::Evm(evm) => {
-                let transport = transports.for_settlement(settlement)?;
-                // ADR 0075 decision 1: bound before anything is served, and
-                // refused by name on a chain without `x402BatchSettlement`.
-                let backend =
-                    build_evm_batch_settlement(evm, transport, reported[evm.network()]).await?;
-                let batch = evm.batch_settlement();
-                let network = format!("eip155:{}", backend.domain().chain_id);
-                // The connection proved the settlement address and the live
-                // chain id; the token comes from the config line `connect`
-                // just verified against that chain (issue #564).
-                let settlement_address = format!("{:#x}", backend.own_address());
-                let token_address =
-                    format!("{:#x}", ethers::types::Address::from(evm.token_address()));
-                let handle = Arc::new(EvmSettlementNetwork::new(Arc::clone(&backend)));
-                voucher_signers.push(handle.voucher_signer());
-                settlement_networks
-                    .insert(handle)
-                    .map_err(RuntimeError::NetworkSettledTwice)?;
-                // ADR 0074 decision 8, issue #1345: this chain's
-                // batch-settlement facts, the greeting's `accepts[]` entry.
-                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Evm(
-                    connector_client_edge::X402BatchSettlementEvmTerms {
-                        network,
-                        asset: token_address,
-                        pay_to: settlement_address.clone(),
-                        receiver_authorizer: settlement_address,
-                        min_withdraw_delay_secs: batch.min_withdraw_delay_secs(),
-                        name: batch.asset_eip712_name().to_string(),
-                        version: batch.asset_eip712_version().to_string(),
-                        // toon-client#695: configured, like `name` and
-                        // `version`; this node never calls the facilitator.
-                        asset_transfer_method: batch.asset_transfer_method(),
-                        facilitator: batch.facilitator_url().map(str::to_string),
-                    },
-                ));
-                batch_settlement_evm.insert(evm.network().clone(), backend);
-            }
+        let transport = transports.for_settlement(settlement)?;
+        let handle: Arc<dyn SettlementNetwork> = match settlement {
+            // ADR 0075 decision 1: bound before anything is served, and
+            // refused by name on a chain without `x402BatchSettlement`.
+            SettlementConfig::Evm(evm) => Arc::new(EvmSettlementNetwork::new(
+                build_evm_batch_settlement(evm, transport, reported[evm.network()]).await?,
+                evm,
+            )),
+            // ADR 0075 decision 1: bound before anything is served, and
+            // refused by name on a chain without `payment-channels`; the
+            // mint must be the SPL Token program's and agree with
+            // `decimals`.
             SettlementConfig::Solana(solana) => {
-                let transport = transports.for_settlement(settlement)?;
-                // ADR 0075 decision 1: bound before anything is served, and
-                // refused by name on a chain without `payment-channels`;
-                // the mint must be the SPL Token program's and agree with
-                // `decimals`.
                 let backend =
                     build_solana_batch_settlement(solana, transport, config.socks_proxy()).await?;
-                // ADR 0074 decision 8, issue #1345: `payTo` and `feePayer`
-                // are both the sponsor key (decision 5's
-                // sponsor-is-the-receiving-operator rule), and `network` is
-                // read off the chain's own genesis hash, never guessed from
-                // the RPC URL. The two minimums are the backend's own: what
-                // it admits by and what its sponsor co-signs above are what
-                // is published. Issue #1357 adds x402's required
-                // `tokenProgram` and where the sponsor is served.
-                let sponsor = backend.sponsor().to_string();
-                let handle = Arc::new(SolanaSettlementNetwork::new(Arc::clone(&backend)));
-                voucher_signers.push(handle.voucher_signer());
-                settlement_networks
-                    .insert(handle)
-                    .map_err(RuntimeError::NetworkSettledTwice)?;
-                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Solana(
-                    connector_client_edge::X402BatchSettlementSolanaTerms {
-                        network: backend.caip2_network(),
-                        asset: backend.mint().to_string(),
-                        pay_to: sponsor.clone(),
-                        fee_payer: sponsor,
-                        min_grace_period_secs: backend.min_grace_period_secs(),
-                        token_program: backend.token_program().to_string(),
-                        min_deposit: backend.min_sponsored_deposit().to_string(),
-                        // The path `sponsor::router` mounts, from the one
-                        // constant, so the greeting can never name a path
-                        // nothing serves.
-                        sponsor_endpoint: crate::sponsor::SPONSOR_PATH.to_string(),
-                    },
-                ));
-                batch_settlement_solana = Some(backend);
+                sponsor = Some(Arc::clone(&backend));
+                Arc::new(SolanaSettlementNetwork::new(backend))
             }
-            SettlementConfig::Xrpl(xrpl) => {
-                let transport = transports.for_settlement(settlement)?;
-                // ADR 0087 decision 5: the network, the account and its
-                // reserve are checked by name before the backend is bound.
-                let backend = build_xrpl_batch_settlement(xrpl, transport).await?;
-                let network = xrpl.network().caip2().to_string();
-                let handle = Arc::new(XrplSettlementNetwork::new(
-                    Network::Xrpl(xrpl.network()),
-                    Arc::clone(&backend),
-                ));
-                voucher_signers.push(handle.voucher_signer());
-                settlement_networks
-                    .insert(handle)
-                    .map_err(RuntimeError::NetworkSettledTwice)?;
-                batch_settlements.push(connector_client_edge::X402BatchSettlementTerms::Xrpl(
-                    connector_client_edge::X402BatchSettlementXrplTerms {
-                        network,
-                        asset: xrpl.asset().to_string(),
-                        pay_to: backend.address().to_string(),
-                        binding: connector_domain::x402::XRPL_PAYCHAN_BINDING.to_string(),
-                        min_settle_delay_secs: xrpl.min_settle_delay_secs(),
-                        redemption_safety_secs: xrpl.redemption_safety_secs(),
-                    },
-                ));
-                batch_settlement_xrpl.insert(Network::Xrpl(xrpl.network()), backend);
-            }
-        }
+            // ADR 0087 decision 5: the network, the account and its reserve
+            // are checked by name before the backend is bound.
+            SettlementConfig::Xrpl(xrpl) => Arc::new(XrplSettlementNetwork::new(
+                build_xrpl_batch_settlement(xrpl, transport).await?,
+                xrpl,
+            )),
+        };
+        settlement_networks
+            .insert(handle)
+            .map_err(RuntimeError::NetworkSettledTwice)?;
     }
     // ADR 0075 decisions 4 and 8: the x402 channels this node pays on,
     // restored from their journal before the runtime peer table below is
     // replayed, because a durable x402 peering is rehydrated onto them --
     // one replayed first would have nothing to sign its forwards on.
-    let outbound_channels = restore_outbound_channels(
-        config,
-        &batch_settlement_evm,
-        &batch_settlement_solana,
-        &batch_settlement_xrpl,
-    )
-    .await?;
+    let outbound_channels = restore_outbound_channels(config, &settlement_networks).await?;
     if let Some(outbound) = &outbound_channels {
         // Each network's chain, read off the network itself: never recovered
         // from the terms built above (spec #1684).
@@ -1510,10 +1412,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     // tightened since cannot strand a voucher already accepted (decision 5).
     // The journal is where an EVM channel's config survives a restart; the
     // chain never gives it back.
-    if !batch_settlement_evm.is_empty()
-        || batch_settlement_solana.is_some()
-        || !batch_settlement_xrpl.is_empty()
-    {
+    if !settlement_networks.is_empty() {
         if let Some(state_dir) = config.state_dir() {
             let path = state_dir.join(CLIENT_EDGE_JOURNAL);
             let unreplayable = |source| RuntimeError::JournalUnreplayable {
@@ -1525,15 +1424,7 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
                 .map_err(unreplayable)?;
             let channels =
                 connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
-            restore_journaled_channels(
-                &channels,
-                &receivers(
-                    &batch_settlement_evm,
-                    &batch_settlement_solana,
-                    &batch_settlement_xrpl,
-                ),
-            )
-            .await;
+            restore_journaled_channels(&channels, &settlement_networks.receivers()).await;
         }
     }
     let connector = Arc::new(connector);
@@ -1546,13 +1437,9 @@ pub async fn build(config: &Config) -> Result<Runtime, RuntimeError> {
     Ok(Runtime {
         connector,
         signer,
-        batch_settlements,
-        voucher_signers,
         rate_table,
-        batch_settlement_evm,
-        batch_settlement_solana,
-        batch_settlement_xrpl,
         settlement_networks,
+        sponsor,
         outbound_channels,
         state_dir_lock,
         zk_edge,
@@ -1723,34 +1610,10 @@ fn wire_config_peerings(
 /// memory, which survives nothing -- the same posture its claim books take.
 async fn restore_outbound_channels(
     config: &Config,
-    evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
-    solana: &Option<Arc<SolanaBatchSettlement>>,
-    xrpl: &BTreeMap<Network, Arc<XrplBatchSettlement>>,
+    networks: &SettlementNetworks,
 ) -> Result<Option<Arc<OutboundChannels>>, RuntimeError> {
-    // ADR 0086: one payer per network, each EVM table's own.
-    let mut payers: Vec<(Network, Arc<dyn BatchSettlementPayer>)> = evm
-        .iter()
-        .map(|(network, backend)| {
-            (
-                network.clone(),
-                Arc::clone(backend) as Arc<dyn BatchSettlementPayer>,
-            )
-        })
-        .collect();
-    if let Some(solana) = solana {
-        payers.push((
-            solana_network_of(solana),
-            Arc::clone(solana) as Arc<dyn BatchSettlementPayer>,
-        ));
-    }
-    // ADR 0087: each XRPL table's backend is its network's payer as well as
-    // its receiver.
-    payers.extend(xrpl.iter().map(|(network, backend)| {
-        (
-            network.clone(),
-            Arc::clone(backend) as Arc<dyn BatchSettlementPayer>,
-        )
-    }));
+    // ADR 0086, ADR 0087: one payer per network, each table's own.
+    let payers = networks.payers();
     if payers.is_empty() {
         return Ok(None);
     }
@@ -1801,57 +1664,9 @@ fn batch_channels_for_operator(
     let outbound = Arc::clone(runtime.outbound_channels.as_ref()?);
     Some(Arc::new(BatchChannels::new(
         outbound,
-        runtime_receivers(runtime),
+        runtime.settlement_networks.receivers(),
         Arc::new(ClaimGateVouchers(Arc::clone(claim_gate))),
     )))
-}
-
-/// The receiving half of every backend this node connected, keyed by its
-/// CAIP-2 network (ADR 0086, ADR 0087): each EVM table's, the Solana one,
-/// then each XRPL table's.
-fn receivers(
-    evm: &BTreeMap<Network, Arc<EvmBatchSettlementBackend>>,
-    solana: &Option<Arc<SolanaBatchSettlement>>,
-    xrpl: &BTreeMap<Network, Arc<XrplBatchSettlement>>,
-) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
-    let mut receivers: Vec<(Network, Arc<dyn BatchSettlementBackend>)> = evm
-        .iter()
-        .map(|(network, backend)| {
-            (
-                network.clone(),
-                Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-            )
-        })
-        .collect();
-    if let Some(solana) = solana {
-        receivers.push((
-            solana_network_of(solana),
-            Arc::clone(solana) as Arc<dyn BatchSettlementBackend>,
-        ));
-    }
-    receivers.extend(xrpl.iter().map(|(network, backend)| {
-        (
-            network.clone(),
-            Arc::clone(backend) as Arc<dyn BatchSettlementBackend>,
-        )
-    }));
-    receivers
-}
-
-fn runtime_receivers(runtime: &Runtime) -> Vec<(Network, Arc<dyn BatchSettlementBackend>)> {
-    receivers(
-        &runtime.batch_settlement_evm,
-        &runtime.batch_settlement_solana,
-        &runtime.batch_settlement_xrpl,
-    )
-}
-
-/// The CAIP-2 network a connected Solana backend read off its cluster.
-fn solana_network_of(backend: &SolanaBatchSettlement) -> Network {
-    backend
-        .caip2_network()
-        .parse()
-        .expect("a connected Solana backend names a CAIP-2 network")
 }
 
 /// Start one background poller per declared quote path, each refreshing its
@@ -2078,26 +1893,29 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
     Ok(transports)
 }
 
-/// Start the watchers and sweeps over every batch-settlement backend this
-/// node opted in to (ADR 0074 decision 5, issue #1344), reading the vouchers
-/// to land from `gate`, the one place a voucher is accepted. Spawned, never
-/// awaited, for the life of the process: a step
-/// that fails is logged and retried on its next tick. A node that opted in
-/// on neither chain starts nothing.
+/// Start the watcher and sweep of every network this node settles on (ADR
+/// 0074 decision 5, issue #1344), reading the vouchers to land from `gate`,
+/// the one place a voucher is accepted. Each network's handle starts its
+/// own (issue #1715), so a new chain's watcher starts without an edit here.
+/// Spawned, never awaited, for the life of the process: a step that fails is
+/// logged and retried on its next tick. A node that settles on no network
+/// starts nothing.
 ///
-/// - EVM: [`EvmBatchWatcher`] reads `WithdrawInitiated` every
+/// What each chain's binding starts:
+///
+/// - EVM: [`EvmBatchWatcher`](connector_settlement_evm::EvmBatchWatcher) reads `WithdrawInitiated` every
 ///   [`watch_interval`] of the node's `min_withdraw_delay_secs` and claims
 ///   the latest voucher on a withdrawing channel at once, and every
 ///   [`BATCH_SWEEP_INTERVAL`] claims every held voucher in one `claim` and
 ///   then `settle`s.
-/// - Solana: [`SolanaBatchWatcher`] rediscovers every sponsored channel every
+/// - Solana: [`SolanaBatchWatcher`](connector_settlement_solana::batch::SolanaBatchWatcher) rediscovers every sponsored channel every
 ///   [`watch_interval`] of the node's `min_grace_period_secs` -- sealing a
 ///   Closing one with its latest voucher, distributing a Sealed one,
 ///   reclaiming a Distributed one's rent -- and settles Open ones every [`OPEN_SETTLE_INTERVAL`]. The Open settle
 ///   check runs only on a watch pass, so a longer watch rounds it up to the
 ///   next pass.
 ///
-/// - XRPL: [`XrplBatchWatcher`], one per table, reads every [`watch_interval`]
+/// - XRPL: [`XrplBatchWatcher`](connector_settlement_xrpl::XrplBatchWatcher), one per table, reads every [`watch_interval`]
 ///   of the table's `min_settle_delay_secs` and answers a payer's exit by landing
 ///   the latest voucher with `tfClose` (ADR 0087 decision 8).
 ///
@@ -2106,7 +1924,7 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 /// minutes, so ninety passes fit inside the shortest delay any admitted
 /// channel can carry and an idle node spends no more RPC than that needs.
 ///
-/// Both backends read and write through the settlement table's one transport
+/// Every backend reads and writes through its settlement table's one transport
 /// (ADR 0073): the watchers are built from the backends, never from a URL.
 ///
 /// [`watch_interval`]: connector_settlement::watch_interval::watch_interval
@@ -2115,35 +1933,13 @@ pub(crate) fn settlement_transports(config: &Config) -> Result<SettlementTranspo
 fn spawn_batch_settlement_watchers(runtime: &Runtime, gate: &Arc<ClientClaimGate>) {
     // ADR 0086: one watcher per network, each handed only the vouchers held
     // on its own network's channels.
-    let networks: Vec<Network> = runtime_receivers(runtime)
-        .into_iter()
-        .map(|(network, _)| network)
-        .collect();
-    let held_on = |network: &Network| -> Arc<dyn HeldVouchers> {
-        Arc::new(NetworkVouchers {
+    let networks = runtime.settlement_networks.networks();
+    for held in runtime.settlement_networks.iter() {
+        held.start_watcher(Arc::new(NetworkVouchers {
             held: ClaimGateVouchers(Arc::clone(gate)),
-            network: network.clone(),
+            network: held.network().clone(),
             networks: networks.clone(),
-        })
-    };
-    for (network, backend) in &runtime.batch_settlement_evm {
-        let watcher = EvmBatchWatcher::new(Arc::clone(backend), held_on(network));
-        tokio::spawn(watcher.run(
-            watch_interval(backend.min_withdraw_delay_secs()),
-            connector_settlement_evm::BATCH_SWEEP_INTERVAL,
-        ));
-    }
-    if let Some(backend) = &runtime.batch_settlement_solana {
-        let watcher =
-            SolanaBatchWatcher::new(Arc::clone(backend), held_on(&solana_network_of(backend)));
-        tokio::spawn(watcher.run(
-            watch_interval(backend.min_grace_period_secs()),
-            connector_settlement_solana::batch::OPEN_SETTLE_INTERVAL,
-        ));
-    }
-    for (network, backend) in &runtime.batch_settlement_xrpl {
-        let watcher = XrplBatchWatcher::new(Arc::clone(backend), held_on(network));
-        tokio::spawn(watcher.run(watch_interval(backend.min_settle_delay_secs())));
+        }));
     }
 }
 
@@ -2288,8 +2084,8 @@ fn node_facts(
             .filter(|carriage| config.peer_expose().exposes(*carriage))
             .map(|carriage| carriage.name().to_string())
             .collect(),
-        batch_settlements: runtime.batch_settlements.clone(),
-        voucher_signers: runtime.voucher_signers.clone(),
+        batch_settlements: runtime.batch_settlements(),
+        voucher_signers: runtime.voucher_signers(),
         zk_note: config.zk_note().map(zk_note_terms).transpose()?,
     })
 }
@@ -2387,10 +2183,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // channel under that network's domain.
     connector.set_channel_networks(Arc::new(GateChannelNetworks {
         gate: Arc::clone(&claim_gate),
-        networks: runtime_receivers(runtime)
-            .into_iter()
-            .map(|(network, _)| network)
-            .collect(),
+        networks: runtime.settlement_networks.networks(),
     }));
     spawn_batch_settlement_watchers(runtime, &claim_gate);
     // ADR 0080 decision 4: a zk edge closes the allowances that expire, for
@@ -2439,9 +2232,7 @@ pub fn router(runtime: &Runtime, config: &Config) -> Result<Router, RuntimeError
     // ADR 0074 decision 9, issue #1346: the public Solana sponsor endpoint,
     // on the client edge's listener. Mounted whether or not this node opted
     // in, so a node that has not refuses by name.
-    let app = app.merge(crate::sponsor::router(
-        runtime.batch_settlement_solana.clone(),
-    ));
+    let app = app.merge(crate::sponsor::router(runtime.sponsor.clone()));
     // ADR 0080 decision 8, #1523: the zk edge's allowance endpoints, beside
     // the sponsor's and on the same terms -- mounted on every node, so one
     // that is no zk edge refuses them by name.
@@ -3763,9 +3554,8 @@ key_file = "{signer_key}"
             let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
             let config = node_config(&key_path.display().to_string(), "");
             let runtime = build(&config).await.expect("builds with no settlement");
-            assert!(runtime.batch_settlement_evm.is_empty());
-            assert!(runtime.batch_settlement_solana.is_none());
-            assert!(runtime.batch_settlements.is_empty());
+            assert!(runtime.settlement_networks.is_empty());
+            assert!(runtime.batch_settlements().is_empty());
         }
 
         /// ADR 0075 decision 1: a `[settlement.evm]` table pointed at a chain
@@ -3952,8 +3742,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
         /// The published EVM `assetTransferMethod` a built node offers.
         fn published_method(runtime: &Runtime) -> connector_domain::x402::X402AssetTransferMethod {
             runtime
-                .batch_settlements
-                .iter()
+                .batch_settlements()
+                .into_iter()
                 .find_map(|entry| match entry {
                     connector_client_edge::X402BatchSettlementTerms::Evm(terms) => {
                         Some(terms.asset_transfer_method)
@@ -4255,18 +4045,30 @@ max_move = {{ numerator = 5, denominator = 100 }}
             let runtime = build(&config)
                 .await
                 .expect("all three chains bind without any refusing startup");
-            assert!(!runtime.batch_settlement_evm.is_empty());
-            assert!(runtime.batch_settlement_solana.is_some());
-            assert_eq!(runtime.batch_settlement_xrpl.len(), 1);
+            for chain in [
+                connector_domain::AssetChain::Evm,
+                connector_domain::AssetChain::Solana,
+                connector_domain::AssetChain::Xrpl,
+            ] {
+                assert_eq!(
+                    runtime
+                        .settlement_networks
+                        .iter()
+                        .filter(|held| held.network().chain() == chain)
+                        .count(),
+                    1,
+                    "one network per table: {chain:?}"
+                );
+            }
 
             // No `{:?}` of the facts: they carry keys derived from the
             // settlement key files (rust/cleartext-logging).
-            assert_eq!(runtime.batch_settlements.len(), 3, "all three chains");
-            assert_eq!(runtime.voucher_signers.len(), 3, "all three chains");
+            assert_eq!(runtime.batch_settlements().len(), 3, "all three chains");
+            assert_eq!(runtime.voucher_signers().len(), 3, "all three chains");
 
             let xrpl_batch = runtime
-                .batch_settlements
-                .iter()
+                .batch_settlements()
+                .into_iter()
                 .find_map(|entry| match entry {
                     connector_client_edge::X402BatchSettlementTerms::Xrpl(terms) => {
                         Some(terms.clone())
@@ -4282,8 +4084,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
             assert_eq!(xrpl_batch.redemption_safety_secs, 60);
             assert!(
                 runtime
-                    .voucher_signers
-                    .iter()
+                    .voucher_signers()
+                    .into_iter()
                     .any(|fact| fact.network == "xrpl:1000"
                         && fact.signer
                             == xrpl_node
@@ -4295,8 +4097,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
             );
 
             let evm_batch = runtime
-                .batch_settlements
-                .iter()
+                .batch_settlements()
+                .into_iter()
                 .find_map(|entry| match entry {
                     connector_client_edge::X402BatchSettlementTerms::Evm(terms) => {
                         Some(terms.clone())
@@ -4331,8 +4133,8 @@ max_move = {{ numerator = 5, denominator = 100 }}
             );
 
             let solana_batch = runtime
-                .batch_settlements
-                .iter()
+                .batch_settlements()
+                .into_iter()
                 .find_map(|entry| match entry {
                     connector_client_edge::X402BatchSettlementTerms::Solana(terms) => {
                         Some(terms.clone())

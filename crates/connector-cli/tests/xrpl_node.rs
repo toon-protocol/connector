@@ -374,7 +374,7 @@ async fn a_node_boots_on_xrpl_and_publishes_it() {
         );
 
         assert_eq!(
-            runtime.batch_settlements,
+            runtime.batch_settlements(),
             vec![X402BatchSettlementTerms::Xrpl(
                 X402BatchSettlementXrplTerms {
                     network: "xrpl:1000".to_string(),
@@ -387,10 +387,10 @@ async fn a_node_boots_on_xrpl_and_publishes_it() {
             )]
         );
         // `voucherSigners`: the 33-byte channel key, in hex (decision 2).
-        assert_eq!(runtime.voucher_signers.len(), 1);
-        assert_eq!(runtime.voucher_signers[0].network, "xrpl:1000");
+        assert_eq!(runtime.voucher_signers().len(), 1);
+        assert_eq!(runtime.voucher_signers()[0].network, "xrpl:1000");
         assert_eq!(
-            runtime.voucher_signers[0].signer,
+            runtime.voucher_signers()[0].signer,
             hex::encode(node.public_key()),
             "{algorithm:?}"
         );
@@ -645,7 +645,7 @@ async fn boot_refuses_two_tables_on_one_account() {
         .expect("two accounts on two networks");
     assert_eq!(
         runtime
-            .voucher_signers
+            .voucher_signers()
             .iter()
             .map(|fact| fact.network.as_str())
             .collect::<Vec<_>>(),
@@ -1379,7 +1379,7 @@ async fn a_node_boots_on_a_spawned_xrpld_and_serves_a_real_channel() {
     assert_eq!(entry["payTo"], node.address, "{terms}");
     assert_eq!(entry["extra"]["binding"], "xrpl-paychan-v1", "{terms}");
     assert_eq!(
-        runtime.voucher_signers[0].signer,
+        runtime.voucher_signers()[0].signer,
         hex::encode(signer(&node.seed).public_key())
     );
 

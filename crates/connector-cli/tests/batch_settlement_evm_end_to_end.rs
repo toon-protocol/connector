@@ -17,9 +17,7 @@ use std::io::Write;
 
 use connector_domain::{Fulfill, JournalEntry, Reject};
 use connector_runtime::{FileJournal, Journal};
-use connector_settlement::batch::{
-    BatchChannelStatus, BatchSettlementBackend, EvmChannelConfig, Voucher,
-};
+use connector_settlement::batch::{BatchChannelStatus, EvmChannelConfig, Voucher};
 use connector_settlement_evm::test_support::x402::X402Chain;
 use connector_settlement_evm::test_support::{require_anvil, Anvil, DEPLOYER_PRIVATE_KEY};
 use ethers::signers::{LocalWallet, Signer};
@@ -114,10 +112,14 @@ price = {PRICE}
     ));
 
     let runtime = connector_cli::build(&config).await.expect("build");
-    assert!(!runtime.batch_settlement_evm.is_empty(), "opted in on EVM");
-    assert!(
-        runtime.batch_settlement_solana.is_none(),
-        "and not on Solana"
+    assert_eq!(
+        runtime
+            .settlement_networks
+            .iter()
+            .map(|held| held.network().chain())
+            .collect::<Vec<_>>(),
+        [connector_domain::AssetChain::Evm],
+        "opted in on EVM, and not on Solana"
     );
     let app = connector_cli::router(&runtime, &config).expect("router");
     let receiver = runtime.signer.public_key().expect("the node's wrap key");
@@ -281,11 +283,11 @@ price = {PRICE}
     drop(runtime);
     let runtime = connector_cli::build(&config).await.expect("rebuild");
     let backend = runtime
-        .batch_settlement_evm
-        .values()
+        .settlement_networks
+        .iter()
         .next()
-        .cloned()
-        .expect("still opted in") as std::sync::Arc<dyn BatchSettlementBackend>;
+        .expect("still opted in")
+        .receiver();
     let before = backend
         .channel_state(&channel)
         .await
