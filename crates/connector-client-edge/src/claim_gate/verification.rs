@@ -7,8 +7,8 @@
 //! ([`VoucherChannels`](crate::batch_settlement::VoucherChannels)), and the port answers the channel's recorded signer
 //! and state. Verifying is the chain's voucher scheme's, against exactly
 //! what the port answered and never against anything the voucher carries.
-//! EVM's is [`EvmVoucherScheme`]; Solana's and XRPL's arms below become
-//! their schemes in #1717 and #1718.
+//! EVM's is [`EvmVoucherScheme`] and Solana's [`SolanaVoucherScheme`];
+//! XRPL's arm below becomes its scheme in #1718.
 //!
 //! A channel this gate has no record of is a discovery, metered against the
 //! unresolvable-lookup budget (issue #613): charged before the port is
@@ -18,15 +18,15 @@ use connector_domain::client_claim::{ClientClaim, EVM_NAMESPACE};
 use connector_domain::Network;
 use connector_settlement::batch::{BatchChannelState, ChannelPresentation, VoucherSigner};
 use connector_signer::{
-    verify_solana_voucher, verify_solana_voucher_claim_state_challenge, verify_xrpl_claim,
-    verify_xrpl_voucher_claim_state_challenge, BatchChannelConfig, BatchSettlementDomain,
-    EvmVoucherScheme, ParsedEvmVoucher, VoucherRefusal, VoucherScheme,
+    verify_xrpl_claim, verify_xrpl_voucher_claim_state_challenge, BatchChannelConfig,
+    BatchSettlementDomain, EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher,
+    RecordedSolanaChannel, SolanaVoucherDomain, SolanaVoucherScheme, VoucherRefusal, VoucherScheme,
 };
 
 use super::ClientClaimGate;
 use crate::batch_settlement::JournaledBatchChannel;
 use crate::batch_settlement::{evm_channel, port_config, solana_channel, xrpl_channel};
-use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
+use crate::channels::{decode_hex_bytes, ChannelResolutionError};
 
 /// A signature on a voucher channel, and what it claims to sign: a
 /// voucher's amount, or a claim-state challenge's expiry. Each chain's
@@ -45,11 +45,9 @@ pub(crate) enum Proof {
         expires: u64,
         signature: Vec<u8>,
     },
-    SolanaVoucher {
-        channel_account: [u8; 32],
-        cumulative: u64,
-        signature: [u8; 64],
-    },
+    /// A Solana voucher, parsed through its scheme.
+    SolanaVoucher(ParsedSolanaVoucher),
+    /// A Solana claim-state challenge.
     SolanaChallenge {
         channel_account: [u8; 32],
         expires: u64,
@@ -76,18 +74,7 @@ impl Proof {
                 EvmVoucherScheme::parse(voucher).map(Proof::EvmVoucher)
             }
             ClientClaim::SolanaVoucher(voucher) => {
-                let signature = decode_base58_bytes::<64>(&voucher.signature).ok_or_else(|| {
-                    VoucherRefusal::Malformed(
-                        "a Solana voucher's 'signature' must be base58 of 64 bytes".to_string(),
-                    )
-                })?;
-                let channel_account = decode_base58_bytes::<32>(&voucher.channel_id)
-                    .ok_or(VoucherRefusal::UnreadableChannel)?;
-                Ok(Proof::SolanaVoucher {
-                    channel_account,
-                    cumulative: voucher.max_claimable_amount,
-                    signature,
-                })
+                SolanaVoucherScheme::parse(voucher).map(Proof::SolanaVoucher)
             }
             ClientClaim::XrplVoucher(voucher) => {
                 let signature = hex::decode(&voucher.signature)
@@ -178,16 +165,13 @@ impl ClientClaimGate {
                 )
                 .await
             }
-            Proof::SolanaVoucher {
-                channel_account,
-                cumulative,
-                signature,
-            } => {
-                // `expiresAt` is zero: the parser refused anything else (ADR
-                // 0074 decision 3), and it is still part of the signed bytes.
-                self.find_then_verify_solana(network, channel_account, requester, |key| {
-                    verify_solana_voucher(channel_account, *cumulative, 0, signature, key)
-                })
+            Proof::SolanaVoucher(voucher) => {
+                self.find_then_verify_solana(
+                    network,
+                    &voucher.channel_account,
+                    requester,
+                    |domain, recorded| SolanaVoucherScheme::verify(domain, voucher, recorded),
+                )
                 .await
             }
             Proof::SolanaChallenge {
@@ -195,14 +179,20 @@ impl ClientClaimGate {
                 expires,
                 signature,
             } => {
-                self.find_then_verify_solana(network, channel_account, requester, |key| {
-                    verify_solana_voucher_claim_state_challenge(
-                        channel_account,
-                        *expires,
-                        signature,
-                        key,
-                    )
-                })
+                self.find_then_verify_solana(
+                    network,
+                    channel_account,
+                    requester,
+                    |domain, recorded| {
+                        SolanaVoucherScheme::verify_challenge(
+                            domain,
+                            channel_account,
+                            *expires,
+                            signature,
+                            recorded,
+                        )
+                    },
+                )
                 .await
             }
             Proof::XrplVoucher {
@@ -283,13 +273,15 @@ impl ClientClaimGate {
     }
 
     /// Every field of a Solana channel is on chain: the signer is its
-    /// `authorized_signer` (ADR 0074 decision 4).
+    /// `authorized_signer` (ADR 0074 decision 4), and the channel is the
+    /// account the network answered at. The scheme verifies against exactly
+    /// that.
     async fn find_then_verify_solana(
         &self,
         network: &Network,
         channel_account: &[u8; 32],
         requester: &str,
-        verify: impl FnOnce(&[u8; 32]) -> bool,
+        verify: impl FnOnce(&SolanaVoucherDomain, &RecordedSolanaChannel) -> Result<(), VoucherRefusal>,
     ) -> Result<Found, NotFound> {
         if !self.voucher_channels.settles_on(network) {
             return Err(NotFound::Unknown);
@@ -306,14 +298,23 @@ impl ClientClaimGate {
             .await?;
         // A Solana network reporting another chain's signer is not a channel
         // this gate can verify against.
-        let VoucherSigner::Solana(key) = state.voucher_signer else {
+        let VoucherSigner::Solana(authorized_signer) = state.voucher_signer else {
             return Err(NotFound::Unknown);
+        };
+        let recorded = RecordedSolanaChannel {
+            channel_account: *channel_account,
+            authorized_signer,
+        };
+        let verified = match verify(&SolanaVoucherDomain::payment_channels(), &recorded) {
+            Ok(()) => true,
+            Err(VoucherRefusal::ChannelIdMismatch) => return Err(NotFound::ChannelIdMismatch),
+            Err(_) => false,
         };
         Ok(Found {
             channel,
             signer: state.voucher_signer,
             max_cumulative: u128::from(saturating_u64(&state)),
-            verified: verify(&key),
+            verified,
         })
     }
 

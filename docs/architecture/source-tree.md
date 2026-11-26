@@ -72,7 +72,8 @@ connector-signer                 the only crate that touches key material
   │                               (ADR 0024, ADR 0053)
   ├─ voucher_scheme.rs           one chain's voucher in one module: wire spelling,
   │                               signature, channel id, verification and the
-  │                               claim-state challenge (spec #1685); EVM's is evm.rs
+  │                               claim-state challenge (spec #1685); EVM's is evm.rs,
+  │                               Solana's solana.rs
   ├─ voucher_signature.rs        x402 batch-settlement voucher digests and signature rules
   │                               (ADR 0074), reached through the voucher schemes
   ├─ claim_state_challenge.rs    "prove you hold this channel", moving no value

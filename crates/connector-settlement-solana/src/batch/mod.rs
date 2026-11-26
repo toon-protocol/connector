@@ -46,6 +46,10 @@ use connector_settlement::batch::{
     BatchSettlementError, ChannelPresentation, Landed, Voucher, VoucherSigner,
 };
 use connector_settlement::ChannelId;
+use connector_signer::{
+    ParsedSolanaVoucher, RecordedSolanaChannel, SolanaVoucherDomain, SolanaVoucherScheme,
+    VoucherScheme,
+};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client::rpc_client::RpcClientConfig;
@@ -887,13 +891,23 @@ impl BatchSettlementBackend for SolanaBatchSettlement {
                 voucher.signature.len()
             ))
         })?;
-        if !connector_signer::verify_solana_voucher(
-            &address.to_bytes(),
-            amount,
-            0,
-            &signature,
-            &account.authorized_signer.to_bytes(),
-        ) {
+        // Solana's voucher scheme (spec #1685), against the account this
+        // node admitted and the signer it records.
+        let verified = SolanaVoucherScheme::verify(
+            &SolanaVoucherDomain {
+                program_id: self.program_id.to_bytes(),
+            },
+            &ParsedSolanaVoucher {
+                channel_account: address.to_bytes(),
+                max_claimable_amount: amount,
+                signature,
+            },
+            &RecordedSolanaChannel {
+                channel_account: address.to_bytes(),
+                authorized_signer: account.authorized_signer.to_bytes(),
+            },
+        );
+        if verified.is_err() {
             return Err(BatchSettlementError::InvalidVoucherSignature(format!(
                 "not a signature by the channel's authorized_signer {} over a voucher for {amount}",
                 account.authorized_signer

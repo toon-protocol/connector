@@ -88,10 +88,10 @@ use connector_domain::{
 };
 use connector_peer_auth::SessionRole;
 use connector_runtime::{Journal, JournalError, SettlementNetworks};
-use connector_signer::{EvmVoucherScheme, VoucherRefusal, VoucherScheme};
+use connector_signer::{EvmVoucherScheme, SolanaVoucherScheme, VoucherRefusal, VoucherScheme};
 
 use crate::batch_settlement::{journaled_batch_channels, JournaledBatchChannel, VoucherChannels};
-use crate::channels::{decode_base58_bytes, ChannelResolutionError};
+use crate::channels::ChannelResolutionError;
 use crate::lookup_budget::{
     LookupBudgetBound, UnresolvableLookupBudget, UnresolvableLookupBudgetPolicy,
 };
@@ -1712,7 +1712,7 @@ fn voucher_signature_bytes(claim: &ClientClaim) -> Result<Vec<u8>, ClaimIngestRe
             EvmVoucherScheme::decode_signature(&voucher.signature).map(|bytes| bytes.to_vec())
         }
         ClientClaim::SolanaVoucher(voucher) => {
-            decode_base58_bytes::<64>(&voucher.signature).map(|bytes| bytes.to_vec())
+            SolanaVoucherScheme::decode_signature(&voucher.signature).map(|bytes| bytes.to_vec())
         }
         ClientClaim::XrplVoucher(voucher) => hex::decode(&voucher.signature)
             .ok()

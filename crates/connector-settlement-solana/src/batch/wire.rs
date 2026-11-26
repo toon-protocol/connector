@@ -820,6 +820,52 @@ mod tests {
         );
     }
 
+    /// Solana's voucher scheme derives a channel id with no Solana SDK
+    /// (spec #1685). It must be exactly the address the program derives,
+    /// under exactly the program this adapter binds to.
+    #[test]
+    fn the_voucher_schemes_domain_is_the_program_this_adapter_binds_to() {
+        assert_eq!(
+            connector_signer::SolanaVoucherDomain::payment_channels().program_id,
+            program_id().to_bytes()
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_voucher_schemes_channel_id_is_the_programs_channel_pda(
+            payer in proptest::array::uniform32(proptest::prelude::any::<u8>()),
+            payee in proptest::array::uniform32(proptest::prelude::any::<u8>()),
+            mint in proptest::array::uniform32(proptest::prelude::any::<u8>()),
+            authorized_signer in proptest::array::uniform32(proptest::prelude::any::<u8>()),
+            salt in proptest::prelude::any::<u64>(),
+            open_slot in proptest::prelude::any::<u64>(),
+        ) {
+            use connector_signer::VoucherScheme as _;
+            let (expected, _) = channel_pda(
+                &Pubkey::new_from_array(payer),
+                &Pubkey::new_from_array(payee),
+                &Pubkey::new_from_array(mint),
+                &Pubkey::new_from_array(authorized_signer),
+                salt,
+                open_slot,
+                &program_id(),
+            );
+            let derived = connector_signer::SolanaVoucherScheme::channel_id(
+                &connector_signer::SolanaVoucherDomain::payment_channels(),
+                &connector_signer::SolanaChannelSeeds {
+                    payer,
+                    payee,
+                    mint,
+                    authorized_signer,
+                    salt,
+                    open_slot,
+                },
+            );
+            proptest::prop_assert_eq!(derived, expected.to_bytes());
+        }
+    }
+
     /// The single-recipient preimage is 38 bytes -- a count of one, the
     /// recipient, and 10000 as u16 LE -- and its hash is SHA-256 of exactly
     /// those bytes.

@@ -59,9 +59,9 @@ use connector_domain::client_claim::{
     declared_scheme, parse_evm_channel_config, DeclaredScheme, SCHEME_BATCH_SETTLEMENT,
 };
 use connector_domain::{AssetChain, Network};
-use connector_signer::{EvmVoucherScheme, VoucherScheme};
+use connector_signer::{EvmVoucherScheme, SolanaVoucherScheme, VoucherScheme};
 
-use crate::channels::{decode_base58_bytes, decode_hex_bytes, ChannelResolutionError};
+use crate::channels::{decode_hex_bytes, ChannelResolutionError};
 use crate::claim_gate::{NotFound, Proof};
 use crate::{hex_encode, now_unix, ClientEdgeState};
 
@@ -520,7 +520,8 @@ async fn resolve_solana_on(
         log_outcome("solana", &channel_account_text, "expired");
         return unverified("solana", channel_account_text, "expired");
     }
-    let Some(channel_account) = decode_base58_bytes::<32>(&channel_account_text) else {
+    let Some(channel_account) = SolanaVoucherScheme::decode_channel_account(&channel_account_text)
+    else {
         log_outcome("solana", &channel_account_text, "malformed_channel_id");
         return unverified("solana", channel_account_text, "unverified");
     };

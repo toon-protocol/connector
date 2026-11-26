@@ -33,7 +33,10 @@ use base64::Engine;
 use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 use connector_settlement::ChannelId;
-use connector_signer::{BatchChannelConfig, EvmVoucherScheme, ParsedEvmVoucher, VoucherScheme};
+use connector_signer::{
+    BatchChannelConfig, EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher,
+    SolanaVoucherScheme, VoucherScheme,
+};
 
 use crate::batch_channels::hex;
 use crate::connector::hex_lower;
@@ -97,6 +100,47 @@ pub fn evm_voucher_fields(
     fields
 }
 
+/// An outbound Solana voucher's own fields, spelled by Solana's voucher
+/// scheme (spec #1685): `blockchain`, `channelId`, `maxClaimableAmount`,
+/// `expiresAt` (always zero, and part of the signed bytes) and `signature`.
+/// The envelope is the caller's.
+///
+/// `channel` and `voucher` are what this node's Solana payer produced: a
+/// base58 channel account, a `u64` amount and 64 signature bytes. Anything
+/// else is not a voucher the payer signs; it is spelled as it stands, for
+/// the receiver to refuse.
+#[must_use]
+pub fn solana_voucher_fields(
+    channel: &ChannelId,
+    voucher: &Voucher,
+) -> serde_json::Map<String, serde_json::Value> {
+    let channel_account = SolanaVoucherScheme::decode_channel_account(&channel.0);
+    let amount = u64::try_from(voucher.cumulative_amount).ok();
+    let signature = <[u8; 64]>::try_from(voucher.signature.as_slice()).ok();
+    let parsed = ParsedSolanaVoucher {
+        channel_account: channel_account.unwrap_or_default(),
+        max_claimable_amount: amount.unwrap_or_default(),
+        signature: signature.unwrap_or([0; 64]),
+    };
+    let mut fields = SolanaVoucherScheme::spell(&parsed);
+    if channel_account.is_none() {
+        fields.insert("channelId".into(), channel.0.clone().into());
+    }
+    if amount.is_none() {
+        fields.insert(
+            "maxClaimableAmount".into(),
+            voucher.cumulative_amount.to_string().into(),
+        );
+    }
+    if signature.is_none() {
+        fields.insert(
+            "signature".into(),
+            bs58::encode(&voucher.signature).into_string().into(),
+        );
+    }
+    fields
+}
+
 /// A voucher on `presentation`'s channel, on `network` -- the CAIP-2 network
 /// the channel is on, which every voucher names (ADR 0086 decision 1) -- as
 /// the claim slot carries it.
@@ -129,19 +173,16 @@ pub fn voucher_json(
             fields.insert("senderId".into(), sender_id.into());
             serde_json::Value::Object(fields)
         }
-        ChannelPresentation::Solana { channel } => serde_json::json!({
-            "version": "1.0",
-            "blockchain": "solana",
-            "network": network.to_string(),
-            "scheme": "batch-settlement",
-            "messageId": message_id,
-            "timestamp": timestamp,
-            "senderId": sender_id,
-            "channelId": channel.0,
-            "maxClaimableAmount": amount,
-            "expiresAt": 0,
-            "signature": bs58::encode(&voucher.signature).into_string(),
-        }),
+        ChannelPresentation::Solana { channel } => {
+            let mut fields = solana_voucher_fields(channel, voucher);
+            fields.insert("version".into(), "1.0".into());
+            fields.insert("network".into(), network.to_string().into());
+            fields.insert("scheme".into(), "batch-settlement".into());
+            fields.insert("messageId".into(), message_id.into());
+            fields.insert("timestamp".into(), timestamp.into());
+            fields.insert("senderId".into(), sender_id.into());
+            serde_json::Value::Object(fields)
+        }
         // ADR 0087 decision 2: the channel id in bare hex and the signature in
         // hex (DER for a secp256k1 key, raw for an Ed25519 one).
         ChannelPresentation::Xrpl { channel } => serde_json::json!({

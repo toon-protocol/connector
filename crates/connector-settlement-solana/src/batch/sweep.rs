@@ -38,6 +38,10 @@ use std::time::Duration;
 use connector_chain_rpc::{retry_read, RefusalLog, Refused};
 use connector_settlement::batch::{BatchSettlementError, ChannelPresentation, HeldVouchers};
 use connector_settlement::ChannelId;
+use connector_signer::{
+    ParsedSolanaVoucher, RecordedSolanaChannel, SolanaVoucherDomain, SolanaVoucherScheme,
+    VoucherScheme,
+};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
@@ -417,13 +421,21 @@ impl SolanaBatchWatcher {
         let mut reclaimable = Vec::new();
         for channel in &channels {
             let voucher = held.get(&channel.address).filter(|held| {
-                let genuine = connector_signer::verify_solana_voucher(
-                    &channel.address.to_bytes(),
-                    held.amount,
-                    0,
-                    &held.signature,
-                    &channel.account.authorized_signer.to_bytes(),
-                );
+                let genuine = SolanaVoucherScheme::verify(
+                    &SolanaVoucherDomain {
+                        program_id: self.backend.program_id.to_bytes(),
+                    },
+                    &ParsedSolanaVoucher {
+                        channel_account: channel.address.to_bytes(),
+                        max_claimable_amount: held.amount,
+                        signature: held.signature,
+                    },
+                    &RecordedSolanaChannel {
+                        channel_account: channel.address.to_bytes(),
+                        authorized_signer: channel.account.authorized_signer.to_bytes(),
+                    },
+                )
+                .is_ok();
                 if !genuine {
                     tracing::warn!(
                         channel = %channel.address,
