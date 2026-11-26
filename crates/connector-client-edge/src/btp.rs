@@ -51,6 +51,7 @@ use connector_btp::{
 use connector_domain::client_claim::ClientEdgeClaim;
 use connector_domain::BTP_MESSAGE_LIMIT;
 use connector_domain::{refuse_oversize, PacketResponse, Prepare, Price, Reject, RejectCode};
+use connector_peer_auth::SessionRole;
 use connector_peer_btp::challenge_json::{self, PeerRoleChallenge};
 use connector_peer_btp::role_gate::{challenge_in_window, VoucherCheck, VoucherEvidence};
 use connector_settlement::batch::ChannelPresentation;
@@ -703,7 +704,7 @@ async fn handle_frame(
     // is likewise only logged.
     if frame.ilp_packet.is_empty() {
         if let Some(json) = claim_json {
-            match state.claim_gate.admit(&json, 0).await {
+            match state.claim_gate.admit(&json, 0, &SessionRole::Client).await {
                 // A standalone claim carries no packet, so nothing is in
                 // flight on it.
                 Ok((claim, durability, _resolved)) => {
@@ -903,7 +904,11 @@ async fn handle_frame(
     // itself.
     let admitted = match claim_json {
         Some(json) if !crate::claim_must_not_be_admitted(state, &prepare) => {
-            match state.claim_gate.admit(&json, charge).await {
+            match state
+                .claim_gate
+                .admit(&json, charge, &SessionRole::Client)
+                .await
+            {
                 Ok(accepted) => Some(accepted),
                 Err(rejection) => {
                     return reply(

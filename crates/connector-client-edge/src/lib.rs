@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -80,6 +80,7 @@ use connector_domain::{
     NodeFacts, NodeSelfDescription, PacketResponse, Prepare, Price, Reject, RejectCode,
     RejectReason, RoutePrice,
 };
+use connector_peer_auth::SessionRole;
 use connector_runtime::{ClientRouteFacts, ClientRouteKind, Connector, ProbeDenied};
 use connector_signer::nip59::{unwrap_claim, WrappedClaim};
 use connector_signer::{PublicKeyBytes, Signer};
@@ -92,6 +93,7 @@ mod claim_state;
 mod evidence_file;
 mod lookup_budget;
 mod outbound_ledger;
+mod paid_packet;
 mod peer;
 mod session_registry;
 mod session_route;
@@ -993,38 +995,16 @@ fn decode_claim_header(
     })
 }
 
-/// A claim that cleared [`extract_and_validate_claim`].
-struct AdmittedClaim {
-    /// The channel it validated on -- the evidence, and the only evidence
-    /// this connector ever gets, that an unaffiliated sender holds a
-    /// payment channel with it (issue #548).
-    channel_key: String,
-    /// This claim's self-declared signer (`ClientClaim::signer`,
-    /// client-edge-spec.md §1.2), present only when the claim header that
-    /// carried it arrived plaintext. `None` for a claim that arrived
-    /// wrapped (`ILP-Payment-Channel-Claim-Wrapped`) -- deriving an
-    /// anonymous sender's ephemeral identity from it would require
-    /// unwrapping before the identity authenticating the request is known,
-    /// so a wrapped-only claim is never a source for one, by construction:
-    /// this field is the one place that rule is enforced.
-    plaintext_signer: Option<String>,
-    /// What [`crate::claim_gate::ClientClaimGate::admit`] just advanced
-    /// [`Self::channel_key`]'s watermark to (issue #1012).
-    watermark: AdmittedWatermark,
-    /// Held until the packet has resolved, past any rollback: an
-    /// allowance is charged only once none of its forwards is in flight
-    /// (ADR 0080 decision 4). Inert for a voucher.
-    in_flight: InFlightForward,
-}
-
 /// The watermark one admitted claim advanced its channel to (issue
 /// #1012): exactly the pair [`crate::claim_gate::ClientClaimGate::roll_back`]
 /// names when a forwarded route's next hop turns out never to have carried
 /// the packet that claim paid for.
 ///
-/// A named type rather than a loose `u64` because both carriages thread it
-/// from their admission to their rollback -- [`Self::of`] is the only way
-/// to build one, so it can only ever come from the voucher itself.
+/// A named type rather than a loose `u64` because the BTP carriage threads
+/// it from its admission to its rollback -- [`Self::of`] is the only way to
+/// build one, so it can only ever come from the voucher itself. The HTTP
+/// carriage's paid packet owns its own rollback (#1719); the BTP carriage
+/// moves onto it in #1720.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmittedWatermark {
     cumulative_amount: u128,
@@ -1040,55 +1020,32 @@ impl AdmittedWatermark {
 }
 
 /// Extract and fully validate whatever claim header `headers` carries, per
-/// client-edge-spec.md §1.3, against `price` -- the matched route's price,
-/// `0` for an unpriced or unmatched destination, since routing itself (not
-/// this gate) is what refuses an unroutable one, with F02.
+/// client-edge-spec.md §1.3, against `charge`, for a probe (`POST
+/// /ilp/probe`): the claim identifies rather than pays, and no packet it
+/// pays for is carried, so there is no paid packet to finish -- only the
+/// channel it proved, which is what this returns.
 ///
-/// `Ok(None)` means no claim header was present at all -- reachable here
-/// only when the destination is unpriced or unmatched, since `handle_ilp`
-/// answers the x402 greeting instead of calling this at all for an unpaid
-/// request to a priced route (issue #526) -- so the request proceeds
-/// unchanged, exactly as it always has. `Ok(Some(admitted))` means a
-/// present claim validated cleanly. A plaintext header takes precedence
-/// when both are present, since a client presenting both is presenting the
-/// same claim twice, not two different ones.
+/// `Ok(None)` means no claim header was present at all.
 async fn extract_and_validate_claim(
     headers: &HeaderMap,
     charge: u64,
     state: &ClientEdgeState,
-) -> Result<Option<AdmittedClaim>, ClaimIngestRejection> {
-    let (header_value, wrapped) = if let Some(value) = headers.get(CLAIM_HEADER) {
-        (value, false)
-    } else if let Some(value) = headers.get(CLAIM_WRAPPED_HEADER) {
-        (value, true)
-    } else {
+) -> Result<Option<String>, ClaimIngestRejection> {
+    let Some((header_value, wrapped)) = presented_claim_header(headers) else {
         return Ok(None);
     };
-
     let claim_json = decode_claim_header(
         header_value.as_bytes(),
         wrapped,
         state.wrap_receiver_secret.as_ref(),
     )?;
-    let (claim, in_flight) = state.claim_gate.ingest_forward(&claim_json, charge).await?;
+    let claim = state.claim_gate.ingest(&claim_json, charge).await?;
     let channel_key = claim.claim_key();
-    // An allowance claim has no signer to declare: who pays is what the
-    // proof hides (ADR 0080).
-    let plaintext_signer = claim
-        .voucher()
-        .filter(|_| !wrapped)
-        .map(|voucher| voucher.signer().to_string());
-    let watermark = AdmittedWatermark::of(&claim);
     // Best-effort liveness bookkeeping for issue #693's claim-state
     // endpoint (`ClientClaimGate::note_claim_time`'s own doc): happens only
     // after `ingest` has already returned durable, never inside it.
     state.claim_gate.note_claim_time(&channel_key, now_unix());
-    Ok(Some(AdmittedClaim {
-        channel_key,
-        plaintext_signer,
-        watermark,
-        in_flight,
-    }))
+    Ok(Some(channel_key))
 }
 
 /// Answer an ILP-level outcome the way client-edge-spec.md §1.1 and §1.6
@@ -1461,82 +1418,75 @@ async fn handle_ilp(
 
     // A claim header's validation failure rejects the packet before it is
     // routed at all (client-edge-spec.md §1.3) -- the app is never asked to
-    // do work that was never validly paid for.
-    let mut plaintext_claim_signer = None;
-    // Issue #535/ADR 0036: the channel this packet's covering claim admitted
-    // on, carried into the `"packet"` span so a paid delivery is joinable to
-    // this gate's own claim journal (`state_dir/client-edge-claims.log`)
-    // `InboundClaimAccepted` entries under the same channel key -- the
-    // honest successor to the relay's retired payer-attribution header.
-    // `None` for an unclaimed request (unpriced/unmatched destination), the
-    // only shape that reaches routing without one.
-    let mut client_channel_id = None;
-    // Issue #1012: the watermark this packet's covering claim advanced its
-    // channel to, kept only so a forwarded route whose next hop terminally
-    // rejects can name exactly this claim to `ClientClaimGate::roll_back`
-    // below. `None` on every path `client_channel_id` is also `None` on.
-    let mut admitted_claim_watermark = None;
-    // ADR 0080 decision 4: the admitted claim's packet, in flight until it
-    // has resolved and any uncarried forward been rolled back below.
-    let mut in_flight = None;
-    // Issue #869: the converse of the invariant stated above -- a packet
-    // whose envelope will be refused for its own target shape
-    // (`AppOutcome::Refused`, F00) is never going to reach the app either,
-    // however good the claim covering it is. Rather than ingest that claim
-    // and then answer a refusal that says nothing was charged, the claim
-    // is left entirely unadmitted: routing below still runs unchanged for
-    // both branches and raises the identical F00 itself
-    // (`Connector::deliver_to_app`'s own check, untouched), so a sender
-    // whose claim was good is told exactly what it was told before --
-    // only that no watermark moves getting there. A sender whose claim
-    // would *also* have been refused now hears about the target instead
-    // of the claim (F00 rather than §1.3's F01/F03/T00 taxonomy): that
-    // claim is never looked at on this path, since nothing about it could
-    // make this packet deliverable.
-    if !claim_must_not_be_admitted(&state, &prepare) {
-        match extract_and_validate_claim(&headers, charge, &state).await {
-            Err(rejection) => return claim_rejected_response(rejection, charge),
-            // A claim that cleared the gate is this connector's evidence
-            // that the sender holds the channel it names (issue #548),
-            // which is what makes that sender eligible to probe at
-            // `POST /ilp/probe` later.
-            Ok(Some(admitted)) => {
-                state.connector.recognize_channel(&admitted.channel_key);
-                plaintext_claim_signer = admitted.plaintext_signer;
-                admitted_claim_watermark = Some(admitted.watermark);
-                in_flight = Some(admitted.in_flight);
-                client_channel_id = Some(admitted.channel_key);
-            }
-            Ok(None) => {}
-        }
-    }
+    // do work that was never validly paid for. Everything from admission to
+    // the outcome is the shared pipeline's (#1719): the refuse-before-
+    // admitting check (issue #869, #1446), the gate, durability, recording
+    // the claim, routing, rolling back an uncarried forward (issue #1012)
+    // and releasing the in-flight hold (ADR 0080 decision 4). What stays
+    // here is HTTP's framing: which header carried the claim, and how a
+    // refusal and an outcome are answered.
+    let packet = paid_packet::Packet {
+        prepare,
+        charge,
+        forwarded: is_forwarded_route(client_route),
+    };
+    let (response, plaintext_claim_signer) = match carry_over_http(&state, &headers, packet).await {
+        Ok(carried) => carried,
+        Err(rejection) => return claim_rejected_response(rejection, charge),
+    };
 
-    // client-edge-spec.md §1.2: the sender's identity, resolved and made
-    // available to everything downstream that needs a payer (issue #502).
-    // A presented `ILP-Peer-Id` was already resolved -- and authenticated,
-    // or this request would have been refused `401` -- above, before the
-    // claim was looked at; the claim signer is consulted only for a
-    // request that presented none, and never a wrapped-only claim's, since
-    // `plaintext_claim_signer` is `None` for one by construction.
+    // client-edge-spec.md §1.2: the sender's identity. A presented
+    // `ILP-Peer-Id` was already resolved -- and authenticated, or this
+    // request would have been refused `401` -- above, before the claim was
+    // looked at; the claim signer is consulted only for a request that
+    // presented none.
     let identity =
         authenticated_peer.unwrap_or_else(|| anonymous_identity(plaintext_claim_signer.as_deref()));
     tracing::debug!(identity = %identity.id(), "client-edge request identity resolved");
 
-    // Issue #736: routing is `Connector::handle_prepare`'s three configured
-    // sources first, then whatever client session `state.session_registry`
-    // has bound to this destination -- see `session_route::route_prepare`.
-    let response =
-        session_route::route_prepare(&state, prepare, client_channel_id.as_deref()).await;
-    roll_back_uncarried_forward(
-        &state,
-        is_forwarded_route(client_route),
-        client_channel_id.as_deref(),
-        admitted_claim_watermark,
-        &response,
-    )
-    .await;
-    drop(in_flight);
     packet_response(response)
+}
+
+/// Carry `packet` through the shared pipeline (#1719) on the claim header
+/// `headers` present, if any, as a client: HTTP's framing of it. Answers the
+/// response and the claim's self-declared signer, present only when the
+/// header that carried it was plaintext (client-edge-spec.md §1.2, issue
+/// #502): deriving an anonymous sender's identity from a wrapped claim would
+/// require unwrapping it before the identity authenticating the request is
+/// known, so a wrapped-only claim is never a source for one, by
+/// construction -- this is the one place that rule is enforced.
+async fn carry_over_http(
+    state: &Arc<ClientEdgeState>,
+    headers: &HeaderMap,
+    packet: paid_packet::Packet,
+) -> Result<(PacketResponse, Option<String>), ClaimIngestRejection> {
+    let presented = presented_claim_header(headers);
+    let wrapped = presented.is_some_and(|(_, wrapped)| wrapped);
+    let claim = presented.map(|(value, wrapped)| {
+        move || {
+            decode_claim_header(
+                value.as_bytes(),
+                wrapped,
+                state.wrap_receiver_secret.as_ref(),
+            )
+        }
+    });
+    let carried = paid_packet::carry(state, packet, claim, &SessionRole::Client).await?;
+    Ok((
+        carried.response,
+        carried.voucher_signer.filter(|_| !wrapped),
+    ))
+}
+
+/// The claim header a request presents, and whether it is the wrapped one
+/// (client-edge-spec.md §1.3). A plaintext header takes precedence when both
+/// are present, since a client presenting both is presenting the same claim
+/// twice, not two different ones.
+fn presented_claim_header(headers: &HeaderMap) -> Option<(&HeaderValue, bool)> {
+    headers
+        .get(CLAIM_HEADER)
+        .map(|value| (value, false))
+        .or_else(|| headers.get(CLAIM_WRAPPED_HEADER).map(|value| (value, true)))
 }
 
 /// Whether `prepare`'s covering claim must be left unadmitted because the
@@ -1646,7 +1596,7 @@ async fn handle_probe(
     };
 
     let channel_key = match extract_and_validate_claim(&headers, 0, &state).await {
-        Ok(Some(admitted)) => admitted.channel_key,
+        Ok(Some(channel_key)) => channel_key,
         Ok(None) => {
             return (
                 StatusCode::FORBIDDEN,
@@ -6337,12 +6287,27 @@ mod tests {
             assert_eq!(extract_bearer(&HeaderMap::new()), "");
         }
 
+        const ROUTED: &str = "g.example.app";
+
+        /// A free packet to [`ROUTED`]: the claim identifies its sender and
+        /// pays nothing (`0` charge), as the identity rule does not care.
+        fn routed_packet() -> paid_packet::Packet {
+            paid_packet::Packet {
+                prepare: sample_prepare(ROUTED),
+                charge: 0,
+                forwarded: false,
+            }
+        }
+
         fn state_with_claim_gate(
             claim_gate: crate::claim_gate::ClientClaimGate,
         ) -> ClientEdgeState {
             ClientEdgeState {
+                // A route the claim can pay for, so the pipeline admits it
+                // rather than leaving it unadmitted for a packet going
+                // nowhere (issue #1446).
                 connector: Arc::new(Connector::new(
-                    vec![],
+                    vec![StaticRoute::new(ROUTED, "http://localhost:4000").unwrap()],
                     vec![],
                     Arc::new(FakeAppClient::new()),
                     Arc::new(InProcessPeerTransport::new()),
@@ -6362,10 +6327,13 @@ mod tests {
         /// AC: "its ephemeral identity derives from the signer of the
         /// claim `ClientClaimGate` already parsed, not from a second parse
         /// of the claim JSON" -- a plaintext claim's already-verified
-        /// self-declared signer is threaded out as `plaintext_signer`.
+        /// self-declared signer is threaded out of the HTTP carriage's
+        /// pipeline call.
         #[tokio::test]
         async fn a_plaintext_claim_admits_with_its_self_declared_signer() {
-            let state = state_with_claim_gate(test_gate(super::claim_headers::test_channels()));
+            let state = Arc::new(state_with_claim_gate(test_gate(
+                super::claim_headers::test_channels(),
+            )));
             let claim_json = super::claim_headers::evm_claim_json(100);
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -6373,12 +6341,11 @@ mod tests {
                 BASE64.encode(claim_json.as_bytes()).parse().unwrap(),
             );
 
-            let admitted = extract_and_validate_claim(&headers, 0, &state)
+            let (_, plaintext_signer) = carry_over_http(&state, &headers, routed_packet())
                 .await
-                .expect("claim admits")
-                .expect("claim header present");
+                .expect("claim admits");
             assert_eq!(
-                admitted.plaintext_signer.as_deref(),
+                plaintext_signer.as_deref(),
                 Some("client-1"),
                 "a voucher's self-declared signer is its senderId"
             );
@@ -6386,11 +6353,13 @@ mod tests {
 
         /// AC: "a request carrying only a wrapped claim gets the fixed
         /// anonymous identity, even though the connector unwraps it" -- a
-        /// wrapped claim's signer must never surface as `plaintext_signer`,
+        /// wrapped claim's signer must never surface as the plaintext signer,
         /// however successfully it unwraps and admits.
         #[tokio::test]
         async fn a_wrapped_claim_admits_with_no_plaintext_signer() {
-            let state = state_with_claim_gate(test_gate(super::claim_headers::test_channels()));
+            let state = Arc::new(state_with_claim_gate(test_gate(
+                super::claim_headers::test_channels(),
+            )));
             let sender_secret = SecretKey::parse(&[1u8; 32]).unwrap();
             let receiver_secret = SecretKey::parse(&[2u8; 32]).unwrap();
             let receiver_public = PublicKey::from_secret_key(&receiver_secret);
@@ -6412,11 +6381,10 @@ mod tests {
                 BASE64.encode(envelope_json.as_bytes()).parse().unwrap(),
             );
 
-            let admitted = extract_and_validate_claim(&headers, 0, &state)
+            let (_, plaintext_signer) = carry_over_http(&state, &headers, routed_packet())
                 .await
-                .expect("claim admits")
-                .expect("claim header present");
-            assert_eq!(admitted.plaintext_signer, None);
+                .expect("claim admits");
+            assert_eq!(plaintext_signer, None);
         }
     }
 }
