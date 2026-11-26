@@ -23,7 +23,6 @@ use std::net::TcpListener;
 
 use axum::Router;
 use connector_runtime::receiver_terms;
-use connector_settlement::batch::BatchSettlementBackend;
 use connector_settlement_solana::test_support::{
     create_mint, fund, mint_to, require_solana_test_validator, SolanaValidator,
 };
@@ -141,7 +140,8 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
     // -- 1. The client's own channel toward A, through A's sponsor --
     let client_outbound = client.outbound_channels.clone().expect("x402");
     let a_url = Url::parse(&format!("http://{a_addr}/ilp")).unwrap();
-    let a_terms = receiver_terms(&a_runtime.batch_settlements[0], Some(&a_url)).expect("A's terms");
+    let a_terms =
+        receiver_terms(&a_runtime.batch_settlements()[0], Some(&a_url)).expect("A's terms");
     let (client_channel, _) = client_outbound
         .open(a_terms, 1_000)
         .await
@@ -161,7 +161,7 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
     // -- 2. A's operator opens the payout channel, through the client's
     //       own sponsor endpoint --
     let client_url = Url::parse(&format!("http://{client_addr}/ilp")).unwrap();
-    let client_terms = receiver_terms(&client.batch_settlements[0], Some(&client_url))
+    let client_terms = receiver_terms(&client.batch_settlements()[0], Some(&client_url))
         .expect("the client's terms");
     let (payout_channel, _) = a_runtime
         .outbound_channels
@@ -184,9 +184,11 @@ async fn a_client_is_paid_a_solana_voucher_it_lands_on_chain_itself() {
 
     // -- 4. The client lands its latest payout itself --
     let lander = client
-        .batch_settlement_solana
-        .clone()
-        .expect("x402 on Solana");
+        .settlement_networks
+        .iter()
+        .next()
+        .expect("x402 on Solana")
+        .receiver();
     lander
         .admit(presentation.clone())
         .await

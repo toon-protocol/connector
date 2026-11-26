@@ -21,7 +21,6 @@ use std::time::Duration;
 use axum::Router;
 use connector_domain::Network;
 use connector_runtime::receiver_terms;
-use connector_settlement::batch::BatchSettlementBackend;
 use connector_settlement_xrpl::test_support::{require_xrpld, Wallet, STANDALONE_NETWORK_ID};
 use url::Url;
 
@@ -138,7 +137,8 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
     // -- 1. The client's own channel toward A --
     let client_outbound = client.outbound_channels.clone().expect("x402");
     let a_url = Url::parse(&format!("http://{a_addr}/ilp")).unwrap();
-    let a_terms = receiver_terms(&a_runtime.batch_settlements[0], Some(&a_url)).expect("A's terms");
+    let a_terms =
+        receiver_terms(&a_runtime.batch_settlements()[0], Some(&a_url)).expect("A's terms");
     let (client_channel, _) = client_outbound
         .open(a_terms, 1_000)
         .await
@@ -154,7 +154,7 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
 
     // -- 2. A's operator opens the payout channel toward the client's account --
     let client_url = Url::parse(&format!("http://{client_addr}/ilp")).unwrap();
-    let client_terms = receiver_terms(&client.batch_settlements[0], Some(&client_url))
+    let client_terms = receiver_terms(&client.batch_settlements()[0], Some(&client_url))
         .expect("the client's terms");
     let (payout_channel, _) = a_runtime
         .outbound_channels
@@ -179,10 +179,10 @@ async fn a_client_is_paid_an_xrpl_voucher_it_lands_on_the_ledger_itself() {
 
     // -- 4. The client lands its latest payout itself: a valid voucher --
     let lander = client
-        .batch_settlement_xrpl
+        .settlement_networks
         .get(&NETWORK.parse::<Network>().expect("a network"))
-        .cloned()
-        .expect("x402 on XRPL");
+        .expect("x402 on XRPL")
+        .receiver();
     lander
         .admit(presentation.clone())
         .await
