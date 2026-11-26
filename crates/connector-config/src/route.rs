@@ -6,6 +6,136 @@ use url::Url;
 
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the route rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum RouteRefusal {
+    #[error(
+        "invalid child name '{name}': must be a single ILP address label \
+         (alphanumeric, '-', '_')"
+    )]
+    InvalidChildName { name: String },
+
+    #[error("invalid handler_url '{value}' for route '{prefix}': {source}")]
+    InvalidHandlerUrl {
+        prefix: String,
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("handler_url '{value}' for route '{prefix}' must be http or https")]
+    UnsupportedUrlScheme { prefix: String, value: String },
+
+    #[error("duplicate route prefix '{prefix}'")]
+    DuplicatePrefix { prefix: String },
+
+    #[error("children are configured but no apex is set: add a top-level 'apex' field")]
+    MissingApex,
+
+    #[error(
+        "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but neither is set"
+    )]
+    RouteMissingTarget { prefix: String },
+
+    #[error(
+        "route '{prefix}' must set exactly one of 'handler_url' or 'peer_id', but both are set"
+    )]
+    RouteTargetAmbiguous { prefix: String },
+
+    #[error(
+        "route '{prefix}' sets 'payment = true' with a 'peer_id': a payment route ends at an \
+         app, so it needs a 'handler_url' (ADR 0083) -- a forward is never the end of a payment"
+    )]
+    PaymentRouteForwards { prefix: String },
+
+    #[error("route '{prefix}' has an empty 'peer_id'")]
+    RoutePeerIdEmpty { prefix: String },
+
+    #[error(
+        "route '{prefix}' terminates locally at '{handler_url}' but sets no 'price': a \
+         terminated route is never silently free -- set 'price = 0' if that is deliberate"
+    )]
+    RouteMissingPrice { prefix: String, handler_url: String },
+
+    /// ADR 0061's removed-field row. A fee attaches to a **peering**, not to
+    /// a route: what this hop retains is the same number whichever prefix
+    /// the packet was addressed to, so it belongs on the `[[peers]]` row
+    /// that names the counterparty. Refused on **any** route, terminated or
+    /// forwarded -- the narrower `TerminatedRouteHasFee` this replaces let a
+    /// forwarded route keep writing one, which is exactly the spelling ADR
+    /// 0061 moves.
+    #[error(
+        "route '{prefix}' sets 'fee', which moved to the '[[peers]]' row it was always about \
+         (ADR 0061): a fee is what this hop retains for carrying one packet to a counterparty, \
+         and that is the same number whichever prefix is addressed. Delete it here and write \
+         'fee' on the '[[peers]]' entry this route's 'peer_id' names -- a terminating route \
+         never had one to move, since an app's work is paid for by 'price'"
+    )]
+    RouteFeeRemoved { prefix: String },
+
+    #[error(
+        "route '{prefix}' forwards to peer '{peer_id}' but sets no 'price': a forwarded route \
+         is never silently free either (ADR 0028) -- 'price' is what this connector's client \
+         edge charges a client for a packet to this prefix, and the peering's own 'fee' is \
+         only what this hop retains of it. Set 'price = 0' if free carriage is deliberate"
+    )]
+    PeerRouteMissingPrice { prefix: String, peer_id: String },
+
+    #[error(
+        "route '{prefix}' forwards to a peer and sets 'transport = \"{value}\"', which this \
+         connector does not yet apply to a forwarded route (issue #701, ADR 0028) -- such a \
+         route accepts both client transports. Remove the 'transport' field"
+    )]
+    PeerRouteHasTransport { prefix: String, value: String },
+
+    /// ADR 0081: a limit of zero refuses every packet with a payload, which
+    /// is a route nobody can use rather than a limit.
+    #[error(
+        "route '{prefix}' sets max_bytes = 0, which refuses every packet with a payload \
+         (ADR 0081). Omit 'max_bytes' for no limit, or set the largest sealed payload, in \
+         bytes, this route accepts"
+    )]
+    RouteMaxBytesZero { prefix: String },
+
+    /// ADR 0082: a route's `max_bytes` raises the node's request limit to
+    /// carry it, and no further than 64 MiB.
+    #[error(
+        "route '{prefix}' sets max_bytes = {value}, above the {limit}-byte limit a route may \
+         declare (ADR 0082: a route raises the node's request limit to carry its largest \
+         packet, up to this bound). Set it to {limit} or less, or omit it"
+    )]
+    RouteMaxBytesAboveLimit {
+        prefix: String,
+        value: u64,
+        limit: u64,
+    },
+
+    #[error(
+        "route '{prefix}' sets transport = '{value}', which this connector does not recognize \
+         -- only 'http', 'btp' or 'both' are valid (issue #701). Omit the field for the \
+         default ('both'), or set one of those three"
+    )]
+    InvalidTransportPolicy { prefix: String, value: String },
+
+    #[error(
+        "handler_url '{handler_url}' is priced inconsistently: route '{first_prefix}' charges \
+         {first_price} but route '{second_prefix}' charges {second_price} -- an app cannot tell \
+         which request arrived under which price, so the cheaper one would always win"
+    )]
+    ConflictingHandlerPrice {
+        handler_url: String,
+        first_prefix: String,
+        first_price: Price,
+        second_prefix: String,
+        second_price: Price,
+    },
+}
+
 /// The largest `max_bytes` a route may declare (ADR 0082, raised from ADR
 /// 0081's 2 MiB): one definition, the domain's, since it also bounds how far
 /// a route can raise the node's [`connector_domain::RequestLimit`].
@@ -45,15 +175,15 @@ pub(crate) fn is_valid_ilp_address(address: &str) -> bool {
 /// packet to this prefix. On a terminated route it buys the app's work
 /// (issue #520); on a forwarded one it buys the whole path, of which this
 /// hop keeps the *peering's* fee. Its absence is
-/// [`ConfigError::RouteMissingPrice`] or
-/// [`ConfigError::PeerRouteMissingPrice`] respectively -- no route is ever
+/// [`RouteRefusal::RouteMissingPrice`] or
+/// [`RouteRefusal::PeerRouteMissingPrice`] respectively -- no route is ever
 /// silently free (issue #557).
 ///
 /// `fee` is **not** a route key any more (ADR 0061): what this hop retains
 /// is the same number whichever prefix a packet is addressed to, so it
 /// belongs to the peering and is written on the `[[peers]]` row instead. It
 /// is kept here as a *parsed and rejected* tombstone
-/// ([`ConfigError::RouteFeeRemoved`]) -- on **either** branch, terminated or
+/// ([`RouteRefusal::RouteFeeRemoved`]) -- on **either** branch, terminated or
 /// forwarded -- so a config that still writes one stops the node by name
 /// rather than being read and discarded (ADR 0009). `toml::Value` rather
 /// than `u64` for the same reason `ceiling` is: the key is refused for
@@ -64,7 +194,7 @@ pub(crate) fn is_valid_ilp_address(address: &str) -> bool {
 /// over a client transport (ADR 0028 makes it reachable over both), but
 /// because the policy is not applied to one, and it is refused rather than
 /// ignored on the branch it does not belong to
-/// ([`ConfigError::PeerRouteHasTransport`], issue #556).
+/// ([`RouteRefusal::PeerRouteHasTransport`], issue #556).
 ///
 /// `deny_unknown_fields` closes the same hole for every other key: a
 /// mistyped `pefix` or `handler_ur` is a refuse-to-start error, not a route
@@ -102,7 +232,7 @@ pub(crate) struct RawRoute {
     max_bytes: Option<u64>,
     /// Marks the route a payment route (ADR 0083, issue #1543). False when
     /// absent; valid only with `handler_url`, and refused by name with a
-    /// `peer_id` ([`ConfigError::PaymentRouteForwards`]).
+    /// `peer_id` ([`RouteRefusal::PaymentRouteForwards`]).
     #[serde(default)]
     payment: bool,
 }
@@ -451,20 +581,24 @@ fn build_route(
     request: Option<toml::Table>,
 ) -> Result<StaticRoute, ConfigError> {
     let prefix = validate_prefix(prefix)?;
-    let url = Url::parse(&handler_url).map_err(|source| ConfigError::InvalidHandlerUrl {
-        prefix: prefix.clone(),
-        value: handler_url.clone(),
-        source,
+    let url = Url::parse(&handler_url).map_err(|source| {
+        ConfigError::Route(RouteRefusal::InvalidHandlerUrl {
+            prefix: prefix.clone(),
+            value: handler_url.clone(),
+            source,
+        })
     })?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ConfigError::UnsupportedUrlScheme {
+        return Err(ConfigError::Route(RouteRefusal::UnsupportedUrlScheme {
             prefix,
             value: handler_url,
-        });
+        }));
     }
-    let price = price.ok_or_else(|| ConfigError::RouteMissingPrice {
-        prefix: prefix.clone(),
-        handler_url: url.to_string(),
+    let price = price.ok_or_else(|| {
+        ConfigError::Route(RouteRefusal::RouteMissingPrice {
+            prefix: prefix.clone(),
+            handler_url: url.to_string(),
+        })
     })?;
     Ok(StaticRoute {
         prefix,
@@ -498,12 +632,12 @@ fn parse_transport_policy(
 ) -> Result<TransportPolicy, ConfigError> {
     match value {
         None => Ok(TransportPolicy::default()),
-        Some(value) => value
-            .parse()
-            .map_err(|()| ConfigError::InvalidTransportPolicy {
+        Some(value) => value.parse().map_err(|()| {
+            ConfigError::Route(RouteRefusal::InvalidTransportPolicy {
                 prefix: prefix.to_string(),
                 value,
-            }),
+            })
+        }),
     }
 }
 
@@ -524,13 +658,13 @@ fn insert_consistent_handler_price(
     let handler_url = route.handler_url().to_string();
     match seen.get(&handler_url) {
         Some((first_prefix, first_price)) if *first_price != route.price() => {
-            Err(ConfigError::ConflictingHandlerPrice {
+            Err(ConfigError::Route(RouteRefusal::ConflictingHandlerPrice {
                 handler_url,
                 first_prefix: first_prefix.clone(),
                 first_price: *first_price,
                 second_prefix: route.prefix().to_string(),
                 second_price: route.price(),
-            })
+            }))
         }
         Some(_) => Ok(()),
         None => {
@@ -548,11 +682,15 @@ fn build_peer_route(
 ) -> Result<PeerRouteConfig, ConfigError> {
     let prefix = validate_prefix(prefix)?;
     if peer_id.trim().is_empty() {
-        return Err(ConfigError::RoutePeerIdEmpty { prefix });
+        return Err(ConfigError::Route(RouteRefusal::RoutePeerIdEmpty {
+            prefix,
+        }));
     }
-    let price = price.ok_or_else(|| ConfigError::PeerRouteMissingPrice {
-        prefix: prefix.clone(),
-        peer_id: peer_id.clone(),
+    let price = price.ok_or_else(|| {
+        ConfigError::Route(RouteRefusal::PeerRouteMissingPrice {
+            prefix: prefix.clone(),
+            peer_id: peer_id.clone(),
+        })
     })?;
     Ok(PeerRouteConfig {
         prefix,
@@ -572,24 +710,24 @@ fn parse_max_bytes(prefix: &str, value: Option<u64>) -> Result<Option<PayloadLim
         return Ok(None);
     };
     if value > MAX_PAYLOAD_LIMIT {
-        return Err(ConfigError::RouteMaxBytesAboveLimit {
+        return Err(ConfigError::Route(RouteRefusal::RouteMaxBytesAboveLimit {
             prefix: prefix.to_string(),
             value,
             limit: MAX_PAYLOAD_LIMIT,
-        });
+        }));
     }
-    PayloadLimit::new(value)
-        .map(Some)
-        .ok_or_else(|| ConfigError::RouteMaxBytesZero {
+    PayloadLimit::new(value).map(Some).ok_or_else(|| {
+        ConfigError::Route(RouteRefusal::RouteMaxBytesZero {
             prefix: prefix.to_string(),
         })
+    })
 }
 
 fn insert_unique_prefix(seen: &mut HashSet<String>, prefix: &str) -> Result<(), ConfigError> {
     if !seen.insert(prefix.to_string()) {
-        return Err(ConfigError::DuplicatePrefix {
+        return Err(ConfigError::Route(RouteRefusal::DuplicatePrefix {
             prefix: prefix.to_string(),
-        });
+        }));
     }
     Ok(())
 }
@@ -613,7 +751,9 @@ pub(crate) fn resolve_routes(
         // ADR 0083: a forward is never the end of a payment. Refused by name
         // ahead of the target match so it is not read as anything else.
         if raw.payment && raw.peer_id.is_some() {
-            return Err(ConfigError::PaymentRouteForwards { prefix: raw.prefix });
+            return Err(ConfigError::Route(RouteRefusal::PaymentRouteForwards {
+                prefix: raw.prefix,
+            }));
         }
         // ADR 0061: a fee attaches to a peering, not to a route. Refused on
         // BOTH branches and before either is examined -- a terminated route
@@ -623,7 +763,9 @@ pub(crate) fn resolve_routes(
         // operator who wrote a fee here believes this hop is charging it
         // (ADR 0009).
         if raw.fee.is_some() {
-            return Err(ConfigError::RouteFeeRemoved { prefix: raw.prefix });
+            return Err(ConfigError::Route(RouteRefusal::RouteFeeRemoved {
+                prefix: raw.prefix,
+            }));
         }
         let max_bytes = parse_max_bytes(&raw.prefix, raw.max_bytes)?;
         match (raw.handler_url, raw.peer_id) {
@@ -653,10 +795,10 @@ pub(crate) fn resolve_routes(
                 // applied to a forwarded route (issue #701); refused rather
                 // than read and discarded (issue #556).
                 if let Some(value) = raw.transport {
-                    return Err(ConfigError::PeerRouteHasTransport {
+                    return Err(ConfigError::Route(RouteRefusal::PeerRouteHasTransport {
                         prefix: raw.prefix,
                         value,
-                    });
+                    }));
                 }
                 let mut route = build_peer_route(raw.prefix, peer_id, raw.price, raw.request)?;
                 route.max_bytes = max_bytes;
@@ -664,10 +806,14 @@ pub(crate) fn resolve_routes(
                 peer_routes.push(route);
             }
             (None, None) => {
-                return Err(ConfigError::RouteMissingTarget { prefix: raw.prefix });
+                return Err(ConfigError::Route(RouteRefusal::RouteMissingTarget {
+                    prefix: raw.prefix,
+                }));
             }
             (Some(_), Some(_)) => {
-                return Err(ConfigError::RouteTargetAmbiguous { prefix: raw.prefix });
+                return Err(ConfigError::Route(RouteRefusal::RouteTargetAmbiguous {
+                    prefix: raw.prefix,
+                }));
             }
         }
     }
@@ -676,7 +822,7 @@ pub(crate) fn resolve_routes(
         return Ok((routes, peer_routes));
     }
 
-    let apex = apex.ok_or(ConfigError::MissingApex)?;
+    let apex = apex.ok_or(ConfigError::Route(RouteRefusal::MissingApex))?;
     if !is_valid_ilp_address(apex) {
         return Err(ConfigError::InvalidAddress {
             field: "apex",
@@ -686,7 +832,9 @@ pub(crate) fn resolve_routes(
 
     for child in raw_children {
         if !is_valid_label(&child.name) {
-            return Err(ConfigError::InvalidChildName { name: child.name });
+            return Err(ConfigError::Route(RouteRefusal::InvalidChildName {
+                name: child.name,
+            }));
         }
         let prefix = format!("{apex}.{}", child.name);
         let transport_policy = parse_transport_policy(&prefix, child.transport)?;
@@ -792,7 +940,7 @@ mod tests {
         over.max_bytes = Some(MAX_PAYLOAD_LIMIT + 1);
         assert!(matches!(
             resolve_routes(None, vec![over], vec![]),
-            Err(ConfigError::RouteMaxBytesAboveLimit { prefix, .. }) if prefix == "g.peer-b"
+            Err(ConfigError::Route(RouteRefusal::RouteMaxBytesAboveLimit { prefix, .. })) if prefix == "g.peer-b"
         ));
     }
 
@@ -811,7 +959,7 @@ mod tests {
         forward.payment = true;
         assert!(matches!(
             resolve_routes(None, vec![forward], vec![]),
-            Err(ConfigError::PaymentRouteForwards { prefix }) if prefix == "g.peer-b"
+            Err(ConfigError::Route(RouteRefusal::PaymentRouteForwards { prefix })) if prefix == "g.peer-b"
         ));
     }
 
@@ -848,7 +996,10 @@ mod tests {
             }],
             vec![],
         );
-        assert!(matches!(result, Err(ConfigError::RouteMissingPrice { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::RouteMissingPrice { .. }))
+        ));
     }
 
     /// ADR 0061: a fee attaches to a peering, not to a route. A terminated
@@ -874,7 +1025,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::RouteFeeRemoved { prefix }) if prefix == "g.example.app"
+            Err(ConfigError::Route(RouteRefusal::RouteFeeRemoved { prefix })) if prefix == "g.example.app"
         ));
     }
 
@@ -898,7 +1049,10 @@ mod tests {
             }],
             vec![],
         );
-        assert!(matches!(result, Err(ConfigError::RouteFeeRemoved { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::RouteFeeRemoved { .. }))
+        ));
     }
 
     /// ADR 0061's actual move: the key is refused on a **forwarded** route
@@ -925,7 +1079,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::RouteFeeRemoved { prefix }) if prefix == "g.example.store"
+            Err(ConfigError::Route(RouteRefusal::RouteFeeRemoved { prefix })) if prefix == "g.example.store"
         ));
     }
 
@@ -1001,7 +1155,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::PeerRouteMissingPrice { peer_id, .. }) if peer_id == "peer-b"
+            Err(ConfigError::Route(RouteRefusal::PeerRouteMissingPrice { peer_id, .. })) if peer_id == "peer-b"
         ));
     }
 
@@ -1026,7 +1180,10 @@ mod tests {
                 transport: None,
             }],
         );
-        assert!(matches!(result, Err(ConfigError::RouteMissingPrice { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::RouteMissingPrice { .. }))
+        ));
     }
 
     #[test]
@@ -1055,7 +1212,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::ConflictingHandlerPrice { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::ConflictingHandlerPrice { .. }
+            ))
         ));
     }
 
@@ -1073,7 +1232,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::ConflictingHandlerPrice { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::ConflictingHandlerPrice { .. }
+            ))
         ));
     }
 
@@ -1173,7 +1334,9 @@ mod tests {
         // above a kibibyte would be bought at the flat route's price.
         assert!(matches!(
             result,
-            Err(ConfigError::ConflictingHandlerPrice { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::ConflictingHandlerPrice { .. }
+            ))
         ));
     }
 
@@ -1241,7 +1404,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::ConflictingHandlerPrice { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::ConflictingHandlerPrice { .. }
+            ))
         ));
     }
 
@@ -1295,7 +1460,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::RouteMissingTarget { .. })
+            Err(ConfigError::Route(RouteRefusal::RouteMissingTarget { .. }))
         ));
     }
 
@@ -1318,14 +1483,19 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::RouteTargetAmbiguous { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::RouteTargetAmbiguous { .. }
+            ))
         ));
     }
 
     #[test]
     fn rejects_a_peer_route_with_an_empty_peer_id() {
         let result = resolve_routes(None, vec![peer_route("g.peer-b", "   ")], vec![]);
-        assert!(matches!(result, Err(ConfigError::RoutePeerIdEmpty { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::RoutePeerIdEmpty { .. }))
+        ));
     }
 
     #[test]
@@ -1338,7 +1508,10 @@ mod tests {
             ],
             vec![],
         );
-        assert!(matches!(result, Err(ConfigError::DuplicatePrefix { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::DuplicatePrefix { .. }))
+        ));
     }
 
     #[test]
@@ -1350,7 +1523,10 @@ mod tests {
     #[test]
     fn rejects_a_non_http_handler_url() {
         let result = resolve_routes(None, vec![route("g.example.app", "not a url")], vec![]);
-        assert!(matches!(result, Err(ConfigError::InvalidHandlerUrl { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::InvalidHandlerUrl { .. }))
+        ));
     }
 
     #[test]
@@ -1362,7 +1538,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::UnsupportedUrlScheme { .. })
+            Err(ConfigError::Route(
+                RouteRefusal::UnsupportedUrlScheme { .. }
+            ))
         ));
     }
 
@@ -1376,7 +1554,10 @@ mod tests {
             ],
             vec![],
         );
-        assert!(matches!(result, Err(ConfigError::DuplicatePrefix { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::DuplicatePrefix { .. }))
+        ));
     }
 
     #[test]
@@ -1400,7 +1581,10 @@ mod tests {
             vec![],
             vec![child("billing", "http://localhost:4001")],
         );
-        assert!(matches!(result, Err(ConfigError::MissingApex)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::MissingApex))
+        ));
     }
 
     #[test]
@@ -1410,7 +1594,10 @@ mod tests {
             vec![],
             vec![child("billing.sub", "http://localhost:4001")],
         );
-        assert!(matches!(result, Err(ConfigError::InvalidChildName { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::InvalidChildName { .. }))
+        ));
     }
 
     #[test]
@@ -1423,7 +1610,10 @@ mod tests {
             )],
             vec![child("billing", "http://localhost:4001")],
         );
-        assert!(matches!(result, Err(ConfigError::DuplicatePrefix { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::DuplicatePrefix { .. }))
+        ));
     }
 
     /// Issue #701: an operator who writes nothing gets exactly the
@@ -1526,7 +1716,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::InvalidTransportPolicy { value, .. }) if value == "carrier-pigeon"
+            Err(ConfigError::Route(RouteRefusal::InvalidTransportPolicy { value, .. })) if value == "carrier-pigeon"
         ));
     }
 
@@ -1554,7 +1744,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ConfigError::PeerRouteHasTransport { value, .. }) if value == "btp"
+            Err(ConfigError::Route(RouteRefusal::PeerRouteHasTransport { value, .. })) if value == "btp"
         ));
     }
 

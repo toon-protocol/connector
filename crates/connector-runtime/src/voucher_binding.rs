@@ -26,7 +26,7 @@
 //!
 //! A signer bound to two peers would make "which peering does this voucher
 //! prove?" depend on iteration order, the failure
-//! `ConfigError::PeerChannelDuplicate` exists to keep out of
+//! `PeerChannelRefusal::PeerChannelDuplicate` exists to keep out of
 //! `[[peer_channels]]`. [`VoucherSignerBindings::bind`] therefore refuses a
 //! signer already bound to a different peer, by name, rather than
 //! re-pointing it.

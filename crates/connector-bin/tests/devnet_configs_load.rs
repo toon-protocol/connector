@@ -1115,7 +1115,7 @@ fn every_committed_route_that_pins_a_carriage_publishes_it_on_its_own_entry() {
 /// Until issue #872 removed the apex, this pin lived on the apex's
 /// `g.toon.relay` peer_id forward being unable to carry one at all
 /// (`transport` is illegal on a `peer_id` route,
-/// `ConfigError::PeerRouteHasTransport`) -- so the apex's own greeting never
+/// `RouteRefusal::PeerRouteHasTransport`) -- so the apex's own greeting never
 /// named a required transport, and only the relay box's own terminating
 /// route enforced it. Now that both boxes terminate their own prefixes
 /// directly, this test asserts the same split at the source: the relay

@@ -1995,7 +1995,7 @@ pub fn spawn_rate_pollers(
 /// precisely because that is the one chain a peering already guarantees
 /// this node RPC for, and `Config::load` refuses a quote on a chain with no
 /// `[settlement.<chain>]` table by name
-/// (`ConfigError::TokenWithoutSettlement`). So the endpoint is that
+/// (`DenominationRefusal::TokenWithoutSettlement`). So the endpoint is that
 /// table's `rpc_url`, read here, and a second key could only ever disagree
 /// with the one the node already dials.
 ///
@@ -2054,7 +2054,7 @@ fn spawn_quote_path_pollers(
 /// precisely because that is the one chain a peering already guarantees
 /// this node RPC for, and `Config::load` refuses a quote on a chain with no
 /// `[settlement.<chain>]` table by name
-/// (`ConfigError::TokenWithoutSettlement`). So the endpoint is that
+/// (`DenominationRefusal::TokenWithoutSettlement`). So the endpoint is that
 /// table's `rpc_url`, read here, and a second key could only ever disagree
 /// with the one the node already dials.
 ///

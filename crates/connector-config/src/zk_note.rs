@@ -29,6 +29,92 @@ use crate::error::ConfigError;
 use crate::secret::SecretLocation;
 use crate::settlement::{check_circuit_route, CircuitRouteRefusal};
 
+use thiserror::Error;
+
+/// Every way the zk note rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum ZkNoteRefusal {
+    // -- [zk_note] (ADR 0080, issue #1522) --
+    /// The vault is not a Mina address.
+    #[error(
+        "[zk_note] vault '{value}' is not a Mina address (B62...): no payer could deposit into it"
+    )]
+    ZkNoteVaultInvalid { value: String },
+
+    /// A network other than the two a vault lives on.
+    #[error("[zk_note] network '{value}' is not 'mina:mainnet' or 'mina:devnet'")]
+    ZkNoteNetworkInvalid { value: String },
+
+    /// The GraphQL endpoint is not an http(s) URL.
+    #[error("[zk_note] graphql_url '{value}' is not an http or https URL")]
+    ZkNoteGraphqlUrlInvalid { value: String },
+
+    /// The archive endpoint is not an http(s) URL.
+    #[error("[zk_note] archive_url '{value}' is not an http or https URL")]
+    ZkNoteArchiveUrlInvalid { value: String },
+
+    /// The vault's reads asked to ride a circuit on a node with none (ADR 0073).
+    #[error(
+        "[zk_note] sets rpc_via_socks_proxy = true but no top-level socks_proxy is set: there \
+         is no fallback to a direct connection, so the vault could never be read. Set \
+         socks_proxy or remove rpc_via_socks_proxy"
+    )]
+    ZkNoteViaSocksProxyWithoutProxy,
+
+    /// The vault's reads would ride a circuit to a plain http endpoint (ADR 0073).
+    #[error(
+        "[zk_note] {key} '{value}' is plain http, and rpc_via_socks_proxy = true would \
+         send it through an exit relay that can read and rewrite every answer (a known root, a \
+         spent nullifier). Use the endpoint's https URL; plain http over a circuit is accepted \
+         only for a .onion or .anyone host (ADR 0070, ADR 0073)"
+    )]
+    ZkNoteViaSocksProxyPlaintext { key: &'static str, value: String },
+
+    /// The state key file does not exist.
+    #[error("[zk_note] state_key_file '{}' does not exist or is not a file", .0.display())]
+    ZkNoteStateKeyFileNotFound(PathBuf),
+
+    /// The verification key hash is not a decimal field element.
+    #[error(
+        "[zk_note] verification_key_hash '{value}' is not a Mina field element in decimal, the \
+         form a verification key's hash is printed in"
+    )]
+    ZkNoteVerificationKeyHashInvalid { value: String },
+
+    /// The tiers are empty, repeat, hold a zero, or name a tier zk_toon does not publish.
+    #[error("[zk_note] tiers are refused: {source}")]
+    ZkNoteTiersInvalid {
+        #[source]
+        source: connector_zk_note::tiers::TiersError,
+    },
+
+    /// An allowance lifetime of zero, or not well below zk_toon's challenge window.
+    #[error(
+        "[zk_note] allowance_lifetime_secs = {secs} is refused: it must be above 0 and at most \
+         {max_secs}, a quarter of zk_toon's challenge window, so that an allowance closes, its \
+         charge is journaled and its evidence reaches the challenger well inside the window"
+    )]
+    ZkNoteAllowanceLifetimeInvalid { secs: u64, max_secs: u64 },
+
+    /// A cap no allowance could ever fit under.
+    #[error(
+        "[zk_note] open_budget_cap = {cap} is below the smallest published tier {tier}: no \
+         allowance could ever be opened"
+    )]
+    ZkNoteOpenBudgetCapBelowTier { cap: u64, tier: u64 },
+
+    /// A subsidy budget with no smallest tier to spend it on (ADR 0080 decision 14).
+    #[error(
+        "[zk_note] subsidy_budget = {budget} is set but 'tiers' does not include {tier}, the \
+         smallest of zk_toon's tiers: a subsidised allowance can only be opened at that tier, so \
+         the budget could never be spent. Add {tier} to 'tiers', or set subsidy_budget = 0"
+    )]
+    ZkNoteSubsidyWithoutSmallestTier { budget: u64, tier: u64 },
+}
+
 /// The vault asset's decimals: native MINA's nanomina.
 pub const ZK_NOTE_DECIMALS: u8 = 9;
 
@@ -158,24 +244,34 @@ pub(crate) fn resolve_zk_note(
     // A zkApp address is a Mina public key; one that does not decode is a
     // vault no payer could deposit into.
     if PubKey::from_address(&raw.vault).is_err() {
-        return Err(ConfigError::ZkNoteVaultInvalid { value: raw.vault });
+        return Err(ConfigError::ZkNote(ZkNoteRefusal::ZkNoteVaultInvalid {
+            value: raw.vault,
+        }));
     }
     let network = match raw.network.as_str() {
         "mina:mainnet" => MinaNetwork::Mainnet,
         "mina:devnet" => MinaNetwork::Devnet,
-        _ => return Err(ConfigError::ZkNoteNetworkInvalid { value: raw.network }),
+        _ => {
+            return Err(ConfigError::ZkNote(ZkNoteRefusal::ZkNoteNetworkInvalid {
+                value: raw.network,
+            }))
+        }
     };
     let graphql_url = Url::parse(&raw.graphql_url)
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
-        .ok_or_else(|| ConfigError::ZkNoteGraphqlUrlInvalid {
-            value: raw.graphql_url.clone(),
+        .ok_or_else(|| {
+            ConfigError::ZkNote(ZkNoteRefusal::ZkNoteGraphqlUrlInvalid {
+                value: raw.graphql_url.clone(),
+            })
         })?;
     let archive_url = Url::parse(&raw.archive_url)
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
-        .ok_or_else(|| ConfigError::ZkNoteArchiveUrlInvalid {
-            value: raw.archive_url.clone(),
+        .ok_or_else(|| {
+            ConfigError::ZkNote(ZkNoteRefusal::ZkNoteArchiveUrlInvalid {
+                value: raw.archive_url.clone(),
+            })
         })?;
     // ADR 0073's two rules for a read that rides the circuit: the ones a
     // settlement table is held to, named for this table. Both endpoints are
@@ -186,16 +282,22 @@ pub(crate) fn resolve_zk_note(
             ("archive_url", &archive_url, &raw.archive_url),
         ] {
             check_circuit_route(url, socks_proxy).map_err(|refusal| match refusal {
-                CircuitRouteRefusal::WithoutProxy => ConfigError::ZkNoteViaSocksProxyWithoutProxy,
-                CircuitRouteRefusal::Plaintext => ConfigError::ZkNoteViaSocksProxyPlaintext {
-                    key,
-                    value: value.clone(),
-                },
+                CircuitRouteRefusal::WithoutProxy => {
+                    ConfigError::ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyWithoutProxy)
+                }
+                CircuitRouteRefusal::Plaintext => {
+                    ConfigError::ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyPlaintext {
+                        key,
+                        value: value.clone(),
+                    })
+                }
             })?;
         }
     }
     if !raw.state_key_file.is_file() {
-        return Err(ConfigError::ZkNoteStateKeyFileNotFound(raw.state_key_file));
+        return Err(ConfigError::ZkNote(
+            ZkNoteRefusal::ZkNoteStateKeyFileNotFound(raw.state_key_file),
+        ));
     }
     // A Mina verification key hash is a field element, printed in decimal.
     let canonical = !raw.verification_key_hash.is_empty()
@@ -210,33 +312,41 @@ pub(crate) fn resolve_zk_note(
                 connector_zk_note::note::field_to_string(field) == raw.verification_key_hash
             });
     if !canonical {
-        return Err(ConfigError::ZkNoteVerificationKeyHashInvalid {
-            value: raw.verification_key_hash,
-        });
+        return Err(ConfigError::ZkNote(
+            ZkNoteRefusal::ZkNoteVerificationKeyHashInvalid {
+                value: raw.verification_key_hash,
+            },
+        ));
     }
-    let tiers =
-        Tiers::new(raw.tiers).map_err(|source| ConfigError::ZkNoteTiersInvalid { source })?;
+    let tiers = Tiers::new(raw.tiers)
+        .map_err(|source| ConfigError::ZkNote(ZkNoteRefusal::ZkNoteTiersInvalid { source }))?;
     if raw.allowance_lifetime_secs == 0 || raw.allowance_lifetime_secs > MAX_ALLOWANCE_LIFETIME_SECS
     {
-        return Err(ConfigError::ZkNoteAllowanceLifetimeInvalid {
-            secs: raw.allowance_lifetime_secs,
-            max_secs: MAX_ALLOWANCE_LIFETIME_SECS,
-        });
+        return Err(ConfigError::ZkNote(
+            ZkNoteRefusal::ZkNoteAllowanceLifetimeInvalid {
+                secs: raw.allowance_lifetime_secs,
+                max_secs: MAX_ALLOWANCE_LIFETIME_SECS,
+            },
+        ));
     }
     let smallest = tiers.as_slice()[0].budget();
     if raw.open_budget_cap < smallest {
-        return Err(ConfigError::ZkNoteOpenBudgetCapBelowTier {
-            cap: raw.open_budget_cap,
-            tier: smallest,
-        });
+        return Err(ConfigError::ZkNote(
+            ZkNoteRefusal::ZkNoteOpenBudgetCapBelowTier {
+                cap: raw.open_budget_cap,
+                tier: smallest,
+            },
+        ));
     }
     // A subsidised allowance is opened at the smallest tier only (decision 14).
     let smallest_published = connector_zk_note::note::policy::TIERS[0];
     if raw.subsidy_budget > 0 && tiers.get(smallest_published).is_none() {
-        return Err(ConfigError::ZkNoteSubsidyWithoutSmallestTier {
-            budget: raw.subsidy_budget,
-            tier: smallest_published,
-        });
+        return Err(ConfigError::ZkNote(
+            ZkNoteRefusal::ZkNoteSubsidyWithoutSmallestTier {
+                budget: raw.subsidy_budget,
+                tier: smallest_published,
+            },
+        ));
     }
     Ok(ZkNoteConfig {
         vault: raw.vault,
@@ -256,6 +366,7 @@ pub(crate) fn resolve_zk_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::denomination::DenominationRefusal;
     use crate::Config;
     use connector_zk_note::note::policy::TIERS;
     use connector_zk_note::{Keypair, Scalar, SecKey};
@@ -355,7 +466,10 @@ key_file = "{signer}"
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteTiersInvalid { .. }),
+            matches!(
+                error,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteTiersInvalid { .. })
+            ),
             "{error}"
         );
         assert!(error.to_string().contains("12345"), "{error}");
@@ -387,7 +501,10 @@ key_file = "{signer}"
             })
             .unwrap_err();
             assert!(
-                matches!(error, ConfigError::ZkNoteAllowanceLifetimeInvalid { .. }),
+                matches!(
+                    error,
+                    ConfigError::ZkNote(ZkNoteRefusal::ZkNoteAllowanceLifetimeInvalid { .. })
+                ),
                 "{secs}: {error}"
             );
         }
@@ -410,7 +527,10 @@ key_file = "{signer}"
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteOpenBudgetCapBelowTier { .. }),
+            matches!(
+                error,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteOpenBudgetCapBelowTier { .. })
+            ),
             "{error}"
         );
     }
@@ -436,7 +556,10 @@ key_file = "{signer}"
         };
         let error = load(without).unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteSubsidyWithoutSmallestTier { .. }),
+            matches!(
+                error,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteSubsidyWithoutSmallestTier { .. })
+            ),
             "{error}"
         );
         // A zero budget needs no smallest tier.
@@ -453,34 +576,52 @@ key_file = "{signer}"
     fn each_malformed_pin_is_refused_by_name() {
         let vault = load(|text| text.replace(&address(), "B62qnotanaddress")).unwrap_err();
         assert!(
-            matches!(vault, ConfigError::ZkNoteVaultInvalid { .. }),
+            matches!(
+                vault,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteVaultInvalid { .. })
+            ),
             "{vault}"
         );
         let network = load(|text| text.replace("mina:devnet", "mina:berkeley")).unwrap_err();
         assert!(
-            matches!(network, ConfigError::ZkNoteNetworkInvalid { .. }),
+            matches!(
+                network,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteNetworkInvalid { .. })
+            ),
             "{network}"
         );
         let url = load(|text| text.replace("https://api", "ftp://api")).unwrap_err();
         assert!(
-            matches!(url, ConfigError::ZkNoteGraphqlUrlInvalid { .. }),
+            matches!(
+                url,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteGraphqlUrlInvalid { .. })
+            ),
             "{url}"
         );
         let archive =
             load(|text| text.replace("https://api.minascan.io/archive", "ftp://x/archive"))
                 .unwrap_err();
         assert!(
-            matches!(archive, ConfigError::ZkNoteArchiveUrlInvalid { .. }),
+            matches!(
+                archive,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteArchiveUrlInvalid { .. })
+            ),
             "{archive}"
         );
         let hash = load(|text| text.replace(VK_HASH, "0x12")).unwrap_err();
         assert!(
-            matches!(hash, ConfigError::ZkNoteVerificationKeyHashInvalid { .. }),
+            matches!(
+                hash,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteVerificationKeyHashInvalid { .. })
+            ),
             "{hash}"
         );
         let key = load(|text| text.replace("zk-state.key", "missing.key")).unwrap_err();
         assert!(
-            matches!(key, ConfigError::ZkNoteStateKeyFileNotFound(_)),
+            matches!(
+                key,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteStateKeyFileNotFound(_))
+            ),
             "{key}"
         );
         let unknown = load(|text| text.replace("open_budget_cap", "budget = 1\nopen_budget_cap"))
@@ -498,7 +639,10 @@ key_file = "{signer}"
         };
         let error = load(opt_in).unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteViaSocksProxyWithoutProxy),
+            matches!(
+                error,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyWithoutProxy)
+            ),
             "{error}"
         );
         let with_proxy = |text: String| {
@@ -510,7 +654,10 @@ key_file = "{signer}"
         load(with_proxy).expect("https over the circuit");
         let error = load(|text| with_proxy(text).replace("https://api", "http://api")).unwrap_err();
         assert!(
-            matches!(error, ConfigError::ZkNoteViaSocksProxyPlaintext { .. }),
+            matches!(
+                error,
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyPlaintext { .. })
+            ),
             "{error}"
         );
         // The archive endpoint is held to the same rules, and named when it breaks them.
@@ -524,10 +671,10 @@ key_file = "{signer}"
         assert!(
             matches!(
                 error,
-                ConfigError::ZkNoteViaSocksProxyPlaintext {
+                ConfigError::ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyPlaintext {
                     key: "archive_url",
                     ..
-                }
+                })
             ),
             "{error}"
         );
@@ -617,7 +764,10 @@ max_move = {{ numerator = 1, denominator = 10 }}
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::TokenMinaNative { .. }),
+            matches!(
+                error,
+                ConfigError::Denomination(DenominationRefusal::TokenMinaNative { .. })
+            ),
             "{error}"
         );
         assert!(error.to_string().contains(MINA), "{error}");
@@ -635,7 +785,10 @@ max_move = {{ numerator = 1, denominator = 10 }}
         })
         .unwrap_err();
         assert!(
-            matches!(error, ConfigError::RateRowUnknownToken { .. }),
+            matches!(
+                error,
+                ConfigError::Denomination(DenominationRefusal::RateRowUnknownToken { .. })
+            ),
             "{error}"
         );
         // As a settlement table.
