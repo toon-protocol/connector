@@ -165,7 +165,7 @@ key a peer's self-description publishes as its `voucherSigners` entry for the sh
 the durable row at every boot. The second is built too (#1380): the `voucher_signer` a
 `[[peer_channels]]` row names — the peer's EVM settlement address, or its Solana settlement key —
 bound at boot to that row's peering exactly as `POST /peers` binds a published one
-(`Connector::with_config_voucher_signer`). A row that also names `inbound_channel` **pins** the
+(`PeeringWiring::with_config_voucher_signer`). A row that also names `inbound_channel` **pins** the
 binding: that signer then proves the peering on that one channel and on no other, where an unpinned
 signer proves it on any channel its vouchers verify on (`configuration-spec.md` §2.1).
 
@@ -268,7 +268,7 @@ corrected by #880 to state the rule that now runs. Issue #881 is the send
 side: covering an outbound peer PREPARE in the first place. It lands in
 `Connector::forward_via_peer_route` (`crates/connector-runtime/src/connector.rs`): a next hop with
 an outbound x402 channel registered for it — by a `[[pay_channels]]` row at boot
-(`Connector::with_config_pay_channel`, #1380) or by `POST /peers` (§1.11) — is covered
+(`PeeringWiring::with_config_pay_channel`, #1380) or by `POST /peers` (§1.11) — is covered
 proactively by `cover_forward`, with a voucher on that channel for this node's own forwarded value
 (or, for a packet that moves no value, the peer-role challenge), before the first attempt is ever
 sent. Until #1380 a config-declared hop was registered by `Connector::with_outbound_client_hop` and

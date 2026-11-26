@@ -543,8 +543,9 @@ impl Peerings {
     /// peering stays on disk until the table's next write, which persists
     /// the table as it now stands.
     ///
-    /// Call after the config file's peer ids ([`Self::set_config_peer_ids`]),
-    /// the registrar and the socks proxy are set: admit reads all three.
+    /// Admit reads the config file's peer ids, the registrar and the socks
+    /// proxy; the only caller, [`crate::PeeringWiring`], is reachable only
+    /// once all three are set.
     pub(crate) fn replay(
         &mut self,
         store: PeerRouteStore,

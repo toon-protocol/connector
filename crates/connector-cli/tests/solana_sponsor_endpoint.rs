@@ -233,7 +233,7 @@ price = {PRICE}
         settlement_key = settlement_key.path().display(),
         rpc_url = validator.rpc_url,
     ));
-    let runtime = connector_cli::build(&config).await.expect("build");
+    let (runtime, networks) = support::build_keeping_networks(&config).await;
     let app = connector_cli::router(&runtime, &config).expect("router");
 
     // The settlement backend creates this node's receiving account when it
@@ -422,7 +422,7 @@ price = {PRICE}
     // spec `#L193-L201`, `#L294-L305`, `#L1003-L1006`). The client holds
     // only its own keys, a salt, and the chain; everything about the node
     // comes off the Solana `batch-settlement` entry.
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
     let terms = greeting(&app, ROUTE, &receiver).await;
     let (offer, extra) = terms
         .batch_settlement_offers()
@@ -490,8 +490,7 @@ price = {PRICE}
         "the sponsor paid the fee and the escrow's rent"
     );
 
-    let backend = runtime
-        .settlement_networks
+    let backend = networks
         .iter()
         .next()
         .expect("opted in on Solana")

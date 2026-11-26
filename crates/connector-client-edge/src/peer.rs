@@ -942,24 +942,24 @@ key_file = "{key_file}"
         async fn a_signer_pinned_to_one_inbound_channel_proves_nothing_on_another() {
             let pinned_to = |channel: String| {
                 let config = peering();
-                let connector = Arc::new(
-                    Connector::new(
-                        Vec::new(),
-                        Vec::new(),
-                        Arc::new(FakeAppClient::new()),
-                        Arc::new(InProcessPeerTransport::new()),
-                        Arc::new(SystemClock),
-                    )
-                    .with_config_peer_ids([PEER_ID.to_string()])
-                    .with_config_voucher_signer(
-                        PEER_ID,
-                        connector_runtime::SettlementChain::Evm,
-                        &format!("0x{}", hex::encode(address_of(&peer_key()))),
-                        Some(&channel),
-                        None,
-                    )
-                    .expect("store is a configured peering"),
-                );
+                let connector = Connector::new(
+                    Vec::new(),
+                    Vec::new(),
+                    Arc::new(FakeAppClient::new()),
+                    Arc::new(InProcessPeerTransport::new()),
+                    Arc::new(SystemClock),
+                )
+                .with_config_peer_ids([PEER_ID.to_string()])
+                .wire_peerings()
+                .with_config_voucher_signer(
+                    PEER_ID,
+                    connector_runtime::SettlementChain::Evm,
+                    &format!("0x{}", hex::encode(address_of(&peer_key()))),
+                    Some(&channel),
+                    None,
+                )
+                .expect("store is a configured peering")
+                .finish();
                 let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
                     .expect("an empty journal")
                     .with_settlement_networks(two_channels_each_chain());

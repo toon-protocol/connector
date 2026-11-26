@@ -53,7 +53,7 @@ pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
     ChannelNetworks, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
-    Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
+    Connector, LeaseRouteError, PeerRouteTableError, PeeringWiring, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
 // dependency of their own (`connector-operator`): the chain key an x402

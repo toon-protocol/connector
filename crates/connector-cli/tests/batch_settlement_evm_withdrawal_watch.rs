@@ -97,7 +97,7 @@ price = {PRICE}
     ));
     let runtime = connector_cli::build(&config).await.expect("build");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     let mut salt = [0u8; 32];
     salt[31] = 1;
@@ -281,7 +281,7 @@ price = {PRICE}
                 let config = support::load_config(&first_config);
                 let runtime = connector_cli::build(&config).await.expect("build");
                 let app = connector_cli::router(&runtime, &config).expect("router");
-                let receiver = runtime.signer.public_key().expect("the node's wrap key");
+                let receiver = runtime.signer().public_key().expect("the node's wrap key");
                 for (amount, signature, config) in payments {
                     let response = post_ilp(
                         &app,
@@ -316,7 +316,7 @@ price = {PRICE}
     )));
     let runtime = connector_cli::build(&config).await.expect("rebuild");
     let app = connector_cli::router(&runtime, &config).expect("router");
-    let receiver = runtime.signer.public_key().expect("the node's wrap key");
+    let receiver = runtime.signer().public_key().expect("the node's wrap key");
 
     // The voucher the node already held is claimed all the same -- on the
     // watch's first pass, which fires at boot: the two-day minimum puts the

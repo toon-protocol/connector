@@ -30,8 +30,9 @@ use connector_runtime::{
     AppClient, BatchChannels, BoundedHttpSelfDescription, ConfigPeeringError, Connector,
     DeclaredRates, FileJournal, HttpAppClient, InMemoryJournal, Journal, JournalError,
     OutboundChannels, OutboundRestoreError, PeerRegistrar, PeerRoute, PeerRouteStore,
-    PeerRouteStoreError, PeerTransport, QuotePathUnusable, RatePoller, RateSources, RuntimePeers,
-    SelfDescriptionSource, SettlementNetwork, SettlementNetworks, SharedRateTable, SystemClock,
+    PeerRouteStoreError, PeerTransport, PeeringWiring, QuotePathUnusable, RatePoller, RateSources,
+    RuntimePeers, SelfDescriptionSource, SettlementNetwork, SettlementNetworks, SharedRateTable,
+    SystemClock,
 };
 use connector_settlement::batch::BatchSettlementError;
 use connector_settlement_evm::{DepositRoute, EvmBatchSettlementBackend};
@@ -1035,80 +1036,77 @@ fn warn_about_host_local_endpoints(config: &Config) {
     }
 }
 
-/// The running node [`assemble`] returns: its router, and what the binary,
-/// the operator surface and the tests still read off it. Its background
-/// tasks -- each network's watcher, the rate pollers and a zk edge's
-/// allowance sweep -- are already running by the time it is returned.
+/// The running node [`assemble`] returns: what the binary serves and holds,
+/// and the facts its self-description publishes. Its background tasks --
+/// each network's watcher, the rate pollers and a zk edge's allowance sweep
+/// -- are already running by the time it is returned, and the operator
+/// surface was handed its inputs by [`assemble`] and is inside the router.
+///
+/// Nothing else is reachable through it (issue #1722): the connector, the
+/// claim gate, the settlement networks and the rate table are the router's,
+/// and a test observes them through it.
 pub struct Runtime {
-    pub connector: Arc<Connector>,
-    pub signer: Arc<dyn Signer>,
-    /// The rates this node deals at, or `None` for a node that declares no
-    /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
-    /// node that predates the record, and is why this is an `Option` rather
-    /// than an empty table.
-    ///
-    /// Built at connect, from the immutable declaration in `[[tokens]]`,
-    /// `[[rates]]` and `[rate_guards]`: it is composed once at boot and
-    /// every reader afterwards shares it rather than rebuilding one of its
-    /// own. Two readers are expected -- the forwarding path, which reads it
-    /// for every forward that crosses a denomination boundary, and the
-    /// operator surface, which renders what it holds -- and both go through
-    /// [`connector_runtime::SharedRateTable`]'s synchronous read API, which
-    /// is what keeps ADR 0071's "the forwarding path does no I/O" true by
-    /// construction rather than by discipline.
-    ///
-    /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's.
-    pub rate_table: Option<SharedRateTable>,
-    /// Every network this node settles on, one handle per settlement table
-    /// (spec #1684, ADR 0086), keyed by CAIP-2 network and built once at
-    /// connect, in table order. The node reaches every chain through it and
-    /// through nothing else (issue #1715): every channel the client-edge
-    /// journal holds vouchers on, and every outbound channel, was restored
-    /// to its network's backend by [`assemble`], which also handed it to the
-    /// claim gate, started each network's watcher through it and published
-    /// each network's terms in the greeting. Empty on a node that settles on
-    /// nothing -- a node that then takes no claim at all, since every claim
-    /// is a voucher (ADR 0075).
-    pub settlement_networks: SettlementNetworks,
-    /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
-    /// over the paying half of each network and journaled to
-    /// [`OUTBOUND_CHANNEL_JOURNAL`]: `Some` exactly when a network is.
-    /// Every channel that journal names was restored by [`assemble`], with
-    /// the highest voucher journaled on it, so the operator surface can
-    /// fund, withdraw from and sign on it from the first request.
-    pub outbound_channels: Option<Arc<OutboundChannels>>,
-    /// The lock on `state_dir` (issue #1318), `Some` exactly when the node
-    /// names one. `run` moves it into the `RunningNode` it hands back, because
-    /// the runtime is dropped before the process stops serving.
-    pub state_dir_lock: Option<std::fs::File>,
-    /// What a zk edge read once at boot (ADR 0080 decisions 14--16), `Some`
-    /// exactly when `[zk_note]` is written. The claim gate holds it, and the
-    /// allowance sweep is running.
-    pub zk_edge: Option<ZkEdgeBoot>,
     /// The client edge, the sponsor and zk-note endpoints and, when
     /// `[operator]` is written, the operator surface, merged.
     router: Router,
+    /// The lock on `state_dir` (issue #1318), `Some` exactly when the node
+    /// names one, until [`Runtime::take_state_dir_lock`] hands it over.
+    state_dir_lock: Option<std::fs::File>,
+    /// The `[signer]` identity `GET /ilp/identity` publishes.
+    signer: Arc<dyn Signer>,
+    /// What `GET /ilp` serves as this node's self-description.
+    node_facts: connector_domain::NodeFacts,
+    /// The x402 channels this node pays on (ADR 0075 decisions 8 and 11),
+    /// `Some` exactly when it settles on a network.
+    outbound_channels: Option<Arc<OutboundChannels>>,
 }
 
 impl Runtime {
+    /// The one router this node serves.
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+
+    /// The lock on `state_dir`, handed to whoever now holds the node: `run`
+    /// moves it into the `RunningNode` it returns, because the runtime is
+    /// dropped before the process stops serving. Dropping it releases
+    /// `state_dir`, as a process ending does.
+    pub fn take_state_dir_lock(&mut self) -> Option<std::fs::File> {
+        self.state_dir_lock.take()
+    }
+
+    /// The node's `[signer]` identity: the key a sender seals a packet to,
+    /// which `GET /ilp/identity` publishes (ADR 0022).
+    pub fn signer(&self) -> &Arc<dyn Signer> {
+        &self.signer
+    }
+
+    /// This node's self-description (ADR 0050): the one value `GET /ilp`
+    /// serves and every x402 greeting projects its `extra` block out of.
+    pub fn node_facts(&self) -> &connector_domain::NodeFacts {
+        &self.node_facts
+    }
+
     /// This node's x402 batch-settlement terms, one entry per network it
     /// settles on, in table order (ADR 0074 decision 8): the greeting's whole
-    /// `accepts[]` (ADR 0075 decision 10), assembled from each network's
-    /// handle. Proved at connect, never declared.
+    /// `accepts[]` (ADR 0075 decision 10). Proved at connect, never declared.
     pub fn batch_settlements(&self) -> Vec<connector_client_edge::X402BatchSettlementTerms> {
-        self.settlement_networks.terms()
+        self.node_facts.batch_settlements.clone()
     }
 
     /// The key this node signs its vouchers with on each network it settles
     /// on (ADR 0075 decisions 3 and 10), published so a peer can bind this
-    /// node's channel toward it. Read off each network's handle.
+    /// node's channel toward it.
     pub fn voucher_signers(&self) -> Vec<connector_domain::VoucherSignerFact> {
-        self.settlement_networks.voucher_signers()
+        self.node_facts.voucher_signers.clone()
     }
 
-    /// The one router this node serves.
-    pub fn router(&self) -> Router {
-        self.router.clone()
+    /// The x402 channels this node pays on, every one its journal names
+    /// restored by [`assemble`] with the highest voucher journaled on it --
+    /// what the operator surface funds, withdraws from and signs on. `None`
+    /// on a node that settles on nothing.
+    pub fn outbound_channels(&self) -> Option<Arc<OutboundChannels>> {
+        self.outbound_channels.clone()
     }
 }
 
@@ -1184,7 +1182,23 @@ pub struct Parts {
     /// `Some` exactly when the node names a `state_dir`.
     pub runtime_peer_routes: Option<StoredPeerRoutes>,
     pub carriages: Carriages,
-    /// See [`Runtime::rate_table`]. Its pollers are already running.
+    /// The rates this node deals at, or `None` for a node that declares no
+    /// token to deal (ADR 0071 decision 6, issue #1294) -- which is every
+    /// node that predates the record, and is why this is an `Option` rather
+    /// than an empty table.
+    ///
+    /// Built from the immutable declaration in `[[tokens]]`, `[[rates]]` and
+    /// `[rate_guards]`: composed once at boot, and every reader afterwards
+    /// shares it rather than rebuilding one of its own. Two readers are
+    /// expected -- the forwarding path, which reads it for every forward
+    /// that crosses a denomination boundary, and the operator surface, which
+    /// renders what it holds -- and both go through
+    /// [`connector_runtime::SharedRateTable`]'s synchronous read API, which
+    /// is what keeps ADR 0071's "the forwarding path does no I/O" true by
+    /// construction rather than by discipline.
+    ///
+    /// Writing it is [`spawn_rate_pollers`]'s job, and nothing else's: its
+    /// pollers are already running.
     pub rate_table: Option<SharedRateTable>,
     /// `Some` exactly when `[zk_note]` is written.
     pub zk_edge: Option<ZkEdgeParts>,
@@ -1493,13 +1507,7 @@ pub async fn assemble(parts: Parts) -> Result<Runtime, RuntimeError> {
             connector_client_edge::journaled_batch_channels(&entries).map_err(unreplayable)?;
         restore_journaled_channels(&channels, &settlement_networks.receivers()).await;
     }
-    // What the runtime keeps of a zk edge, and the terms its greeting
-    // publishes; the gate takes the rest.
-    let zk_boot = zk_edge.as_ref().map(|edge| ZkEdgeBoot {
-        vault: Arc::clone(&edge.boot.vault),
-        subsidy: edge.boot.subsidy,
-        slots: edge.boot.slots,
-    });
+    // The terms a zk edge's greeting publishes; the gate takes the rest.
     let zk_note_terms = zk_edge.as_ref().map(|edge| edge.terms.clone());
     let claim_gate = client_claim_gate(
         &config,
@@ -1513,7 +1521,7 @@ pub async fn assemble(parts: Parts) -> Result<Runtime, RuntimeError> {
     // written, and refused by name on the rest.
     let claim_gate = Arc::new(claim_gate.with_settlement_networks(settlement_networks.clone()));
 
-    let connector = Arc::new(build_connector(
+    let connector = build_connector(
         &config,
         carriages,
         &signer,
@@ -1522,22 +1530,23 @@ pub async fn assemble(parts: Parts) -> Result<Runtime, RuntimeError> {
         outbound_channels.as_ref(),
         runtime_peer_routes,
         rate_table.as_ref(),
-    )?);
+    )?;
 
     spawn_batch_settlement_watchers(&settlement_networks, &claim_gate);
     // ADR 0080 decision 4: a zk edge closes the allowances that expire, for
     // as long as it runs.
-    if zk_boot.is_some() {
+    if zk_note_terms.is_some() {
         tokio::spawn(Arc::clone(&claim_gate).run_allowance_sweep(ALLOWANCE_SWEEP_INTERVAL));
     }
 
+    let node_facts = node_facts(&config, &settlement_networks, zk_note_terms);
     let router = routers(
         &config,
         &connector,
         &signer,
         wrap_receiver_secret,
         &claim_gate,
-        node_facts(&config, &settlement_networks, zk_note_terms),
+        node_facts.clone(),
         sponsor,
         outbound_channels.as_ref().map(|outbound| {
             batch_channels_for_operator(outbound, &settlement_networks, &claim_gate)
@@ -1546,19 +1555,18 @@ pub async fn assemble(parts: Parts) -> Result<Runtime, RuntimeError> {
         rate_table.as_ref(),
     );
     Ok(Runtime {
-        connector,
-        signer,
-        rate_table,
-        settlement_networks,
-        outbound_channels,
-        state_dir_lock,
-        zk_edge: zk_boot,
         router,
+        state_dir_lock,
+        signer,
+        node_facts,
+        outbound_channels,
     })
 }
 
-/// The connector, built complete: every port it reads is given before it is
-/// shared, and nothing patches it afterwards.
+/// The connector, built complete: every setting first, then the config
+/// file's peerings and the durable runtime table -- the order
+/// [`Connector::wire_peerings`] enforces -- and shared only then, so nothing
+/// patches it afterwards.
 ///
 /// Every `peer_id`-targeted `[[routes]]` entry becomes a [`PeerRoute`]
 /// alongside the terminated [`connector_config::StaticRoute`]s.
@@ -1572,7 +1580,7 @@ fn build_connector(
     outbound_channels: Option<&Arc<OutboundChannels>>,
     runtime_peer_routes: Option<StoredPeerRoutes>,
     rate_table: Option<&SharedRateTable>,
-) -> Result<Connector, RuntimeError> {
+) -> Result<Arc<Connector>, RuntimeError> {
     let peer_routes = config
         .peer_routes()
         .iter()
@@ -1675,17 +1683,6 @@ fn build_connector(
             .collect();
         connector = connector.with_outbound_channels(Arc::clone(outbound), networks);
     }
-    // ADR 0075 decisions 4, 6 and 9, issue #1380: the config file's own
-    // peerings, on x402 channels. After the outbound channels above, which a
-    // `[[pay_channels]]` row names one of; before the runtime table below,
-    // so a durable runtime row cannot take a signer a config row binds.
-    connector = wire_config_peerings(connector, config)?;
-    // Issue #884: replay this node's durable runtime peer/route table, and
-    // arm the connector to persist future writes back to the same file.
-    if let Some(stored) = runtime_peer_routes {
-        connector =
-            connector.with_runtime_peer_route_store(stored.store, stored.peers, stored.routes);
-    }
     // ADR 0071 decisions 1 and 2, issues #1295 and #1301: the facts the
     // forwarding path's converting arm reads, and the only ones. Which
     // token each leg holds decides whether a forward crosses a
@@ -1717,7 +1714,19 @@ fn build_connector(
     if let Some(zk_note) = config.zk_note() {
         connector = connector.with_zk_note_network(zk_note.network().caip2());
     }
-    Ok(connector)
+    // ADR 0075 decisions 4, 6 and 9, issue #1380: the config file's own
+    // peerings, on x402 channels, then the durable runtime table (issue
+    // #884), which is replayed and armed to persist future writes back to
+    // the same file. Every setting above is fixed first: the types allow no
+    // other order, so a durable runtime row cannot take a signer a config
+    // row binds, nor replay before the channels it is paid on.
+    let wiring = wire_config_peerings(connector.wire_peerings(), config)?;
+    Ok(match runtime_peer_routes {
+        Some(stored) => {
+            wiring.replaying_runtime_peer_routes(stored.store, stored.peers, stored.routes)
+        }
+        None => wiring.finish(),
+    })
 }
 
 /// A zk edge's vault adapter and the reads boot makes of it (ADR 0080
@@ -1858,11 +1867,12 @@ async fn connect_zk_edge(
 ///
 /// The claim-state ask takes the peering's own `peer_answer_timeout_ms`,
 /// and leaves on `socks_proxy` when the next hop's client edge is an onion
-/// host (`Connector::with_socks_proxy`, set before this runs).
+/// host: the settings are fixed before any peering is wired
+/// ([`Connector::wire_peerings`]).
 fn wire_config_peerings(
-    mut connector: Connector,
+    mut connector: PeeringWiring,
     config: &Config,
-) -> Result<Connector, RuntimeError> {
+) -> Result<PeeringWiring, RuntimeError> {
     for row in config.peer_channels() {
         connector = connector
             .with_config_voucher_signer(
@@ -2670,7 +2680,7 @@ key_file = "{}"
         });
 
         let runtime = build(&config).await.expect("build");
-        assert!(runtime.connector.routes().is_empty());
+        assert!(runtime.signer().public_key().is_ok());
     }
 
     #[tokio::test]
@@ -3811,7 +3821,7 @@ key_file = "{signer_key}"
             let key_path = key_file_with(DEPLOYER_PRIVATE_KEY);
             let config = node_config(&key_path.display().to_string(), "");
             let runtime = build(&config).await.expect("builds with no settlement");
-            assert!(runtime.settlement_networks.is_empty());
+            assert!(runtime.voucher_signers().is_empty());
             assert!(runtime.batch_settlements().is_empty());
         }
 
@@ -3957,11 +3967,9 @@ max_move = {{ numerator = 5, denominator = 100 }}
                 ),
             );
 
-            let runtime = build(&config).await.expect("build");
+            let parts = connect(&config).await.expect("connect");
 
-            let table = runtime
-                .rate_table
-                .expect("a node that declares tokens deals");
+            let table = parts.rate_table.expect("a node that declares tokens deals");
             let held = table.read();
             let usdc: connector_domain::AssetId = usdc.parse().expect("an asset");
             let anyone: connector_domain::AssetId = anyone.parse().expect("an asset");
@@ -4309,9 +4317,15 @@ max_move = {{ numerator = 5, denominator = 100 }}
             ] {
                 assert_eq!(
                     runtime
-                        .settlement_networks
+                        .voucher_signers()
                         .iter()
-                        .filter(|held| held.network().chain() == chain)
+                        .filter(|fact| {
+                            fact.network
+                                .parse::<connector_domain::Network>()
+                                .ok()
+                                .map(|network| network.chain())
+                                == Some(chain)
+                        })
                         .count(),
                     1,
                     "one network per table: {chain:?}"
@@ -4477,9 +4491,9 @@ key_file = "{}"
                 )
             });
 
-            let runtime = build(&config).await.expect("build");
+            let parts = connect(&config).await.expect("connect");
 
-            assert!(runtime.rate_table.is_none());
+            assert!(parts.rate_table.is_none());
         }
 
         /// The seam issue #1293's reader drops into: a declared quote path,

@@ -687,6 +687,215 @@ fn default_probe_window() -> Duration {
     Duration::seconds(60)
 }
 
+/// A [`Connector`] whose settings are fixed, being given its peerings
+/// (spec #1689, issue #1722): the config file's own, then the durable
+/// runtime table. The order startup needs is the order the types allow --
+/// [`Connector::wire_peerings`] ends the settings, the config peerings are
+/// wired here, and [`PeeringWiring::replaying_runtime_peer_routes`] (or
+/// [`PeeringWiring::finish`], for a node with no durable table) ends the
+/// wiring and shares the connector.
+pub struct PeeringWiring {
+    connector: Connector,
+}
+
+impl PeeringWiring {
+    /// Wire one `[[pay_channels]]` row (ADR 0042 item 2, as ADR 0075 decision
+    /// 6 amends it, issue #1380): every forward to `peer_id` is covered by a
+    /// voucher on this node's own outbound x402 channel `outbound_channel`,
+    /// and `client_edge_url`'s `POST /ilp/claim-state` is the watermark
+    /// authority when this process has not yet asked, or has had a voucher
+    /// refused -- exactly as a runtime peering's hop is.
+    ///
+    /// The claim-state ask leaves on the node's `socks_proxy` when the
+    /// client edge is an onion host, by the one host rule
+    /// (`connector_config::is_onion_endpoint`). `answer_timeout` is the
+    /// peering's own `peer_answer_timeout_ms`: the ask is a request to that
+    /// peer on the packet's path.
+    ///
+    /// # Errors
+    ///
+    /// Refused, by name, when this node has no x402 channels at all or its
+    /// outbound-channel journal does not hold `outbound_channel`: a row
+    /// naming a channel this node never opened -- or opened under a
+    /// `state_dir` it no longer has -- would refuse every forward at packet
+    /// time, and ADR 0009 turns that into a refusal to start.
+    pub fn with_config_pay_channel(
+        self,
+        peer_id: &str,
+        outbound_channel: &str,
+        client_edge_url: &url::Url,
+        answer_timeout: std::time::Duration,
+        network: Option<&connector_domain::Network>,
+    ) -> Result<Self, ConfigPeeringError> {
+        let Some(outbound) = self.connector.outbound_channels.as_ref() else {
+            return Err(ConfigPeeringError::NoOutboundChannels {
+                peer_id: peer_id.to_string(),
+            });
+        };
+        if outbound.presentation(outbound_channel).is_none() {
+            return Err(ConfigPeeringError::OutboundChannelUnknown {
+                peer_id: peer_id.to_string(),
+                channel: outbound_channel.to_string(),
+            });
+        }
+        // A config peering is on the network its rows name (ADR 0086
+        // decision 11): the channel the row pays on must be held there.
+        if let (Some(row), Some(held_on)) = (network, outbound.network(outbound_channel)) {
+            if *row != held_on {
+                return Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
+                    peer_id: peer_id.into(),
+                    channel: outbound_channel.into(),
+                    row: row.to_string().into(),
+                    held_on: held_on.to_string().into(),
+                });
+            }
+        }
+        // A peering's settlement key both signs its vouchers toward this node
+        // and receives this node's (ADR 0075 decision 4), so where the config
+        // binds the peer a voucher signer on the channel's chain, the channel
+        // must pay that key: one opened toward anyone else carries vouchers
+        // the hop cannot redeem, and would only be found at packet time.
+        let chain_of = |signer: &VoucherSigner| match signer {
+            VoucherSigner::Evm(_) => SettlementChain::Evm,
+            VoucherSigner::Solana(_) => SettlementChain::Solana,
+            VoucherSigner::Xrpl(_) => SettlementChain::Xrpl,
+        };
+        let channel_chain =
+            outbound
+                .presentation(outbound_channel)
+                .map(|presentation| match presentation {
+                    connector_settlement::batch::ChannelPresentation::Evm { .. } => {
+                        SettlementChain::Evm
+                    }
+                    connector_settlement::batch::ChannelPresentation::Solana { .. } => {
+                        SettlementChain::Solana
+                    }
+                    connector_settlement::batch::ChannelPresentation::Xrpl { .. } => {
+                        SettlementChain::Xrpl
+                    }
+                });
+        let receivers: Vec<VoucherSigner> = self
+            .connector
+            .peerings
+            .voucher_bindings()
+            .signers_of(peer_id)
+            .into_iter()
+            .filter(|signer| Some(chain_of(signer)) == channel_chain)
+            .collect();
+        if !receivers.is_empty()
+            && !receivers.iter().any(|receiver| {
+                outbound
+                    .opened_toward(receiver)
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(outbound_channel))
+            })
+        {
+            return Err(ConfigPeeringError::OutboundChannelPaysSomeoneElse {
+                peer_id: peer_id.to_string(),
+                channel: outbound_channel.to_string(),
+            });
+        }
+        self.connector.peerings.register_voucher_hop_at(
+            peer_id,
+            outbound_channel,
+            client_edge_url.as_str(),
+            answer_timeout,
+        );
+        Ok(self)
+    }
+
+    /// Wire one `[[peer_channels]]` row (ADR 0075 decisions 4, 5 and 9,
+    /// issue #1380): bind `voucher_signer` -- an EVM address or a base58
+    /// Solana key, on `chain` -- to the config peering `peer_id`, so a
+    /// voucher on a channel the chain records that signer for -- or, for a
+    /// packet that moves no value, the claim-state challenge it signs --
+    /// proves the peer role. With `inbound_channel`, only that one channel
+    /// proves it.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigPeeringError::VoucherSignerUnreadable`] for a signer not in
+    /// `chain`'s spelling (`Config::load` already refuses one), and
+    /// [`ConfigPeeringError::VoucherSignerUnbound`] for a peer id the config
+    /// file does not own or a signer already proving another peering.
+    pub fn with_config_voucher_signer(
+        self,
+        peer_id: &str,
+        chain: SettlementChain,
+        voucher_signer: &str,
+        inbound_channel: Option<&str>,
+        network: Option<&connector_domain::Network>,
+    ) -> Result<Self, ConfigPeeringError> {
+        let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
+            return Err(ConfigPeeringError::VoucherSignerUnreadable {
+                peer_id: peer_id.to_string(),
+                value: voucher_signer.to_string(),
+            });
+        };
+        let unbound = |source| ConfigPeeringError::VoucherSignerUnbound {
+            peer_id: peer_id.to_string(),
+            source,
+        };
+        if !self.connector.peerings.is_config_peer(peer_id) {
+            return Err(unbound(VoucherBindingError::UnknownPeer(
+                peer_id.to_string(),
+            )));
+        }
+        // ADR 0086 decision 11: the row's network is the peering's.
+        self.connector
+            .peerings
+            .voucher_bindings()
+            .bind_on_network(peer_id, signer, network, inbound_channel)
+            .map_err(unbound)?;
+        Ok(self)
+    }
+
+    /// Replay a durable runtime peer/route table (issue #884) into this
+    /// connector and arm it to persist future writes back to the same
+    /// store -- the two must always be given together, since a table
+    /// replayed from `peers`/`routes` but not armed to persist further
+    /// writes would silently stop being durable after the first mutation.
+    /// Every replayed peering goes through the same admit operation
+    /// `POST /peers` uses, so it is **re-armed** exactly as establishing it
+    /// was: the peer's voucher signer is bound to it again, its outbound
+    /// x402 channel is registered again as the hop every forward to it is
+    /// covered on (ADR 0075 decision 6), and its carriage goes back into
+    /// the registrar. A durable row that came back as a name would be the
+    /// hollow row ADR 0058 exists to remove, one restart later.
+    ///
+    /// A stored peering that admit refuses, or that fails while being wired
+    /// (a voucher signer that already proves another peering), is **skipped
+    /// whole**: no hop, binding, carriage or table row, and the routes
+    /// naming it are dropped. It is logged by name at error level and the
+    /// node serves its other peerings. It reads every setting -- the config
+    /// file's peer ids (a stored peering whose id the config file owns is
+    /// skipped), the registrar the carriages replay into, the outbound
+    /// channels the forwards are signed on and the socks proxy -- and every
+    /// config peering already wired, so it is the last step: it hands back
+    /// the connector, shared, and nothing can be set or wired after it.
+    ///
+    /// A row with no `client_edge_url` -- the shape rows written before
+    /// issue #1217 have -- has no claim-state to restore its watermark from,
+    /// so it replays bound but unpaid, accept-only until re-peered. A row
+    /// naming a `toon-channel` never reaches here: [`PeerRouteStore::open`]
+    /// refuses it at boot by name (ADR 0075 decision 8).
+    pub fn replaying_runtime_peer_routes(
+        mut self,
+        store: PeerRouteStore,
+        peers: RuntimePeers,
+        routes: HashMap<String, PeerRoute>,
+    ) -> Arc<Connector> {
+        self.connector.peerings.replay(store, peers, routes);
+        Arc::new(self.connector)
+    }
+
+    /// End the wiring on a node with no durable runtime table, and share
+    /// the connector.
+    pub fn finish(self) -> Arc<Connector> {
+        Arc::new(self.connector)
+    }
+}
+
 impl Connector {
     pub fn new(
         routes: Vec<StaticRoute>,
@@ -1032,54 +1241,15 @@ impl Connector {
         self
     }
 
-    /// Replay a durable runtime peer/route table (issue #884) into this
-    /// connector and arm it to persist future writes back to the same
-    /// store -- the two must always be given together, since a table
-    /// replayed from `peers`/`routes` but not armed to persist further
-    /// writes would silently stop being durable after the first mutation.
-    /// Every replayed peering goes through the same admit operation
-    /// `POST /peers` uses, so it is **re-armed** exactly as establishing it
-    /// was: the peer's voucher signer is bound to it again, its outbound
-    /// x402 channel is registered again as the hop every forward to it is
-    /// covered on (ADR 0075 decision 6), and its carriage goes back into
-    /// the registrar. A durable row that came back as a name would be the
-    /// hollow row ADR 0058 exists to remove, one restart later.
-    ///
-    /// A stored peering that admit refuses, or that fails while being wired
-    /// (a voucher signer that already proves another peering), is **skipped
-    /// whole**: no hop, binding, carriage or table row, and the routes
-    /// naming it are dropped. It is logged by name at error level and the
-    /// node serves its other peerings. Call this after
-    /// [`Connector::with_config_peer_ids`] (a stored peering whose id the
-    /// config file owns is skipped), after [`Connector::with_peer_registrar`],
-    /// or the carriages replay nowhere, and after
-    /// [`Connector::with_outbound_channels`], or the forwards have no
-    /// channel to be signed on.
-    ///
-    /// A row with no `client_edge_url` -- the shape rows written before
-    /// issue #1217 have -- has no claim-state to restore its watermark from,
-    /// so it replays bound but unpaid, accept-only until re-peered. A row
-    /// naming a `toon-channel` never reaches here: [`PeerRouteStore::open`]
-    /// refuses it at boot by name (ADR 0075 decision 8).
-    pub fn with_runtime_peer_route_store(
-        mut self,
-        store: PeerRouteStore,
-        peers: RuntimePeers,
-        routes: HashMap<String, PeerRoute>,
-    ) -> Self {
-        self.peerings.replay(store, peers, routes);
-        self
-    }
-
     /// Give this node the x402 channels it pays on (ADR 0075 decisions 8
     /// and 11), and its own CAIP-2 network on each chain they are on: what
     /// `POST /peers` opens a peering's outbound channel through, on either
     /// chain, and what every forward over such a peering signs its voucher
     /// through.
     ///
-    /// Call before [`Connector::with_runtime_peer_route_store`]: a durable
-    /// x402 peering is rehydrated onto these channels, and one replayed
-    /// before them could not pay.
+    /// A settings builder: a durable x402 peering replayed by
+    /// [`PeeringWiring::replaying_runtime_peer_routes`] is rehydrated onto
+    /// these channels, and the types put every replay after them.
     pub fn with_outbound_channels(
         mut self,
         outbound: Arc<OutboundChannels>,
@@ -1092,11 +1262,21 @@ impl Connector {
 
     /// Give this node its `socks_proxy` (ADR 0070): the proxy a runtime
     /// peering's claim-state ask leaves on when the peer's client edge is an
-    /// onion host. Call before [`Connector::with_runtime_peer_route_store`],
-    /// so a rehydrated onion peering is asked through it too.
+    /// onion host -- a config peering's and a rehydrated one's alike, since
+    /// every peering is wired after the settings ([`Connector::wire_peerings`]).
     pub fn with_socks_proxy(mut self, proxy: Option<url::Url>) -> Self {
         self.peerings.set_socks_proxy(proxy);
         self
+    }
+
+    /// Fix this node's settings and start wiring its peerings onto them
+    /// (spec #1689, issue #1722). Every setting a peering reads -- the
+    /// config file's peer ids, the registrar, the socks proxy, the outbound
+    /// channels -- is a builder on [`Connector`], and every step that wires
+    /// a peering is on the [`PeeringWiring`] this returns, so a peering can
+    /// only be wired once the settings it reads are in place.
+    pub fn wire_peerings(self) -> PeeringWiring {
+        PeeringWiring { connector: self }
     }
 
     /// The x402 channels this node pays on, if it has any.
@@ -1138,157 +1318,6 @@ impl Connector {
                 .network_of(channel_key)
                 .map(|network| network.to_string()),
         }
-    }
-
-    /// Wire one `[[pay_channels]]` row (ADR 0042 item 2, as ADR 0075 decision
-    /// 6 amends it, issue #1380): every forward to `peer_id` is covered by a
-    /// voucher on this node's own outbound x402 channel `outbound_channel`,
-    /// and `client_edge_url`'s `POST /ilp/claim-state` is the watermark
-    /// authority when this process has not yet asked, or has had a voucher
-    /// refused -- exactly as a runtime peering's hop is.
-    ///
-    /// The claim-state ask leaves on the node's `socks_proxy` when the
-    /// client edge is an onion host, by the one host rule
-    /// (`connector_config::is_onion_endpoint`), so call
-    /// [`Connector::with_socks_proxy`] first. `answer_timeout` is the
-    /// peering's own `peer_answer_timeout_ms`: the ask is a request to that
-    /// peer on the packet's path.
-    ///
-    /// # Errors
-    ///
-    /// Refused, by name, when this node has no x402 channels at all or its
-    /// outbound-channel journal does not hold `outbound_channel`: a row
-    /// naming a channel this node never opened -- or opened under a
-    /// `state_dir` it no longer has -- would refuse every forward at packet
-    /// time, and ADR 0009 turns that into a refusal to start. Call
-    /// [`Connector::with_outbound_channels`] first.
-    pub fn with_config_pay_channel(
-        self,
-        peer_id: &str,
-        outbound_channel: &str,
-        client_edge_url: &url::Url,
-        answer_timeout: std::time::Duration,
-        network: Option<&connector_domain::Network>,
-    ) -> Result<Self, ConfigPeeringError> {
-        let Some(outbound) = self.outbound_channels.as_ref() else {
-            return Err(ConfigPeeringError::NoOutboundChannels {
-                peer_id: peer_id.to_string(),
-            });
-        };
-        if outbound.presentation(outbound_channel).is_none() {
-            return Err(ConfigPeeringError::OutboundChannelUnknown {
-                peer_id: peer_id.to_string(),
-                channel: outbound_channel.to_string(),
-            });
-        }
-        // A config peering is on the network its rows name (ADR 0086
-        // decision 11): the channel the row pays on must be held there.
-        if let (Some(row), Some(held_on)) = (network, outbound.network(outbound_channel)) {
-            if *row != held_on {
-                return Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
-                    peer_id: peer_id.into(),
-                    channel: outbound_channel.into(),
-                    row: row.to_string().into(),
-                    held_on: held_on.to_string().into(),
-                });
-            }
-        }
-        // A peering's settlement key both signs its vouchers toward this node
-        // and receives this node's (ADR 0075 decision 4), so where the config
-        // binds the peer a voucher signer on the channel's chain, the channel
-        // must pay that key: one opened toward anyone else carries vouchers
-        // the hop cannot redeem, and would only be found at packet time.
-        let chain_of = |signer: &VoucherSigner| match signer {
-            VoucherSigner::Evm(_) => SettlementChain::Evm,
-            VoucherSigner::Solana(_) => SettlementChain::Solana,
-            VoucherSigner::Xrpl(_) => SettlementChain::Xrpl,
-        };
-        let channel_chain =
-            outbound
-                .presentation(outbound_channel)
-                .map(|presentation| match presentation {
-                    connector_settlement::batch::ChannelPresentation::Evm { .. } => {
-                        SettlementChain::Evm
-                    }
-                    connector_settlement::batch::ChannelPresentation::Solana { .. } => {
-                        SettlementChain::Solana
-                    }
-                    connector_settlement::batch::ChannelPresentation::Xrpl { .. } => {
-                        SettlementChain::Xrpl
-                    }
-                });
-        let receivers: Vec<VoucherSigner> = self
-            .peerings
-            .voucher_bindings()
-            .signers_of(peer_id)
-            .into_iter()
-            .filter(|signer| Some(chain_of(signer)) == channel_chain)
-            .collect();
-        if !receivers.is_empty()
-            && !receivers.iter().any(|receiver| {
-                outbound
-                    .opened_toward(receiver)
-                    .iter()
-                    .any(|id| id.eq_ignore_ascii_case(outbound_channel))
-            })
-        {
-            return Err(ConfigPeeringError::OutboundChannelPaysSomeoneElse {
-                peer_id: peer_id.to_string(),
-                channel: outbound_channel.to_string(),
-            });
-        }
-        self.peerings.register_voucher_hop_at(
-            peer_id,
-            outbound_channel,
-            client_edge_url.as_str(),
-            answer_timeout,
-        );
-        Ok(self)
-    }
-
-    /// Wire one `[[peer_channels]]` row (ADR 0075 decisions 4, 5 and 9,
-    /// issue #1380): bind `voucher_signer` -- an EVM address or a base58
-    /// Solana key, on `chain` -- to the config peering `peer_id`, so a
-    /// voucher on a channel the chain records that signer for -- or, for a
-    /// packet that moves no value, the claim-state challenge it signs --
-    /// proves the peer role. With `inbound_channel`, only that one channel
-    /// proves it. Call [`Connector::with_config_peer_ids`] first.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigPeeringError::VoucherSignerUnreadable`] for a signer not in
-    /// `chain`'s spelling (`Config::load` already refuses one), and
-    /// [`ConfigPeeringError::VoucherSignerUnbound`] for a peer id the config
-    /// file does not own or a signer already proving another peering.
-    pub fn with_config_voucher_signer(
-        self,
-        peer_id: &str,
-        chain: SettlementChain,
-        voucher_signer: &str,
-        inbound_channel: Option<&str>,
-        network: Option<&connector_domain::Network>,
-    ) -> Result<Self, ConfigPeeringError> {
-        let Some(signer) = crate::peering::parse_chain_key(chain, voucher_signer) else {
-            return Err(ConfigPeeringError::VoucherSignerUnreadable {
-                peer_id: peer_id.to_string(),
-                value: voucher_signer.to_string(),
-            });
-        };
-        let unbound = |source| ConfigPeeringError::VoucherSignerUnbound {
-            peer_id: peer_id.to_string(),
-            source,
-        };
-        if !self.peerings.is_config_peer(peer_id) {
-            return Err(unbound(VoucherBindingError::UnknownPeer(
-                peer_id.to_string(),
-            )));
-        }
-        // ADR 0086 decision 11: the row's network is the peering's.
-        self.peerings
-            .voucher_bindings()
-            .bind_on_network(peer_id, signer, network, inbound_channel)
-            .map_err(unbound)?;
-        Ok(self)
     }
 
     /// Pay `peer_id` over this node's outbound x402 channel `channel_id`,
@@ -2452,7 +2481,7 @@ impl Connector {
     ///
     /// [`Connector::cover_forward`] signs for exactly this packet's own
     /// forwarded value: a hop registered by a runtime peering or by
-    /// [`Connector::with_config_pay_channel`] gets a fresh voucher on its
+    /// [`crate::PeeringWiring::with_config_pay_channel`] gets a fresh voucher on its
     /// outbound x402 channel, signed and journaled before the packet is
     /// ever sent -- covered from the first attempt, including the first
     /// attempt after a restart, never merely recovered after a refusal. If
@@ -2848,7 +2877,7 @@ impl Connector {
     /// voucher on this node's own outbound x402 channel toward the hop (ADR
     /// 0075 decision 6), whether a runtime peering registered that channel
     /// (`register_voucher_hop`) or a `[[pay_channels]]` row did
-    /// ([`Connector::with_config_pay_channel`]).
+    /// ([`crate::PeeringWiring::with_config_pay_channel`]).
     async fn cover_forward(
         &self,
         peer_id: &str,
@@ -9001,7 +9030,8 @@ mod tests {
                 ),
                 "apex-relay-2",
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
             before_restart
                 .upsert_runtime_peer("apex-relay-2", peering(3))
                 .unwrap();
@@ -9023,7 +9053,8 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
 
             let peers = after_restart.peers();
             assert_eq!(peers.len(), 1);
@@ -9220,7 +9251,8 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
 
             assert!(connector.peers().is_empty(), "skipped whole");
             let error = connector
@@ -9608,7 +9640,8 @@ mod tests {
             let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
             let before = a_node_over(&next_hop, &outbound)
                 .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
-                .with_runtime_peer_route_store(store, peers, routes);
+                .wire_peerings()
+                .replaying_runtime_peer_routes(store, peers, routes);
             before
                 .peerings
                 .admit("next-hop", stored_peering(&channel, 0x02))
@@ -9624,7 +9657,8 @@ mod tests {
             let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("re-open");
             let after = a_node_over(&next_hop, &outbound)
                 .with_peer_registrar(Arc::clone(&after_carriages) as Arc<dyn PeerRegistrar>)
-                .with_runtime_peer_route_store(store, peers, routes);
+                .wire_peerings()
+                .replaying_runtime_peer_routes(store, peers, routes);
 
             assert_eq!(
                 after.peerings.hop("next-hop").map(|hop| hop.channel_id),
@@ -9692,7 +9726,8 @@ mod tests {
                 tracing::callsite::rebuild_interest_cache();
                 a_node_over(&next_hop, &outbound)
                     .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
-                    .with_runtime_peer_route_store(store, peers, routes)
+                    .wire_peerings()
+                    .replaying_runtime_peer_routes(store, peers, routes)
             };
 
             let signer = VoucherSigner::Evm([0x02; 20]);
@@ -9764,6 +9799,7 @@ mod tests {
                 let (connector, _, _, _, channel) = peered().await;
                 let wired = connector
                     .with_config_peer_ids(["next-hop".to_string()])
+                    .wire_peerings()
                     .with_config_voucher_signer(
                         "next-hop",
                         SettlementChain::Evm,
@@ -9797,6 +9833,7 @@ mod tests {
             let elsewhere: connector_domain::Network = "eip155:8453".parse().unwrap();
             let refused = connector
                 .with_config_peer_ids(["next-hop".to_string()])
+                .wire_peerings()
                 .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&elsewhere));
             match refused {
                 Err(ConfigPeeringError::OutboundChannelOnAnotherNetwork {
@@ -9817,6 +9854,7 @@ mod tests {
             let own: connector_domain::Network = "eip155:31337".parse().unwrap();
             assert!(connector
                 .with_config_peer_ids(["next-hop".to_string()])
+                .wire_peerings()
                 .with_config_pay_channel("next-hop", &channel, &url, timeout, Some(&own))
                 .is_ok());
         }

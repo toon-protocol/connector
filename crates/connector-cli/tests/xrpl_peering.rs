@@ -291,7 +291,7 @@ asset = "xrpl:{STANDALONE_NETWORK_ID}/slip44:144"
     }
 
     async fn restart(&mut self) {
-        self.runtime.state_dir_lock.take();
+        self.runtime.take_state_dir_lock();
         self.runtime = connector_cli::build(&self.config)
             .await
             .expect("rebuild the node");
@@ -315,7 +315,7 @@ asset = "xrpl:{STANDALONE_NETWORK_ID}/slip44:144"
 
     fn identity(&self) -> PublicKeyBytes {
         self.runtime
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }
