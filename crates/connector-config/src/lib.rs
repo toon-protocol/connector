@@ -13,7 +13,7 @@
 //! 0060 deleted it -- a peering is proven by a voucher signed by the key its
 //! `[[peer_channels]]` row names (ADR 0075), so there is no bearer string left to compare
 //! against and none to keep out of a `Debug` rendering. The key is parsed
-//! solely to be refused by name ([`ConfigError::PeerCredentialRemoved`]).
+//! solely to be refused by name ([`PeerRefusal::PeerCredentialRemoved`]).
 
 mod batch_settlement;
 mod client_channel_asset;
@@ -36,32 +36,38 @@ mod x402_row;
 mod zk_note;
 
 pub use batch_settlement::{
-    EvmBatchSettlementConfig, SolanaBatchSettlementConfig, BATCH_SETTLEMENT_DELAY_FLOOR_SECS,
-    DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS, EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
+    BatchSettlementRefusal, EvmBatchSettlementConfig, SolanaBatchSettlementConfig,
+    BATCH_SETTLEMENT_DELAY_FLOOR_SECS, DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS,
+    EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS,
 };
-pub use client_channel_asset::ClientChannelAssets;
+pub use client_channel_asset::{ClientChannelAssetRefusal, ClientChannelAssets};
 pub use config::{parse_socks_proxy, Config};
 pub use controller_keys::{
-    ControllerKey, ControllerKeysFile, DepositLimit, SpendingLimit, WriteScope,
+    ControllerKey, ControllerKeysFile, ControllerKeysRefusal, DepositLimit, SpendingLimit,
+    WriteScope,
 };
-pub use denomination::{DeclaredToken, DenominationConfig, QuoteLeg, QuotePath, RateRow};
+pub use denomination::{
+    DeclaredToken, DenominationConfig, DenominationRefusal, QuoteLeg, QuotePath, RateRow,
+};
 pub use error::ConfigError;
-pub use identity::ClientIdentityConfig;
-pub use node::NodeConfig;
-pub use operator::OperatorConfig;
-pub use pay_channel::PayChannelConfig;
+pub use identity::{ClientIdentityConfig, ClientIdentityRefusal};
+pub use node::{NodeConfig, NodeRefusal};
+pub use operator::{OperatorConfig, OperatorRefusal};
+pub use pay_channel::{PayChannelConfig, PayChannelRefusal};
 pub use peer::{
     is_onion_endpoint, plaintext_permitted, ForwardedClaimEnforcement, PeerCarriage, PeerConfig,
-    PeerExposure, DEFAULT_MAX_PACKET_AMOUNT, DEFAULT_PEER_TIMEOUT_MS,
+    PeerExposure, PeerRefusal, DEFAULT_MAX_PACKET_AMOUNT, DEFAULT_PEER_TIMEOUT_MS,
 };
-pub use peer_channel::PeerChannelConfig;
-pub use peering_asset::PeeringAssets;
-pub use route::{PeerRouteConfig, StaticRoute, TransportPolicy};
-pub use secret::SecretLocation;
+pub use peer_channel::{PeerChannelConfig, PeerChannelRefusal};
+pub use peering_asset::{PeeringAssetRefusal, PeeringAssets};
+pub use route::{PeerRouteConfig, RouteRefusal, StaticRoute, TransportPolicy};
+pub use secret::{SecretLocation, SignerRefusal};
 pub use settlement::{
     EvmSettlementConfig, NetworkTableFamily, SettlementChain, SettlementConfig, SettlementRefusal,
     SolanaSettlementConfig, UnknownSettlementChain, XrplSettlementConfig,
     DEFAULT_XRPL_MAX_FEE_DROPS, DEFAULT_XRPL_MIN_SETTLE_DELAY_SECS,
     DEFAULT_XRPL_REDEMPTION_SAFETY_SECS, XRPL_MIN_SETTLE_DELAY_FLOOR_SECS,
 };
-pub use zk_note::{MinaNetwork, ZkNoteConfig, MAX_ALLOWANCE_LIFETIME_SECS, ZK_NOTE_DECIMALS};
+pub use zk_note::{
+    MinaNetwork, ZkNoteConfig, ZkNoteRefusal, MAX_ALLOWANCE_LIFETIME_SECS, ZK_NOTE_DECIMALS,
+};

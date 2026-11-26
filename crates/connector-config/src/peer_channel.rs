@@ -37,7 +37,7 @@
 //! own program, and in both cases a `counterparty_key`. ADR 0075 retires all
 //! of it, and every one of those fields is still parsed so that a file which
 //! writes it is refused naming it (ADR 0009) rather than failing the row's
-//! shape: [`ConfigError::PeerChannelToonFieldRemoved`].
+//! shape: [`PeerChannelRefusal::PeerChannelToonFieldRemoved`].
 
 use std::collections::HashSet;
 
@@ -48,6 +48,85 @@ use connector_domain::Network;
 
 use crate::settlement::{SettlementChain, SettlementTables};
 use crate::x402_row::{parse_voucher_signer, parse_x402_channel, RemovedToonFields};
+
+use thiserror::Error;
+
+/// Every way the peer channel rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum PeerChannelRefusal {
+    /// A `[[peer_channels]]` row still writes a field of the `toon-channel`
+    /// row shape (ADR 0075 decision 9, issue #1380): `channel_id` (the EVM
+    /// channel ADR 0059 derived), `channel_account` (a Solana channel in its
+    /// TOON meaning, a PDA of TOON's own program), `chain_id` or
+    /// `token_network` (the EIP-712 domain ADR 0024 signed under),
+    /// `counterparty_key` (what a `toon-channel` claim was verified against)
+    /// or `program_id`. Parsed only so it is refused by name (ADR 0009).
+    #[error(
+        "peer '{peer_id}' writes '{field}' on a '[[peer_channels]]' row, a field of the \
+         'toon-channel' row shape ADR 0075 retired (issue #1380): every channel is an x402 \
+         channel now, and a peering's inbound channel is admitted by its voucher signer rather \
+         than configured by a TOON channel id, domain and counterparty key. Replace the row \
+         with:\n\
+         \n\
+             [[peer_channels]]\n\
+             peer_id = \"{peer_id}\"\n\
+             voucher_signer = \"<the peer's settlement address (EVM) or key (Solana)>\"\n\
+             # inbound_channel = \"<optional: the one x402 channel it pays this node on>\"\n\
+         \n\
+         A node still holding live TOON channels drains them on the last TOON-capable release \
+         first (ADR 0075, 'Draining a node with live TOON channels')"
+    )]
+    PeerChannelToonFieldRemoved {
+        peer_id: String,
+        field: &'static str,
+    },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' names no 'voucher_signer': the row's whole \
+         job is to name the key whose vouchers prove this peering -- the peer's EVM settlement \
+         address, or its Solana settlement key (ADR 0075 decisions 3 and 4)"
+    )]
+    PeerChannelVoucherSignerMissing { peer_id: String },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' has voucher_signer '{value}', which is \
+         neither a '0x'-prefixed 20-byte EVM address nor a base58 32-byte Solana key"
+    )]
+    PeerChannelInvalidVoucherSigner { peer_id: String, value: String },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' has inbound_channel '{value}', which is not \
+         an x402 channel on {chain}, the chain its voucher_signer is on: an EVM channel is a \
+         '0x'-prefixed 32-byte id, a Solana one a base58 32-byte channel account"
+    )]
+    PeerChannelInvalidInboundChannel {
+        peer_id: String,
+        value: String,
+        chain: &'static str,
+    },
+
+    #[error(
+        "'[[peer_channels]]' for peer '{peer_id}' names a voucher signer on {chain}, but this \
+         node has no '{heading}' table, so no channel the peer opens toward this \
+         node could ever be admitted (ADR 0075). Add the table, or peer over a chain this node \
+         settles on",
+        heading = crate::settlement::settlement_heading(.chain)
+    )]
+    PeerChannelWithoutX402 {
+        peer_id: String,
+        chain: &'static str,
+    },
+
+    #[error(
+        "'{value}' is named by two '[[peer_channels]]' rows: one voucher signer, or one inbound \
+         channel, proves exactly one peering, and a second row would leave which one to file \
+         order"
+    )]
+    PeerChannelDuplicate { value: String },
+}
 
 /// One `[[peer_channels]]` entry as written in the config file.
 ///
@@ -152,40 +231,50 @@ fn resolve_peer_channel(
     // this is the branch that must never fall through to a silent ignore
     // (ADR 0009).
     if let Some(field) = raw.removed().first() {
-        return Err(ConfigError::PeerChannelToonFieldRemoved {
-            peer_id: raw.peer_id,
-            field,
-        });
+        return Err(ConfigError::PeerChannel(
+            PeerChannelRefusal::PeerChannelToonFieldRemoved {
+                peer_id: raw.peer_id,
+                field,
+            },
+        ));
     }
     let Some(written) = raw.voucher_signer else {
-        return Err(ConfigError::PeerChannelVoucherSignerMissing {
-            peer_id: raw.peer_id,
-        });
+        return Err(ConfigError::PeerChannel(
+            PeerChannelRefusal::PeerChannelVoucherSignerMissing {
+                peer_id: raw.peer_id,
+            },
+        ));
     };
     let Some(signer) = parse_voucher_signer(&written) else {
-        return Err(ConfigError::PeerChannelInvalidVoucherSigner {
-            peer_id: raw.peer_id,
-            value: written,
-        });
+        return Err(ConfigError::PeerChannel(
+            PeerChannelRefusal::PeerChannelInvalidVoucherSigner {
+                peer_id: raw.peer_id,
+                value: written,
+            },
+        ));
     };
     let inbound_channel = match raw.inbound_channel {
         None => None,
         Some(written) => match parse_x402_channel(&written) {
             Some(channel) if channel.chain == signer.chain => Some(channel.value),
             _ => {
-                return Err(ConfigError::PeerChannelInvalidInboundChannel {
-                    peer_id: raw.peer_id,
-                    value: written,
-                    chain: signer.chain.name(),
-                })
+                return Err(ConfigError::PeerChannel(
+                    PeerChannelRefusal::PeerChannelInvalidInboundChannel {
+                        peer_id: raw.peer_id,
+                        value: written,
+                        chain: signer.chain.name(),
+                    },
+                ))
             }
         },
     };
     if !tables.x402(signer.chain) {
-        return Err(ConfigError::PeerChannelWithoutX402 {
-            peer_id: raw.peer_id,
-            chain: signer.chain.name(),
-        });
+        return Err(ConfigError::PeerChannel(
+            PeerChannelRefusal::PeerChannelWithoutX402 {
+                peer_id: raw.peer_id,
+                chain: signer.chain.name(),
+            },
+        ));
     }
     let network = tables.row_network(
         "peer_channels",
@@ -218,15 +307,19 @@ pub(crate) fn resolve_peer_channels(
         // runtime). Two rows naming one signer for one peer are refused
         // too -- the second says nothing the first did not.
         if !seen_signers.insert(row.voucher_signer.clone()) {
-            return Err(ConfigError::PeerChannelDuplicate {
-                value: row.voucher_signer,
-            });
+            return Err(ConfigError::PeerChannel(
+                PeerChannelRefusal::PeerChannelDuplicate {
+                    value: row.voucher_signer,
+                },
+            ));
         }
         if let Some(channel) = &row.inbound_channel {
             if !seen_channels.insert(channel.clone()) {
-                return Err(ConfigError::PeerChannelDuplicate {
-                    value: channel.clone(),
-                });
+                return Err(ConfigError::PeerChannel(
+                    PeerChannelRefusal::PeerChannelDuplicate {
+                        value: channel.clone(),
+                    },
+                ));
             }
         }
         channels.push(row);
@@ -238,6 +331,7 @@ pub(crate) fn resolve_peer_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settlement::SettlementRefusal;
 
     const EVM_SIGNER: &str = "0x2222222222222222222222222222222222222222";
     const CHANNEL: &str = "0xaaaabbbbccccddddeeeeffff00001111aaaabbbbccccddddeeeeffff00001111";
@@ -306,7 +400,9 @@ mod tests {
         let both = [XrplNetwork::Testnet, XrplNetwork::Standalone];
         assert!(matches!(
             resolve_on(&both, &[&row(XRPL_SIGNER)]),
-            Err(ConfigError::ChannelRowNetworkAmbiguous { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::ChannelRowNetworkAmbiguous { .. }
+            ))
         ));
         let rows = resolve_on(
             &both,
@@ -322,14 +418,18 @@ mod tests {
                 &[XrplNetwork::Testnet],
                 &[&format!("{}\nnetwork = \"xrpl:1000\"", row(XRPL_SIGNER))],
             ),
-            Err(ConfigError::ChannelRowNetworkUnsettled { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::ChannelRowNetworkUnsettled { .. }
+            ))
         ));
         assert!(matches!(
             resolve_on(
                 &both,
                 &[&format!("{}\nnetwork = \"eip155:1\"", row(XRPL_SIGNER))],
             ),
-            Err(ConfigError::ChannelRowNetworkInvalid { .. })
+            Err(ConfigError::Settlement(
+                SettlementRefusal::ChannelRowNetworkInvalid { .. }
+            ))
         ));
     }
 
@@ -339,7 +439,9 @@ mod tests {
     fn an_xrpl_row_needs_an_xrpl_table() {
         assert!(matches!(
             resolve_on(&[], &[&row(XRPL_SIGNER)]),
-            Err(ConfigError::PeerChannelWithoutX402 { chain: "xrpl", .. })
+            Err(ConfigError::PeerChannel(
+                PeerChannelRefusal::PeerChannelWithoutX402 { chain: "xrpl", .. }
+            ))
         ));
     }
 
@@ -385,7 +487,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ConfigError::PeerChannelToonFieldRemoved { peer_id, field: named }
+                    ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelToonFieldRemoved { peer_id, field: named })
                         if peer_id == "store" && *named == field
                 ),
                 "{field}: {error:?}"
@@ -410,10 +512,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PeerChannelToonFieldRemoved {
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelToonFieldRemoved {
                 field: "channel_id",
                 ..
-            }
+            })
         ));
 
         let error = resolve(&[&format!(
@@ -423,10 +525,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PeerChannelToonFieldRemoved {
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelToonFieldRemoved {
                 field: "channel_account",
                 ..
-            }
+            })
         ));
     }
 
@@ -435,7 +537,7 @@ mod tests {
         let error = resolve(&["peer_id = \"store\""]).unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PeerChannelVoucherSignerMissing { ref peer_id } if peer_id == "store"
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelVoucherSignerMissing { ref peer_id }) if peer_id == "store"
         ));
     }
 
@@ -444,7 +546,12 @@ mod tests {
         for bad in ["0x12", "not-base58!!!", CHANNEL] {
             let error = resolve(&[&row(bad)]).unwrap_err();
             assert!(
-                matches!(error, ConfigError::PeerChannelInvalidVoucherSigner { .. }),
+                matches!(
+                    error,
+                    ConfigError::PeerChannel(
+                        PeerChannelRefusal::PeerChannelInvalidVoucherSigner { .. }
+                    )
+                ),
                 "{bad}: {error:?}"
             );
         }
@@ -461,7 +568,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PeerChannelInvalidInboundChannel { chain: "evm", .. }
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelInvalidInboundChannel {
+                chain: "evm",
+                ..
+            })
         ));
     }
 
@@ -474,7 +584,10 @@ mod tests {
             resolve_peer_channels(rows(), &SettlementTables::for_tests(false, true)).unwrap_err();
         assert!(matches!(
             error,
-            ConfigError::PeerChannelWithoutX402 { chain: "evm", .. }
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelWithoutX402 {
+                chain: "evm",
+                ..
+            })
         ));
         assert!(
             resolve_peer_channels(rows(), &SettlementTables::for_tests(true, false)).is_ok(),
@@ -486,7 +599,10 @@ mod tests {
     fn one_signer_on_two_rows_is_refused() {
         let other = format!("peer_id = \"relay\"\nvoucher_signer = \"{EVM_SIGNER}\"");
         let error = resolve(&[&row(EVM_SIGNER), &other]).unwrap_err();
-        assert!(matches!(error, ConfigError::PeerChannelDuplicate { .. }));
+        assert!(matches!(
+            error,
+            ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelDuplicate { .. })
+        ));
     }
 
     #[test]

@@ -27,6 +27,94 @@ use connector_domain::x402::X402AssetTransferMethod;
 
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the batch settlement rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum BatchSettlementRefusal {
+    /// A settlement table published a minimum `withdrawDelay` or
+    /// `grace_period` below x402's 900 seconds (ADR 0074 decision 5).
+    #[error(
+        "[settlement.{table}] {key} = {value} is below the floor of 900 \
+         seconds. ADR 0074 lets a connector publish its own minimum, but never one below \
+         x402's; omit the key for the default of one day, the window a delayed claim still \
+         has to land in"
+    )]
+    BatchSettlementDelayBelowFloor {
+        table: String,
+        key: &'static str,
+        value: u64,
+    },
+
+    /// `[settlement.eip155.<chainId>] min_withdraw_delay_secs` above the
+    /// contract's own thirty-day `MAX_WITHDRAW_DELAY`: no channel could carry
+    /// a `withdrawDelay` that meets it.
+    #[error(
+        "[settlement.eip155.<chainId>] min_withdraw_delay_secs = {value} exceeds \
+         x402BatchSettlement's MAX_WITHDRAW_DELAY of 2592000 seconds (30 days). No channel \
+         could ever meet it, so the opt-in would admit nothing"
+    )]
+    BatchSettlementWithdrawDelayAboveContractMaximum { value: u64 },
+
+    /// `[settlement.solana] min_sponsored_deposit = 0`: the
+    /// bound on the public sponsor endpoint would bound nothing (ADR 0074
+    /// decision 5).
+    #[error(
+        "[settlement.solana] min_sponsored_deposit is 0. It bounds a public \
+         endpoint that spends this node's lamports on rent for every channel it sponsors, so \
+         it must name a real opening deposit in the mint's base units"
+    )]
+    BatchSettlementZeroMinimumSponsoredDeposit,
+
+    /// `[settlement.eip155.<chainId>] asset_eip712_name` or
+    /// `asset_eip712_version` was written empty. Both are required wherever
+    /// the table exists (ADR 0074 decision 8, issue #1345): the greeting
+    /// publishes them so a payer's deposit can be signed under the asset's
+    /// real EIP-712 domain, and an empty value would be published as one.
+    #[error(
+        "[settlement.eip155.<chainId>] {key} is empty. A client signs its deposit \
+         authorization under this asset's real EIP-712 domain, so the greeting must publish \
+         it -- there is no safe default for an arbitrary settlement token"
+    )]
+    BatchSettlementEmptyAssetEip712Field { key: &'static str },
+
+    /// `[settlement.eip155.<chainId>] asset_transfer_method` names neither of x402's two
+    /// EVM deposit methods (toon-client#695). The greeting publishes it as
+    /// `extra.assetTransferMethod`, and a payer that deposits by a method
+    /// the operator did not mean has its deposit refused on chain.
+    #[error(
+        "[settlement.eip155.<chainId>] asset_transfer_method = \"{value}\" is not an x402 asset transfer \
+         method. Write \"eip3009\" (ERC-3009 receiveWithAuthorization -- the token must \
+         implement ERC-3009, as USDC does) or \"permit2\" (a Permit2 witness transfer, for any \
+         ERC-20), or omit the key for \"eip3009\""
+    )]
+    BatchSettlementUnknownAssetTransferMethod { value: String },
+
+    /// `[settlement.eip155.<chainId>] facilitator_url` is not a URL at all
+    /// (toon-client#695).
+    #[error(
+        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" is not a valid URL ({source}). It is \
+         published to payers as the x402 facilitator their deposit is relayed through; write \
+         an absolute http(s) URL, or omit the key to name none"
+    )]
+    BatchSettlementInvalidFacilitatorUrl {
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    /// `[settlement.eip155.<chainId>] facilitator_url` is a URL, but not `http`/`https`
+    /// (toon-client#695): a payer POSTs its deposit to it.
+    #[error(
+        "[settlement.eip155.<chainId>] facilitator_url = \"{value}\" must use http or https. A payer POSTs \
+         its deposit to the x402 facilitator it names"
+    )]
+    BatchSettlementUnsupportedFacilitatorScheme { value: String },
+}
+
 /// The floor under both published minimums, in seconds: x402's own 900
 /// (ADR 0074 decision 5). On EVM it is the contract's `MIN_WITHDRAW_DELAY`,
 /// fifteen minutes; on Solana the program's only bound is one second, and
@@ -163,11 +251,13 @@ impl SolanaBatchSettlementConfig {
 
 fn delay_at_or_above_floor(table: &str, key: &'static str, value: u64) -> Result<u64, ConfigError> {
     if value < BATCH_SETTLEMENT_DELAY_FLOOR_SECS {
-        return Err(ConfigError::BatchSettlementDelayBelowFloor {
-            table: table.to_string(),
-            key,
-            value,
-        });
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementDelayBelowFloor {
+                table: table.to_string(),
+                key,
+                value,
+            },
+        ));
     }
     Ok(value)
 }
@@ -183,26 +273,33 @@ pub(crate) fn resolve_evm_batch_settlement(
             .unwrap_or(DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS),
     )?;
     if min_withdraw_delay_secs > EVM_BATCH_SETTLEMENT_MAX_WITHDRAW_DELAY_SECS {
-        return Err(
-            ConfigError::BatchSettlementWithdrawDelayAboveContractMaximum {
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementWithdrawDelayAboveContractMaximum {
                 value: min_withdraw_delay_secs,
             },
-        );
+        ));
     }
     if raw.asset_eip712_name.trim().is_empty() {
-        return Err(ConfigError::BatchSettlementEmptyAssetEip712Field {
-            key: "asset_eip712_name",
-        });
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementEmptyAssetEip712Field {
+                key: "asset_eip712_name",
+            },
+        ));
     }
     if raw.asset_eip712_version.trim().is_empty() {
-        return Err(ConfigError::BatchSettlementEmptyAssetEip712Field {
-            key: "asset_eip712_version",
-        });
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementEmptyAssetEip712Field {
+                key: "asset_eip712_version",
+            },
+        ));
     }
     let asset_transfer_method = match raw.asset_transfer_method {
         None => X402AssetTransferMethod::default(),
-        Some(value) => X402AssetTransferMethod::from_name(&value)
-            .ok_or(ConfigError::BatchSettlementUnknownAssetTransferMethod { value })?,
+        Some(value) => {
+            X402AssetTransferMethod::from_name(&value).ok_or(ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementUnknownAssetTransferMethod { value },
+            ))?
+        }
     };
     let facilitator_url = raw.facilitator_url.map(facilitator_url).transpose()?;
     Ok(EvmBatchSettlementConfig {
@@ -221,11 +318,15 @@ fn facilitator_url(value: String) -> Result<String, ConfigError> {
     let url = match url::Url::parse(&value) {
         Ok(url) => url,
         Err(source) => {
-            return Err(ConfigError::BatchSettlementInvalidFacilitatorUrl { value, source })
+            return Err(ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementInvalidFacilitatorUrl { value, source },
+            ))
         }
     };
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ConfigError::BatchSettlementUnsupportedFacilitatorScheme { value });
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementUnsupportedFacilitatorScheme { value },
+        ));
     }
     Ok(value)
 }
@@ -240,7 +341,9 @@ pub(crate) fn resolve_solana_batch_settlement(
             .unwrap_or(DEFAULT_BATCH_SETTLEMENT_MIN_DELAY_SECS),
     )?;
     if raw.min_sponsored_deposit == 0 {
-        return Err(ConfigError::BatchSettlementZeroMinimumSponsoredDeposit);
+        return Err(ConfigError::BatchSettlement(
+            BatchSettlementRefusal::BatchSettlementZeroMinimumSponsoredDeposit,
+        ));
     }
     Ok(SolanaBatchSettlementConfig {
         min_grace_period_secs,
@@ -294,11 +397,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementDelayBelowFloor {
+            ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementDelayBelowFloor {
                 ref table,
                 key: "min_withdraw_delay_secs",
                 value: 899,
-            } if table == "eip155.31337"
+            }) if table == "eip155.31337"
         ));
         let message = error.to_string();
         assert!(
@@ -315,7 +418,11 @@ mod tests {
         let error = evm("min_withdraw_delay_secs = 2592001").expect_err("above 30 days");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementWithdrawDelayAboveContractMaximum { value: 2_592_001 }
+            ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementWithdrawDelayAboveContractMaximum {
+                    value: 2_592_001
+                }
+            )
         ));
 
         evm("min_withdraw_delay_secs = 2592000").expect("thirty days exactly is the maximum");
@@ -333,9 +440,11 @@ mod tests {
         .expect_err("an empty name publishes a useless domain");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementEmptyAssetEip712Field {
-                key: "asset_eip712_name"
-            }
+            ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementEmptyAssetEip712Field {
+                    key: "asset_eip712_name"
+                }
+            )
         ));
 
         let error = resolve_evm_batch_settlement(
@@ -346,9 +455,11 @@ mod tests {
         .expect_err("an empty version publishes a useless domain");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementEmptyAssetEip712Field {
-                key: "asset_eip712_version"
-            }
+            ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementEmptyAssetEip712Field {
+                    key: "asset_eip712_version"
+                }
+            )
         ));
     }
 
@@ -400,7 +511,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ConfigError::BatchSettlementUnknownAssetTransferMethod { value: written }
+                    ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementUnknownAssetTransferMethod { value: written })
                         if written == value
                 ),
                 "got {error:?}"
@@ -437,7 +548,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ConfigError::BatchSettlementInvalidFacilitatorUrl { value: written, .. }
+                    ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementInvalidFacilitatorUrl { value: written, .. })
                         if written == value
                 ),
                 "got {error:?}"
@@ -454,7 +565,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    ConfigError::BatchSettlementUnsupportedFacilitatorScheme { value: written }
+                    ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementUnsupportedFacilitatorScheme { value: written })
                         if written == value
                 ),
                 "got {error:?}"
@@ -479,7 +590,9 @@ mod tests {
         let error = solana("min_sponsored_deposit = 0").expect_err("zero bounds nothing");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementZeroMinimumSponsoredDeposit
+            ConfigError::BatchSettlement(
+                BatchSettlementRefusal::BatchSettlementZeroMinimumSponsoredDeposit
+            )
         ));
         assert!(error.to_string().contains("min_sponsored_deposit"));
     }
@@ -490,11 +603,11 @@ mod tests {
             .expect_err("below x402's 900 seconds");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementDelayBelowFloor {
+            ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementDelayBelowFloor {
                 ref table,
                 key: "min_grace_period_secs",
                 value: 899,
-            } if table == "solana"
+            }) if table == "solana"
         ));
 
         let config = solana("min_sponsored_deposit = 1\nmin_grace_period_secs = 900")
