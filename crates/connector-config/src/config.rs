@@ -996,7 +996,7 @@ impl Config {
 
     /// The x402 channels this node **pays** a next hop from (ADR 0042 item
     /// 2, as ADR 0075 decisions 4, 6 and 9 amend it; issue #1380) -- what
-    /// `Connector::with_config_pay_channel` is configured from. Every row
+    /// `Connector::admit_config_peering` is configured from. Every row
     /// names a configured peer at most once, no channel appears twice, none
     /// of them is also a `[[peer_channels]]` inbound channel (an x402
     /// channel moves value one way), and every peering a `[[routes]]` entry

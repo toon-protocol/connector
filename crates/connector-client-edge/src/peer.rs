@@ -950,14 +950,15 @@ key_file = "{key_file}"
                         Arc::new(InProcessPeerTransport::new()),
                         Arc::new(SystemClock),
                     )
-                    .with_config_peer_ids([PEER_ID.to_string()])
-                    .with_config_voucher_signer(
-                        PEER_ID,
-                        connector_runtime::SettlementChain::Evm,
-                        &format!("0x{}", hex::encode(address_of(&peer_key()))),
-                        Some(&channel),
-                        None,
-                    )
+                    .admit_config_peering(&connector_runtime::ConfigPeering {
+                        peer_channels: vec![connector_runtime::ConfigPeerChannel {
+                            chain: connector_runtime::SettlementChain::Evm,
+                            voucher_signer: format!("0x{}", hex::encode(address_of(&peer_key()))),
+                            inbound_channel: Some(channel),
+                            network: None,
+                        }],
+                        ..connector_runtime::ConfigPeering::new(PEER_ID)
+                    })
                     .expect("store is a configured peering"),
                 );
                 let gate = ClientClaimGate::restore(Arc::new(InMemoryJournal::new()))
