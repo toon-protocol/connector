@@ -15,7 +15,7 @@ test-util = ["connector-chain-rpc/test-support", "dep:tempfile"]
 # The XRPL JSON-RPC client over a table's one `RpcTransport` (ADR 0073).
 connector-chain-rpc = { path = "../connector-chain-rpc", features = ["xrpl"] }
 # The receiving half of the batch-settlement port, and the one XRPL key and
-# claim implementation (`XrplSigner`, `verify_xrpl_claim`): the backend signs
+# claim implementation (`XrplSigner`, `XrplVoucherScheme`): the backend signs
 # its own `PaymentChannelClaim` and checks a voucher with them, never a second.
 connector-settlement = { path = "../connector-settlement" }
 connector-signer = { path = "../connector-signer" }
