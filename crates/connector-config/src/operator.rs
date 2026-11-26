@@ -6,6 +6,99 @@ use serde::Deserialize;
 use crate::controller_keys::{ControllerKey, ControllerKeysFile};
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the operator rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum OperatorRefusal {
+    #[error(
+        "the [operator] section is present but names no bearer token, or an empty one: the \
+         operator surface would have no read authentication. Set exactly one of \
+         'bearer_token_file = \"/app/data/…\"' (what a deployed node should use -- this \
+         repository is public, so a committed config must not carry the literal) or \
+         'bearer_token = \"…\"'"
+    )]
+    OperatorMissingBearerToken,
+
+    #[error(
+        "the [operator] section is present but names no write keys: the operator surface \
+         would accept writes from no one. Set exactly one of 'write_keys_file = \
+         \"/app/data/…\"' (the deployed form -- a file an operator can edit to revoke, which \
+         a committed literal is not) or 'write_keys = [\"…\"]'"
+    )]
+    OperatorNoWriteKeys,
+
+    #[error(
+        "invalid operator write_keys entry '{value}': must be 64 hex characters \
+         (a 32-byte ed25519 public key)"
+    )]
+    OperatorInvalidWriteKey { value: String },
+
+    #[error(
+        "the [operator] section sets both '{literal}' and '{file}': exactly one of them says \
+         where this setting's value comes from, and two answers is not a merge -- it is an \
+         unanswerable question about which one gates the operator surface, with the losing \
+         value left in the file looking authoritative. Keep '{file}' (the deployed form -- \
+         this repository is public, so a committed config must not carry the literal) and \
+         delete '{literal}'; see docs/operators/key-rotation-runbook.md"
+    )]
+    OperatorSettingAmbiguous {
+        literal: &'static str,
+        file: &'static str,
+    },
+
+    #[error(
+        "the [operator] section sets '{setting} = {path}', which does not exist or is not a \
+         file: an operator surface that cannot read its own authentication authenticates \
+         nobody, so this is refused at load rather than becoming a surface that is enabled \
+         and quietly rejects every request. The path is resolved the same way '[signer] \
+         key_file' is -- relative to the process's working directory, so write an absolute \
+         path; see docs/operators/key-rotation-runbook.md"
+    )]
+    OperatorFileNotFound {
+        setting: &'static str,
+        path: PathBuf,
+    },
+
+    #[error(
+        "the [operator] section sets '{setting} = {path}', which could not be read as text: \
+         {source} -- check the file's permissions inside the container (a secret file is \
+         usually mode 600 and must be owned by the uid the connector runs as); see \
+         docs/operators/key-rotation-runbook.md"
+    )]
+    OperatorFileUnreadable {
+        setting: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "the [operator] section sets '{setting} = {path}', which carries nothing once \
+         whitespace and comments are stripped: an empty file is the same unauthenticated \
+         surface an empty literal would be, and a truncated or half-written file is the usual \
+         cause -- rewrite it; see docs/operators/key-rotation-runbook.md"
+    )]
+    OperatorFileEmpty {
+        setting: &'static str,
+        path: PathBuf,
+    },
+
+    #[error(
+        "invalid operator write_keys_file entry at {path}:{line}: '{value}' must be 64 hex \
+         characters (a 32-byte ed25519 public key). One key per line, '#' starts a comment; \
+         see docs/operators/key-rotation-runbook.md"
+    )]
+    OperatorWriteKeysFileInvalidKey {
+        path: PathBuf,
+        line: usize,
+        value: String,
+    },
+}
+
 /// The `[operator]` section as written in the config file. Its presence
 /// enables the operator surface (ADR 0008); its absence means the surface
 /// is not started at all, and none of the fields below are read.
@@ -162,8 +255,10 @@ impl OperatorConfig {
 }
 
 fn parse_write_key(value: &str) -> Result<[u8; 32], ConfigError> {
-    hex_decode_32(value).ok_or_else(|| ConfigError::OperatorInvalidWriteKey {
-        value: value.to_string(),
+    hex_decode_32(value).ok_or_else(|| {
+        ConfigError::Operator(OperatorRefusal::OperatorInvalidWriteKey {
+            value: value.to_string(),
+        })
     })
 }
 
@@ -187,7 +282,7 @@ pub(crate) fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
 /// request that the file it was pointed at is not there -- a surface that
 /// reads as enabled and authenticates nobody. ADR 0009 puts that failure at
 /// load instead, so a missing or unreadable file is a refuse-to-start error
-/// naming the setting, exactly as [`ConfigError::SignerKeyFileNotFound`] is
+/// naming the setting, exactly as [`SignerRefusal::SignerKeyFileNotFound`] is
 /// for `[signer] key_file`. The path is resolved the same way those are (by
 /// the OS, against the process's working directory), which is why the
 /// committed fleet configs write absolute container paths.
@@ -196,15 +291,19 @@ pub(crate) fn read_operator_file(
     path: &Path,
 ) -> Result<String, ConfigError> {
     if !path.is_file() {
-        return Err(ConfigError::OperatorFileNotFound {
+        return Err(ConfigError::Operator(
+            OperatorRefusal::OperatorFileNotFound {
+                setting,
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|source| {
+        ConfigError::Operator(OperatorRefusal::OperatorFileUnreadable {
             setting,
             path: path.to_path_buf(),
-        });
-    }
-    std::fs::read_to_string(path).map_err(|source| ConfigError::OperatorFileUnreadable {
-        setting,
-        path: path.to_path_buf(),
-        source,
+            source,
+        })
     })
 }
 
@@ -223,26 +322,30 @@ fn resolve_bearer_token(
     file: Option<PathBuf>,
 ) -> Result<String, ConfigError> {
     match (literal, file) {
-        (Some(_), Some(_)) => Err(ConfigError::OperatorSettingAmbiguous {
-            literal: "bearer_token",
-            file: "bearer_token_file",
-        }),
+        (Some(_), Some(_)) => Err(ConfigError::Operator(
+            OperatorRefusal::OperatorSettingAmbiguous {
+                literal: "bearer_token",
+                file: "bearer_token_file",
+            },
+        )),
         (Some(token), None) if !token.trim().is_empty() => Ok(token),
         (None, Some(path)) => {
             let token = read_operator_file("bearer_token_file", &path)?
                 .trim()
                 .to_string();
             if token.is_empty() {
-                return Err(ConfigError::OperatorFileEmpty {
+                return Err(ConfigError::Operator(OperatorRefusal::OperatorFileEmpty {
                     setting: "bearer_token_file",
                     path,
-                });
+                }));
             }
             Ok(token)
         }
         // Neither field set, or `bearer_token = ""`. One condition, because
         // it is one outcome: an enabled surface with no read authentication.
-        (_, None) => Err(ConfigError::OperatorMissingBearerToken),
+        (_, None) => Err(ConfigError::Operator(
+            OperatorRefusal::OperatorMissingBearerToken,
+        )),
     }
 }
 
@@ -253,10 +356,12 @@ fn resolve_write_keys(
     file: Option<PathBuf>,
 ) -> Result<Vec<[u8; 32]>, ConfigError> {
     match (literal, file) {
-        (Some(_), Some(_)) => Err(ConfigError::OperatorSettingAmbiguous {
-            literal: "write_keys",
-            file: "write_keys_file",
-        }),
+        (Some(_), Some(_)) => Err(ConfigError::Operator(
+            OperatorRefusal::OperatorSettingAmbiguous {
+                literal: "write_keys",
+                file: "write_keys_file",
+            },
+        )),
         (Some(keys), None) if !keys.is_empty() => {
             keys.iter().map(|key| parse_write_key(key)).collect()
         }
@@ -264,16 +369,16 @@ fn resolve_write_keys(
             let contents = read_operator_file("write_keys_file", &path)?;
             let keys = parse_write_keys_file(&contents, &path)?;
             if keys.is_empty() {
-                return Err(ConfigError::OperatorFileEmpty {
+                return Err(ConfigError::Operator(OperatorRefusal::OperatorFileEmpty {
                     setting: "write_keys_file",
                     path,
-                });
+                }));
             }
             Ok(keys)
         }
         // Neither field set, or `write_keys = []`. One outcome: an enabled
         // surface that would accept a write from no one.
-        (_, None) => Err(ConfigError::OperatorNoWriteKeys),
+        (_, None) => Err(ConfigError::Operator(OperatorRefusal::OperatorNoWriteKeys)),
     }
 }
 
@@ -296,12 +401,13 @@ fn parse_write_keys_file(contents: &str, path: &Path) -> Result<Vec<[u8; 32]>, C
         if line.is_empty() {
             continue;
         }
-        let key =
-            hex_decode_32(line).ok_or_else(|| ConfigError::OperatorWriteKeysFileInvalidKey {
+        let key = hex_decode_32(line).ok_or_else(|| {
+            ConfigError::Operator(OperatorRefusal::OperatorWriteKeysFileInvalidKey {
                 path: path.to_path_buf(),
                 line: index + 1,
                 value: line.to_string(),
-            })?;
+            })
+        })?;
         keys.push(key);
     }
     Ok(keys)
@@ -363,6 +469,7 @@ pub(crate) fn resolve_operator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller_keys::ControllerKeysRefusal;
 
     use std::io::Write;
 
@@ -454,7 +561,9 @@ mod tests {
         .expect("rewrite");
         assert!(matches!(
             read(live),
-            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyAlsoWriteKey { .. }
+            ))
         ));
     }
 
@@ -465,10 +574,12 @@ mod tests {
         ))));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorFileNotFound {
-                setting: "controller_keys_file",
-                ..
-            })
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorFileNotFound {
+                    setting: "controller_keys_file",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -480,10 +591,12 @@ mod tests {
         let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorFileUnreadable {
-                setting: "controller_keys_file",
-                ..
-            })
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorFileUnreadable {
+                    setting: "controller_keys_file",
+                    ..
+                }
+            ))
         ));
     }
 
@@ -499,7 +612,9 @@ mod tests {
         let result = resolve_operator(Some(config));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyAlsoWriteKey { .. }
+            ))
         ));
     }
 
@@ -511,7 +626,9 @@ mod tests {
         let result = resolve_operator(Some(with_controllers(file.path().to_path_buf())));
         assert!(matches!(
             result,
-            Err(ConfigError::ControllerKeyAlsoWriteKey { .. })
+            Err(ConfigError::ControllerKeys(
+                ControllerKeysRefusal::ControllerKeyAlsoWriteKey { .. }
+            ))
         ));
     }
 
@@ -539,7 +656,9 @@ mod tests {
         let result = resolve_operator(Some(raw("", &[key])));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorMissingBearerToken)
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorMissingBearerToken
+            ))
         ));
     }
 
@@ -549,14 +668,19 @@ mod tests {
         let result = resolve_operator(Some(raw("   ", &[key])));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorMissingBearerToken)
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorMissingBearerToken
+            ))
         ));
     }
 
     #[test]
     fn rejects_no_write_keys() {
         let result = resolve_operator(Some(raw("secret-token", &[])));
-        assert!(matches!(result, Err(ConfigError::OperatorNoWriteKeys)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Operator(OperatorRefusal::OperatorNoWriteKeys))
+        ));
     }
 
     #[test]
@@ -564,7 +688,9 @@ mod tests {
         let result = resolve_operator(Some(raw("secret-token", &["abcd"])));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorInvalidWriteKey { .. })
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorInvalidWriteKey { .. }
+            ))
         ));
     }
 
@@ -574,7 +700,9 @@ mod tests {
         let result = resolve_operator(Some(raw("secret-token", &[non_hex])));
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorInvalidWriteKey { .. })
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorInvalidWriteKey { .. }
+            ))
         ));
     }
 
@@ -866,7 +994,7 @@ mod tests {
         let error = result.expect_err("malformed entry");
         assert!(matches!(
             error,
-            ConfigError::OperatorWriteKeysFileInvalidKey { line: 4, .. }
+            ConfigError::Operator(OperatorRefusal::OperatorWriteKeysFileInvalidKey { line: 4, .. })
         ));
         assert!(error.to_string().contains(":4"), "{error}");
     }

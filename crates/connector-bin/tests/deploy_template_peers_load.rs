@@ -2,7 +2,7 @@
 //! peering example still boots on the current binary (issue #1221).
 //!
 //! ADR 0060 deleted `[[peers]].credential` outright -- it is parsed solely
-//! to be refused by name (`ConfigError::PeerCredentialRemoved`). The
+//! to be refused by name (`PeerRefusal::PeerCredentialRemoved`). The
 //! template's example predated that deletion and, until this test, nothing
 //! caught it teaching a shape `Config::load` refuses on sight: uncommenting
 //! it as written was a load failure, the same defect #1178 fixed one file

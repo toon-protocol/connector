@@ -6,6 +6,180 @@ use url::Url;
 
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the peer rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum PeerRefusal {
+    #[error("peer entry has an empty 'id'")]
+    PeerIdEmpty,
+
+    #[error(
+        "duplicate peer id '{id}': two '[[peers]]' entries name it, so which endpoint, fee \
+         and cap apply to it is unanswerable -- see \
+         docs/operators/btp-peer-transport-bringup.md"
+    )]
+    DuplicatePeerId { id: String },
+
+    // -- The peer carriage config surface (issue #677, peer-carriage-spec
+    // §11). Every message names the bring-up doc, because a peering that
+    // does not come up produces no other evidence an operator can read.
+    #[error(
+        "invalid peer_expose value '{value}': a connector exposes 'btp', 'http', 'both' or \
+         'neither' peer carriage (peer-carriage-spec.md §2.1) -- 'neither' is the NAT'd \
+         operator, who exposes nothing and only dials out. Omit the field for the default \
+         ('neither'); see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    InvalidPeerExposure { value: String },
+
+    /// ADR 0042 (item 3): the forwarded-arrival migration knob, spelled
+    /// wrong. Refused by name rather than falling through to the default,
+    /// because the default here is the permissive one -- a typo meant as
+    /// "enforce" would leave this peering carrying forwards for free.
+    #[error(
+        "invalid forwarded_claim_enforcement value '{value}' for peer '{id}': a peer sets \
+         'observe' (admit an uncovered forwarded arrival and log it -- the default, because the \
+         fleet's send halves are not live yet) or 'enforce' (refuse it with the x402 greeting, \
+         ADR 0042's permanent rule). Omit the field for the default ('observe'); see \
+         docs/operators/claim-policy-rollout.md"
+    )]
+    InvalidForwardedClaimEnforcement { id: String, value: String },
+
+    /// ADR 0042's cap, written as `0`. A cap of zero refuses every packet
+    /// this peering could carry, so it is a peering that silently does
+    /// nothing -- and there is deliberately no spelling that turns the cap
+    /// off, since the whole point of the rule is that a bound always
+    /// exists.
+    #[error(
+        "max_packet_amount = 0 for peer '{id}': the cap is the largest amount this connector \
+         will forward to a peer in ONE packet (ADR 0042), so zero refuses every packet that \
+         peering could ever carry. Write a positive amount in the settlement asset's base \
+         units, or omit the field for the default"
+    )]
+    PeerMaxPacketAmountZero { id: String },
+
+    #[error(
+        "invalid endpoint '{value}' for peer '{id}': {source} -- a peer endpoint is a URL \
+         ('wss://host:port/path' for BTP, 'https://host:port/path' for ILP-over-HTTP), not a \
+         host:port pair; see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    InvalidPeerEndpoint {
+        id: String,
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error(
+        "endpoint '{value}' for peer '{id}' has scheme '{scheme}', which selects no peer \
+         carriage: 'wss://' selects BTP and 'https://' selects ILP-over-HTTP, and there is no \
+         third one (ADR 0027 deleted the raw-TCP transport). Both are TLS-only because a \
+         peering carries signed balance proofs (ADR 0004), so 'ws://' and 'http://' are not \
+         accepted either -- except at a host ending in '.onion' or '.anyone', which \
+         authenticates the circuit with its own key and needs no certificate (ADR 0070), and \
+         this host is not one; see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerEndpointScheme {
+        id: String,
+        value: String,
+        scheme: String,
+    },
+
+    #[error(
+        "peer '{id}' sets 'credential': the '{{peerId, secret}}' shared secret is deleted (ADR \
+         0060). A peering is proven by a verified claim on one of its '[[peer_channels]]' \
+         rows, not by a string both operators wrote into their own config files, and there is \
+         no replacement key -- not renamed, not optional. Delete the 'credential' table from \
+         this peer; see docs/protocol/peer-carriage-spec.md §1.2"
+    )]
+    PeerCredentialRemoved { id: String },
+
+    #[error(
+        "route '{prefix}' forwards to peer '{peer_id}', which this connector can never \
+         originate to: the peering configures no 'endpoint' (so this connector never dials it) \
+         and peer_expose does not include 'btp' (so it can never be reached back over a dialed \
+         session either) -- packets flow only in the dialing direction on HTTP \
+         (peer-carriage-spec.md §6.4). Give the peer a 'wss://' or 'https://' endpoint, or set \
+         peer_expose to include 'btp'; see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerRouteUndeliverable { prefix: String, peer_id: String },
+
+    #[error(
+        "peer '{id}' has no 'endpoint' and this connector's peer_expose is 'neither': it dials \
+         nothing and accepts nothing, so this peering can never establish and no amount of \
+         retrying changes that (peer-carriage-spec.md §2.2). Give it an endpoint, or expose a \
+         carriage for it to dial; see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerUndialable { id: String },
+
+    #[error(
+        "peer '{id}' sets 'addr', which was removed with the raw-TCP transport (ADR 0027, \
+         issue #679) -- a peer is reached by 'endpoint' (a wss:// or https:// URL) instead; \
+         see docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerAddrRemoved { id: String },
+
+    /// §11's removed-field row, `ceiling` half (ADR 0033, issue #882):
+    /// nothing tracks trailing exposure any more, so there is nothing for a
+    /// ceiling to bound. Cites the record that removed the machinery, not the
+    /// reasoning behind it (issue #1068) -- ADR 0042's covering-claim rule is
+    /// a target record whose forwarded half is unbuilt, and a boot error must
+    /// not depend on it.
+    #[error(
+        "peer '{id}' sets 'ceiling', which was removed when the exposure machinery was retired \
+         (ADR 0033, issue #882) -- nothing tracks trailing exposure, so there is nothing for a \
+         ceiling to bound. Delete the key rather than replace it; see \
+         docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerCeilingRemoved { id: String },
+
+    /// §11's removed-field row, `flush_interval_ms` half (ADR 0033, issue
+    /// #882): a claim no longer trails the fulfilment it covers, so there is
+    /// nothing left to flush.
+    #[error(
+        "peer '{id}' sets 'flush_interval_ms', which was removed for the same reason 'ceiling' \
+         was (ADR 0033, issue #882): nothing tracks trailing exposure, so there is no pending \
+         claim for a timer to flush. Delete the key rather than replace it; see \
+         docs/operators/btp-peer-transport-bringup.md"
+    )]
+    PeerFlushIntervalRemoved { id: String },
+
+    /// `claim_ack_timeout_ms` (ADR 0075, issue #1380): it bounded how long a
+    /// flushed claim waited for its acknowledgement, and the flush is gone.
+    /// A peering's voucher rides the packet it covers, and its verdict rides
+    /// that packet's answer, bounded by `peer_answer_timeout_ms`.
+    #[error(
+        "peer '{id}' sets 'claim_ack_timeout_ms', which was removed with the flush it bounded \
+         (ADR 0075, issue #1380): a peering's voucher rides the packet it covers and is \
+         acknowledged on that packet's answer, which 'peer_answer_timeout_ms' already bounds. \
+         Delete the key rather than replace it"
+    )]
+    PeerClaimAckTimeoutRemoved { id: String },
+
+    /// §11's removed-field row, `claim_enforcement` (ADR 0042 item 4, issue
+    /// #1077): the issue #883 migration ramp is gone, so `"observe"` names
+    /// no mode and `"enforce"` names the only behaviour there is. Refused by
+    /// name rather than ignored, because a config still writing `"observe"`
+    /// was written by an operator who believes uncovered arrivals to a
+    /// priced termination are admitted here, and none are.
+    ///
+    /// Not to be confused with `forwarded_claim_enforcement`, which is a
+    /// live field and defaults the other way
+    /// ([`PeerRefusal::InvalidForwardedClaimEnforcement`]).
+    #[error(
+        "peer '{id}' sets 'claim_enforcement', which was removed with the issue #883 migration \
+         ramp (ADR 0042 item 4, issue #1077): an uncovered peer PREPARE to a priced termination \
+         is now always refused, so 'observe' names a mode this build does not have and \
+         'enforce' names the only behaviour there is. Delete the key rather than replace it -- \
+         and note that 'forwarded_claim_enforcement', which governs forwarded arrivals, is a \
+         different and still-live field; see docs/operators/claim-policy-rollout.md"
+    )]
+    PeerClaimEnforcementRemoved { id: String },
+}
+
 /// The default for `peer_answer_timeout_ms` (`peer-carriage-spec.md`
 /// §6.3): thirty seconds.
 ///
@@ -106,7 +280,7 @@ impl PeerCarriage {
     /// `allow_plaintext` is `false` on every production config and on
     /// every config that does not mention the field, and then this is
     /// [`PeerCarriage::from_scheme`] byte for byte -- a plaintext endpoint
-    /// is still [`ConfigError::PeerEndpointScheme`]. The switch exists so a
+    /// is still [`PeerRefusal::PeerEndpointScheme`]. The switch exists so a
     /// laptop-runnable end-to-end test can point one connector at another's
     /// loopback socket without a TLS terminator in the harness; it is not
     /// a deployment shape.
@@ -334,7 +508,7 @@ impl std::str::FromStr for PeerExposure {
 /// **termination** -- was deleted with its `"observe"` escape hatch (ADR
 /// 0042 item 4, issue #1077); a terminated arrival is now always enforced
 /// and the key is a parsed-and-rejected tombstone
-/// ([`ConfigError::PeerClaimEnforcementRemoved`]). This field survived that
+/// ([`PeerRefusal::PeerClaimEnforcementRemoved`]). This field survived that
 /// deletion because the two migrations default in opposite directions and
 /// end on different days:
 ///
@@ -359,7 +533,7 @@ impl std::str::FromStr for PeerExposure {
 /// covers its forwards and reads `Enforce`, this field and its `Observe`
 /// variant should be deleted so the ADR 0042 rule is simply the behaviour,
 /// using the same removed-field-trap convention `ceiling`/`flush_interval_ms`
-/// use (`ConfigError::PeerCeilingRemoved`, [`resolve_peers`]).
+/// use (`PeerRefusal::PeerCeilingRemoved`, [`resolve_peers`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForwardedClaimEnforcement {
     /// Admit an uncovered forwarded arrival, logging it exactly the way a
@@ -412,7 +586,7 @@ pub(crate) fn parse_peer_exposure(value: Option<String>) -> Result<PeerExposure,
         None => Ok(PeerExposure::default()),
         Some(value) => value
             .parse()
-            .map_err(|()| ConfigError::InvalidPeerExposure { value }),
+            .map_err(|()| ConfigError::Peer(PeerRefusal::InvalidPeerExposure { value })),
     }
 }
 
@@ -446,7 +620,7 @@ pub(crate) struct RawPeer {
     /// is P2 + P3 -- a channel binding and a verified claim signature --
     /// and a bearer string decides nothing. Parsed as an opaque value only
     /// so a config that still writes one is refused **by name**
-    /// ([`ConfigError::PeerCredentialRemoved`]) rather than dropped, the
+    /// ([`PeerRefusal::PeerCredentialRemoved`]) rather than dropped, the
     /// posture ADR 0009 requires of every removed key.
     #[serde(default)]
     credential: Option<toml::Value>,
@@ -589,7 +763,7 @@ impl PeerConfig {
     /// here rather than to a `[[routes]]` entry because this hop does the
     /// same work whichever prefix the packet was addressed to (ADR 0061);
     /// `[[routes]] fee` is a refuse-to-start tombstone
-    /// ([`crate::ConfigError::RouteFeeRemoved`]).
+    /// ([`crate::RouteRefusal::RouteFeeRemoved`]).
     ///
     /// Defaults to zero -- free carriage. Unlike
     /// [`Self::max_packet_amount`], which exists to bound a loss, a fee
@@ -606,14 +780,14 @@ impl PeerConfig {
 /// `expose` is an argument rather than a field on each peer because it is a
 /// property of *this connector*, not of any one peering: the whole point of
 /// §2.1 is that the two axes are independent, and the load-time checks that
-/// matter -- [`ConfigError::PeerUndialable`] and, via
-/// [`PeerConfig::can_originate`], [`ConfigError::PeerRouteUndeliverable`]
+/// matter -- [`PeerRefusal::PeerUndialable`] and, via
+/// [`PeerConfig::can_originate`], [`PeerRefusal::PeerRouteUndeliverable`]
 /// -- are exactly the ones that need both axes at once.
 ///
 /// `allow_plaintext` is issue #678's loopback opt-in
 /// (`peer_allow_plaintext_endpoints`): `false` -- the default and every
 /// production config -- keeps `ws://` and `http://` a hard
-/// [`ConfigError::PeerEndpointScheme`], exactly as before the switch
+/// [`PeerRefusal::PeerEndpointScheme`], exactly as before the switch
 /// existed.
 pub(crate) fn resolve_peers(
     raw: Vec<RawPeer>,
@@ -625,19 +799,27 @@ pub(crate) fn resolve_peers(
 
     for peer in raw {
         if peer.id.trim().is_empty() {
-            return Err(ConfigError::PeerIdEmpty);
+            return Err(ConfigError::Peer(PeerRefusal::PeerIdEmpty));
         }
         if peer.addr.is_some() {
-            return Err(ConfigError::PeerAddrRemoved { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerAddrRemoved {
+                id: peer.id,
+            }));
         }
         if peer.ceiling.is_some() {
-            return Err(ConfigError::PeerCeilingRemoved { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerCeilingRemoved {
+                id: peer.id,
+            }));
         }
         if peer.flush_interval_ms.is_some() {
-            return Err(ConfigError::PeerFlushIntervalRemoved { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerFlushIntervalRemoved {
+                id: peer.id,
+            }));
         }
         if peer.claim_ack_timeout_ms.is_some() {
-            return Err(ConfigError::PeerClaimAckTimeoutRemoved { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerClaimAckTimeoutRemoved {
+                id: peer.id,
+            }));
         }
         // ADR 0042 item 4 (issue #1077): the B6 ramp is gone, so `"observe"`
         // no longer names a mode -- and `"enforce"` names the only behaviour
@@ -645,7 +827,9 @@ pub(crate) fn resolve_peers(
         // still writing `"observe"` was written by an operator who believes
         // this peering admits uncovered arrivals, and it does not.
         if peer.claim_enforcement.is_some() {
-            return Err(ConfigError::PeerClaimEnforcementRemoved { id: peer.id });
+            return Err(ConfigError::Peer(
+                PeerRefusal::PeerClaimEnforcementRemoved { id: peer.id },
+            ));
         }
         // ADR 0060 (issue #1157): the `{peerId, secret}` bearer credential
         // is deleted, not renamed. Refused by name rather than ignored,
@@ -653,28 +837,33 @@ pub(crate) fn resolve_peers(
         // authenticated by it, and a claim signature is what authenticates
         // it now.
         if peer.credential.is_some() {
-            return Err(ConfigError::PeerCredentialRemoved { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerCredentialRemoved {
+                id: peer.id,
+            }));
         }
         if !seen.insert(peer.id.clone()) {
-            return Err(ConfigError::DuplicatePeerId { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::DuplicatePeerId {
+                id: peer.id,
+            }));
         }
 
         let (endpoint, dial) = match peer.endpoint {
             None => (None, None),
             Some(value) => {
-                let url =
-                    Url::parse(&value).map_err(|source| ConfigError::InvalidPeerEndpoint {
+                let url = Url::parse(&value).map_err(|source| {
+                    ConfigError::Peer(PeerRefusal::InvalidPeerEndpoint {
                         id: peer.id.clone(),
                         value: value.clone(),
                         source,
-                    })?;
+                    })
+                })?;
                 let carriage =
                     PeerCarriage::for_endpoint(&url, allow_plaintext).ok_or_else(|| {
-                        ConfigError::PeerEndpointScheme {
+                        ConfigError::Peer(PeerRefusal::PeerEndpointScheme {
                             id: peer.id.clone(),
                             value: value.clone(),
                             scheme: url.scheme().to_string(),
-                        }
+                        })
                     })?;
                 // No host check is needed: `wss` and `https` are both
                 // *special* schemes in the URL standard, so a URL without
@@ -691,14 +880,12 @@ pub(crate) fn resolve_peers(
         // for free, silently, which is precisely the gap ADR 0042 closes.
         let forwarded_claim_enforcement = match peer.forwarded_claim_enforcement {
             None => ForwardedClaimEnforcement::default(),
-            Some(value) => {
-                value
-                    .parse()
-                    .map_err(|()| ConfigError::InvalidForwardedClaimEnforcement {
-                        id: peer.id.clone(),
-                        value,
-                    })?
-            }
+            Some(value) => value.parse().map_err(|()| {
+                ConfigError::Peer(PeerRefusal::InvalidForwardedClaimEnforcement {
+                    id: peer.id.clone(),
+                    value,
+                })
+            })?,
         };
 
         // ADR 0042's cap. `0` is refused by name rather than taken
@@ -709,7 +896,11 @@ pub(crate) fn resolve_peers(
         // point is that a bound always exists.
         let max_packet_amount = match peer.max_packet_amount {
             None => DEFAULT_MAX_PACKET_AMOUNT,
-            Some(0) => return Err(ConfigError::PeerMaxPacketAmountZero { id: peer.id }),
+            Some(0) => {
+                return Err(ConfigError::Peer(PeerRefusal::PeerMaxPacketAmountZero {
+                    id: peer.id,
+                }))
+            }
             Some(written) => written,
         };
 
@@ -717,7 +908,9 @@ pub(crate) fn resolve_peers(
         // dial into, can never establish -- and no amount of retrying
         // changes that (§2.2).
         if endpoint.is_none() && expose.is_empty() {
-            return Err(ConfigError::PeerUndialable { id: peer.id });
+            return Err(ConfigError::Peer(PeerRefusal::PeerUndialable {
+                id: peer.id,
+            }));
         }
 
         let can_originate = endpoint.is_some() || expose.exposes(PeerCarriage::Btp);
@@ -788,7 +981,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerClaimEnforcementRemoved { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerClaimEnforcementRemoved { ref id })) if id == "peer-b"
         ));
     }
 
@@ -803,7 +996,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerClaimEnforcementRemoved { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerClaimEnforcementRemoved { ref id })) if id == "peer-b"
         ));
     }
 
@@ -880,7 +1073,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::InvalidForwardedClaimEnforcement { ref id, ref value })
+            Err(ConfigError::Peer(PeerRefusal::InvalidForwardedClaimEnforcement { ref id, ref value }))
                 if id == "peer-b" && value == "enfroce"
         ));
     }
@@ -965,7 +1158,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerMaxPacketAmountZero { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerMaxPacketAmountZero { ref id })) if id == "peer-b"
         ));
     }
 
@@ -986,7 +1179,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Both, false),
-            Err(ConfigError::PeerIdEmpty)
+            Err(ConfigError::Peer(PeerRefusal::PeerIdEmpty))
         ));
     }
 
@@ -1026,7 +1219,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerCeilingRemoved { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerCeilingRemoved { ref id })) if id == "peer-b"
         ));
     }
 
@@ -1037,7 +1230,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerFlushIntervalRemoved { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerFlushIntervalRemoved { ref id })) if id == "peer-b"
         ));
     }
 
@@ -1051,7 +1244,7 @@ mod tests {
 
         assert!(matches!(
             resolve_peers(vec![entry], PeerExposure::Neither, false),
-            Err(ConfigError::PeerClaimAckTimeoutRemoved { ref id }) if id == "peer-b"
+            Err(ConfigError::Peer(PeerRefusal::PeerClaimAckTimeoutRemoved { ref id })) if id == "peer-b"
         ));
     }
 
@@ -1088,7 +1281,7 @@ mod tests {
             assert!(
                 matches!(
                     resolve_peers(vec![entry], PeerExposure::Neither, false),
-                    Err(ConfigError::PeerCredentialRemoved { ref id }) if id == "peer-b"
+                    Err(ConfigError::Peer(PeerRefusal::PeerCredentialRemoved { ref id })) if id == "peer-b"
                 ),
                 "credential = {written:?} should be refused by name"
             );
@@ -1120,7 +1313,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::InvalidPeerExposure { ref value }) if value == "carrier-pigeon"
+            Err(ConfigError::Peer(PeerRefusal::InvalidPeerExposure { ref value })) if value == "carrier-pigeon"
         ));
     }
 

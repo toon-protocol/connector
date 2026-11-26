@@ -4,6 +4,21 @@ use serde::Deserialize;
 
 use crate::error::ConfigError;
 
+use thiserror::Error;
+
+/// Every way the identity rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum ClientIdentityRefusal {
+    #[error("[[client_identities]] entry has an empty 'id'")]
+    ClientIdentityIdEmpty,
+
+    #[error("[[client_identities]] names identity '{id}' more than once")]
+    DuplicateClientIdentityId { id: String },
+}
+
 /// A `[[client_identities]]` entry as written in the config file: a
 /// client-edge identity this node authenticates over HTTP
 /// (`docs/protocol/client-edge-spec.md` §1.2), distinct from `[[peers]]`
@@ -60,10 +75,14 @@ pub(crate) fn resolve_client_identities(
 
     for identity in raw {
         if identity.id.trim().is_empty() {
-            return Err(ConfigError::ClientIdentityIdEmpty);
+            return Err(ConfigError::ClientIdentity(
+                ClientIdentityRefusal::ClientIdentityIdEmpty,
+            ));
         }
         if !seen.insert(identity.id.clone()) {
-            return Err(ConfigError::DuplicateClientIdentityId { id: identity.id });
+            return Err(ConfigError::ClientIdentity(
+                ClientIdentityRefusal::DuplicateClientIdentityId { id: identity.id },
+            ));
         }
         identities.push(ClientIdentityConfig {
             id: identity.id,
@@ -102,7 +121,12 @@ mod tests {
     #[test]
     fn rejects_an_empty_id() {
         let result = resolve_client_identities(vec![raw("", "s3cr3t")]);
-        assert!(matches!(result, Err(ConfigError::ClientIdentityIdEmpty)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::ClientIdentity(
+                ClientIdentityRefusal::ClientIdentityIdEmpty
+            ))
+        ));
     }
 
     #[test]
@@ -110,7 +134,7 @@ mod tests {
         let result = resolve_client_identities(vec![raw("peer-a", "one"), raw("peer-a", "two")]);
         assert!(matches!(
             result,
-            Err(ConfigError::DuplicateClientIdentityId { id }) if id == "peer-a"
+            Err(ConfigError::ClientIdentity(ClientIdentityRefusal::DuplicateClientIdentityId { id })) if id == "peer-a"
         ));
     }
 
