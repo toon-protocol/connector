@@ -11,7 +11,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use connector_cli::{build, router, RuntimeError};
+use connector_cli::{assemble, build, connect, router, RuntimeError};
 use connector_config::Config;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -143,30 +143,31 @@ open_budget_cap = 1000000000
 async fn a_zk_edge_boots_reads_its_vault_publishes_its_terms_and_runs_the_sweep() {
     let (daemon, archive) = (daemon().await, StandIn::spawn(|_| None).await);
     let fixture = fixture(&daemon.url(), &archive.url(), &request_key_hash());
-    let runtime = build(&fixture.config)
+    let parts = connect(&fixture.config)
         .await
-        .expect("a zk edge boots against a readable vault");
+        .expect("a zk edge connects to a readable vault");
     assert!(
         daemon.calls().contains(&"SlotAnchor".to_string()),
         "boot reads the slot anchor: {:?}",
         daemon.calls()
     );
-    assert!(runtime.zk_edge.is_some());
 
     // The allowance sweep is a task for the life of the node, and a node with
-    // no zk edge starts none. Counted across `router()` alone: the tasks
-    // boot's own reads leave alive are not the sweep.
+    // no zk edge starts none. Counted across `assemble` alone: the tasks
+    // connect's own reads leave alive are not the sweep.
     let alive_before = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
-    let app = router(&runtime, &fixture.config).expect("the node's router");
+    let runtime = assemble(parts).await.expect("a zk edge assembles");
     let alive_after = tokio::runtime::Handle::current()
         .metrics()
         .num_alive_tasks();
+    assert!(runtime.zk_edge.is_some());
     assert!(
         alive_after > alive_before,
-        "the sweep is spawned beside the router ({alive_before} -> {alive_after})"
+        "assemble spawns the sweep ({alive_before} -> {alive_after})"
     );
+    let app = router(&runtime, &fixture.config).expect("the node's router");
 
     // The terms: the self-description names the vault, the key hash and the
     // endpoint, the greeting's source.
