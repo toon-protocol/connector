@@ -2,12 +2,299 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use connector_domain::{AssetChain, AssetId, GuardOverride, Guards, MaxMove, Rate, Spread, Ttl};
+use connector_domain::{
+    AssetChain, AssetId, AssetIdError, GuardError, GuardOverride, Guards, MaxMove, Rate, RateError,
+    Spread, Ttl,
+};
 use serde::Deserialize;
 
 use crate::encoding::{is_base58_32_bytes, parse_evm_address, to_hex};
 use crate::error::ConfigError;
 use crate::settlement::SettlementTables;
+
+use thiserror::Error;
+
+/// Every way the denomination rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum DenominationRefusal {
+    /// A `[[tokens]]` row whose `asset` is not an asset at all (ADR 0071
+    /// decision 3). Carries the domain's own words, because
+    /// `AssetIdError` already says the three things that can be wrong with
+    /// the text -- an unknown chain, no chain at all, no token -- and
+    /// restating them here would be a second place for them to drift.
+    #[error("invalid [[tokens]] asset '{value}': {source}")]
+    TokenAssetInvalid {
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// A `[[tokens]]` row naming native MINA, `mina:<network>/slip44:12586`
+    /// (ADR 0080 decision 7, as amended): native MINA is a zk-note vault's asset and no settlement
+    /// table's, so no channel holds it and no TWAP quotes it. A zk edge
+    /// deals it only as a `[[rates]]` row's `from`.
+    #[error(
+        "[[tokens]] asset '{value}' is refused: native MINA is the [zk_note] vault's asset, not \
+         a token this connector settles or quotes. On a zk edge, name it as a [[rates]] row's \
+         'from' instead (ADR 0080)"
+    )]
+    TokenMinaNative { value: String },
+
+    /// Two `[[tokens]]` rows for one token. Refused rather than merged: a
+    /// rate table is keyed by token, so the second row is either a typo or
+    /// a disagreement, and a disagreement resolved silently is the one a
+    /// packet finds out about.
+    #[error(
+        "[[tokens]] declares '{asset}' more than once -- a token has one row, and two \
+         spellings of one contract address (a checksummed one and a lowercase one) are one \
+         token"
+    )]
+    DuplicateToken { asset: AssetId },
+
+    /// Two `[[tokens]]` rows both set `numeraire = true` (ADR 0071
+    /// decision 3). The boot refusal that keeps peg arithmetic out of the
+    /// node: a cross rate is composed as `X -> Y = (X/numeraire) /
+    /// (Y/numeraire)`, and composing one leg through USDC and the other
+    /// through DAI silently prices the USDC/DAI peg at exactly 1 -- a peg
+    /// nobody declared, which holds right up until it does not.
+    #[error(
+        "[[tokens]] names two numeraires, '{first}' and '{second}': a node declares exactly \
+         one, because every cross rate composes through it. Mixing them would price the peg \
+         between the two at 1 without anyone declaring it -- set 'numeraire = true' on one \
+         row and declare the other pair's rate in [[rates]] if you deal it"
+    )]
+    MixedNumeraire { first: AssetId, second: AssetId },
+
+    /// The numeraire's own row carries a `quote`. The numeraire is what
+    /// every quote path ends at, so a quote on it is a path from a token to
+    /// itself -- there is nothing it could read.
+    #[error(
+        "[[tokens]] gives the numeraire '{asset}' a quote: the numeraire is the token every \
+         other token's quote path ends AT, so it has no price of its own to read. Remove the \
+         'quote' from this row"
+    )]
+    NumeraireQuoted { asset: AssetId },
+
+    /// `quote = []`. An empty path names no pool and is not a declaration
+    /// of anything; a token priced by hand simply has no `quote` key.
+    #[error(
+        "[[tokens]] gives '{asset}' an empty quote: a quote is one or two pools, and a token \
+         with no pool to read is declared without a 'quote' and priced by a [[rates]] row"
+    )]
+    TokenQuoteEmpty { asset: AssetId },
+
+    /// More than two legs (ADR 0071 decision 3). Not a longer path -- a
+    /// path nobody has reasoned about: each leg is an independent
+    /// manipulation surface and the legs' errors compose.
+    #[error(
+        "[[tokens]] gives '{asset}' a quote of {legs} pools: ADR 0071 allows one (a \
+         numeraire-quoted token) or two (a token whose only real venue is quoted in an \
+         intermediate, e.g. ANYONE/WETH then WETH/USDC). Every extra leg is another \
+         manipulation surface and another rounding, so a third is refused rather than \
+         composed"
+    )]
+    TokenQuoteTooLong { asset: AssetId, legs: usize },
+
+    /// A quote leg's `quote_token` is not an asset.
+    #[error("invalid quote_token '{value}' in '{asset}'s quote: {source}")]
+    TokenQuoteTokenInvalid {
+        asset: AssetId,
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// A quote leg quoting into a token on another network. There is no
+    /// cross-network pool: a path that leaves the token's own settlement
+    /// network names a venue that does not exist (ADR 0086 decision 13).
+    #[error(
+        "'{asset}'s quote names '{quote_token}', which is on another network: ADR 0071 puts a \
+         token's quote on its OWN settlement network -- the one network the peering already \
+         guarantees this node RPC for -- and no pool spans two of them. Price this pair with \
+         a [[rates]] row instead"
+    )]
+    TokenQuoteOffChain {
+        asset: AssetId,
+        quote_token: AssetId,
+    },
+
+    /// A quote leg's pool is not an address on its chain.
+    #[error(
+        "invalid pool '{value}' in '{asset}'s quote: an EVM pool is 40 hex characters \
+         (optionally '0x'-prefixed) and a Solana pool is a base58 32-byte account. A pool \
+         this node cannot address is a rate it can never read"
+    )]
+    TokenQuotePoolInvalid { asset: AssetId, value: String },
+
+    /// A quote leg with `twap_window_secs = 0`. A window of nothing is a
+    /// spot read, and ADR 0071 decision 3 has none: the whole defence
+    /// against a shoved pool is that manipulation has to be sustained for
+    /// the length of the window.
+    #[error(
+        "'{asset}'s quote sets 'twap_window_secs = 0': a window of nothing is a spot read, \
+         and a spot ratio is manipulable inside one block. Set a window long enough that \
+         holding the pool at a false price across it costs an attacker more than the packets \
+         it would misprice"
+    )]
+    TokenQuoteZeroWindow { asset: AssetId },
+
+    /// A declared token on a network this node has no settlement table for
+    /// (ADR 0086 decision 2, issue #1598). Every asset says which network it
+    /// is on, and one on a network this node does not settle on is a token
+    /// no channel of this node can ever hold -- and, for a quoted one, a pool
+    /// it can never read (ADR 0071 decision 3).
+    #[error(
+        "[[tokens]] declares '{asset}', but this node has no {heading} table: a node deals \
+         only tokens on a network it settles on. Add the settlement table, or correct the \
+         asset's network",
+        heading = crate::settlement::network_heading(.asset.network())
+    )]
+    TokenWithoutSettlement { asset: AssetId },
+
+    /// A declared token on a network other than the numeraire's, with no
+    /// `[[rates]]` row giving it a static rate (ADR 0086 decision 13). A
+    /// quote path cannot leave its token's network, so only tokens on the
+    /// numeraire's own network quote themselves; this one has no way to be
+    /// priced at all, and every forward across it would be refused.
+    #[error(
+        "[[tokens]] declares '{asset}', which is on {network} while the numeraire '{numeraire}' \
+         is on {numeraire_network}: a quote path cannot leave its token's network, so only \
+         tokens on the numeraire's network quote themselves by TWAP. Give '{asset}' a static \
+         rate in a [[rates]] row (a row with `rate`, from or to it), or remove it",
+        network = .asset.network(),
+        numeraire_network = .numeraire.network()
+    )]
+    TokenOffNumeraireNetworkWithoutRate { asset: AssetId, numeraire: AssetId },
+
+    /// A quote path with no numeraire to end at.
+    #[error(
+        "'{asset}' has a quote but no [[tokens]] row sets 'numeraire = true': a quote path \
+         ends at the numeraire, and a node with none has nowhere for it to end"
+    )]
+    QuoteWithoutNumeraire { asset: AssetId },
+
+    /// The last leg of a quote path lands somewhere other than the
+    /// numeraire (ADR 0071 decision 3). The refusal that makes composition
+    /// sound: every quote answers "how much numeraire is this token worth",
+    /// and one that answers in WETH instead would be composed with the
+    /// others as if it had answered in the numeraire.
+    #[error(
+        "'{asset}'s quote ends at '{ends_at}', not at the numeraire '{numeraire}': every \
+         quote path ends at the numeraire, because a cross rate is composed as (X/numeraire) \
+         / (Y/numeraire) and a leg that answers in a different unit is silently treated as \
+         though it had answered in that one. Add the final leg that reaches the numeraire \
+         (e.g. WETH/USDC after ANYONE/WETH)"
+    )]
+    TokenQuoteDoesNotEndAtNumeraire {
+        asset: AssetId,
+        ends_at: AssetId,
+        numeraire: AssetId,
+    },
+
+    /// A `[[rates]]` row whose `from` or `to` is not an asset.
+    #[error("invalid [[rates]] {field} '{value}': {source}")]
+    RateRowAssetInvalid {
+        field: &'static str,
+        value: String,
+        #[source]
+        source: AssetIdError,
+    },
+
+    /// A `[[rates]]` row whose two sides are one token. A pair with itself
+    /// is not a denomination boundary, so nothing would ever look it up.
+    #[error(
+        "[[rates]] declares '{asset}' against itself: a rate crosses a denomination \
+         boundary, and a token is not a boundary with itself -- a forward whose two legs \
+         hold the same token is not a conversion and takes the flat fee alone"
+    )]
+    RateRowSelfPair { asset: AssetId },
+
+    /// A `[[rates]]` row naming a token no `[[tokens]]` row declares (ADR
+    /// 0071 decision 3).
+    #[error(
+        "[[rates]] declares '{from}' -> '{to}', but '{unknown}' is not a token this node \
+         deals: every side of a rate is a [[tokens]] row, so that a mistyped contract \
+         address is a boot refusal rather than a rate filed under a key no forward ever \
+         looks up"
+    )]
+    RateRowUnknownToken {
+        from: AssetId,
+        to: AssetId,
+        unknown: AssetId,
+    },
+
+    /// Two `[[rates]]` rows for one ordered pair. The reverse pair is a
+    /// different row and is not this: direction is the trade.
+    #[error(
+        "[[rates]] declares '{from}' -> '{to}' more than once: one ordered pair has one row. \
+         (The reverse pair is a DIFFERENT row and may carry a different rate -- direction is \
+         the trade.)"
+    )]
+    DuplicateRateRow { from: AssetId, to: AssetId },
+
+    /// A `[[rates]]` row whose declared rate is not a rate -- a zero
+    /// denominator, or the zero numerator ADR 0071 decision 7 refuses for
+    /// the same reason. The check itself lives in `connector_domain::Rate`,
+    /// which is where a rate is constructed at all; this variant exists so
+    /// that the operator reading the refusal learns which ROW was wrong,
+    /// which the domain's message on its own cannot say.
+    #[error("invalid rate on [[rates]] '{from}' -> '{to}': {source}")]
+    RateRowInvalid {
+        from: AssetId,
+        to: AssetId,
+        #[source]
+        source: RateError,
+    },
+
+    /// A declared guard that is not one (ADR 0071 decision 5): a spread at
+    /// or above the whole mid, a fraction with no whole, a ttl of no time
+    /// at all. The check is each guard's own constructor in
+    /// `connector_domain` -- which is where a guard is made at all -- and
+    /// this variant exists so the operator reading the refusal learns which
+    /// row carried it, which the domain's message cannot say. `row` is
+    /// `[rate_guards]`, or the ordered pair whose `[[rates]]` row overrode
+    /// it.
+    #[error("invalid guard on {row}: {source}")]
+    RateGuardInvalid {
+        row: String,
+        #[source]
+        source: GuardError,
+    },
+
+    /// A node that can produce a rate but declared no `[rate_guards]` (ADR
+    /// 0071 decision 5). Required exactly when something can produce a
+    /// rate, and only then: declaring tokens alone -- which is what a
+    /// same-asset cross-chain hop does -- produces none and needs none.
+    #[error(
+        "this node declares a rate (a [[rates]] row, or a [[tokens]] quote) but no \
+         [rate_guards] table: the three guards have no safe default. A defaulted spread \
+         would be zero -- dealing at mid and donating the risk -- and a defaulted 'ttl' or \
+         'max_move' would be a number nobody wrote being enforced on an operator's book. \
+         Add '[rate_guards]' with 'spread', 'ttl_secs' and 'max_move'; a [[rates]] row may \
+         override any of the three for its own pair"
+    )]
+    RateGuardsMissing,
+
+    /// An XRPL table on a node that declares no `[[tokens]]` (ADR 0087
+    /// decision 6, #1636). No forward on such a node is a crossing, so it
+    /// would pass one network's XRP to another's at par, and any other asset
+    /// to XRP at one base unit per drop.
+    #[error(
+        "{table} settles XRP, but this node declares no [[tokens]]: every XRPL leg is a dealing \
+         boundary (ADR 0087), and with nothing declared a forward would cross it unconverted. \
+         Declare it with a [[tokens]] row, asset = \"{asset}\", and one for every other \
+         settlement table this node holds"
+    )]
+    XrplSettlementWithoutTokens {
+        /// The table as an operator wrote it, `[settlement.xrpl.<id>]`.
+        table: String,
+        /// The asset to declare, `xrpl:<id>/slip44:144`.
+        asset: String,
+    },
+}
 
 /// The most pools one token's quote path may name (ADR 0071 decision 3):
 /// one for a numeraire-quoted token, two for a token whose only real venue
@@ -260,7 +547,7 @@ impl RateRow {
 /// Nothing downstream needs to ask whether the operator meant to deal --
 /// [`DenominationConfig::declares_tokens`] is the question, and `false` is
 /// every node that predates ADR 0071. A node with an XRPL table may not be
-/// empty ([`ConfigError::XrplSettlementWithoutTokens`], #1636).
+/// empty ([`DenominationRefusal::XrplSettlementWithoutTokens`], #1636).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DenominationConfig {
     tokens: Vec<DeclaredToken>,
@@ -371,10 +658,10 @@ fn guard<T>(
     build: fn(u64, u64) -> Result<T, connector_domain::GuardError>,
 ) -> Result<T, ConfigError> {
     build(fraction.numerator, fraction.denominator).map_err(|source| {
-        ConfigError::RateGuardInvalid {
+        ConfigError::Denomination(DenominationRefusal::RateGuardInvalid {
             row: row.to_string(),
             source,
-        }
+        })
     })
 }
 
@@ -386,9 +673,11 @@ fn guard_ttl(row: &str, ttl_secs: u64) -> Result<Ttl, ConfigError> {
     Ttl::new(TimeDelta::seconds(
         i64::try_from(ttl_secs).unwrap_or(i64::MAX),
     ))
-    .map_err(|source| ConfigError::RateGuardInvalid {
-        row: row.to_string(),
-        source,
+    .map_err(|source| {
+        ConfigError::Denomination(DenominationRefusal::RateGuardInvalid {
+            row: row.to_string(),
+            source,
+        })
     })
 }
 
@@ -425,32 +714,36 @@ fn resolve_tokens(
     let mut assets = Vec::with_capacity(raw.len());
     let mut seen = HashSet::with_capacity(raw.len());
     for token in &raw {
-        let asset =
-            token
-                .asset
-                .parse::<AssetId>()
-                .map_err(|source| ConfigError::TokenAssetInvalid {
-                    value: token.asset.clone(),
-                    source,
-                })?;
+        let asset = token.asset.parse::<AssetId>().map_err(|source| {
+            ConfigError::Denomination(DenominationRefusal::TokenAssetInvalid {
+                value: token.asset.clone(),
+                source,
+            })
+        })?;
         // ADR 0080 decision 7, as amended: native MINA is the zk-note
         // table's asset and no other table's. It parses, so it is refused
         // here by its own name; any other Mina asset is refused by the parser
         // above.
         if asset.chain() == AssetChain::Mina {
-            return Err(ConfigError::TokenMinaNative {
-                value: token.asset.clone(),
-            });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::TokenMinaNative {
+                    value: token.asset.clone(),
+                },
+            ));
         }
         // ADR 0086 decision 2: an asset says which network it is on, and a
         // node deals only on networks it settles on. Before the quote path
         // is walked, because a pool on a network with no table is one this
         // node could never read either.
         if !networks.settles(asset.network()) {
-            return Err(ConfigError::TokenWithoutSettlement { asset });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::TokenWithoutSettlement { asset },
+            ));
         }
         if !seen.insert(asset.clone()) {
-            return Err(ConfigError::DuplicateToken { asset });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::DuplicateToken { asset },
+            ));
         }
         assets.push(asset);
     }
@@ -461,10 +754,12 @@ fn resolve_tokens(
             continue;
         }
         if let Some(first) = numeraire {
-            return Err(ConfigError::MixedNumeraire {
-                first,
-                second: asset.clone(),
-            });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::MixedNumeraire {
+                    first,
+                    second: asset.clone(),
+                },
+            ));
         }
         numeraire = Some(asset.clone());
     }
@@ -476,7 +771,9 @@ fn resolve_tokens(
         // would answer a numeraire quoted in WETH with a complaint about
         // where the path ends -- which is true, and not the problem.
         if token.numeraire && token.quote.is_some() {
-            return Err(ConfigError::NumeraireQuoted { asset });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::NumeraireQuoted { asset },
+            ));
         }
         let quote = match token.quote {
             None => None,
@@ -500,41 +797,49 @@ fn resolve_quote(
     numeraire: Option<&AssetId>,
 ) -> Result<QuotePath, ConfigError> {
     if legs.is_empty() {
-        return Err(ConfigError::TokenQuoteEmpty {
-            asset: asset.clone(),
-        });
+        return Err(ConfigError::Denomination(
+            DenominationRefusal::TokenQuoteEmpty {
+                asset: asset.clone(),
+            },
+        ));
     }
     if legs.len() > MAX_QUOTE_LEGS {
-        return Err(ConfigError::TokenQuoteTooLong {
-            asset: asset.clone(),
-            legs: legs.len(),
-        });
+        return Err(ConfigError::Denomination(
+            DenominationRefusal::TokenQuoteTooLong {
+                asset: asset.clone(),
+                legs: legs.len(),
+            },
+        ));
     }
     let mut resolved = Vec::with_capacity(legs.len());
     for leg in legs {
         let quote_token = leg.quote_token.parse::<AssetId>().map_err(|source| {
-            ConfigError::TokenQuoteTokenInvalid {
+            ConfigError::Denomination(DenominationRefusal::TokenQuoteTokenInvalid {
                 asset: asset.clone(),
                 value: leg.quote_token.clone(),
                 source,
-            }
+            })
         })?;
         if quote_token.network() != asset.network() {
-            return Err(ConfigError::TokenQuoteOffChain {
-                asset: asset.clone(),
-                quote_token,
-            });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::TokenQuoteOffChain {
+                    asset: asset.clone(),
+                    quote_token,
+                },
+            ));
         }
         let pool = canonical_pool(asset.chain(), &leg.pool).ok_or_else(|| {
-            ConfigError::TokenQuotePoolInvalid {
+            ConfigError::Denomination(DenominationRefusal::TokenQuotePoolInvalid {
                 asset: asset.clone(),
                 value: leg.pool.clone(),
-            }
+            })
         })?;
         if leg.twap_window_secs == 0 {
-            return Err(ConfigError::TokenQuoteZeroWindow {
-                asset: asset.clone(),
-            });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::TokenQuoteZeroWindow {
+                    asset: asset.clone(),
+                },
+            ));
         }
         resolved.push(QuoteLeg {
             pool,
@@ -544,9 +849,11 @@ fn resolve_quote(
     }
 
     let Some(numeraire) = numeraire else {
-        return Err(ConfigError::QuoteWithoutNumeraire {
-            asset: asset.clone(),
-        });
+        return Err(ConfigError::Denomination(
+            DenominationRefusal::QuoteWithoutNumeraire {
+                asset: asset.clone(),
+            },
+        ));
     };
     // The last leg is the one that has to land on the numeraire; the first
     // leg of a two-leg path lands wherever the operator's real venue quotes
@@ -554,11 +861,13 @@ fn resolve_quote(
     // declaration of its own because this node never deals it.
     let ends_at = &resolved[resolved.len() - 1].quote_token;
     if ends_at != numeraire {
-        return Err(ConfigError::TokenQuoteDoesNotEndAtNumeraire {
-            asset: asset.clone(),
-            ends_at: ends_at.clone(),
-            numeraire: numeraire.clone(),
-        });
+        return Err(ConfigError::Denomination(
+            DenominationRefusal::TokenQuoteDoesNotEndAtNumeraire {
+                asset: asset.clone(),
+                ends_at: ends_at.clone(),
+                numeraire: numeraire.clone(),
+            },
+        ));
     }
 
     Ok(QuotePath { legs: resolved })
@@ -577,39 +886,43 @@ fn resolve_rate_rows(
     let mut rows = Vec::with_capacity(raw.len());
 
     for row in raw {
-        let from =
-            row.from
-                .parse::<AssetId>()
-                .map_err(|source| ConfigError::RateRowAssetInvalid {
-                    field: "from",
-                    value: row.from.clone(),
-                    source,
-                })?;
-        let to = row
-            .to
-            .parse::<AssetId>()
-            .map_err(|source| ConfigError::RateRowAssetInvalid {
+        let from = row.from.parse::<AssetId>().map_err(|source| {
+            ConfigError::Denomination(DenominationRefusal::RateRowAssetInvalid {
+                field: "from",
+                value: row.from.clone(),
+                source,
+            })
+        })?;
+        let to = row.to.parse::<AssetId>().map_err(|source| {
+            ConfigError::Denomination(DenominationRefusal::RateRowAssetInvalid {
                 field: "to",
                 value: row.to.clone(),
                 source,
-            })?;
+            })
+        })?;
         if from == to {
-            return Err(ConfigError::RateRowSelfPair { asset: from });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::RateRowSelfPair { asset: from },
+            ));
         }
         // Both sides, `from` first, so a row with two typos names the one
         // an operator reads first.
         for unknown in [&from, &to] {
             let vault_asset = unknown == &from && zk_vault_asset == Some(&from);
             if !declared(unknown) && !vault_asset {
-                return Err(ConfigError::RateRowUnknownToken {
-                    from: from.clone(),
-                    to: to.clone(),
-                    unknown: unknown.clone(),
-                });
+                return Err(ConfigError::Denomination(
+                    DenominationRefusal::RateRowUnknownToken {
+                        from: from.clone(),
+                        to: to.clone(),
+                        unknown: unknown.clone(),
+                    },
+                ));
             }
         }
         if !seen.insert((from.clone(), to.clone())) {
-            return Err(ConfigError::DuplicateRateRow { from, to });
+            return Err(ConfigError::Denomination(
+                DenominationRefusal::DuplicateRateRow { from, to },
+            ));
         }
 
         let pair = format!("{from} -> {to}");
@@ -619,10 +932,12 @@ fn resolve_rate_rows(
         let rate = match row.rate {
             None => None,
             Some(fraction) => Some(Rate::new(fraction.numerator, fraction.denominator).map_err(
-                |source| ConfigError::RateRowInvalid {
-                    from: from.clone(),
-                    to: to.clone(),
-                    source,
+                |source| {
+                    ConfigError::Denomination(DenominationRefusal::RateRowInvalid {
+                        from: from.clone(),
+                        to: to.clone(),
+                        source,
+                    })
                 },
             )?),
         };
@@ -642,7 +957,7 @@ fn resolve_rate_rows(
 /// `[[rates]]` row gives a static rate (ADR 0086 decision 13).
 ///
 /// A quote path cannot leave its token's network
-/// ([`ConfigError::TokenQuoteOffChain`]), and every path ends at the
+/// ([`DenominationRefusal::TokenQuoteOffChain`]), and every path ends at the
 /// numeraire, so only a token on the numeraire's own network can quote
 /// itself. Any other is priced by a static row or by nothing -- and nothing
 /// is a token every forward across would refuse, so it is refused here,
@@ -670,10 +985,12 @@ fn refuse_unpriced_off_numeraire_network(
         .map(DeclaredToken::asset)
         .find(|asset| asset.network() != numeraire.network() && !priced(asset))
     {
-        Some(asset) => Err(ConfigError::TokenOffNumeraireNetworkWithoutRate {
-            asset: asset.clone(),
-            numeraire: numeraire.clone(),
-        }),
+        Some(asset) => Err(ConfigError::Denomination(
+            DenominationRefusal::TokenOffNumeraireNetworkWithoutRate {
+                asset: asset.clone(),
+                numeraire: numeraire.clone(),
+            },
+        )),
         None => Ok(()),
     }
 }
@@ -719,7 +1036,9 @@ pub(crate) fn resolve_denomination(
     // rate, and required only then: declaring tokens alone (which is what a
     // same-asset cross-chain hop does) produces none and needs none.
     if guards.is_none() && (!rates.is_empty() || tokens.iter().any(|token| token.quote.is_some())) {
-        return Err(ConfigError::RateGuardsMissing);
+        return Err(ConfigError::Denomination(
+            DenominationRefusal::RateGuardsMissing,
+        ));
     }
 
     Ok(DenominationConfig {
@@ -918,7 +1237,7 @@ numeraire = true
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a node has one numeraire");
         assert!(
-            matches!(&error, ConfigError::MixedNumeraire { first, second }
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::MixedNumeraire { first, second })
                 if first == &asset(USDC) && second == &asset(ANYONE)),
             "got: {error}"
         );
@@ -938,7 +1257,7 @@ rate = {{ numerator = 3, denominator = 0 }}
         let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("there is no rational over zero");
         assert!(
-            matches!(&error, ConfigError::RateRowInvalid { from, to, .. }
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::RateRowInvalid { from, to, .. })
                 if from == &asset(USDC) && to == &asset(ANYONE)),
             "got: {error}"
         );
@@ -961,7 +1280,7 @@ rate = {{ numerator = 1, denominator = 2 }}
         let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("a pair is between two tokens this node deals");
         assert!(
-            matches!(&error, ConfigError::RateRowUnknownToken { unknown, .. }
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::RateRowUnknownToken { unknown, .. })
                 if unknown == &asset(WETH)),
             "got: {error}"
         );
@@ -985,7 +1304,7 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path ends at the numeraire");
         assert!(
-            matches!(&error, ConfigError::TokenQuoteDoesNotEndAtNumeraire { asset: a, ends_at, numeraire }
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::TokenQuoteDoesNotEndAtNumeraire { asset: a, ends_at, numeraire })
                 if a == &asset(ANYONE) && ends_at == &asset(WETH) && numeraire == &asset(USDC)),
             "got: {error}"
         );
@@ -1018,7 +1337,7 @@ asset = "{on_arbitrum}"
             let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
                 .expect_err("a token on a network this node does not settle on");
             assert!(
-                matches!(&error, ConfigError::TokenWithoutSettlement { asset: a }
+                matches!(&error, ConfigError::Denomination(DenominationRefusal::TokenWithoutSettlement { asset: a })
                     if a == &asset(&on_arbitrum)),
                 "got: {error}"
             );
@@ -1036,7 +1355,10 @@ asset = "{on_arbitrum}"
         let error = resolve_denomination(tokens, vec![], None, &solana_only, None)
             .expect_err("no EVM table");
         assert!(
-            matches!(&error, ConfigError::TokenWithoutSettlement { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::TokenWithoutSettlement { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1055,7 +1377,7 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path has nowhere to end");
         assert!(
-            matches!(&error, ConfigError::QuoteWithoutNumeraire { asset: a } if a == &asset(ANYONE)),
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::QuoteWithoutNumeraire { asset: a }) if a == &asset(ANYONE)),
             "got: {error}"
         );
     }
@@ -1080,7 +1402,7 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("one or two pools, never three");
         assert!(
-            matches!(&error, ConfigError::TokenQuoteTooLong { legs, .. } if *legs == 3),
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::TokenQuoteTooLong { legs, .. }) if *legs == 3),
             "got: {error}"
         );
     }
@@ -1103,7 +1425,10 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a quote path stays on the token's own chain");
         assert!(
-            matches!(&error, ConfigError::TokenQuoteOffChain { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::TokenQuoteOffChain { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1126,7 +1451,10 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a window of nothing is a spot read");
         assert!(
-            matches!(&error, ConfigError::TokenQuoteZeroWindow { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::TokenQuoteZeroWindow { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1149,7 +1477,7 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("a pool this node cannot address is a rate it cannot read");
         assert!(
-            matches!(&error, ConfigError::TokenQuotePoolInvalid { value, .. }
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::TokenQuotePoolInvalid { value, .. })
                 if value == "the-anyone-weth-pool"),
             "got: {error}"
         );
@@ -1170,7 +1498,10 @@ quote = [
         let error = resolve_denomination(tokens, vec![], guards(), &both_chains(), None)
             .expect_err("the numeraire is what everything else is quoted in");
         assert!(
-            matches!(&error, ConfigError::NumeraireQuoted { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::NumeraireQuoted { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1192,7 +1523,7 @@ asset = "{lowercase}"
         // The checksummed spelling and the lowercase one are one token --
         // which is the whole reason `AssetId` canonicalizes.
         assert!(
-            matches!(&error, ConfigError::DuplicateToken { asset: declared } if declared == &asset(USDC)),
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::DuplicateToken { asset: declared }) if declared == &asset(USDC)),
             "got: {error}"
         );
     }
@@ -1211,7 +1542,10 @@ rate = {{ numerator = 1, denominator = 1 }}
         let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("a token is not a denomination boundary with itself");
         assert!(
-            matches!(&error, ConfigError::RateRowSelfPair { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::RateRowSelfPair { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1235,7 +1569,10 @@ rate = {{ numerator = 5000000000000, denominator = 1 }}
         let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("one ordered pair, one row");
         assert!(
-            matches!(&error, ConfigError::DuplicateRateRow { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::DuplicateRateRow { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1288,7 +1625,7 @@ rate = {{ numerator = 4000000000000, denominator = 1 }}
         )
         .expect_err("a pair dealt at its own mid forwards nothing");
         assert!(
-            matches!(&error, ConfigError::RateGuardInvalid { row, .. } if row == "[rate_guards]"),
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::RateGuardInvalid { row, .. }) if row == "[rate_guards]"),
             "got: {error}"
         );
         assert!(error.to_string().contains("spread"), "got: {error}");
@@ -1309,7 +1646,10 @@ rate = {{ numerator = 4000000000000, denominator = 1 }}
         )
         .expect_err("a rate that is dead on arrival is not a rate");
         assert!(
-            matches!(&error, ConfigError::RateGuardInvalid { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::RateGuardInvalid { .. })
+            ),
             "got: {error}"
         );
         assert!(error.to_string().contains("ttl"), "got: {error}");
@@ -1353,7 +1693,7 @@ ttl_secs = 0
         let error = resolve_denomination(tokens, rates, guards(), &both_chains(), None)
             .expect_err("an override is a guard too");
         assert!(
-            matches!(&error, ConfigError::RateGuardInvalid { row, .. } if row.contains("->")),
+            matches!(&error, ConfigError::Denomination(DenominationRefusal::RateGuardInvalid { row, .. }) if row.contains("->")),
             "got: {error}"
         );
     }
@@ -1364,7 +1704,10 @@ ttl_secs = 0
         let error = resolve_denomination(tokens, rates, None, &both_chains(), None)
             .expect_err("a rate with no ttl is one this node deals on forever");
         assert!(
-            matches!(&error, ConfigError::RateGuardsMissing),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::RateGuardsMissing)
+            ),
             "got: {error}"
         );
     }
@@ -1456,7 +1799,10 @@ asset = "mina:B62qFoo"
         let error = resolve_denomination(tokens, vec![], None, &both_chains(), None)
             .expect_err("mina is gone from this repository");
         assert!(
-            matches!(&error, ConfigError::TokenAssetInvalid { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::TokenAssetInvalid { .. })
+            ),
             "got: {error}"
         );
     }
@@ -1473,7 +1819,10 @@ asset = "mina:devnet/slip44:12586"
         let error = resolve_denomination(tokens, vec![], None, &both_chains(), None)
             .expect_err("MINA is the vault's asset, not a token");
         assert!(
-            matches!(&error, ConfigError::TokenMinaNative { .. }),
+            matches!(
+                &error,
+                ConfigError::Denomination(DenominationRefusal::TokenMinaNative { .. })
+            ),
             "got: {error}"
         );
     }

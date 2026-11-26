@@ -236,6 +236,50 @@ pub enum SettlementRefusal {
          authenticates the service itself (ADR 0070, ADR 0073)"
     )]
     SettlementRpcViaSocksProxyPlaintext { table: String, value: String },
+
+    /// A `[[peer_channels]]` or `[[pay_channels]]` row's `network` is not a
+    /// CAIP-2 network on the chain its value is spelled for (ADR 0086
+    /// decision 8).
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' has network '{value}', which {reason}. A row's \
+         network is the CAIP-2 network of one of this node's settlement tables, such as \
+         'eip155:8453' for [settlement.eip155.8453] (ADR 0086 decision 8)"
+    )]
+    ChannelRowNetworkInvalid {
+        table: &'static str,
+        peer_id: String,
+        value: String,
+        reason: String,
+    },
+
+    /// A channel row's `network` names no `[settlement.eip155.<chainId>]`
+    /// table this node has (ADR 0086 decision 8): a channel on a network this
+    /// node does not settle on could never be admitted or paid on.
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' has network '{network}', and this node has no \
+         settlement table for that network -- add [settlement.eip155.<chainId>] for it, or name \
+         the network of a table this node has (ADR 0086 decision 8)"
+    )]
+    ChannelRowNetworkUnsettled {
+        table: &'static str,
+        peer_id: String,
+        network: String,
+    },
+
+    /// A `0x` channel row with no `network` on a node holding more than one
+    /// EVM table (ADR 0086 decision 8): which network the channel is on is
+    /// never guessed.
+    #[error(
+        "'[[{table}]]' for peer '{peer_id}' names an EVM channel or signer but no network, and \
+         this node settles on several EVM networks ({networks}): add network = \"<one of \
+         them>\" to the row. A row is never guessed onto one of several networks (ADR 0086 \
+         decision 8)"
+    )]
+    ChannelRowNetworkAmbiguous {
+        table: &'static str,
+        peer_id: String,
+        networks: String,
+    },
 }
 
 /// The `[settlement]` section as written in the config file: one table per
@@ -1120,31 +1164,37 @@ impl SettlementTables {
                 | (SettlementChain::Xrpl, _, []) => Ok(None),
                 (SettlementChain::Evm, [only], _) => Ok(Some(Network::Eip155(*only))),
                 (SettlementChain::Xrpl, _, [only]) => Ok(Some(Network::Xrpl(*only))),
-                (SettlementChain::Evm, many, _) => Err(ConfigError::ChannelRowNetworkAmbiguous {
-                    table,
-                    peer_id: peer_id.to_string(),
-                    networks: many
-                        .iter()
-                        .map(|id| format!("eip155:{id}"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                }),
-                (SettlementChain::Xrpl, _, many) => Err(ConfigError::ChannelRowNetworkAmbiguous {
-                    table,
-                    peer_id: peer_id.to_string(),
-                    networks: many
-                        .iter()
-                        .map(|network| network.caip2())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                }),
+                (SettlementChain::Evm, many, _) => Err(ConfigError::Settlement(
+                    SettlementRefusal::ChannelRowNetworkAmbiguous {
+                        table,
+                        peer_id: peer_id.to_string(),
+                        networks: many
+                            .iter()
+                            .map(|id| format!("eip155:{id}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
+                )),
+                (SettlementChain::Xrpl, _, many) => Err(ConfigError::Settlement(
+                    SettlementRefusal::ChannelRowNetworkAmbiguous {
+                        table,
+                        peer_id: peer_id.to_string(),
+                        networks: many
+                            .iter()
+                            .map(|network| network.caip2())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    },
+                )),
             };
         };
-        let invalid = |reason: String| ConfigError::ChannelRowNetworkInvalid {
-            table,
-            peer_id: peer_id.to_string(),
-            value: written.to_string(),
-            reason,
+        let invalid = |reason: String| {
+            ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkInvalid {
+                table,
+                peer_id: peer_id.to_string(),
+                value: written.to_string(),
+                reason,
+            })
         };
         let network = written
             .parse::<Network>()
@@ -1156,20 +1206,20 @@ impl SettlementTables {
             )));
         }
         match &network {
-            Network::Eip155(id) if !self.eip155.contains(id) => {
-                Err(ConfigError::ChannelRowNetworkUnsettled {
+            Network::Eip155(id) if !self.eip155.contains(id) => Err(ConfigError::Settlement(
+                SettlementRefusal::ChannelRowNetworkUnsettled {
                     table,
                     peer_id: peer_id.to_string(),
                     network: network.to_string(),
-                })
-            }
-            Network::Xrpl(id) if !self.xrpl.contains(id) => {
-                Err(ConfigError::ChannelRowNetworkUnsettled {
+                },
+            )),
+            Network::Xrpl(id) if !self.xrpl.contains(id) => Err(ConfigError::Settlement(
+                SettlementRefusal::ChannelRowNetworkUnsettled {
                     table,
                     peer_id: peer_id.to_string(),
                     network: network.to_string(),
-                })
-            }
+                },
+            )),
             _ => Ok(Some(network)),
         }
     }
@@ -1653,6 +1703,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::batch_settlement::BatchSettlementRefusal;
 
     /// The composition is transparent: wrapping a refusal in the public
     /// error changes neither its message nor what it is.
@@ -2013,11 +2064,11 @@ key_file = "{key}"
             .expect_err("below x402's floor");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementDelayBelowFloor {
+            ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementDelayBelowFloor {
                 ref table,
                 key: "min_grace_period_secs",
                 value: 60,
-            } if table == "solana"
+            }) if table == "solana"
         ));
     }
 
