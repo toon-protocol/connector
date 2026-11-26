@@ -695,6 +695,92 @@ fn default_probe_window() -> Duration {
     Duration::seconds(60)
 }
 
+/// A [`Connector`] whose settings are fixed, being given its peerings
+/// (spec #1689, issue #1722): the config file's own, then the durable
+/// runtime table. The order startup needs is the order the types allow --
+/// [`Connector::wire_peerings`] ends the settings, the config peerings are
+/// wired here, and [`PeeringWiring::replaying_runtime_peer_routes`] (or
+/// [`PeeringWiring::finish`], for a node with no durable table) ends the
+/// wiring and shares the connector.
+pub struct PeeringWiring {
+    connector: Connector,
+}
+
+impl PeeringWiring {
+    /// Admit one config-file peering (spec #1686, issue #1695): the same
+    /// [`Peerings::admit_config`] wiring every peering gets -- rules, voucher
+    /// hop, signer binding, carriage, table entry (reserved id, cap, fee) --
+    /// so a config peering and a runtime one are wired alike.
+    ///
+    /// It reads the outbound channels a `[[pay_channels]]` row names a
+    /// channel of, the registrar its carriage goes into and the socks proxy
+    /// an onion client edge's claim-state ask leaves on: all settings, fixed
+    /// before this runs ([`Connector::wire_peerings`]). Every config peering
+    /// is admitted before the runtime table is replayed
+    /// ([`Self::replaying_runtime_peer_routes`]), so a stored peering cannot
+    /// take an id or signer a config row owns.
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfigPeeringError`] naming the rule or step that refused it.
+    /// `Config::load` has already refused a bad config, so one here is a
+    /// bug, reported rather than panicked on.
+    pub fn admit_config_peering(
+        mut self,
+        peering: &ConfigPeering,
+    ) -> Result<Self, ConfigPeeringError> {
+        self.connector
+            .peerings
+            .admit_config(peering, self.connector.outbound_channels.as_ref())?;
+        Ok(self)
+    }
+
+    /// Replay a durable runtime peer/route table (issue #884) into this
+    /// connector and arm it to persist future writes back to the same
+    /// store -- the two must always be given together, since a table
+    /// replayed from `peers`/`routes` but not armed to persist further
+    /// writes would silently stop being durable after the first mutation.
+    /// Every replayed peering goes through the same admit operation
+    /// `POST /peers` uses, so it is **re-armed** exactly as establishing it
+    /// was: the peer's voucher signer is bound to it again, its outbound
+    /// x402 channel is registered again as the hop every forward to it is
+    /// covered on (ADR 0075 decision 6), and its carriage goes back into
+    /// the registrar. A durable row that came back as a name would be the
+    /// hollow row ADR 0058 exists to remove, one restart later.
+    ///
+    /// A stored peering that admit refuses, or that fails while being wired
+    /// (a voucher signer that already proves another peering), is **skipped
+    /// whole**: no hop, binding, carriage or table row, and the routes
+    /// naming it are dropped. It is logged by name at error level and the
+    /// node serves its other peerings. It reads every setting -- the config
+    /// file's peer ids (a stored peering whose id the config file owns is
+    /// skipped), the registrar the carriages replay into, the outbound
+    /// channels the forwards are signed on and the socks proxy -- and every
+    /// config peering already wired, so it is the last step: it hands back
+    /// the connector, shared, and nothing can be set or wired after it.
+    ///
+    /// A row with no `client_edge_url` -- the shape rows written before
+    /// issue #1217 have -- has no claim-state to restore its watermark from,
+    /// so it replays bound but unpaid, accept-only until re-peered. A row
+    /// naming a `toon-channel` never reaches here: [`PeerRouteStore::open`]
+    /// refuses it at boot by name (ADR 0075 decision 8).
+    pub fn replaying_runtime_peer_routes(
+        mut self,
+        store: PeerRouteStore,
+        peers: RuntimePeers,
+        routes: HashMap<String, PeerRoute>,
+    ) -> Arc<Connector> {
+        self.connector.peerings.replay(store, peers, routes);
+        Arc::new(self.connector)
+    }
+
+    /// End the wiring on a node with no durable runtime table, and share
+    /// the connector.
+    pub fn finish(self) -> Arc<Connector> {
+        Arc::new(self.connector)
+    }
+}
+
 impl Connector {
     pub fn new(
         routes: Vec<StaticRoute>,
@@ -1040,56 +1126,15 @@ impl Connector {
         self
     }
 
-    /// Replay a durable runtime peer/route table (issue #884) into this
-    /// connector and arm it to persist future writes back to the same
-    /// store -- the two must always be given together, since a table
-    /// replayed from `peers`/`routes` but not armed to persist further
-    /// writes would silently stop being durable after the first mutation.
-    /// Every replayed peering goes through the same admit operation
-    /// `POST /peers` uses, so it is **re-armed** exactly as establishing it
-    /// was: the peer's voucher signer is bound to it again, its outbound
-    /// x402 channel is registered again as the hop every forward to it is
-    /// covered on (ADR 0075 decision 6), and its carriage goes back into
-    /// the registrar. A durable row that came back as a name would be the
-    /// hollow row ADR 0058 exists to remove, one restart later.
-    ///
-    /// A stored peering that admit refuses, or that fails while being wired
-    /// (a voucher signer that already proves another peering), is **skipped
-    /// whole**: no hop, binding, carriage or table row, and the routes
-    /// naming it are dropped. It is logged by name at error level and the
-    /// node serves its other peerings. Call this after the config file's
-    /// peerings are admitted ([`Connector::admit_config_peering`], or
-    /// [`Connector::with_config_peer_ids`] alone in tests): a stored peering
-    /// whose id the config file owns is skipped. Call it after
-    /// [`Connector::with_peer_registrar`],
-    /// or the carriages replay nowhere, and after
-    /// [`Connector::with_outbound_channels`], or the forwards have no
-    /// channel to be signed on.
-    ///
-    /// A row with no `client_edge_url` -- the shape rows written before
-    /// issue #1217 have -- has no claim-state to restore its watermark from,
-    /// so it replays bound but unpaid, accept-only until re-peered. A row
-    /// naming a `toon-channel` never reaches here: [`PeerRouteStore::open`]
-    /// refuses it at boot by name (ADR 0075 decision 8).
-    pub fn with_runtime_peer_route_store(
-        mut self,
-        store: PeerRouteStore,
-        peers: RuntimePeers,
-        routes: HashMap<String, PeerRoute>,
-    ) -> Self {
-        self.peerings.replay(store, peers, routes);
-        self
-    }
-
     /// Give this node the x402 channels it pays on (ADR 0075 decisions 8
     /// and 11), and its own CAIP-2 network on each chain they are on: what
     /// `POST /peers` opens a peering's outbound channel through, on either
     /// chain, and what every forward over such a peering signs its voucher
     /// through.
     ///
-    /// Call before [`Connector::with_runtime_peer_route_store`]: a durable
-    /// x402 peering is rehydrated onto these channels, and one replayed
-    /// before them could not pay.
+    /// A settings builder: a durable x402 peering replayed by
+    /// [`PeeringWiring::replaying_runtime_peer_routes`] is rehydrated onto
+    /// these channels, and the types put every replay after them.
     pub fn with_outbound_channels(
         mut self,
         outbound: Arc<OutboundChannels>,
@@ -1102,11 +1147,21 @@ impl Connector {
 
     /// Give this node its `socks_proxy` (ADR 0070): the proxy a runtime
     /// peering's claim-state ask leaves on when the peer's client edge is an
-    /// onion host. Call before [`Connector::with_runtime_peer_route_store`],
-    /// so a rehydrated onion peering is asked through it too.
+    /// onion host -- a config peering's and a rehydrated one's alike, since
+    /// every peering is wired after the settings ([`Connector::wire_peerings`]).
     pub fn with_socks_proxy(mut self, proxy: Option<url::Url>) -> Self {
         self.peerings.set_socks_proxy(proxy);
         self
+    }
+
+    /// Fix this node's settings and start wiring its peerings onto them
+    /// (spec #1689, issue #1722). Every setting a peering reads -- the
+    /// config file's peer ids, the registrar, the socks proxy, the outbound
+    /// channels -- is a builder on [`Connector`], and every step that wires
+    /// a peering is on the [`PeeringWiring`] this returns, so a peering can
+    /// only be wired once the settings it reads are in place.
+    pub fn wire_peerings(self) -> PeeringWiring {
+        PeeringWiring { connector: self }
     }
 
     /// The x402 channels this node pays on, if it has any.
@@ -1148,31 +1203,6 @@ impl Connector {
                 .network_of(channel_key)
                 .map(|network| network.to_string()),
         }
-    }
-
-    /// Admit one config-file peering (spec #1686, issue #1695): the same
-    /// [`Peerings::admit_config`] wiring every peering gets -- rules, voucher
-    /// hop, signer binding, carriage, table entry -- so a config peering
-    /// and a runtime one are wired alike.
-    ///
-    /// Call after [`Connector::with_outbound_channels`], which a
-    /// `[[pay_channels]]` row names a channel of, after
-    /// [`Connector::with_peer_registrar`] and after
-    /// [`Connector::with_socks_proxy`] (an onion client edge's claim-state
-    /// ask leaves on it).
-    ///
-    /// # Errors
-    ///
-    /// A [`ConfigPeeringError`] naming the rule or step that refused it.
-    /// `Config::load` has already refused a bad config, so one here is a
-    /// bug, reported rather than panicked on.
-    pub fn admit_config_peering(
-        mut self,
-        peering: &ConfigPeering,
-    ) -> Result<Self, ConfigPeeringError> {
-        self.peerings
-            .admit_config(peering, self.outbound_channels.as_ref())?;
-        Ok(self)
     }
 
     /// Pay `peer_id` over this node's outbound x402 channel `channel_id`,
@@ -2336,7 +2366,7 @@ impl Connector {
     ///
     /// [`Connector::cover_forward`] signs for exactly this packet's own
     /// forwarded value: a hop registered by a runtime peering or by
-    /// [`Connector::admit_config_peering`] gets a fresh voucher on its
+    /// [`crate::PeeringWiring::admit_config_peering`] gets a fresh voucher on its
     /// outbound x402 channel, signed and journaled before the packet is
     /// ever sent -- covered from the first attempt, including the first
     /// attempt after a restart, never merely recovered after a refusal. If
@@ -2732,7 +2762,7 @@ impl Connector {
     /// voucher on this node's own outbound x402 channel toward the hop (ADR
     /// 0075 decision 6), whether a runtime peering registered that channel
     /// (`register_voucher_hop`) or a `[[pay_channels]]` row did
-    /// ([`Connector::admit_config_peering`]).
+    /// ([`crate::PeeringWiring::admit_config_peering`]).
     async fn cover_forward(
         &self,
         peer_id: &str,
@@ -8885,7 +8915,8 @@ mod tests {
                 ),
                 "apex-relay-2",
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
             before_restart
                 .upsert_runtime_peer("apex-relay-2", peering(3))
                 .unwrap();
@@ -8907,7 +8938,8 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
 
             let peers = after_restart.peers();
             assert_eq!(peers.len(), 1);
@@ -9104,7 +9136,8 @@ mod tests {
                 Arc::new(InProcessPeerTransport::new()),
                 test_clock(),
             )
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
 
             assert!(connector.peers().is_empty(), "skipped whole");
             let error = connector
@@ -9492,7 +9525,8 @@ mod tests {
             let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
             let before = a_node_over(&next_hop, &outbound)
                 .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
-                .with_runtime_peer_route_store(store, peers, routes);
+                .wire_peerings()
+                .replaying_runtime_peer_routes(store, peers, routes);
             before
                 .peerings
                 .admit("next-hop", stored_peering(&channel, 0x02))
@@ -9508,7 +9542,8 @@ mod tests {
             let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("re-open");
             let after = a_node_over(&next_hop, &outbound)
                 .with_peer_registrar(Arc::clone(&after_carriages) as Arc<dyn PeerRegistrar>)
-                .with_runtime_peer_route_store(store, peers, routes);
+                .wire_peerings()
+                .replaying_runtime_peer_routes(store, peers, routes);
 
             assert_eq!(
                 after.peerings.hop("next-hop").map(|hop| hop.channel_id),
@@ -9576,7 +9611,8 @@ mod tests {
                 tracing::callsite::rebuild_interest_cache();
                 a_node_over(&next_hop, &outbound)
                     .with_peer_registrar(Arc::clone(&carriages) as Arc<dyn PeerRegistrar>)
-                    .with_runtime_peer_route_store(store, peers, routes)
+                    .wire_peerings()
+                    .replaying_runtime_peer_routes(store, peers, routes)
             };
 
             let signer = VoucherSigner::Evm([0x02; 20]);
@@ -9644,8 +9680,9 @@ mod tests {
                 (format!("0x{}", "02".repeat(20)), true),
             ] {
                 let (connector, _, _, _, channel) = peered().await;
-                let wired =
-                    connector.admit_config_peering(&config_peering(&channel, &signer, None));
+                let wired = connector
+                    .wire_peerings()
+                    .admit_config_peering(&config_peering(&channel, &signer, None));
                 if pays_it {
                     assert!(wired.is_ok(), "the channel pays {signer}");
                 } else {
@@ -9691,11 +9728,9 @@ mod tests {
         async fn a_config_pay_channel_must_be_on_its_channels_own_network() {
             let signer = format!("0x{}", "02".repeat(20));
             let (connector, _, _, _, channel) = peered().await;
-            let refused = connector.admit_config_peering(&config_peering(
-                &channel,
-                &signer,
-                Some("eip155:8453"),
-            ));
+            let refused = connector
+                .wire_peerings()
+                .admit_config_peering(&config_peering(&channel, &signer, Some("eip155:8453")));
             match refused {
                 Err(ConfigPeeringError::Inadmissible { .. }) => {
                     panic!("the rule set judges a network difference between rows, not this")
@@ -9716,6 +9751,7 @@ mod tests {
 
             let (connector, _, _, _, channel) = peered().await;
             assert!(connector
+                .wire_peerings()
                 .admit_config_peering(&config_peering(&channel, &signer, Some("eip155:31337")))
                 .is_ok());
         }
@@ -9779,6 +9815,7 @@ mod tests {
                 let endpoint = "wss://next-hop.example/ilp/btp";
                 let connector = if kind == "config" {
                     connector
+                        .wire_peerings()
                         .admit_config_peering(&crate::ConfigPeering {
                             fee: FEE,
                             max_packet_amount: 5_000,
@@ -9787,6 +9824,7 @@ mod tests {
                             ..config_peering(&channel, &signer, Some("eip155:31337"))
                         })
                         .expect("admitted")
+                        .finish()
                 } else {
                     connector
                         .peerings
@@ -9806,7 +9844,7 @@ mod tests {
                             },
                         )
                         .expect("admitted");
-                    connector
+                    connector.wire_peerings().finish()
                 };
 
                 let peerings = &connector.peerings;
@@ -9856,7 +9894,9 @@ mod tests {
         #[tokio::test]
         async fn a_config_peering_admission_refuses_is_a_named_error() {
             let (connector, _, _, _, _) = peered().await;
-            let refused = connector.admit_config_peering(&crate::ConfigPeering::new("next-hop"));
+            let refused = connector
+                .wire_peerings()
+                .admit_config_peering(&crate::ConfigPeering::new("next-hop"));
             assert!(
                 matches!(
                     refused,

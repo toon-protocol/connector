@@ -1,8 +1,13 @@
 //! **A peering established from a URL, against a real chain** (ADR 0058,
 //! as ADR 0075 decision 4 amends it; issues #1160, #1378).
 //!
-//! Nothing here injects a settlement backend or hands a node a pre-opened
-//! channel. Config-driven nodes -- built by `connector_cli::build` and
+//! Three tests -- the operator write's find-or-open, trust-on-first-use, and
+//! an HTTP-only node's self-description (#1723) -- are about the operator
+//! surface and the peering's wiring, not about a chain: they hand `assemble`
+//! an in-memory settlement network and spawn nothing. The rest carry real
+//! vouchers between two nodes, which only a real chain's paying half signs,
+//! and stay on `anvil`. In the real-chain tests nothing here injects a
+//! settlement backend or hands a node a pre-opened channel. Config-driven nodes -- built by `connector_cli::build` and
 //! served by `connector_cli::router`, the production boot path -- are given
 //! one authenticated write each, `POST /peers { id, url, fee,
 //! max_packet_amount, deposit }`, pointed at a real self-description on a
@@ -52,7 +57,12 @@ use connector_domain::{
     Prepare, Reject, VoucherSignerFact,
 };
 use connector_operator::test_support::sign_request;
-use connector_runtime::PeerView;
+use connector_runtime::{
+    InMemorySettlementNetwork, PeerView, SettlementNetwork, SettlementNetworks,
+};
+use connector_settlement::batch::{
+    BatchSettlementPayer, InMemoryBatchChain, InMemoryBatchSettlement, PayerExit,
+};
 use connector_settlement::batch::{ChannelPresentation, Voucher};
 use connector_settlement::ChannelId;
 use connector_settlement_evm::test_support::x402::X402Chain;
@@ -225,6 +235,58 @@ impl Chain {
     }
 }
 
+/// What a node settles on: a real chain its config dials, or an in-memory
+/// network handed to `assemble` (#1723).
+enum Settlement<'a> {
+    Anvil(&'a Chain),
+    InMemory(SettlementNetworks),
+}
+
+/// The chain id every in-memory node here settles on, as the anvil tests'.
+const IN_MEMORY_CHAIN_ID: u64 = 31_337;
+
+/// The USDC the in-memory nodes' terms name.
+const IN_MEMORY_TOKEN: [u8; 20] = [0x70; 20];
+
+/// Node `party` on `chain`, settling as `settlement_key`, holding
+/// [`FUNDED`] USDC: the network to hand `assemble`, and the fake under it to
+/// read the chain's side of the story from.
+fn in_memory_network(
+    chain: &Arc<InMemoryBatchChain>,
+    party: u8,
+    settlement_key: &str,
+) -> (SettlementNetworks, Arc<InMemoryBatchSettlement>) {
+    let settlement = Arc::new(InMemoryBatchSettlement::on(
+        Arc::clone(chain),
+        party,
+        86_400,
+    ));
+    settlement.fund(FUNDED);
+    let signer = spelled(address_of(settlement_key));
+    let network = format!("eip155:{IN_MEMORY_CHAIN_ID}");
+    let held = InMemorySettlementNetwork::new(
+        network.parse().expect("a CAIP-2 network"),
+        Arc::clone(&settlement),
+        signer.clone(),
+    )
+    .with_terms(X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
+        network,
+        asset: spelled(Address::from(IN_MEMORY_TOKEN)),
+        pay_to: signer.clone(),
+        receiver_authorizer: signer,
+        min_withdraw_delay_secs: 86_400,
+        name: "USDC".to_string(),
+        version: "2".to_string(),
+        asset_transfer_method: Default::default(),
+        facilitator: None,
+    }));
+    let mut networks = SettlementNetworks::new();
+    networks
+        .insert(Arc::new(held) as Arc<dyn SettlementNetwork>)
+        .expect("one network");
+    (networks, settlement)
+}
+
 /// A router behind a socket that can be swapped for another: how a node
 /// **restarts** here. A new runtime is built from the same config file and
 /// `state_dir` through the production boot path and takes over the socket
@@ -296,6 +358,46 @@ impl Node {
         carriage: Carriage,
         app: &str,
     ) -> Node {
+        Self::boot_on(
+            name,
+            settlement_key,
+            signer_seed,
+            Settlement::Anvil(chain),
+            carriage,
+            app,
+        )
+        .await
+    }
+
+    /// [`Node::boot`] over an in-memory settlement network handed to
+    /// `assemble`: the config names no chain, and nothing is spawned.
+    async fn boot_in_memory(
+        name: &'static str,
+        settlement_key: &'static str,
+        signer_seed: u8,
+        networks: SettlementNetworks,
+        carriage: Carriage,
+        app: &str,
+    ) -> Node {
+        Self::boot_on(
+            name,
+            settlement_key,
+            signer_seed,
+            Settlement::InMemory(networks),
+            carriage,
+            app,
+        )
+        .await
+    }
+
+    async fn boot_on(
+        name: &'static str,
+        settlement_key: &'static str,
+        signer_seed: u8,
+        settlement: Settlement<'_>,
+        carriage: Carriage,
+        app: &str,
+    ) -> Node {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the node");
         let addr = listener.local_addr().expect("the node's address");
         let operator = Keypair::generate(&mut OsRng);
@@ -349,7 +451,14 @@ handler_url = "http://{app}/pinned"
 price = 0
 transport = "{pinned}"
 
-[settlement.eip155.31337]
+{settlement_table}
+"#,
+            state_dir = state_dir.path().display(),
+            signer_key = signer_key.path().display(),
+            write_key = write_key_hex(&operator),
+            settlement_table = match &settlement {
+                Settlement::Anvil(chain) => format!(
+                    r#"[settlement.eip155.31337]
 rpc_url = "{rpc_url}"
 token_address = "{token:?}"
 decimals = 6
@@ -358,16 +467,22 @@ asset_eip712_version = "2"
 
 [settlement.eip155.31337.key]
 key_file = "{settlement_key}"
-
 "#,
-            state_dir = state_dir.path().display(),
-            signer_key = signer_key.path().display(),
-            settlement_key = settlement_key_file.path().display(),
-            write_key = write_key_hex(&operator),
-            rpc_url = chain.anvil.rpc_url,
-            token = chain.token,
+                    rpc_url = chain.anvil.rpc_url,
+                    token = chain.token,
+                    settlement_key = settlement_key_file.path().display(),
+                ),
+                Settlement::InMemory(_) => String::new(),
+            },
         ));
-        let runtime = connector_cli::build(&config).await.expect("build the node");
+        let runtime = match settlement {
+            Settlement::Anvil(_) => connector_cli::build(&config).await.expect("build the node"),
+            Settlement::InMemory(networks) => {
+                let mut parts = connector_cli::connect(&config).await.expect("connect");
+                parts.settlement_networks = networks;
+                connector_cli::assemble(parts).await.expect("assemble")
+            }
+        };
         let router = connector_cli::router(&runtime, &config).expect("the node's router");
         let socket = Swappable::serve(listener, router);
         Node {
@@ -389,7 +504,7 @@ key_file = "{settlement_key}"
     async fn restart(&mut self) {
         // A restart ends the old process first, and with it its hold on
         // `state_dir` (issue #1318).
-        self.runtime.state_dir_lock.take();
+        self.runtime.take_state_dir_lock();
         self.runtime = connector_cli::build(&self.config)
             .await
             .expect("rebuild the node");
@@ -408,7 +523,7 @@ key_file = "{settlement_key}"
     /// The key a payload for this node is sealed to (ADR 0018).
     fn identity(&self) -> PublicKeyBytes {
         self.runtime
-            .signer
+            .signer()
             .public_key()
             .expect("a local signer has a public key")
     }
@@ -763,7 +878,7 @@ async fn two_nodes_peer_over_two_x402_channels(carriage: Carriage, offset: u16) 
 /// packet they ride is refused as uncovered; and a voucher below the
 /// channel's watermark is refused `amount_not_advancing`.
 async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node, b_to_a: &str) {
-    let outbound = b.runtime.outbound_channels.clone().expect("B pays on x402");
+    let outbound = b.runtime.outbound_channels().expect("B pays on x402");
     let presentation = outbound.presentation(b_to_a).expect("B's channel");
     assert!(matches!(presentation, ChannelPresentation::Evm { .. }));
     let stale = outbound.signed(b_to_a).expect("B's channel");
@@ -845,10 +960,10 @@ async fn the_ack_carries_each_vouchers_verdict(chain: &Chain, a: &Node, b: &Node
 /// `receiver`, and `receiver` as the voucher signer. Nothing signs it and
 /// nothing vouches for it: whoever answers the URL the operator named is who
 /// the peering is with.
-fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
+fn serve_self_description(chain_id: u64, token: Address, receiver: Address) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
-    let network = format!("eip155:{}", chain.x402.chain_id());
+    let network = format!("eip155:{chain_id}");
     let document = NodeSelfDescription::describe(
         &NodeFacts {
             ilp_addresses: vec!["g.example.counterparty".to_string()],
@@ -857,7 +972,7 @@ fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
             peer_carriages: vec!["http".to_string()],
             batch_settlements: vec![X402BatchSettlementTerms::Evm(X402BatchSettlementEvmTerms {
                 network: network.clone(),
-                asset: spelled(chain.token),
+                asset: spelled(token),
                 pay_to: spelled(receiver),
                 receiver_authorizer: spelled(receiver),
                 min_withdraw_delay_secs: 86_400,
@@ -897,28 +1012,43 @@ fn serve_self_description(chain: &Chain, receiver: Address) -> SocketAddr {
     addr
 }
 
+/// What the in-memory chain holds on `channel`, as the anvil tests read it
+/// off x402: `(deposit still behind it, landed)`.
+async fn on_chain(settlement: &InMemoryBatchSettlement, channel: &str) -> (u128, u128) {
+    let state = settlement
+        .outbound_state(&ChannelId(channel.to_string()))
+        .await
+        .expect("the channel is on the chain");
+    (
+        state.on_chain.collateral + state.on_chain.landed,
+        state.on_chain.landed,
+    )
+}
+
 /// **One operator write opens this node's own channel, and repeating it
 /// finds that channel** (ADR 0075 decisions 4 and 8). The endpoint spends
 /// gas, so a repeat must be a success rather than a second channel -- and
 /// the answer says which branch it took.
 #[tokio::test]
 async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_it() {
-    if !require_anvil() {
-        return;
-    }
-    let chain = Chain::spawn(0).await;
+    let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+    let (networks, settlement) = in_memory_network(&chain, 0xb1, DEPLOYER_PRIVATE_KEY);
     let app = spawn_app();
-    let node = Node::boot(
+    let node = Node::boot_in_memory(
         "nodeb",
         DEPLOYER_PRIVATE_KEY,
         0x0b,
-        &chain,
+        networks,
         Carriage::Http,
         &app,
     )
     .await;
     let counterparty = address_of(COUNTERPARTY_PRIVATE_KEY);
-    let served = serve_self_description(&chain, counterparty);
+    let served = serve_self_description(
+        IN_MEMORY_CHAIN_ID,
+        Address::from(IN_MEMORY_TOKEN),
+        counterparty,
+    );
     let body = serde_json::json!({
         "id": "apex-relay-2",
         "url": format!("http://{served}/ilp"),
@@ -956,10 +1086,7 @@ async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_
 
     // The channel is this node's, toward the published receiver, on x402 --
     // read off the chain and off this node's own channel list.
-    assert_eq!(
-        chain.x402.channel(&ChannelId(channel_id.clone())).await,
-        (DEPOSIT, 0)
-    );
+    assert_eq!(on_chain(&settlement, &channel_id).await, (DEPOSIT, 0));
     let channels = node.read("/channels").await;
     let row = channels
         .as_array()
@@ -974,17 +1101,8 @@ async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_
     let repeated = node.write(Method::POST, "/peers", with_deposit).await;
     assert_eq!(repeated["channel"]["status"], "found");
     assert_eq!(repeated["channel"]["id"], channel_id.as_str());
-    assert_eq!(
-        chain.x402.channel(&ChannelId(channel_id)).await,
-        (DEPOSIT, 0)
-    );
-    assert_eq!(
-        chain
-            .x402
-            .balance_of(chain.token, node.settlement_address())
-            .await,
-        FUNDED - DEPOSIT
-    );
+    assert_eq!(on_chain(&settlement, &channel_id).await, (DEPOSIT, 0));
+    assert_eq!(settlement.balance(), FUNDED - DEPOSIT);
 
     let peers: Vec<PeerView> = serde_json::from_value(node.read("/peers").await).unwrap();
     assert_eq!(peers.len(), 1, "one write, one peering: {peers:?}");
@@ -1011,22 +1129,21 @@ async fn one_operator_write_opens_this_nodes_own_channel_and_repeating_it_finds_
 /// rather than passing one.
 #[tokio::test]
 async fn whatever_the_url_serves_is_who_the_peering_is_with() {
-    if !require_anvil() {
-        return;
-    }
-    let chain = Chain::spawn(10).await;
+    let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+    let (networks, _settlement) = in_memory_network(&chain, 0xb1, DEPLOYER_PRIVATE_KEY);
     let app = spawn_app();
-    let node = Node::boot(
+    let node = Node::boot_in_memory(
         "nodeb",
         DEPLOYER_PRIVATE_KEY,
         0x0b,
-        &chain,
+        networks,
         Carriage::Http,
         &app,
     )
     .await;
     let stranger = Address::from([0x5a; 20]);
-    let served = serve_self_description(&chain, stranger);
+    let served =
+        serve_self_description(IN_MEMORY_CHAIN_ID, Address::from(IN_MEMORY_TOKEN), stranger);
     let established = node
         .write(
             Method::POST,
@@ -1068,25 +1185,24 @@ async fn whatever_the_url_serves_is_who_the_peering_is_with() {
 /// over that one carriage.
 #[tokio::test]
 async fn an_http_only_nodes_self_description_is_dialable_and_a_counterparty_peers_with_it() {
-    if !require_anvil() {
-        return;
-    }
-    let chain = Chain::spawn(20).await;
+    let chain = InMemoryBatchChain::new(PayerExit::Withdrawal);
+    let (a_networks, _a_settlement) = in_memory_network(&chain, 0xa1, COUNTERPARTY_PRIVATE_KEY);
+    let (b_networks, _b_settlement) = in_memory_network(&chain, 0xb1, DEPLOYER_PRIVATE_KEY);
     let app = spawn_app();
-    let a = Node::boot(
+    let a = Node::boot_in_memory(
         "nodea",
         COUNTERPARTY_PRIVATE_KEY,
         0x0a,
-        &chain,
+        a_networks,
         Carriage::Http,
         &app,
     )
     .await;
-    let b = Node::boot(
+    let b = Node::boot_in_memory(
         "nodeb",
         DEPLOYER_PRIVATE_KEY,
         0x0b,
-        &chain,
+        b_networks,
         Carriage::Http,
         &app,
     )

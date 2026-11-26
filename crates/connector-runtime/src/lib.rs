@@ -54,7 +54,7 @@ pub use claim::{ClaimAckOutcome, ClaimRejectReason, Covering};
 pub use clock::{Clock, SystemClock, TestClock};
 pub use connector::{
     ChannelNetworks, ClientRouteFacts, ClientRouteKind, ClientRoutePrice, ConfigPeeringError,
-    Connector, LeaseRouteError, PeerRouteTableError, ProbeDenied,
+    Connector, LeaseRouteError, PeerRouteTableError, PeeringWiring, ProbeDenied,
 };
 // Re-exported for callers that hold a `Connector` but not a config-crate
 // dependency of their own (`connector-operator`): the chain key an x402
@@ -71,8 +71,8 @@ pub use packet_history::{Direction, Outcome, PacketHistoryView, PacketRow};
 // x402 channels (ADR 0075 decisions 5 and 6), and how it asks the receiver
 // where that channel's watermark stands.
 pub use outbound_voucher::{
-    challenge_entry, evm_voucher_fields, solana_voucher_fields, voucher_json, HttpVoucherState,
-    VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
+    challenge_entry, evm_voucher_fields, solana_voucher_fields, voucher_json, xrpl_voucher_fields,
+    HttpVoucherState, VoucherStateSource, PEER_CHALLENGE_TTL_SECS,
 };
 pub use peer_route_store::{
     PeerRouteStore, PeerRouteStoreError, RuntimePeerChannel, RuntimePeering, RuntimePeers,

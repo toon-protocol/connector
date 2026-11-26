@@ -1408,7 +1408,8 @@ mod tests {
         let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
         let connector = connector
             .with_peer_registrar(Arc::clone(&registrar) as Arc<dyn PeerRegistrar>)
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
         connector
             .establish_peering("node-b", &url(), 0, 0, None, Some(1_000))
             .await
@@ -1483,7 +1484,8 @@ mod tests {
         let (store, peers, routes) = crate::PeerRouteStore::open(&path).expect("open");
         let connector = connector
             .with_peer_registrar(Arc::clone(&registrar) as Arc<dyn PeerRegistrar>)
-            .with_runtime_peer_route_store(store, peers, routes);
+            .wire_peerings()
+            .replaying_runtime_peer_routes(store, peers, routes);
 
         let error = connector
             .establish_peering("node-b", &url(), 0, 0, None, Some(1_000))

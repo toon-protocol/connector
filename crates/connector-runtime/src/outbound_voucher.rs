@@ -34,8 +34,8 @@ use connector_domain::Network;
 use connector_settlement::batch::{ChannelPresentation, EvmChannelConfig, Voucher};
 use connector_settlement::ChannelId;
 use connector_signer::{
-    BatchChannelConfig, EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher,
-    SolanaVoucherScheme, VoucherScheme,
+    BatchChannelConfig, EvmVoucherScheme, ParsedEvmVoucher, ParsedSolanaVoucher, ParsedXrplVoucher,
+    SolanaVoucherScheme, VoucherScheme, XrplVoucherScheme,
 };
 
 use crate::batch_channels::hex;
@@ -141,6 +141,32 @@ pub fn solana_voucher_fields(
     fields
 }
 
+/// An outbound XRPL voucher's own fields, spelled by XRPL's voucher scheme
+/// (spec #1685, ADR 0087 decision 2): `blockchain`, `channelId` in bare hex,
+/// `maxClaimableAmount` in drops and `signature` in hex (DER for a secp256k1
+/// key, raw for an Ed25519 one). The envelope is the caller's.
+///
+/// `channel` is what this node's XRPL payer named: 64 lowercase hex, which
+/// is exactly what the scheme spells. Anything else is spelled as it stands,
+/// so this never changes what the payer named, and a channel id that is not
+/// one is the receiver's to refuse.
+#[must_use]
+pub fn xrpl_voucher_fields(
+    channel: &ChannelId,
+    voucher: &Voucher,
+) -> serde_json::Map<String, serde_json::Value> {
+    let parsed = ParsedXrplVoucher {
+        channel_id: XrplVoucherScheme::decode_channel_id(&channel.0).unwrap_or_default(),
+        max_claimable_amount: voucher.cumulative_amount,
+        signature: voucher.signature.clone(),
+    };
+    let mut fields = XrplVoucherScheme::spell(&parsed);
+    if fields.get("channelId").and_then(|id| id.as_str()) != Some(channel.0.as_str()) {
+        fields.insert("channelId".into(), channel.0.clone().into());
+    }
+    fields
+}
+
 /// A voucher on `presentation`'s channel, on `network` -- the CAIP-2 network
 /// the channel is on, which every voucher names (ADR 0086 decision 1) -- as
 /// the claim slot carries it.
@@ -183,20 +209,16 @@ pub fn voucher_json(
             fields.insert("senderId".into(), sender_id.into());
             serde_json::Value::Object(fields)
         }
-        // ADR 0087 decision 2: the channel id in bare hex and the signature in
-        // hex (DER for a secp256k1 key, raw for an Ed25519 one).
-        ChannelPresentation::Xrpl { channel } => serde_json::json!({
-            "version": "1.0",
-            "blockchain": "xrpl",
-            "network": network.to_string(),
-            "scheme": "batch-settlement",
-            "messageId": message_id,
-            "timestamp": timestamp,
-            "senderId": sender_id,
-            "channelId": channel.0,
-            "maxClaimableAmount": amount,
-            "signature": hex_lower(&voucher.signature),
-        }),
+        ChannelPresentation::Xrpl { channel } => {
+            let mut fields = xrpl_voucher_fields(channel, voucher);
+            fields.insert("version".into(), "1.0".into());
+            fields.insert("network".into(), network.to_string().into());
+            fields.insert("scheme".into(), "batch-settlement".into());
+            fields.insert("messageId".into(), message_id.into());
+            fields.insert("timestamp".into(), timestamp.into());
+            fields.insert("senderId".into(), sender_id.into());
+            serde_json::Value::Object(fields)
+        }
     }
     .to_string()
 }

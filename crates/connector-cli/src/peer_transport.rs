@@ -81,7 +81,7 @@ pub(crate) struct ConfiguredPeerTransport {
 /// The transport a validated [`Config`] describes: both carriages, with the
 /// node's `socks_proxy` and plaintext opt-in, and **no peering registered**.
 /// Every peering, the config file's included, gets its carriage from
-/// `Connector::admit_config_peering` through [`PeerRegistrar`] (issue #1695),
+/// `PeeringWiring::admit_config_peering` through [`PeerRegistrar`] (issue #1695),
 /// so one path decides it.
 ///
 /// It renders no claim of its own: what covers a forward -- a voucher, or

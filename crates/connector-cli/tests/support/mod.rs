@@ -182,12 +182,30 @@ pub fn evm_voucher_on(
 /// it names the network read from the chain (ADR 0086 decision 1).
 pub fn solana_network(runtime: &connector_cli::Runtime) -> String {
     runtime
-        .settlement_networks
-        .iter()
-        .find(|held| held.network().chain() == connector_domain::AssetChain::Solana)
+        .batch_settlements()
+        .into_iter()
+        .find_map(|terms| match terms {
+            connector_domain::x402::X402BatchSettlementTerms::Solana(solana) => {
+                Some(solana.network)
+            }
+            _ => None,
+        })
         .expect("the node settles on Solana")
-        .network()
-        .to_string()
+}
+
+/// Start the node `config` describes as `connector_cli::build` does --
+/// connect, then assemble -- keeping the settlement networks connect handed
+/// assemble, for a test that reads a chain through its node's own backend.
+pub async fn build_keeping_networks(
+    config: &Config,
+) -> (
+    connector_cli::Runtime,
+    connector_runtime::SettlementNetworks,
+) {
+    let parts = connector_cli::connect(config).await.expect("connect");
+    let networks = parts.settlement_networks.clone();
+    let runtime = connector_cli::assemble(parts).await.expect("assemble");
+    (runtime, networks)
 }
 
 /// `network` is the CAIP-2 network the channel is on ([`solana_network`]).

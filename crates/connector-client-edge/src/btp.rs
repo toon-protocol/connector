@@ -527,9 +527,11 @@ pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolDa
                 json[field] = value;
             }
         }
-        ChannelPresentation::Xrpl { .. } => {
-            json["blockchain"] = "xrpl".into();
-            json["signature"] = hex::encode(&payout.voucher.signature).into();
+        // XRPL's voucher scheme spells the voucher's own fields (spec #1685).
+        ChannelPresentation::Xrpl { channel } => {
+            for (field, value) in connector_runtime::xrpl_voucher_fields(channel, &payout.voucher) {
+                json[field] = value;
+            }
         }
     }
     ProtocolData {
