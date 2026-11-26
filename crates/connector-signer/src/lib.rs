@@ -7,9 +7,12 @@
 //! operation directly -- anything that needs to sign a claim or a
 //! settlement transaction takes a `&dyn Signer`. It is also where a claim's
 //! signature is checked: every claim is an x402 `batch-settlement` voucher
-//! (ADR 0074, ADR 0075), verified through [`verify_evm_voucher`]/
-//! [`verify_solana_voucher`] and [`VoucherSignature`], needing no key
-//! material of its own, only the signer a channel names. TOON's own
+//! (ADR 0074, ADR 0075), and each chain's voucher is one [`VoucherScheme`]
+//! (spec #1685; EVM's is [`EvmVoucherScheme`]): its wire spelling, its
+//! signature, its channel id, its verification against the signer the chain
+//! records, and its claim-state challenge. Verifying needs no key material,
+//! only the signer a channel names; encoding an outbound voucher takes a
+//! signer port. TOON's own
 //! balance-proof claim and its verification are deleted (ADR 0075, issue
 //! #1385). [`verify`] is unrelated: it is the `Signer` contract suite's own
 //! "a signature recovers to its signer's own public key" check
@@ -51,6 +54,7 @@ mod kms;
 mod local;
 pub mod nip59;
 mod signer;
+mod voucher_scheme;
 mod voucher_signature;
 mod xrpl;
 mod zk_state;
@@ -67,6 +71,7 @@ pub use kms::{InMemoryKmsBackend, KmsBackend, KmsSigner};
 pub use local::LocalSigner;
 pub use nip59::{unwrap_claim, wrap_claim, Nip59Error, WrappedClaim};
 pub use signer::{verify, PublicKeyBytes, Signature, Signer};
+pub use voucher_scheme::{EvmVoucherScheme, ParsedEvmVoucher, VoucherRefusal, VoucherScheme};
 pub use voucher_signature::{
     evm_batch_channel_id, evm_voucher_digest, evm_voucher_signer, solana_voucher_message,
     verify_evm_voucher, verify_solana_voucher, BatchChannelConfig, BatchSettlementDomain,

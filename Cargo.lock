@@ -1497,6 +1497,7 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "chacha20poly1305",
+ "connector-domain",
  "connector-zk-note",
  "ed25519-dalek",
  "hkdf",

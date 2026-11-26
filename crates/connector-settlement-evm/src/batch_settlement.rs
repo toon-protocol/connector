@@ -65,8 +65,9 @@ use connector_settlement::batch::{
 };
 use connector_settlement::ChannelId;
 use connector_signer::{
-    evm_batch_channel_id, evm_voucher_signer, verify_evm_voucher, BatchChannelConfig,
-    BatchSettlementDomain, X402_BATCH_SETTLEMENT_ADDRESS,
+    evm_batch_channel_id, evm_voucher_signer, BatchChannelConfig, BatchSettlementDomain,
+    EvmVoucherScheme, ParsedEvmVoucher, VoucherRefusal, VoucherScheme,
+    X402_BATCH_SETTLEMENT_ADDRESS,
 };
 use ethers::abi::{AbiDecode, AbiEncode};
 use ethers::types::{Address, BlockId, BlockNumber, Bytes, TransactionReceipt};
@@ -540,12 +541,26 @@ impl BatchSettlementBackend for EvmBatchSettlementBackend {
                 voucher.signature.len()
             ))
         })?;
-        let signer = evm_voucher_signer(&signer_config(&config));
-        if !verify_evm_voucher(&self.domain, &id, amount, &signature, &signer) {
-            return Err(BatchSettlementError::InvalidVoucherSignature(format!(
-                "it is not a voucher for {amount} on '{channel}' by 0x{}",
-                hex(&signer)
-            )));
+        let recorded = signer_config(&config);
+        let parsed = ParsedEvmVoucher {
+            channel_id: id,
+            max_claimable_amount: amount,
+            signature,
+            channel_config: None,
+        };
+        match EvmVoucherScheme::verify(&self.domain, &parsed, &recorded) {
+            Ok(()) => {}
+            Err(VoucherRefusal::ChannelIdMismatch) => {
+                return Err(BatchSettlementError::InvalidVoucherSignature(format!(
+                    "'{channel}' is not the channel its admitted config hashes to"
+                )));
+            }
+            Err(_) => {
+                return Err(BatchSettlementError::InvalidVoucherSignature(format!(
+                    "it is not a voucher for {amount} on '{channel}' by 0x{}",
+                    hex(&EvmVoucherScheme::signer(&recorded))
+                )));
+            }
         }
 
         let before = self.snapshot(id).await?;

@@ -54,7 +54,7 @@ use connector_settlement::batch::{
     HeldVoucher, HeldVouchers,
 };
 use connector_settlement::ChannelId;
-use connector_signer::{evm_voucher_signer, verify_evm_voucher};
+use connector_signer::{EvmVoucherScheme, ParsedEvmVoucher, VoucherScheme};
 use ethers::abi::{AbiDecode, AbiEncode};
 use ethers::contract::Event;
 use ethers::middleware::Middleware;
@@ -224,9 +224,14 @@ impl EvmBatchSettlementBackend {
             };
             let amount = entry.voucher.cumulative_amount;
             let signature: Option<[u8; 65]> = entry.voucher.signature.as_slice().try_into().ok();
-            let signer = evm_voucher_signer(&signer_config(&config));
             let Some(signature) = signature.filter(|signature| {
-                verify_evm_voucher(&self.domain(), &id, amount, signature, &signer)
+                let voucher = ParsedEvmVoucher {
+                    channel_id: id,
+                    max_claimable_amount: amount,
+                    signature: *signature,
+                    channel_config: None,
+                };
+                EvmVoucherScheme::verify(&self.domain(), &voucher, &signer_config(&config)).is_ok()
             }) else {
                 tracing::warn!(
                     %channel,

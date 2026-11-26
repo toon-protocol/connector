@@ -102,8 +102,7 @@ mod voucher_evidence;
 pub mod zk_note;
 mod zk_note_http;
 pub use batch_settlement::{
-    first_toon_channel_entry, journaled_batch_channels, AdmittedEvmVoucherChannel,
-    AdmittedSolanaVoucherChannel, AdmittedXrplVoucherChannel, JournaledBatchChannel,
+    first_toon_channel_entry, journaled_batch_channels, JournaledBatchChannel,
 };
 pub use channels::{ChannelLookupFailed, ChannelResolutionError, ChannelTerminal};
 pub use claim_gate::{
