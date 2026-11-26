@@ -61,7 +61,7 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
                 s.peerings[0].source = Source::Runtime;
                 s.config_peer_ids.insert("hop".into());
             }),
-            |e| matches!(e, ConfigError::PeeringOwnedByConfig { value } if value == "hop"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeeringOwnedByConfig { value }) if value == "hop"),
             |e| matches!(e, PeerRouteTableError::OwnedByConfig(v) if v == "hop"),
         ),
         (
@@ -69,17 +69,17 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
                 s.routes[0].source = Source::Runtime;
                 s.config_prefixes.insert("g.example".into());
             }),
-            |e| matches!(e, ConfigError::PeeringOwnedByConfig { value } if value == "g.example"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeeringOwnedByConfig { value }) if value == "g.example"),
             |e| matches!(e, PeerRouteTableError::OwnedByConfig(v) if v == "g.example"),
         ),
         (
             refusal(|s| s.routes[0].peer_id = "ghost".into()),
-            |e| matches!(e, ConfigError::UnknownPeerId { peer_id, .. } if peer_id == "ghost"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::UnknownPeerId { peer_id, .. }) if peer_id == "ghost"),
             |e| matches!(e, PeerRouteTableError::UnknownPeerId { peer_id, .. } if peer_id == "ghost"),
         ),
         (
             refusal(|s| s.inbound[0].peer_id = "ghost".into()),
-            |e| matches!(e, ConfigError::PeerChannelOrphaned { peer_id } if peer_id == "ghost"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeerChannelOrphaned { peer_id }) if peer_id == "ghost"),
             |e| {
                 matches!(
                     e,
@@ -89,12 +89,12 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
         ),
         (
             refusal(|s| s.inbound.clear()),
-            |e| matches!(e, ConfigError::PeerChannelUnbound { id } if id == "hop"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeerChannelUnbound { id }) if id == "hop"),
             |e| matches!(e, PeerRouteTableError::PeerChannelUnbound(id) if id == "hop"),
         ),
         (
             refusal(pay_only),
-            |e| matches!(e, ConfigError::PayChannelOrphaned { peer_id } if peer_id == "ghost"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelOrphaned { peer_id }) if peer_id == "ghost"),
             |e| {
                 matches!(
                     e,
@@ -104,7 +104,17 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
         ),
         (
             refusal(|s| s.settled_chains.clear()),
-            |e| matches!(e, ConfigError::PayChannelWithoutX402 { chain: "evm", .. }),
+            |e| {
+                matches!(
+                    e,
+                    ConfigError::PeeringAdmission(
+                        connector_config::PeeringAdmissionRefusal::PayChannelWithoutX402 {
+                            chain: "evm",
+                            ..
+                        }
+                    )
+                )
+            },
             |e| {
                 matches!(
                     e,
@@ -116,7 +126,7 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
         ),
         (
             refusal(|s| s.pay[0].channel = s.inbound[0].channel.clone()),
-            |e| matches!(e, ConfigError::ChannelInBothDirections { value } if value == "in"),
+            |e| matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::ChannelInBothDirections { value }) if value == "in"),
             |e| {
                 matches!(
                     e,
@@ -129,7 +139,7 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
         (
             refusal(|s| s.pay[0].network = Some("eip155:1".into())),
             |e| {
-                matches!(e, ConfigError::PeeringNetworksDiffer { inbound, outbound, .. }
+                matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeeringNetworksDiffer { inbound, outbound, .. })
                 if inbound == "eip155:31337" && outbound == "eip155:1")
             },
             |e| {
@@ -142,7 +152,7 @@ fn every_rule_has_a_config_name_and_a_runtime_name() {
         (
             refusal(|s| s.pay.clear()),
             |e| {
-                matches!(e, ConfigError::PayChannelUnbound { prefix, peer_id }
+                matches!(e, ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PayChannelUnbound { prefix, peer_id })
                 if prefix == "g.example" && peer_id == "hop")
             },
             |e| {

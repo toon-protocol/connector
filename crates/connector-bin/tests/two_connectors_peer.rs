@@ -922,7 +922,7 @@ async fn a_claim_that_does_not_prove_the_peer_role_reaches_no_peer_handling(carr
 
 /// **§1.9 case 4, in the only form a live binary can express it**: a
 /// peering with no `[[peer_channels]]` row is refused at load
-/// (`ConfigError::PeerChannelUnbound`), so the process never carries a
+/// (`ConfigError::PeeringAdmission(connector_config::PeeringAdmissionRefusal::PeerChannelUnbound)`), so the process never carries a
 /// peering nothing can prove.
 #[test]
 fn a_peer_with_no_channel_binding_refuses_to_start() {
