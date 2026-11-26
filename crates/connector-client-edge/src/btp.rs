@@ -520,10 +520,12 @@ pub(crate) fn payout_voucher_protocol_data(payout: &PayoutVoucher) -> ProtocolDa
                 json[field] = value;
             }
         }
-        ChannelPresentation::Solana { .. } => {
-            json["blockchain"] = "solana".into();
-            json["expiresAt"] = 0.into();
-            json["signature"] = bs58::encode(&payout.voucher.signature).into_string().into();
+        // Solana's voucher scheme spells the voucher's own fields (spec #1685).
+        ChannelPresentation::Solana { channel } => {
+            for (field, value) in connector_runtime::solana_voucher_fields(channel, &payout.voucher)
+            {
+                json[field] = value;
+            }
         }
         // XRPL's voucher scheme spells the voucher's own fields (spec #1685).
         ChannelPresentation::Xrpl { channel } => {

@@ -114,12 +114,6 @@ pub(crate) fn decode_hex_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
         .ok()
 }
 
-/// Decode a base58 string into exactly `N` bytes, or `None` for anything
-/// malformed or the wrong length.
-pub(crate) fn decode_base58_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
-    bs58::decode(s).into_vec().ok()?.try_into().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,14 +124,5 @@ mod tests {
         assert_eq!(decode_hex_bytes::<2>("abcd"), Some([0xab, 0xcd]));
         assert_eq!(decode_hex_bytes::<2>("0xab"), None);
         assert_eq!(decode_hex_bytes::<2>("0xzzzz"), None);
-    }
-
-    #[test]
-    fn base58_decodes_only_at_its_length() {
-        let key = [7u8; 32];
-        let text = bs58::encode(key).into_string();
-        assert_eq!(decode_base58_bytes::<32>(&text), Some(key));
-        assert_eq!(decode_base58_bytes::<31>(&text), None);
-        assert_eq!(decode_base58_bytes::<32>("0OIl"), None);
     }
 }
