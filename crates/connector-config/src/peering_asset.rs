@@ -7,6 +7,52 @@ use crate::peer::PeerConfig;
 use crate::peer_channel::PeerChannelConfig;
 use crate::settlement::{SettlementChain, SettlementConfig};
 
+use thiserror::Error;
+
+/// Every way the peering asset rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum PeeringAssetRefusal {
+    /// A peering whose channels hold a token no `[[tokens]]` row declares
+    /// (ADR 0071 decision 1, issue #1292).
+    ///
+    /// Only ever reached on a node that declares tokens: one that declares
+    /// none resolves no peering at all and is not held to this rule, which
+    /// is what makes ADR 0071 free for every operator who deals nothing.
+    /// On a node that does deal, the alternative to this refusal is a
+    /// forward discovering mid-packet that it cannot say what unit it is
+    /// carrying -- and the packet is already paid for by then.
+    #[error(
+        "peering '{peer_id}' is denominated in '{asset}', which is not a token this node \
+         deals: a node that declares [[tokens]] must be able to say which declared token \
+         every peering holds, because a forward between two peerings is a conversion exactly \
+         when their tokens differ. The token comes from the [settlement] table that peering's \
+         channels settle through -- declare it with a [[tokens]] row, or remove the [[tokens]] \
+         table if this node deals nothing"
+    )]
+    PeeringTokenNotDeclared { peer_id: String, asset: String },
+
+    /// One peering whose channel rows sit on two chains, and therefore in
+    /// two tokens (ADR 0071 decision 1, issue #1292). A packet's amount is
+    /// denominated by the channel it rides, so a peering with two units has
+    /// no unit at all: which one a forward was converting into would depend
+    /// on which of the two tables the reader consulted.
+    #[error(
+        "peering '{peer_id}' holds channels in two tokens, '{first}' and '{second}': a \
+         peering is one denomination -- a packet's amount is denominated by the channel it \
+         rides, and a forward out of this one has no single unit to convert into. Give each \
+         chain its own [[peers]] row, so that every peering's [[peer_channels]] and \
+         [[pay_channels]] rows settle through one [settlement] table"
+    )]
+    PeeringTokenAmbiguous {
+        peer_id: String,
+        first: AssetId,
+        second: AssetId,
+    },
+}
+
 /// Which declared token each peering's channels are denominated in (ADR
 /// 0071 decision 1, issue #1292).
 ///
@@ -26,7 +72,7 @@ use crate::settlement::{SettlementChain, SettlementConfig};
 /// [`Config::load`](crate::Config::load) refuses by name. XRPL is the
 /// exception (ADR 0087 decision 6, #1636): a node with an XRPL table must
 /// declare tokens, or
-/// [`ConfigError::XrplSettlementWithoutTokens`] refuses it.
+/// [`DenominationRefusal::XrplSettlementWithoutTokens`] refuses it.
 ///
 /// A pure function of loaded config, and deliberately so: this is read on
 /// the forwarding path, for every forward, where there is no I/O to do and
@@ -59,7 +105,7 @@ impl PeeringAssets {
     ///
     /// `None` has two causes and neither is "this peering holds an
     /// undeclared token" -- that is a boot refusal
-    /// ([`ConfigError::PeeringTokenNotDeclared`]), so it never reaches a
+    /// ([`PeeringAssetRefusal::PeeringTokenNotDeclared`]), so it never reaches a
     /// reader. It is either a node that declares no tokens at all, or a
     /// peering with no `[[peers]]` row for this table to have been
     /// resolved from: one established at runtime over the operator surface
@@ -251,21 +297,25 @@ pub(crate) fn resolve_peering_assets(
                 None => continue,
                 Some(Ok(asset)) => asset,
                 Some(Err(asset)) => {
-                    return Err(ConfigError::PeeringTokenNotDeclared {
-                        peer_id: peer.id().to_string(),
-                        asset,
-                    })
+                    return Err(ConfigError::PeeringAsset(
+                        PeeringAssetRefusal::PeeringTokenNotDeclared {
+                            peer_id: peer.id().to_string(),
+                            asset,
+                        },
+                    ))
                 }
             };
             match &resolved {
                 None => resolved = Some(asset),
                 Some(first) if first == &asset => {}
                 Some(first) => {
-                    return Err(ConfigError::PeeringTokenAmbiguous {
-                        peer_id: peer.id().to_string(),
-                        first: first.clone(),
-                        second: asset,
-                    })
+                    return Err(ConfigError::PeeringAsset(
+                        PeeringAssetRefusal::PeeringTokenAmbiguous {
+                            peer_id: peer.id().to_string(),
+                            first: first.clone(),
+                            second: asset,
+                        },
+                    ))
                 }
             }
         }

@@ -10,7 +10,7 @@
 //!
 //! A peering carries signed balance proofs (ADR 0004), so the scheme that
 //! selects this carriage in any deployed config is `wss://`. `ws://` is
-//! [`connector_config::ConfigError::PeerEndpointScheme`] at load unless
+//! [`PeerRefusal::PeerEndpointScheme`] at load unless
 //! the node set `peer_allow_plaintext_endpoints` (issue #678's gap 3) --
 //! or unless the endpoint's host ends in `.onion`, which permits the
 //! plaintext schemes on its own (ADR 0070 decision 2) because the address

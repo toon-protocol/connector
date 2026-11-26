@@ -47,6 +47,95 @@ use crate::error::ConfigError;
 use crate::peer::{is_onion_endpoint, PeerCarriage, PeerExposure};
 use crate::route::is_valid_ilp_address;
 
+use thiserror::Error;
+
+/// Every way the node rules refuse a config. Composed into
+/// [`ConfigError`] (issue #1690), so the binary still handles one error and the
+/// messages are the ones the operator has always seen.
+#[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
+pub enum NodeRefusal {
+    // -- The `[node]` section (ADR 0050, issue #1080) --
+    //
+    // Every one of these refuses a value this node would otherwise publish
+    // in its own self-description, which is read by strangers and acted on.
+    // That is what makes them load errors rather than warnings.
+    #[error(
+        "[node] names no addresses: a section with no `addresses` describes no node at all. \
+         Set `addresses = [\"g.your.node\"]` (primary first) -- see \
+         docs/protocol/self-description-spec.md (ADR 0050, issue #1080)"
+    )]
+    NodeNoAddresses,
+
+    /// Issue #1220: `btp_endpoint` is required when `peer_expose` opens a BTP
+    /// peer listener; `http_endpoint` whenever it opens any -- a peer covering
+    /// a forward asks this node's client edge for claim-state over HTTP
+    /// whichever carriage the packet rides (issue #1217), so a peerable node
+    /// with no HTTP endpoint is one nobody can pay.
+    #[error(
+        "[node] {field} is not set, but peer_expose = \"{peer_expose}\" makes this node \
+         peerable and a peer needs it (btp_endpoint to dial over BTP; http_endpoint to ask \
+         this node's client edge for claim-state over HTTP, whichever carriage a packet \
+         rides): a node behind TLS termination cannot learn its own public name, so this is \
+         an operator fact and there is deliberately no default. The retired announcer sidecar \
+         DID default it, and its compiled-in fallback named a `/rust/ilp` path that \
+         answers 410 Gone on both devnet boxes -- a default here is how a node ends up \
+         publishing a dead URL to whoever asks (ADR 0050, issue #1220)"
+    )]
+    NodeMissingEndpoint {
+        field: &'static str,
+        peer_expose: &'static str,
+    },
+
+    #[error("[node] {field} '{value}' is not a URL: {source}")]
+    NodeInvalidUrl {
+        field: &'static str,
+        value: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error(
+        "[node] {field} '{value}' has scheme '{scheme}', but this field must name one of: \
+         {allowed}. The two URLs a node publishes are where clients PAY it, over two different \
+         carriages: `http_endpoint` is ILP-over-HTTP (`https://`) and `btp_endpoint` is BTP \
+         (`wss://`). Conflating them publishes an address no client can reach (ADR 0050)"
+    )]
+    NodeEndpointScheme {
+        field: &'static str,
+        value: String,
+        scheme: String,
+        allowed: String,
+    },
+
+    /// A `[node]` (or a stale `[announce]`) key that died with the kind:10032
+    /// announce (ADR 0046, issue #1074).
+    ///
+    /// The removed-key trap [`ConfigError::PeerWireAddrRemoved`] and
+    /// [`ConfigError::PeerSaleRemoved`] already take, for the same reason: the
+    /// devnet boxes bind-mount configs that lead the repo copies, so a stale
+    /// file must stop the node **by name** rather than load with the key
+    /// silently dropped (ADR 0009).
+    ///
+    /// One variant covers all fifteen, because the fix is always the same --
+    /// delete the line. Nothing survives for any of them to be rewritten into:
+    /// what a node publishes about itself is now either one of `[node]`'s three
+    /// configured facts or derived from a settlement backend that proved it
+    /// against a chain.
+    #[error(
+        "'[node] {field}' was removed with the kind:10032 announce (ADR 0046, issue #1074): a \
+         connector answers when asked and never announces, so there is no event for this key to \
+         ride on. `[node]` keeps exactly three fields -- `addresses`, `http_endpoint` and \
+         `btp_endpoint` -- the facts a node cannot introspect about itself; everything else it \
+         publishes is derived from the settlement backends and the route table (ADR 0050). \
+         Delete the line. `relay_url` in particular described software BEHIND this connector, \
+         which a self-description never carries, and `solana_chain_id` was a second declaration \
+         of a fact `[settlement.solana]` already holds -- which is how a mainnet node came to \
+         describe itself as devnet (issue #981)"
+    )]
+    AnnounceKeyRemoved { field: &'static str },
+}
+
 /// The `[node]` section exactly as written. `deny_unknown_fields` for the
 /// reason every other section has it (issue #542): a mistyped `addressess`
 /// would otherwise be dropped silently and the node would describe itself
@@ -192,18 +281,20 @@ fn validate_endpoint(
     value: String,
     allowed: &[&str],
 ) -> Result<String, ConfigError> {
-    let url = url::Url::parse(&value).map_err(|source| ConfigError::NodeInvalidUrl {
-        field,
-        value: value.clone(),
-        source,
+    let url = url::Url::parse(&value).map_err(|source| {
+        ConfigError::Node(NodeRefusal::NodeInvalidUrl {
+            field,
+            value: value.clone(),
+            source,
+        })
     })?;
     if !allowed.contains(&url.scheme()) {
-        return Err(ConfigError::NodeEndpointScheme {
+        return Err(ConfigError::Node(NodeRefusal::NodeEndpointScheme {
             field,
             value,
             scheme: url.scheme().to_string(),
             allowed: allowed.join(", "),
-        });
+        }));
     }
     Ok(value)
 }
@@ -224,10 +315,10 @@ fn resolve_endpoint(
 ) -> Result<Option<String>, ConfigError> {
     match (value, required) {
         (Some(value), _) => Ok(Some(validate_endpoint(field, value, allowed_schemes)?)),
-        (None, true) => Err(ConfigError::NodeMissingEndpoint {
+        (None, true) => Err(ConfigError::Node(NodeRefusal::NodeMissingEndpoint {
             field,
             peer_expose: peer_expose.name(),
-        }),
+        })),
         (None, false) => Ok(None),
     }
 }
@@ -267,12 +358,12 @@ pub(crate) fn resolve_node(
         ("notice_url", raw.notice_url.is_some()),
     ] {
         if present {
-            return Err(ConfigError::AnnounceKeyRemoved { field });
+            return Err(ConfigError::Node(NodeRefusal::AnnounceKeyRemoved { field }));
         }
     }
 
     if raw.addresses.is_empty() {
-        return Err(ConfigError::NodeNoAddresses);
+        return Err(ConfigError::Node(NodeRefusal::NodeNoAddresses));
     }
     for address in &raw.addresses {
         if !is_valid_ilp_address(address) {
@@ -380,7 +471,7 @@ mod tests {
         without_http.http_endpoint = None;
         assert!(matches!(
             resolve_node(Some(without_http), PeerExposure::Both),
-            Err(ConfigError::NodeMissingEndpoint { field, peer_expose })
+            Err(ConfigError::Node(NodeRefusal::NodeMissingEndpoint { field, peer_expose }))
                 if field == "http_endpoint" && peer_expose == "both"
         ));
 
@@ -388,7 +479,7 @@ mod tests {
         without_btp.btp_endpoint = None;
         assert!(matches!(
             resolve_node(Some(without_btp), PeerExposure::Both),
-            Err(ConfigError::NodeMissingEndpoint { field, peer_expose })
+            Err(ConfigError::Node(NodeRefusal::NodeMissingEndpoint { field, peer_expose }))
                 if field == "btp_endpoint" && peer_expose == "both"
         ));
     }
@@ -422,7 +513,7 @@ mod tests {
         btp_only_without_http.http_endpoint = None;
         assert!(matches!(
             resolve_node(Some(btp_only_without_http), PeerExposure::Btp),
-            Err(ConfigError::NodeMissingEndpoint { field, peer_expose })
+            Err(ConfigError::Node(NodeRefusal::NodeMissingEndpoint { field, peer_expose }))
                 if field == "http_endpoint" && peer_expose == "btp"
         ));
 
@@ -430,7 +521,7 @@ mod tests {
         http_only_without_btp.btp_endpoint = None;
         assert!(matches!(
             resolve_node(Some(http_only_without_btp), PeerExposure::Btp),
-            Err(ConfigError::NodeMissingEndpoint { field, peer_expose })
+            Err(ConfigError::Node(NodeRefusal::NodeMissingEndpoint { field, peer_expose }))
                 if field == "btp_endpoint" && peer_expose == "btp"
         ));
     }
@@ -476,14 +567,14 @@ mod tests {
         swapped.http_endpoint = Some("wss://proxy.example/ilp/btp".to_string());
         assert!(matches!(
             resolve_node(Some(swapped), PeerExposure::Both),
-            Err(ConfigError::NodeEndpointScheme { field, .. }) if field == "http_endpoint"
+            Err(ConfigError::Node(NodeRefusal::NodeEndpointScheme { field, .. })) if field == "http_endpoint"
         ));
 
         let mut swapped = raw();
         swapped.btp_endpoint = Some("https://proxy.example/ilp".to_string());
         assert!(matches!(
             resolve_node(Some(swapped), PeerExposure::Both),
-            Err(ConfigError::NodeEndpointScheme { field, .. }) if field == "btp_endpoint"
+            Err(ConfigError::Node(NodeRefusal::NodeEndpointScheme { field, .. })) if field == "btp_endpoint"
         ));
     }
 
@@ -493,7 +584,7 @@ mod tests {
         empty.addresses = Vec::new();
         assert!(matches!(
             resolve_node(Some(empty), PeerExposure::Both),
-            Err(ConfigError::NodeNoAddresses)
+            Err(ConfigError::Node(NodeRefusal::NodeNoAddresses))
         ));
     }
 
@@ -571,7 +662,7 @@ mod tests {
             set(&mut written);
             let error = resolve_node(Some(written), PeerExposure::Both).expect_err(name);
             assert!(
-                matches!(error, ConfigError::AnnounceKeyRemoved { field } if field == name),
+                matches!(error, ConfigError::Node(NodeRefusal::AnnounceKeyRemoved { field }) if field == name),
                 "{name} must be refused by its own name, got: {error}"
             );
         }
@@ -587,7 +678,7 @@ mod tests {
 
         assert!(matches!(
             resolve_node(Some(written), PeerExposure::Both),
-            Err(ConfigError::AnnounceKeyRemoved { field }) if field == "ttl_secs"
+            Err(ConfigError::Node(NodeRefusal::AnnounceKeyRemoved { field })) if field == "ttl_secs"
         ));
     }
 
@@ -602,7 +693,7 @@ mod tests {
 
         assert!(matches!(
             resolve_node(Some(written), PeerExposure::Both),
-            Err(ConfigError::AnnounceKeyRemoved { field }) if field == "relay_url"
+            Err(ConfigError::Node(NodeRefusal::AnnounceKeyRemoved { field })) if field == "relay_url"
         ));
     }
 

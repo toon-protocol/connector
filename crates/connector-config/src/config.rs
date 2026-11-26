@@ -11,6 +11,7 @@ use connector_domain::peering_admission::{
 };
 
 use crate::client_channel_asset::{resolve_client_channel_assets, ClientChannelAssets};
+use crate::denomination::DenominationRefusal;
 use crate::denomination::{
     resolve_denomination, DenominationConfig, RawRateGuards, RawRateRow, RawToken,
 };
@@ -19,6 +20,7 @@ use crate::identity::{resolve_client_identities, ClientIdentityConfig, RawClient
 use crate::node::{resolve_node, NodeConfig, RawNodeConfig};
 use crate::operator::{resolve_operator, OperatorConfig, RawOperatorConfig};
 use crate::pay_channel::{resolve_pay_channels, PayChannelConfig, RawPayChannel};
+use crate::peer::PeerRefusal;
 use crate::peer::{
     is_onion_endpoint, parse_peer_exposure, resolve_peers, PeerConfig, PeerExposure, RawPeer,
 };
@@ -92,7 +94,7 @@ struct RawConfig {
     /// gap 3).
     ///
     /// Absent and `false` are the same thing and are the production
-    /// answer: a plaintext endpoint stays [`ConfigError::PeerEndpointScheme`],
+    /// answer: a plaintext endpoint stays [`PeerRefusal::PeerEndpointScheme`],
     /// exactly as before this field existed. `true` is a **loopback and
     /// test** opt-in, for a harness that stands up two connectors on
     /// `127.0.0.1` with no TLS terminator between them; a node that sets it
@@ -393,10 +395,10 @@ impl Config {
             // What the *far* side exposes is not knowable from here and
             // stays a runtime dial failure.
             if !peer.can_originate() {
-                return Err(ConfigError::PeerRouteUndeliverable {
+                return Err(ConfigError::Peer(PeerRefusal::PeerRouteUndeliverable {
                     prefix: peer_route.prefix().to_string(),
                     peer_id: peer_route.peer_id().to_string(),
-                });
+                }));
             }
         }
         // Unknown peer, orphaned `[[peer_channels]]` rows and unbound
@@ -535,10 +537,12 @@ impl Config {
                 SettlementConfig::Xrpl(xrpl) => Some(xrpl),
                 _ => None,
             }) {
-                return Err(ConfigError::XrplSettlementWithoutTokens {
-                    table: format!("[settlement.{}]", xrpl.table_name()),
-                    asset: xrpl.asset().to_string(),
-                });
+                return Err(ConfigError::Denomination(
+                    DenominationRefusal::XrplSettlementWithoutTokens {
+                        table: format!("[settlement.{}]", xrpl.table_name()),
+                        asset: xrpl.asset().to_string(),
+                    },
+                ));
             }
         }
         // ADR 0080 decision 7, as amended: a zk edge prices in MINA, and a
@@ -1116,8 +1120,17 @@ pub fn parse_socks_proxy(value: &str) -> Result<Url, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_settlement::BatchSettlementRefusal;
+    use crate::client_channel_asset::ClientChannelAssetRefusal;
+    use crate::identity::ClientIdentityRefusal;
+    use crate::operator::OperatorRefusal;
+    use crate::pay_channel::PayChannelRefusal;
     use crate::peer::{PeerCarriage, DEFAULT_MAX_PACKET_AMOUNT};
+    use crate::peer_channel::PeerChannelRefusal;
+    use crate::peering_asset::PeeringAssetRefusal;
+    use crate::route::RouteRefusal;
     use crate::route::TransportPolicy;
+    use crate::secret::SecretRefusal;
     use crate::settlement::{SettlementChain, SettlementRefusal};
     use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
@@ -1570,7 +1583,10 @@ handler_url = "http://localhost:5000"
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::RouteMissingPrice { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Route(RouteRefusal::RouteMissingPrice { .. }))
+        ));
     }
 
     // -- The peer carriage config surface (issue #677,
@@ -1775,7 +1791,7 @@ client_edge_url = "https://store.example/ilp"
         assert!(
             matches!(
                 &error,
-                ConfigError::ChannelRowNetworkAmbiguous { table: "peer_channels", peer_id, .. }
+                ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkAmbiguous { table: "peer_channels", peer_id, .. })
                     if peer_id == "store"
             ),
             "{error:?}"
@@ -1794,10 +1810,10 @@ client_edge_url = "https://store.example/ilp"
         assert!(
             matches!(
                 &error,
-                ConfigError::ChannelRowNetworkAmbiguous {
+                ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkAmbiguous {
                     table: "pay_channels",
                     ..
-                }
+                })
             ),
             "{error:?}"
         );
@@ -1810,7 +1826,7 @@ client_edge_url = "https://store.example/ilp"
         assert!(
             matches!(
                 &error,
-                ConfigError::ChannelRowNetworkUnsettled { table: "peer_channels", network, .. }
+                ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkUnsettled { table: "peer_channels", network, .. })
                     if network == "eip155:8453"
             ),
             "{error:?}"
@@ -1819,7 +1835,10 @@ client_edge_url = "https://store.example/ilp"
 
         let error = load_peering(|text| rows_on(text, "eip155:base")).unwrap_err();
         assert!(
-            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            matches!(
+                &error,
+                ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkInvalid { .. })
+            ),
             "{error:?}"
         );
 
@@ -1828,7 +1847,10 @@ client_edge_url = "https://store.example/ilp"
         let error = load_peering(|text| rows_on(text, "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"))
             .unwrap_err();
         assert!(
-            matches!(&error, ConfigError::ChannelRowNetworkInvalid { .. }),
+            matches!(
+                &error,
+                ConfigError::Settlement(SettlementRefusal::ChannelRowNetworkInvalid { .. })
+            ),
             "{error:?}"
         );
     }
@@ -1905,7 +1927,7 @@ client_edge_url = "https://store.example/ilp"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerMaxPacketAmountZero { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerMaxPacketAmountZero { id }) if id == "store"),
         );
         assert!(
             message.contains("max_packet_amount = 0") && message.contains("ONE packet"),
@@ -1976,7 +1998,7 @@ client_edge_url = "https://store.example/ilp"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerUndialable { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerUndialable { id }) if id == "store"),
         );
         assert!(
             message.contains("can never establish") && message.contains(BRINGUP_DOC),
@@ -1997,7 +2019,7 @@ client_edge_url = "https://store.example/ilp"
             let result = load_peering(|text| text.replace("wss://store.example:443/btp", written));
 
             let message = expect_error(result, |error| {
-                matches!(error, ConfigError::PeerEndpointScheme { id, scheme: s, .. }
+                matches!(error, ConfigError::Peer(PeerRefusal::PeerEndpointScheme { id, scheme: s, .. })
                     if id == "store" && s == scheme)
             });
             assert!(
@@ -2052,7 +2074,7 @@ client_edge_url = "https://store.example/ilp"
         });
         assert!(matches!(
             result,
-            Err(ConfigError::PeerEndpointScheme { .. })
+            Err(ConfigError::Peer(PeerRefusal::PeerEndpointScheme { .. }))
         ));
     }
 
@@ -2353,7 +2375,7 @@ key_file = "{key}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::InvalidPeerEndpoint { id, .. } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::InvalidPeerEndpoint { id, .. }) if id == "store"),
         );
         assert!(
             message.contains("is a URL") && message.contains(BRINGUP_DOC),
@@ -2372,7 +2394,7 @@ key_file = "{key}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::InvalidPeerEndpoint { id, .. } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::InvalidPeerEndpoint { id, .. }) if id == "store"),
         );
         assert!(message.contains("is a URL"), "got: {message}");
     }
@@ -2396,7 +2418,7 @@ key_file = "{key}"
 
             let message = expect_error(
                 result,
-                |error| matches!(error, ConfigError::PeerCredentialRemoved { id } if id == "store"),
+                |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerCredentialRemoved { id }) if id == "store"),
             );
             assert!(
                 message.contains("ADR 0060") && message.contains("verified claim"),
@@ -2557,7 +2579,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeerChannelToonFieldRemoved { peer_id, field: "channel_account" }
+                ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelToonFieldRemoved { peer_id, field: "channel_account" })
                     if peer_id == "store"
             )
         });
@@ -2577,7 +2599,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeerChannelWithoutX402 { peer_id, chain: "solana" }
+                ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelWithoutX402 { peer_id, chain: "solana" })
                     if peer_id == "store"
             )
         });
@@ -2745,7 +2767,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeeringTokenNotDeclared { peer_id, asset }
+                ConfigError::PeeringAsset(PeeringAssetRefusal::PeeringTokenNotDeclared { peer_id, asset })
                     if peer_id == "store"
                         && asset == &SETTLEMENT_TOKEN.to_ascii_lowercase()
             )
@@ -2813,7 +2835,7 @@ voucher_signer = "{SOLANA_COUNTERPARTY_KEY}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeeringTokenAmbiguous { peer_id, .. } if peer_id == "from-evm"
+                ConfigError::PeeringAsset(PeeringAssetRefusal::PeeringTokenAmbiguous { peer_id, .. }) if peer_id == "from-evm"
             )
         });
         assert!(
@@ -2945,7 +2967,7 @@ key_file = "{key_file}"
         let message = expect_error(load_text(&text), |error| {
             matches!(
                 error,
-                ConfigError::ClientChannelTokenNotDeclared { chain, asset }
+                ConfigError::ClientChannelAsset(ClientChannelAssetRefusal::ClientChannelTokenNotDeclared { chain, asset })
                     if *chain == SettlementChain::Solana
                         && asset == &format!("solana:<genesis prefix>/token:{SOLANA_MINT}")
             )
@@ -3053,9 +3075,13 @@ key_file = "{key_file}"
                 |error| {
                     matches!(
                         error,
-                        ConfigError::TokenAssetInvalid { .. }
-                            | ConfigError::RateRowAssetInvalid { .. }
-                            | ConfigError::TokenQuoteTokenInvalid { .. }
+                        ConfigError::Denomination(DenominationRefusal::TokenAssetInvalid { .. })
+                            | ConfigError::Denomination(
+                                DenominationRefusal::RateRowAssetInvalid { .. }
+                            )
+                            | ConfigError::Denomination(
+                                DenominationRefusal::TokenQuoteTokenInvalid { .. }
+                            )
                     )
                 },
             );
@@ -3073,7 +3099,12 @@ key_file = "{key_file}"
         let on_base = SETTLEMENT_TOKEN.replace("eip155:31337", "eip155:8453");
         let message = expect_error(
             load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &on_base]))),
-            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
+            |error| {
+                matches!(
+                    error,
+                    ConfigError::Denomination(DenominationRefusal::TokenWithoutSettlement { .. })
+                )
+            },
         );
         assert!(
             message.contains("[settlement.eip155.8453]"),
@@ -3084,7 +3115,12 @@ key_file = "{key_file}"
         let solana_token = format!("solana:{SOLANA_GENESIS}/token:{SOLANA_MINT}");
         expect_error(
             load_peering(|text| format!("{text}{}", declaring(&[SETTLEMENT_TOKEN, &solana_token]))),
-            |error| matches!(error, ConfigError::TokenWithoutSettlement { .. }),
+            |error| {
+                matches!(
+                    error,
+                    ConfigError::Denomination(DenominationRefusal::TokenWithoutSettlement { .. })
+                )
+            },
         );
     }
 
@@ -3115,7 +3151,7 @@ key_file = "{key_file}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeerChannelWithoutX402 { peer_id, chain: "evm" } if peer_id == "store"
+                ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelWithoutX402 { peer_id, chain: "evm" }) if peer_id == "store"
             )
         });
         assert!(
@@ -3264,7 +3300,7 @@ key_file = "{key_file}"
         let message = expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PayChannelToonFieldRemoved { peer_id, field: "channel_id" }
+                ConfigError::PayChannel(PayChannelRefusal::PayChannelToonFieldRemoved { peer_id, field: "channel_id" })
                     if peer_id == "store"
             )
         });
@@ -3291,7 +3327,7 @@ key_file = "{key_file}"
         expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PeerChannelToonFieldRemoved { peer_id, field: "channel_id" }
+                ConfigError::PeerChannel(PeerChannelRefusal::PeerChannelToonFieldRemoved { peer_id, field: "channel_id" })
                     if peer_id == "store"
             )
         });
@@ -3362,10 +3398,10 @@ key_file = "{key_file}"
         expect_error(result, |error| {
             matches!(
                 error,
-                ConfigError::PayChannelToonFieldRemoved {
+                ConfigError::PayChannel(PayChannelRefusal::PayChannelToonFieldRemoved {
                     field: "channel_account",
                     ..
-                }
+                })
             )
         });
     }
@@ -3405,7 +3441,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerCeilingRemoved { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerCeilingRemoved { id }) if id == "store"),
         );
         assert!(
             message.contains("ADR 0033") && message.contains(BRINGUP_DOC),
@@ -3425,7 +3461,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerFlushIntervalRemoved { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerFlushIntervalRemoved { id }) if id == "store"),
         );
         assert!(
             message.contains("ADR 0033") && message.contains(BRINGUP_DOC),
@@ -3446,7 +3482,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerClaimAckTimeoutRemoved { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerClaimAckTimeoutRemoved { id }) if id == "store"),
         );
         assert!(
             message.contains("ADR 0075") && message.contains("peer_answer_timeout_ms"),
@@ -3465,7 +3501,7 @@ key_file = "{key_file}"
         });
 
         let message = expect_error(result, |error| {
-            matches!(error, ConfigError::PeerRouteUndeliverable { prefix, peer_id }
+            matches!(error, ConfigError::Peer(PeerRefusal::PeerRouteUndeliverable { prefix, peer_id })
                 if prefix == "g.example.store" && peer_id == "store")
         });
         assert!(
@@ -3486,7 +3522,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::DuplicatePeerId { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::DuplicatePeerId { id }) if id == "store"),
         );
         assert!(
             message.contains("unanswerable") && message.contains(BRINGUP_DOC),
@@ -3508,7 +3544,7 @@ key_file = "{key_file}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::PeerAddrRemoved { id } if id == "store"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::PeerAddrRemoved { id }) if id == "store"),
         );
         assert!(
             message.contains("removed with the raw-TCP transport")
@@ -3635,7 +3671,7 @@ controller_keys_file = "{}"
 
         let message = expect_error(
             result,
-            |error| matches!(error, ConfigError::InvalidPeerExposure { value } if value == "tcp"),
+            |error| matches!(error, ConfigError::Peer(PeerRefusal::InvalidPeerExposure { value }) if value == "tcp"),
         );
         assert!(message.contains("neither"), "got: {message}");
     }
@@ -3703,7 +3739,7 @@ key_file = "{key}"
             |error| {
                 matches!(
                     error,
-                    ConfigError::XrplSettlementWithoutTokens { table, asset }
+                    ConfigError::Denomination(DenominationRefusal::XrplSettlementWithoutTokens { table, asset })
                         if table == "[settlement.xrpl.1000]"
                             && asset == "xrpl:1000/slip44:144"
                 )
@@ -3965,7 +4001,10 @@ addr = "127.0.0.1:5000"
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::PeerAddrRemoved { .. })));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Peer(PeerRefusal::PeerAddrRemoved { .. }))
+        ));
     }
 
     #[test]
@@ -4022,7 +4061,10 @@ key_file = "/nonexistent/does-not-exist.key"
 "#,
             Path::new("test.toml"),
         );
-        assert!(matches!(result, Err(ConfigError::SignerKeyFileNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Secret(SecretRefusal::SignerKeyFileNotFound(_)))
+        ));
     }
 
     #[test]
@@ -4197,10 +4239,12 @@ write_keys = ["{key}"]
 
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorSettingAmbiguous {
-                literal: "bearer_token",
-                file: "bearer_token_file",
-            })
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorSettingAmbiguous {
+                    literal: "bearer_token",
+                    file: "bearer_token_file",
+                }
+            ))
         ));
     }
 
@@ -4221,7 +4265,10 @@ bearer_token = "secret-token"
             )
         });
 
-        assert!(matches!(result, Err(ConfigError::OperatorNoWriteKeys)));
+        assert!(matches!(
+            result,
+            Err(ConfigError::Operator(OperatorRefusal::OperatorNoWriteKeys))
+        ));
     }
 
     #[test]
@@ -4244,7 +4291,9 @@ write_keys = ["{key}"]
 
         assert!(matches!(
             result,
-            Err(ConfigError::OperatorMissingBearerToken)
+            Err(ConfigError::Operator(
+                OperatorRefusal::OperatorMissingBearerToken
+            ))
         ));
     }
 
@@ -4376,7 +4425,10 @@ key_file = "{key_path}"
         let error = load("min_withdraw_delay_secs = 600").expect_err("below the floor");
         assert!(matches!(
             error,
-            ConfigError::BatchSettlementDelayBelowFloor { value: 600, .. }
+            ConfigError::BatchSettlement(BatchSettlementRefusal::BatchSettlementDelayBelowFloor {
+                value: 600,
+                ..
+            })
         ));
     }
 
@@ -4953,7 +5005,7 @@ secret = "two"
 
         assert!(matches!(
             result,
-            Err(ConfigError::DuplicateClientIdentityId { id }) if id == "peer-a"
+            Err(ConfigError::ClientIdentity(ClientIdentityRefusal::DuplicateClientIdentityId { id })) if id == "peer-a"
         ));
     }
 
