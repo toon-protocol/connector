@@ -15,7 +15,7 @@ use crate::peer::PeerRefusal;
 use crate::peer_channel::PeerChannelRefusal;
 use crate::peering_asset::PeeringAssetRefusal;
 use crate::route::RouteRefusal;
-use crate::secret::SecretRefusal;
+use crate::secret::SignerRefusal;
 use crate::settlement::SettlementRefusal;
 use crate::zk_note::ZkNoteRefusal;
 
@@ -95,9 +95,9 @@ pub enum ConfigError {
     #[error(transparent)]
     Route(#[from] RouteRefusal),
 
-    /// A refusal of the `secret` rules, defined beside them in `secret.rs`.
+    /// A refusal of the `[signer]` rules, defined beside them in `secret.rs`.
     #[error(transparent)]
-    Secret(#[from] SecretRefusal),
+    Signer(#[from] SignerRefusal),
 
     /// A refusal of the `zk note` rules, defined beside them in `zk_note.rs`.
     #[error(transparent)]
@@ -544,8 +544,8 @@ mod tests {
             Peer(PeerRefusal::PeerIdEmpty);
         a_route_refusal_is_the_config_error_it_is_wrapped_in:
             Route(RouteRefusal::MissingApex);
-        a_secret_refusal_is_the_config_error_it_is_wrapped_in:
-            Secret(SecretRefusal::SignerKmsIdEmpty);
+        a_signer_refusal_is_the_config_error_it_is_wrapped_in:
+            Signer(SignerRefusal::SignerKmsIdEmpty);
         a_zk_note_refusal_is_the_config_error_it_is_wrapped_in:
             ZkNote(ZkNoteRefusal::ZkNoteViaSocksProxyWithoutProxy);
     }

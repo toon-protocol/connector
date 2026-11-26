@@ -1130,7 +1130,7 @@ mod tests {
     use crate::peering_asset::PeeringAssetRefusal;
     use crate::route::RouteRefusal;
     use crate::route::TransportPolicy;
-    use crate::secret::SecretRefusal;
+    use crate::secret::SignerRefusal;
     use crate::settlement::{SettlementChain, SettlementRefusal};
     use connector_domain::{AssetId, PayloadLimit, Price};
     use std::io::Write;
@@ -4063,7 +4063,7 @@ key_file = "/nonexistent/does-not-exist.key"
         );
         assert!(matches!(
             result,
-            Err(ConfigError::Secret(SecretRefusal::SignerKeyFileNotFound(_)))
+            Err(ConfigError::Signer(SignerRefusal::SignerKeyFileNotFound(_)))
         ));
     }
 

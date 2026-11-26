@@ -282,7 +282,7 @@ pub(crate) fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
 /// request that the file it was pointed at is not there -- a surface that
 /// reads as enabled and authenticates nobody. ADR 0009 puts that failure at
 /// load instead, so a missing or unreadable file is a refuse-to-start error
-/// naming the setting, exactly as [`SecretRefusal::SignerKeyFileNotFound`] is
+/// naming the setting, exactly as [`SignerRefusal::SignerKeyFileNotFound`] is
 /// for `[signer] key_file`. The path is resolved the same way those are (by
 /// the OS, against the process's working directory), which is why the
 /// committed fleet configs write absolute container paths.

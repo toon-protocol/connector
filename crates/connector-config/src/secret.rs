@@ -6,12 +6,12 @@ use crate::error::ConfigError;
 
 use thiserror::Error;
 
-/// Every way the secret rules refuse a config. Composed into
+/// Every way the `[signer]` rules refuse a config. Composed into
 /// [`ConfigError`] (issue #1690), so the binary still handles one error and the
 /// messages are the ones the operator has always seen.
 #[derive(Debug, Error)]
 #[allow(clippy::enum_variant_names)]
-pub enum SecretRefusal {
+pub enum SignerRefusal {
     #[error("signer config must set exactly one of 'key_file' or 'kms_key_id', but {reason}")]
     SignerLocationAmbiguous { reason: &'static str },
 
@@ -59,7 +59,7 @@ impl SecretLocation {
         match (raw.key_file, raw.kms_key_id) {
             (Some(path), None) => {
                 if !path.is_file() {
-                    return Err(ConfigError::Secret(SecretRefusal::SignerKeyFileNotFound(
+                    return Err(ConfigError::Signer(SignerRefusal::SignerKeyFileNotFound(
                         path,
                     )));
                 }
@@ -67,17 +67,17 @@ impl SecretLocation {
             }
             (None, Some(key_id)) => {
                 if key_id.trim().is_empty() {
-                    return Err(ConfigError::Secret(SecretRefusal::SignerKmsIdEmpty));
+                    return Err(ConfigError::Signer(SignerRefusal::SignerKmsIdEmpty));
                 }
                 Ok(SecretLocation::Kms { key_id })
             }
-            (None, None) => Err(ConfigError::Secret(
-                SecretRefusal::SignerLocationAmbiguous {
+            (None, None) => Err(ConfigError::Signer(
+                SignerRefusal::SignerLocationAmbiguous {
                     reason: "neither 'key_file' nor 'kms_key_id' is set",
                 },
             )),
-            (Some(_), Some(_)) => Err(ConfigError::Secret(
-                SecretRefusal::SignerLocationAmbiguous {
+            (Some(_), Some(_)) => Err(ConfigError::Signer(
+                SignerRefusal::SignerLocationAmbiguous {
                     reason: "both 'key_file' and 'kms_key_id' are set",
                 },
             )),
@@ -113,7 +113,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::Secret(SecretRefusal::SignerKeyFileNotFound(_)))
+            Err(ConfigError::Signer(SignerRefusal::SignerKeyFileNotFound(_)))
         ));
     }
 
@@ -142,7 +142,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::Secret(SecretRefusal::SignerKmsIdEmpty))
+            Err(ConfigError::Signer(SignerRefusal::SignerKmsIdEmpty))
         ));
     }
 
@@ -155,8 +155,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::Secret(
-                SecretRefusal::SignerLocationAmbiguous { .. }
+            Err(ConfigError::Signer(
+                SignerRefusal::SignerLocationAmbiguous { .. }
             ))
         ));
     }
@@ -173,8 +173,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ConfigError::Secret(
-                SecretRefusal::SignerLocationAmbiguous { .. }
+            Err(ConfigError::Signer(
+                SignerRefusal::SignerLocationAmbiguous { .. }
             ))
         ));
     }

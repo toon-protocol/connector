@@ -61,7 +61,7 @@ pub use peer::{
 pub use peer_channel::{PeerChannelConfig, PeerChannelRefusal};
 pub use peering_asset::{PeeringAssetRefusal, PeeringAssets};
 pub use route::{PeerRouteConfig, RouteRefusal, StaticRoute, TransportPolicy};
-pub use secret::{SecretLocation, SecretRefusal};
+pub use secret::{SecretLocation, SignerRefusal};
 pub use settlement::{
     EvmSettlementConfig, NetworkTableFamily, SettlementChain, SettlementConfig, SettlementRefusal,
     SolanaSettlementConfig, UnknownSettlementChain, XrplSettlementConfig,
