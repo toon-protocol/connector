@@ -3347,11 +3347,11 @@ impl Connector {
     /// came, and no second expiry check is applied to work already done.
     /// That asymmetry is deliberate and is the whole of ADR 0064: the claim
     /// paying for this packet was taken *before* the app was called -- at
-    /// the client edge by `ClientClaimGate::ingest`, or on a peer arrival by
-    /// the same gate's voucher admission (ADR 0075 decision 6), in both
+    /// the client edge by the claim gate's admission, or on a peer arrival
+    /// by the same gate's voucher admission (ADR 0075 decision 6), in both
     /// cases with the watermark advanced and journalled
     /// before routing began -- and only a forwarded route's terminal reject
-    /// gives one back (`roll_back_uncarried_forward`, issue #1012). So the
+    /// gives one back (the client edge's paid packet, issue #1012). So the
     /// verdict returned here decides nothing about who is out of pocket.
     /// Rejecting a late-but-real answer would destroy work the payer has
     /// already been charged for, refund nobody, and say something false
